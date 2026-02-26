@@ -51,3 +51,8 @@ The HTTP service now exposes:
 To offload layers to Metal (MPS), set either `runtime.mps_layers` in `config/server.yaml` or export `INFERFLUX_MPS_LAYERS=<layer-count>` before launching `inferfluxd`. The metrics endpoint reports the active backend label (`cpu`, `mps`, or `stub`).
 
 See `docs/` for the PRD, design, and non-functional requirements, and `config/server.yaml` for a reference deployment configuration.
+
+## Tests
+- Unit tests: `ctest --test-dir build --output-on-failure`
+- Integration (requires `INFERFLUX_MODEL_PATH` pointing to a GGUF and `INFERCTL_API_KEY`):  
+  `ctest -R IntegrationSSE --output-on-failure`

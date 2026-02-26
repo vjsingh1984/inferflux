@@ -231,6 +231,12 @@ int main(int argc, char** argv) {
   if (const char* env_oidc_aud = std::getenv("INFERFLUX_OIDC_AUDIENCE")) {
     oidc_audience = env_oidc_aud;
   }
+  if (const char* env_port = std::getenv("INFERFLUX_PORT_OVERRIDE")) {
+    port = std::stoi(env_port);
+  }
+  if (const char* env_host = std::getenv("INFERFLUX_HOST_OVERRIDE")) {
+    host = env_host;
+  }
 
   inferflux::SimpleTokenizer tokenizer;
   auto device = std::make_shared<inferflux::CPUDeviceContext>();
