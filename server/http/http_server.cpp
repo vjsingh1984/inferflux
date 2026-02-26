@@ -340,8 +340,20 @@ HttpServer::HttpServer(std::string host,
                        int port,
                        Scheduler* scheduler,
                        std::shared_ptr<ApiKeyAuth> auth,
-                       MetricsRegistry* metrics)
-    : host_(std::move(host)), port_(port), scheduler_(scheduler), auth_(std::move(auth)), metrics_(metrics) {}
+                       MetricsRegistry* metrics,
+                       OIDCValidator* oidc,
+                       RateLimiter* rate_limiter,
+                       Guardrail* guardrail,
+                       AuditLogger* audit_logger)
+    : host_(std::move(host)),
+      port_(port),
+      scheduler_(scheduler),
+      auth_(std::move(auth)),
+      metrics_(metrics),
+      oidc_(oidc),
+      rate_limiter_(rate_limiter),
+      guardrail_(guardrail),
+      audit_logger_(audit_logger) {}
 
 HttpServer::~HttpServer() { Stop(); }
 
@@ -405,8 +417,12 @@ void HttpServer::Run() {
   ::close(server_fd);
 }
 
-bool HttpServer::CheckAuth(const std::string& headers) const {
-  if (!auth_ || !auth_->HasKeys()) {
+bool HttpServer::ResolveSubject(const std::string& headers, std::string* subject) const {
+  bool require_auth = (auth_ && auth_->HasKeys()) || (oidc_ && oidc_->Enabled());
+  if (!require_auth) {
+    if (subject) {
+      *subject = "anonymous";
+    }
     return true;
   }
   auto pos = headers.find("Authorization:");
@@ -419,10 +435,25 @@ bool HttpServer::CheckAuth(const std::string& headers) const {
   if (token_pos == std::string::npos) {
     return false;
   }
-  std::string key = line.substr(token_pos + 6);
-  key.erase(0, key.find_first_not_of(' '));
-  key.erase(key.find_last_not_of(' ') + 1);
-  return auth_->IsAllowed(key);
+  std::string token = line.substr(token_pos + 6);
+  token.erase(0, token.find_first_not_of(' '));
+  token.erase(token.find_last_not_of(' ') + 1);
+  if (auth_ && auth_->HasKeys() && auth_->IsAllowed(token)) {
+    if (subject) {
+      *subject = token;
+    }
+    return true;
+  }
+  if (oidc_ && oidc_->Enabled()) {
+    std::string sub;
+    if (oidc_->Validate(token, &sub)) {
+      if (subject) {
+        *subject = sub;
+      }
+      return true;
+    }
+  }
+  return false;
 }
 
 void HttpServer::HandleClient(int client_fd) {
@@ -435,10 +466,22 @@ void HttpServer::HandleClient(int client_fd) {
   std::string request(buffer);
   auto header_end = request.find("\r\n\r\n");
   std::string headers = header_end == std::string::npos ? request : request.substr(0, header_end);
-  if (!CheckAuth(headers)) {
+  std::string subject = "anonymous";
+  if (!ResolveSubject(headers, &subject)) {
     std::string body = R"({"error":"unauthorized"})";
     auto response = BuildResponse(body, 401, "Unauthorized");
-    ::send(client_fd, response.c_str(), response.size(), 0);
+    SendAll(client_fd, response);
+    if (audit_logger_) {
+      audit_logger_->Log(subject, "", "unauthorized", "missing or invalid credentials");
+    }
+    return;
+  }
+  if (rate_limiter_ && rate_limiter_->Enabled() && !rate_limiter_->Allow(subject)) {
+    auto response = BuildResponse(R"({"error":"rate_limited"})", 429, "Too Many Requests");
+    SendAll(client_fd, response);
+    if (audit_logger_) {
+      audit_logger_->Log(subject, "", "rate_limited", "token bucket exceeded");
+    }
     return;
   }
 
@@ -482,10 +525,25 @@ void HttpServer::HandleClient(int client_fd) {
       return;
     }
     bool chat_mode = (path == "/v1/chat/completions") || !parsed.messages.empty();
+    std::string guard_reason;
+    if (guardrail_ && guardrail_->Enabled() && !guardrail_->Check(req.prompt, &guard_reason)) {
+      auto payload = BuildResponse(BuildErrorBody(guard_reason), 400, "Bad Request");
+      SendAll(client_fd, payload);
+      if (audit_logger_) {
+        audit_logger_->Log(subject, parsed.model, "blocked", guard_reason);
+      }
+      return;
+    }
     try {
       auto result = scheduler_->Generate(req);
       if (metrics_) {
         metrics_->RecordSuccess(result.prompt_tokens, result.completion_tokens);
+      }
+      if (audit_logger_) {
+        audit_logger_->Log(subject, parsed.model, "success", "prompt_tokens=" +
+                                                            std::to_string(result.prompt_tokens) +
+                                                            ",completion_tokens=" +
+                                                            std::to_string(result.completion_tokens));
       }
       if (parsed.stream) {
         auto now = std::chrono::system_clock::now();
@@ -510,12 +568,18 @@ void HttpServer::HandleClient(int client_fd) {
       }
       auto payload = BuildResponse(BuildErrorBody(ex.what()), 500, "Error");
       SendAll(client_fd, payload);
+      if (audit_logger_) {
+        audit_logger_->Log(subject, parsed.model, "error", ex.what());
+      }
     }
     return;
   }
 
   auto response = BuildResponse(R"({"error":"not_found"})", 404, "Not Found");
   SendAll(client_fd, response);
+  if (audit_logger_) {
+    audit_logger_->Log(subject, "", "not_found", path);
+  }
 }
 
 }  // namespace inferflux

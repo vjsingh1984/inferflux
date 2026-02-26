@@ -4,7 +4,12 @@
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "scheduler/scheduler.h"
 #include "server/auth/api_key_auth.h"
+#include "server/auth/oidc_validator.h"
+#include "server/auth/rate_limiter.h"
 #include "server/http/http_server.h"
+#include "server/logging/audit_logger.h"
+#include "server/metrics/metrics.h"
+#include "server/policy/guardrail.h"
 
 #include <atomic>
 #include <csignal>
@@ -16,6 +21,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 std::string Trim(const std::string& input) {
@@ -46,6 +52,11 @@ int main(int argc, char** argv) {
   auto auth = std::make_shared<inferflux::ApiKeyAuth>();
   std::string model_path;
   int mps_layers = 0;
+  int rate_limit_per_minute = 0;
+  std::string audit_log_path;
+  std::vector<std::string> guard_blocklist;
+  std::string oidc_issuer;
+  std::string oidc_audience;
 
   if (std::filesystem::exists(config_path)) {
     std::ifstream input(config_path);
@@ -53,6 +64,8 @@ int main(int argc, char** argv) {
     bool in_auth = false;
     bool in_model = false;
     bool in_runtime = false;
+    bool in_guardrails = false;
+    bool in_logging = false;
     bool in_api_keys = false;
     while (std::getline(input, line)) {
       auto trimmed = Trim(line);
@@ -62,31 +75,57 @@ int main(int argc, char** argv) {
       if (trimmed == "server:") {
         in_auth = false;
         in_runtime = false;
+        in_guardrails = false;
+        in_logging = false;
         in_api_keys = false;
         continue;
       }
       if (trimmed == "model:") {
         in_model = true;
         in_runtime = false;
+        in_guardrails = false;
+        in_logging = false;
         continue;
       }
       if (trimmed == "auth:") {
         in_model = false;
         in_runtime = false;
+        in_guardrails = false;
+        in_logging = false;
         in_auth = true;
         continue;
       }
       if (trimmed == "runtime:") {
         in_model = false;
         in_auth = false;
+        in_guardrails = false;
+        in_logging = false;
         in_api_keys = false;
         in_runtime = true;
         continue;
       }
-      if (trimmed == "adapters:" || trimmed == "logging:") {
+      if (trimmed == "guardrails:") {
         in_model = false;
         in_auth = false;
         in_runtime = false;
+        in_logging = false;
+        in_guardrails = true;
+        continue;
+      }
+      if (trimmed == "logging:") {
+        in_model = false;
+        in_auth = false;
+        in_runtime = false;
+        in_guardrails = false;
+        in_logging = true;
+        continue;
+      }
+      if (trimmed == "adapters:") {
+        in_model = false;
+        in_auth = false;
+        in_runtime = false;
+        in_guardrails = false;
+        in_logging = false;
         in_api_keys = false;
         continue;
       }
@@ -107,6 +146,41 @@ int main(int argc, char** argv) {
       }
       if (in_runtime && trimmed.rfind("mps_layers:", 0) == 0) {
         mps_layers = std::stoi(trimmed.substr(trimmed.find(':') + 1));
+        continue;
+      }
+      if (in_auth && trimmed.rfind("rate_limit_per_minute:", 0) == 0) {
+        rate_limit_per_minute = std::stoi(trimmed.substr(trimmed.find(':') + 1));
+        continue;
+      }
+      if (in_auth && trimmed.rfind("oidc_issuer:", 0) == 0) {
+        oidc_issuer = Trim(trimmed.substr(trimmed.find(':') + 1));
+        continue;
+      }
+      if (in_auth && trimmed.rfind("oidc_audience:", 0) == 0) {
+        oidc_audience = Trim(trimmed.substr(trimmed.find(':') + 1));
+        continue;
+      }
+      if (in_guardrails && trimmed.rfind("blocklist:", 0) == 0) {
+        auto inline_list = trimmed.substr(trimmed.find(':') + 1);
+        std::stringstream ss(inline_list);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+          auto word = Trim(item);
+          if (!word.empty()) {
+            guard_blocklist.push_back(word);
+          }
+        }
+        continue;
+      }
+      if (in_guardrails && trimmed.rfind("-", 0) == 0) {
+        auto word = Trim(trimmed.substr(1));
+        if (!word.empty()) {
+          guard_blocklist.push_back(word);
+        }
+        continue;
+      }
+      if (in_logging && trimmed.rfind("audit_log:", 0) == 0) {
+        audit_log_path = Trim(trimmed.substr(trimmed.find(':') + 1));
         continue;
       }
       if (trimmed.rfind("http_port:", 0) == 0) {
@@ -135,6 +209,28 @@ int main(int argc, char** argv) {
   if (const char* env_mps = std::getenv("INFERFLUX_MPS_LAYERS")) {
     mps_layers = std::stoi(env_mps);
   }
+  if (const char* env_rate = std::getenv("INFERFLUX_RATE_LIMIT_PER_MINUTE")) {
+    rate_limit_per_minute = std::stoi(env_rate);
+  }
+  if (const char* env_audit = std::getenv("INFERFLUX_AUDIT_LOG")) {
+    audit_log_path = env_audit;
+  }
+  if (const char* env_blk = std::getenv("INFERFLUX_GUARDRAIL_BLOCKLIST")) {
+    std::stringstream ss(env_blk);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      auto word = Trim(item);
+      if (!word.empty()) {
+        guard_blocklist.push_back(word);
+      }
+    }
+  }
+  if (const char* env_oidc_iss = std::getenv("INFERFLUX_OIDC_ISSUER")) {
+    oidc_issuer = env_oidc_iss;
+  }
+  if (const char* env_oidc_aud = std::getenv("INFERFLUX_OIDC_AUDIENCE")) {
+    oidc_audience = env_oidc_aud;
+  }
 
   inferflux::SimpleTokenizer tokenizer;
   auto device = std::make_shared<inferflux::CPUDeviceContext>();
@@ -157,7 +253,15 @@ int main(int argc, char** argv) {
   inferflux::Scheduler scheduler(tokenizer, device, cache, llama_backend);
   auto& metrics = inferflux::GlobalMetrics();
   metrics.SetBackend(backend_label);
-  inferflux::HttpServer server(host, port, &scheduler, auth, &metrics);
+  inferflux::OIDCValidator oidc_validator(oidc_issuer, oidc_audience);
+  inferflux::RateLimiter rate_limiter(rate_limit_per_minute);
+  inferflux::Guardrail guardrail;
+  guardrail.SetBlocklist(guard_blocklist);
+  inferflux::AuditLogger audit_logger(audit_log_path);
+  inferflux::HttpServer server(host, port, &scheduler, auth, &metrics, &oidc_validator,
+                               rate_limit_per_minute > 0 ? &rate_limiter : nullptr,
+                               guardrail.Enabled() ? &guardrail : nullptr,
+                               audit_logger.Enabled() ? &audit_logger : nullptr);
 
   std::signal(SIGINT, SignalHandler);
   std::signal(SIGTERM, SignalHandler);

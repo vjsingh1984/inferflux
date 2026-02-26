@@ -31,6 +31,14 @@ add_library(inferflux_core
   server/auth/api_key_auth.h
   server/metrics/metrics.cpp
   server/metrics/metrics.h
+  server/auth/rate_limiter.cpp
+  server/auth/rate_limiter.h
+  server/auth/oidc_validator.cpp
+  server/auth/oidc_validator.h
+  server/logging/audit_logger.cpp
+  server/logging/audit_logger.h
+  server/policy/guardrail.cpp
+  server/policy/guardrail.h
 )
 
 target_include_directories(inferflux_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

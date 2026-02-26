@@ -27,6 +27,11 @@ Set an API key (matching `config/server.yaml`) and query the server:
 ```bash
 export INFERCTL_API_KEY=dev-key-123
 export INFERFLUX_MODEL_PATH=$HOME/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
+export INFERFLUX_RATE_LIMIT_PER_MINUTE=60
+export INFERFLUX_GUARDRAIL_BLOCKLIST=classified,pii
+export INFERFLUX_AUDIT_LOG=logs/audit.log
+export INFERFLUX_OIDC_ISSUER=https://issuer.example.com
+export INFERFLUX_OIDC_AUDIENCE=inferflux
 ./build/inferctl status --host 127.0.0.1 --port 8080
 ./build/inferctl completion --prompt "Hello from InferFlux" --api-key "$INFERCTL_API_KEY" --model llama3
 ./build/inferctl chat --message "user:Hello" --stream --api-key "$INFERCTL_API_KEY"
