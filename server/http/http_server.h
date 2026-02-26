@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_set>
 
 namespace inferflux {
 
@@ -34,7 +35,17 @@ class HttpServer {
  private:
   void Run();
   void HandleClient(int client_fd);
-  bool ResolveSubject(const std::string& header_blob, std::string* subject) const;
+
+  struct AuthContext {
+    std::string subject{"anonymous"};
+    std::unordered_set<std::string> scopes;
+  };
+
+  bool ResolveSubject(const std::string& header_blob, AuthContext* ctx) const;
+  bool RequireScope(const AuthContext& ctx,
+                    const std::string& scope,
+                    int client_fd,
+                    const std::string& error_message);
 
   std::string host_;
   int port_;

@@ -13,6 +13,15 @@
 
 namespace {
 
+std::string Trim(const std::string& input) {
+  auto start = input.find_first_not_of(" \t");
+  auto end = input.find_last_not_of(" \t\r\n");
+  if (start == std::string::npos || end == std::string::npos) {
+    return "";
+  }
+  return input.substr(start, end - start + 1);
+}
+
 struct ChatMessage {
   std::string role;
   std::string content;
@@ -145,6 +154,19 @@ int Connect(const std::string& host, int port) {
   return sock;
 }
 
+std::string Receive(int sock) {
+  std::string data;
+  char buf[4096];
+  ssize_t read_bytes = 0;
+  while ((read_bytes = ::recv(sock, buf, sizeof(buf), 0)) > 0) {
+    data.append(buf, buf + read_bytes);
+    if (read_bytes < static_cast<ssize_t>(sizeof(buf))) {
+      break;
+    }
+  }
+  return data;
+}
+
 std::string BuildChatPayload(const std::vector<ChatMessage>& messages,
                              const std::string& model,
                              int max_tokens,
@@ -161,6 +183,45 @@ std::string BuildChatPayload(const std::vector<ChatMessage>& messages,
   }
   out << "]}";
   return out.str();
+}
+
+std::string BuildJsonArray(const std::vector<std::string>& items) {
+  std::ostringstream out;
+  out << "[";
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (i > 0) {
+      out << ",";
+    }
+    out << "\"" << EscapeJson(items[i]) << "\"";
+  }
+  out << "]";
+  return out.str();
+}
+
+std::string SendHttpRequest(const std::string& method,
+                            const std::string& path,
+                            const std::string& payload,
+                            const std::string& host,
+                            int port,
+                            const std::string& api_key,
+                            const std::string& content_type = "application/json") {
+  int sock = Connect(host, port);
+  std::ostringstream request;
+  request << method << " " << path << " HTTP/1.1\r\n";
+  request << "Host: " << host << "\r\n";
+  if (!content_type.empty()) {
+    request << "Content-Type: " << content_type << "\r\n";
+  }
+  if (!api_key.empty()) {
+    request << "Authorization: Bearer " << api_key << "\r\n";
+  }
+  request << "Content-Length: " << payload.size() << "\r\n\r\n";
+  request << payload;
+  auto serialized = request.str();
+  ::send(sock, serialized.c_str(), serialized.size(), 0);
+  auto response = Receive(sock);
+  ::close(sock);
+  return response;
 }
 
 std::string BuildCompletionPayload(const std::string& prompt,
@@ -183,7 +244,9 @@ void PrintUsage() {
             << "  inferctl completion --prompt 'Hello' [--model MODEL] [--max-tokens N] [--stream]\n"
                "                      [--host 127.0.0.1] [--port 8080] [--api-key KEY]\n"
             << "  inferctl chat --message 'user:Hello' [--message 'assistant:Hi'] [--model MODEL]\n"
-               "               [--max-tokens N] [--stream] [--interactive]\n";
+               "               [--max-tokens N] [--stream] [--interactive]\n"
+            << "  inferctl admin guardrails [--list | --set word1,word2] [--host ... --port ... --api-key KEY]\n"
+            << "  inferctl admin rate-limit [--get | --set N] [--host ... --port ... --api-key KEY]\n";
 }
 
 bool ReceiveStandard(int sock, bool print_raw, std::string* body_out) {
@@ -393,6 +456,80 @@ int main(int argc, char** argv) {
   }
 
   try {
+    if (command == "admin") {
+      if (argc < 3) {
+        PrintUsage();
+        return 1;
+      }
+      if (api_key.empty()) {
+        std::cerr << "--api-key is required for admin commands" << std::endl;
+        return 1;
+      }
+      std::string target = argv[2];
+      if (target == "guardrails") {
+        bool list = false;
+        std::string set_values;
+        for (int i = 3; i < argc; ++i) {
+          std::string arg = argv[i];
+          if (arg == "--list") {
+            list = true;
+          } else if (arg == "--set" && i + 1 < argc) {
+            set_values = argv[++i];
+          }
+        }
+        if (list) {
+          auto resp = SendHttpRequest("GET", "/v1/admin/guardrails", "", host, port, api_key);
+          std::cout << resp << std::endl;
+          return 0;
+        }
+        if (!set_values.empty()) {
+          std::vector<std::string> words;
+          std::stringstream ss(set_values);
+          std::string token;
+          while (std::getline(ss, token, ',')) {
+            auto trimmed = Trim(token);
+            if (!trimmed.empty()) {
+              words.push_back(trimmed);
+            }
+          }
+          std::string payload = std::string("{\"blocklist\":") + BuildJsonArray(words) + "}";
+          auto resp = SendHttpRequest("PUT", "/v1/admin/guardrails", payload, host, port, api_key);
+          std::cout << resp << std::endl;
+          return 0;
+        }
+        PrintUsage();
+        return 1;
+      }
+      if (target == "rate-limit") {
+        bool get = false;
+        bool set_flag = false;
+        int new_limit = 0;
+        for (int i = 3; i < argc; ++i) {
+          std::string arg = argv[i];
+          if (arg == "--get") {
+            get = true;
+          } else if (arg == "--set" && i + 1 < argc) {
+            new_limit = std::stoi(argv[++i]);
+            set_flag = true;
+          }
+        }
+        if (get) {
+          auto resp = SendHttpRequest("GET", "/v1/admin/rate_limit", "", host, port, api_key);
+          std::cout << resp << std::endl;
+          return 0;
+        }
+        if (set_flag) {
+          std::string payload = std::string("{\"tokens_per_minute\":") + std::to_string(new_limit) + "}";
+          auto resp = SendHttpRequest("PUT", "/v1/admin/rate_limit", payload, host, port, api_key);
+          std::cout << resp << std::endl;
+          return 0;
+        }
+        PrintUsage();
+        return 1;
+      }
+      PrintUsage();
+      return 1;
+    }
     if (command == "status") {
       int sock = Connect(host, port);
       std::string request = "GET /healthz HTTP/1.1\r\nHost: " + host + "\r\n";

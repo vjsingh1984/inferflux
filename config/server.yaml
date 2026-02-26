@@ -20,7 +20,8 @@ runtime:
 adapters: []
 auth:
   api_keys:
-    - dev-key-123
+    - key: dev-key-123
+      scopes: [generate, read, admin]
   rate_limit_per_minute: 120
   oidc_issuer: https://issuer.example.com
   oidc_audience: inferflux

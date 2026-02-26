@@ -334,6 +334,66 @@ std::string BuildStreamChunk(const std::string& id,
          EscapeJson(model) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" +
          EscapeJson(content) + "\"},\"finish_reason\":null}]}\n\n";
 }
+
+std::vector<std::string> ExtractStringArray(const std::string& body, const std::string& key) {
+  std::vector<std::string> values;
+  std::string needle = "\"" + key + "\"";
+  auto key_pos = body.find(needle);
+  if (key_pos == std::string::npos) {
+    return values;
+  }
+  auto bracket_start = body.find('[', key_pos);
+  if (bracket_start == std::string::npos) {
+    return values;
+  }
+  auto bracket_end = body.find(']', bracket_start);
+  if (bracket_end == std::string::npos) {
+    return values;
+  }
+  std::string array_body = body.substr(bracket_start + 1, bracket_end - bracket_start - 1);
+  std::string current;
+  bool in_string = false;
+  bool escape = false;
+  for (char c : array_body) {
+    if (!in_string) {
+      if (c == '"') {
+        in_string = true;
+        current.clear();
+      }
+      continue;
+    }
+    if (escape) {
+      current.push_back(c);
+      escape = false;
+      continue;
+    }
+    if (c == '\\') {
+      escape = true;
+      continue;
+    }
+    if (c == '"') {
+      in_string = false;
+      if (!current.empty()) {
+        values.push_back(current);
+      }
+      continue;
+    }
+    current.push_back(c);
+  }
+  return values;
+}
+
+std::string BuildStringArray(const std::vector<std::string>& values) {
+  std::string out = "[";
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      out.append(",");
+    }
+    out.append("\"").append(EscapeJson(values[i])).append("\"");
+  }
+  out.append("]");
+  return out;
+}
 }
 
 HttpServer::HttpServer(std::string host,
@@ -417,12 +477,13 @@ void HttpServer::Run() {
   ::close(server_fd);
 }
 
-bool HttpServer::ResolveSubject(const std::string& headers, std::string* subject) const {
+bool HttpServer::ResolveSubject(const std::string& headers, AuthContext* ctx) const {
+  ctx->subject = "anonymous";
+  ctx->scopes.clear();
   bool require_auth = (auth_ && auth_->HasKeys()) || (oidc_ && oidc_->Enabled());
   if (!require_auth) {
-    if (subject) {
-      *subject = "anonymous";
-    }
+    ctx->scopes.insert("read");
+    ctx->scopes.insert("generate");
     return true;
   }
   auto pos = headers.find("Authorization:");
@@ -439,19 +500,36 @@ bool HttpServer::ResolveSubject(const std::string& headers, std::string* subject
   token.erase(0, token.find_first_not_of(' '));
   token.erase(token.find_last_not_of(' ') + 1);
   if (auth_ && auth_->HasKeys() && auth_->IsAllowed(token)) {
-    if (subject) {
-      *subject = token;
-    }
+    ctx->subject = token;
+    auto scopes = auth_->Scopes(token);
+    ctx->scopes.insert(scopes.begin(), scopes.end());
     return true;
   }
   if (oidc_ && oidc_->Enabled()) {
     std::string sub;
     if (oidc_->Validate(token, &sub)) {
-      if (subject) {
-        *subject = sub;
-      }
+      ctx->subject = sub.empty() ? "oidc-user" : sub;
+      ctx->scopes.insert("generate");
+      ctx->scopes.insert("read");
       return true;
     }
+  }
+  return false;
+}
+
+bool HttpServer::RequireScope(const AuthContext& ctx,
+                              const std::string& scope,
+                              int client_fd,
+                              const std::string& error_message) {
+  if (ctx.scopes.find(scope) != ctx.scopes.end()) {
+    return true;
+  }
+  auto payload = BuildResponse(BuildErrorBody(error_message.empty() ? "insufficient_scope" : error_message),
+                               403,
+                               "Forbidden");
+  SendAll(client_fd, payload);
+  if (audit_logger_) {
+    audit_logger_->Log(ctx.subject, "", "insufficient_scope", error_message);
   }
   return false;
 }
@@ -466,33 +544,32 @@ void HttpServer::HandleClient(int client_fd) {
   std::string request(buffer);
   auto header_end = request.find("\r\n\r\n");
   std::string headers = header_end == std::string::npos ? request : request.substr(0, header_end);
-  std::string subject = "anonymous";
-  if (!ResolveSubject(headers, &subject)) {
+  AuthContext auth_ctx;
+  if (!ResolveSubject(headers, &auth_ctx)) {
     std::string body = R"({"error":"unauthorized"})";
     auto response = BuildResponse(body, 401, "Unauthorized");
     SendAll(client_fd, response);
     if (audit_logger_) {
-      audit_logger_->Log(subject, "", "unauthorized", "missing or invalid credentials");
+      audit_logger_->Log(auth_ctx.subject, "", "unauthorized", "missing or invalid credentials");
     }
     return;
   }
-  if (rate_limiter_ && rate_limiter_->Enabled() && !rate_limiter_->Allow(subject)) {
+  if (rate_limiter_ && rate_limiter_->Enabled() && !rate_limiter_->Allow(auth_ctx.subject)) {
     auto response = BuildResponse(R"({"error":"rate_limited"})", 429, "Too Many Requests");
     SendAll(client_fd, response);
     if (audit_logger_) {
-      audit_logger_->Log(subject, "", "rate_limited", "token bucket exceeded");
+      audit_logger_->Log(auth_ctx.subject, "", "rate_limited", "token bucket exceeded");
     }
     return;
   }
 
   std::string body = header_end == std::string::npos ? std::string() : request.substr(header_end + 4);
-  std::string path;
   auto first_line_end = headers.find("\r\n");
   std::string first_line = headers.substr(0, first_line_end);
   auto method_end = first_line.find(' ');
   auto path_end = first_line.find(' ', method_end + 1);
   std::string method = first_line.substr(0, method_end);
-  path = first_line.substr(method_end + 1, path_end - method_end - 1);
+  std::string path = first_line.substr(method_end + 1, path_end - method_end - 1);
 
   if (method == "GET" && path == "/healthz") {
     auto response = BuildResponse(R"({"status":"ok"})");
@@ -501,14 +578,81 @@ void HttpServer::HandleClient(int client_fd) {
   }
 
   if (method == "GET" && path == "/metrics") {
-    std::string body = metrics_ ? metrics_->RenderPrometheus() : "";
-    std::string headers = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: " +
-                          std::to_string(body.size()) + "\r\n\r\n";
-    SendAll(client_fd, headers + body);
+    if (!RequireScope(auth_ctx, "read", client_fd, "metrics scope required")) {
+      return;
+    }
+    std::string metrics_body = metrics_ ? metrics_->RenderPrometheus() : "";
+    std::string metrics_headers =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: " +
+        std::to_string(metrics_body.size()) + "\r\n\r\n";
+    SendAll(client_fd, metrics_headers + metrics_body);
+    return;
+  }
+
+  if (method == "GET" && path == "/v1/admin/guardrails") {
+    if (!guardrail_) {
+      SendAll(client_fd, BuildResponse(R"({"error":"guardrail_disabled"})", 503, "Unavailable"));
+      return;
+    }
+    if (!RequireScope(auth_ctx, "admin", client_fd, "admin scope required")) {
+      return;
+    }
+    auto list = guardrail_->Blocklist();
+    std::string payload = std::string("{\"blocklist\":") + BuildStringArray(list) + "}";
+    SendAll(client_fd, BuildResponse(payload));
+    return;
+  }
+
+  if (method == "PUT" && path == "/v1/admin/guardrails") {
+    if (!guardrail_) {
+      SendAll(client_fd, BuildResponse(R"({"error":"guardrail_disabled"})", 503, "Unavailable"));
+      return;
+    }
+    if (!RequireScope(auth_ctx, "admin", client_fd, "admin scope required")) {
+      return;
+    }
+    auto list = ExtractStringArray(body, "blocklist");
+    guardrail_->UpdateBlocklist(list);
+    SendAll(client_fd, BuildResponse(R"({"status":"ok"})"));
+    if (audit_logger_) {
+      audit_logger_->Log(auth_ctx.subject, "", "guardrail_update", "updated blocklist");
+    }
+    return;
+  }
+
+  if (method == "GET" && path == "/v1/admin/rate_limit") {
+    if (!RequireScope(auth_ctx, "admin", client_fd, "admin scope required")) {
+      return;
+    }
+    int limit = rate_limiter_ ? rate_limiter_->CurrentLimit() : 0;
+    std::string payload = std::string("{\"tokens_per_minute\":") + std::to_string(limit) + "}";
+    SendAll(client_fd, BuildResponse(payload));
+    return;
+  }
+
+  if (method == "PUT" && path == "/v1/admin/rate_limit") {
+    if (!RequireScope(auth_ctx, "admin", client_fd, "admin scope required")) {
+      return;
+    }
+    auto value = ExtractJsonInt(body, "tokens_per_minute");
+    if (!value.has_value()) {
+      SendAll(client_fd, BuildResponse(BuildErrorBody("tokens_per_minute is required"), 400, "Bad Request"));
+      return;
+    }
+    if (rate_limiter_) {
+      rate_limiter_->UpdateLimit(*value);
+    }
+    SendAll(client_fd, BuildResponse(R"({"status":"ok"})"));
+    if (audit_logger_) {
+      audit_logger_->Log(auth_ctx.subject, "", "rate_limit_update", std::to_string(*value));
+    }
     return;
   }
 
   if (method == "POST" && (path == "/v1/completions" || path == "/v1/chat/completions")) {
+    if (!RequireScope(auth_ctx, "generate", client_fd, "generate scope required")) {
+      return;
+    }
     auto parsed = ParseJsonPayload(body);
     GenerateRequest req;
     if (!parsed.prompt.empty()) {
@@ -530,7 +674,7 @@ void HttpServer::HandleClient(int client_fd) {
       auto payload = BuildResponse(BuildErrorBody(guard_reason), 400, "Bad Request");
       SendAll(client_fd, payload);
       if (audit_logger_) {
-        audit_logger_->Log(subject, parsed.model, "blocked", guard_reason);
+        audit_logger_->Log(auth_ctx.subject, parsed.model, "blocked", guard_reason);
       }
       return;
     }
@@ -540,18 +684,18 @@ void HttpServer::HandleClient(int client_fd) {
         metrics_->RecordSuccess(result.prompt_tokens, result.completion_tokens);
       }
       if (audit_logger_) {
-        audit_logger_->Log(subject, parsed.model, "success", "prompt_tokens=" +
-                                                            std::to_string(result.prompt_tokens) +
-                                                            ",completion_tokens=" +
-                                                            std::to_string(result.completion_tokens));
+        audit_logger_->Log(auth_ctx.subject, parsed.model, "success", "prompt_tokens=" +
+                                                                      std::to_string(result.prompt_tokens) +
+                                                                      ",completion_tokens=" +
+                                                                      std::to_string(result.completion_tokens));
       }
       if (parsed.stream) {
         auto now = std::chrono::system_clock::now();
         auto ts = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
         std::string id = std::string("chatcmpl-") + std::to_string(ts);
-        std::string headers =
+        std::string stream_headers =
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
-        SendAll(client_fd, headers);
+        SendAll(client_fd, stream_headers);
         auto chunks = SplitForStreaming(result.completion);
         for (const auto& chunk : chunks) {
           SendAll(client_fd, BuildStreamChunk(id, parsed.model, ts, chunk, false));
@@ -569,7 +713,7 @@ void HttpServer::HandleClient(int client_fd) {
       auto payload = BuildResponse(BuildErrorBody(ex.what()), 500, "Error");
       SendAll(client_fd, payload);
       if (audit_logger_) {
-        audit_logger_->Log(subject, parsed.model, "error", ex.what());
+        audit_logger_->Log(auth_ctx.subject, parsed.model, "error", ex.what());
       }
     }
     return;
@@ -578,7 +722,7 @@ void HttpServer::HandleClient(int client_fd) {
   auto response = BuildResponse(R"({"error":"not_found"})", 404, "Not Found");
   SendAll(client_fd, response);
   if (audit_logger_) {
-    audit_logger_->Log(subject, "", "not_found", path);
+    audit_logger_->Log(auth_ctx.subject, "", "not_found", path);
   }
 }
 

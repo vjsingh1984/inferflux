@@ -58,6 +58,36 @@ int main(int argc, char** argv) {
   std::string oidc_issuer;
   std::string oidc_audience;
 
+  struct ApiKeyEntry {
+    std::string key;
+    std::vector<std::string> scopes;
+  };
+  std::vector<ApiKeyEntry> api_key_entries;
+  auto parse_scopes = [&](const std::string& line) {
+    std::vector<std::string> scopes;
+    auto l = line.find('[');
+    auto r = line.find(']');
+    if (l == std::string::npos || r == std::string::npos || r <= l) {
+      return scopes;
+    }
+    std::string inner = line.substr(l + 1, r - l - 1);
+    std::stringstream ss(inner);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+      auto trimmed = Trim(token);
+      if (!trimmed.empty()) {
+        scopes.push_back(trimmed);
+      }
+    }
+    return scopes;
+  };
+  auto flush_key = [&](std::string& current_key, std::vector<std::string>& current_scopes) {
+    if (!current_key.empty()) {
+      api_key_entries.push_back({current_key, current_scopes});
+      current_key.clear();
+      current_scopes.clear();
+    }
+  };
   if (std::filesystem::exists(config_path)) {
     std::ifstream input(config_path);
     std::string line;
@@ -67,6 +97,8 @@ int main(int argc, char** argv) {
     bool in_guardrails = false;
     bool in_logging = false;
     bool in_api_keys = false;
+    std::string current_key;
+    std::vector<std::string> current_scopes;
     while (std::getline(input, line)) {
       auto trimmed = Trim(line);
       if (trimmed.empty() || trimmed[0] == '#') {
@@ -130,13 +162,29 @@ int main(int argc, char** argv) {
         continue;
       }
       if (in_auth && trimmed.rfind("api_keys:", 0) == 0) {
+        flush_key(current_key, current_scopes);
         in_api_keys = true;
         continue;
       }
-      if (in_api_keys && trimmed.rfind("-", 0) == 0) {
+      if (in_api_keys && trimmed.rfind("- key:", 0) == 0) {
+        flush_key(current_key, current_scopes);
+        current_key = Trim(trimmed.substr(trimmed.find(':') + 1));
+        continue;
+      }
+      if (in_api_keys && trimmed.rfind("key:", 0) == 0) {
+        flush_key(current_key, current_scopes);
+        current_key = Trim(trimmed.substr(trimmed.find(':') + 1));
+        continue;
+      }
+      if (in_api_keys && trimmed.rfind("scopes:", 0) == 0) {
+        current_scopes = parse_scopes(trimmed);
+        continue;
+      }
+      if (in_api_keys && trimmed.rfind("-", 0) == 0 && trimmed.find(':') == std::string::npos) {
+        flush_key(current_key, current_scopes);
         auto key = Trim(trimmed.substr(1));
         if (!key.empty()) {
-          auth->AddKey(key);
+          api_key_entries.push_back({key, {}});
         }
         continue;
       }
@@ -190,6 +238,11 @@ int main(int argc, char** argv) {
         host = Trim(trimmed.substr(trimmed.find(':') + 1));
       }
     }
+    flush_key(current_key, current_scopes);
+  }
+
+  for (const auto& entry : api_key_entries) {
+    auth->AddKey(entry.key, entry.scopes);
   }
 
   if (const char* env_keys = std::getenv("INFERFLUX_API_KEYS")) {

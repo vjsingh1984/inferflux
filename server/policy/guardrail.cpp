@@ -4,19 +4,38 @@
 #include <cctype>
 
 namespace inferflux {
-
-void Guardrail::SetBlocklist(const std::vector<std::string>& words) {
-  blocklist_.clear();
+namespace {
+std::vector<std::string> NormalizeWords(const std::vector<std::string>& words) {
+  std::vector<std::string> normalized;
+  normalized.reserve(words.size());
   for (auto word : words) {
     std::transform(word.begin(), word.end(), word.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (!word.empty()) {
-      blocklist_.push_back(word);
+      normalized.push_back(word);
     }
   }
+  return normalized;
+}
+}
+
+void Guardrail::SetBlocklist(const std::vector<std::string>& words) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  blocklist_ = NormalizeWords(words);
+}
+
+void Guardrail::UpdateBlocklist(const std::vector<std::string>& words) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  blocklist_ = NormalizeWords(words);
+}
+
+std::vector<std::string> Guardrail::Blocklist() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return blocklist_;
 }
 
 bool Guardrail::Check(const std::string& text, std::string* reason) const {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (blocklist_.empty()) {
     return true;
   }
@@ -35,6 +54,11 @@ bool Guardrail::Check(const std::string& text, std::string* reason) const {
     }
   }
   return true;
+}
+
+bool Guardrail::Enabled() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return !blocklist_.empty();
 }
 
 }  // namespace inferflux

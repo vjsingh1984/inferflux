@@ -13,6 +13,8 @@ class RateLimiter {
 
   bool Allow(const std::string& key);
   bool Enabled() const { return tokens_per_minute_ > 0; }
+  void UpdateLimit(int tokens_per_minute);
+  int CurrentLimit() const { return tokens_per_minute_; }
 
  private:
   struct Entry {
