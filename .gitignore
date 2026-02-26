@@ -2,3 +2,7 @@ build/
 *.log
 .DS_Store
 models/
+logs/
+server.log
+*.gguf
+.env.local
