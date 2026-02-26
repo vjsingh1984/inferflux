@@ -1,0 +1,26 @@
+server:
+  host: 0.0.0.0
+  http_port: 8080
+  max_concurrent: 1024
+  enable_metrics: true
+  enable_tracing: false
+model:
+  repo: meta-llama/Meta-Llama-3-8B-Instruct
+  path: models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
+  format: gguf
+  quantization: q4_k_m
+  tokenizer: sentencepiece
+runtime:
+  backend_priority: [cpu]
+  tensor_parallel: 1
+  mps_layers: 0
+  paged_kv:
+    cpu_pages: 4096
+    eviction: lru
+adapters: []
+auth:
+  api_keys:
+    - dev-key-123
+logging:
+  level: info
+  format: json

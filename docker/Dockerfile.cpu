@@ -1,0 +1,12 @@
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/inferflux
+COPY . .
+RUN ./scripts/build.sh
+
+EXPOSE 8080
+CMD ["/opt/inferflux/build/inferfluxd", "--config", "config/server.yaml"]

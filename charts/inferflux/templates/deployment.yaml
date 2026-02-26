@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "inferflux.fullname" . }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ include "inferflux.name" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "inferflux.name" . }}
+    spec:
+      containers:
+        - name: inferflux
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config", "/etc/inferflux/server.yaml"]
+          ports:
+            - containerPort: {{ .Values.service.port }}
+          env:
+            - name: INFERFLUX_API_KEYS
+              value: "{{ join "," .Values.auth.apiKeys }}"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/inferflux
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "inferflux.fullname" . }}

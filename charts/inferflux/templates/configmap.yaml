@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "inferflux.fullname" . }}
+data:
+  server.yaml: |
+{{ .Files.Get "config/server.yaml" | indent 4 }}
