@@ -19,6 +19,8 @@ add_library(inferflux_core
   runtime/backends/cpu/cpu_backend.h
   runtime/backends/cpu/llama_backend.cpp
   runtime/backends/cpu/llama_backend.h
+  runtime/backends/backend_manager.cpp
+  runtime/backends/backend_manager.h
   runtime/speculative/speculative_decoder.cpp
   runtime/speculative/speculative_decoder.h
   model/gguf/gguf_loader.cpp
@@ -45,6 +47,10 @@ add_library(inferflux_core
   policy/policy_store.h
   policy/opa_client.cpp
   policy/opa_client.h
+  io/async_file_writer.cpp
+  io/async_file_writer.h
+  net/http_client.cpp
+  net/http_client.h
 )
 
 target_include_directories(inferflux_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

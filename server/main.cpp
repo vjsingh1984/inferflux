@@ -1,5 +1,6 @@
 #include "model/tokenizer/simple_tokenizer.h"
 #include "policy/policy_store.h"
+#include "runtime/backends/backend_manager.h"
 #include "runtime/backends/cpu/cpu_backend.h"
 #include "runtime/backends/cpu/llama_backend.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
@@ -359,18 +360,14 @@ int main(int argc, char** argv) {
   if (!nvme_offload_path.empty()) {
     cache->SetOffloadPath(nvme_offload_path);
   }
+  inferflux::BackendManager backend_manager;
   std::shared_ptr<inferflux::LlamaCPUBackend> llama_backend;
   std::string backend_label = "stub";
   if (!model_path.empty()) {
-    llama_backend = std::make_shared<inferflux::LlamaCPUBackend>();
-    inferflux::LlamaBackendConfig backend_config;
-    backend_config.gpu_layers = std::max(0, mps_layers);
-    if (!llama_backend->LoadModel(model_path, backend_config)) {
-      std::cerr << "Failed to load llama.cpp model at " << model_path
-                << ". Falling back to stub responses." << std::endl;
-      llama_backend.reset();
-    } else {
-      backend_label = backend_config.gpu_layers > 0 ? "mps" : "cpu";
+    auto primary = backend_manager.LoadBackend("primary", model_path, mps_layers);
+    if (primary) {
+      llama_backend = primary;
+      backend_label = mps_layers > 0 ? "mps" : "cpu";
       std::cout << "InferFlux loaded model: " << model_path << " (backend=" << backend_label << ")" << std::endl;
     }
   }
@@ -414,10 +411,18 @@ int main(int argc, char** argv) {
   spec_config.enabled = speculative_enabled;
   spec_config.max_prefill_tokens = speculative_max_prefill_tokens;
   spec_config.draft_model = speculative_draft_model;
+  std::shared_ptr<inferflux::LlamaCPUBackend> draft_backend = llama_backend;
+  if (speculative_enabled && !speculative_draft_model.empty() &&
+      speculative_draft_model != model_path) {
+    auto backend = backend_manager.LoadBackend("draft", speculative_draft_model, mps_layers);
+    if (backend) {
+      draft_backend = backend;
+    }
+  }
   std::shared_ptr<inferflux::SpeculativeDecoder> speculative_decoder;
   if (speculative_enabled) {
-    speculative_decoder =
-        std::make_shared<inferflux::SpeculativeDecoder>(spec_config, device, &tokenizer);
+    speculative_decoder = std::make_shared<inferflux::SpeculativeDecoder>(spec_config, device, &tokenizer,
+                                                                          draft_backend);
   }
 
   inferflux::Scheduler scheduler(tokenizer, device, cache, llama_backend, speculative_decoder);

@@ -1,8 +1,9 @@
 #include "runtime/kv_cache/paged_kv_cache.h"
 
 #include <filesystem>
-#include <stdexcept>
 #include <fstream>
+#include <memory>
+#include <stdexcept>
 
 namespace inferflux {
 
@@ -61,6 +62,13 @@ void PagedKVCache::SetOffloadPath(const std::string& path) {
   if (!offload_path_.empty()) {
     std::error_code ec;
     std::filesystem::create_directories(offload_path_, ec);
+    if (!writer_) {
+      writer_ = std::make_shared<AsyncFileWriter>();
+    }
+    writer_->Start();
+  } else if (writer_) {
+    writer_->Stop();
+    writer_.reset();
   }
 }
 
@@ -70,12 +78,18 @@ void PagedKVCache::PersistPage(int page_id, const std::vector<float>& values) co
   }
   std::filesystem::path file = std::filesystem::path(offload_path_) /
                                ("page_" + std::to_string(page_id) + ".bin");
-  std::ofstream out(file, std::ios::binary | std::ios::trunc);
-  if (!out.good()) {
-    return;
+  std::vector<char> buffer(reinterpret_cast<const char*>(values.data()),
+                           reinterpret_cast<const char*>(values.data()) +
+                               values.size() * sizeof(float));
+  if (writer_) {
+    writer_->Enqueue(AsyncWriteTask{file, std::move(buffer)});
+  } else {
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    if (!out.good()) {
+      return;
+    }
+    out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
   }
-  out.write(reinterpret_cast<const char*>(values.data()),
-            static_cast<std::streamsize>(values.size() * sizeof(float)));
 }
 
 std::vector<float> PagedKVCache::LoadPage(int page_id) const {

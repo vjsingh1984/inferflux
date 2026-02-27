@@ -3,6 +3,9 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include "io/async_file_writer.h"
+
+#include <memory>
 #include <vector>
 
 namespace inferflux {
@@ -30,6 +33,7 @@ class PagedKVCache {
   std::vector<KVPage> pages_;
   mutable std::mutex mutex_;
   std::string offload_path_;
+  std::shared_ptr<AsyncFileWriter> writer_;
 
   void PersistPage(int page_id, const std::vector<float>& values) const;
   std::vector<float> LoadPage(int page_id) const;
