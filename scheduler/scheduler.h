@@ -3,6 +3,7 @@
 #include "model/tokenizer/simple_tokenizer.h"
 #include "runtime/backends/cpu/cpu_backend.h"
 #include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/speculative/speculative_decoder.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
 
 #include <memory>
@@ -28,7 +29,8 @@ class Scheduler {
   Scheduler(SimpleTokenizer tokenizer,
             std::shared_ptr<CPUDeviceContext> device,
             std::shared_ptr<PagedKVCache> cache,
-            std::shared_ptr<LlamaCPUBackend> llama_backend = nullptr);
+            std::shared_ptr<LlamaCPUBackend> llama_backend = nullptr,
+            std::shared_ptr<SpeculativeDecoder> speculative_decoder = nullptr);
 
   GenerateResponse Generate(const GenerateRequest& request);
 
@@ -37,6 +39,7 @@ class Scheduler {
   std::shared_ptr<CPUDeviceContext> device_;
   std::shared_ptr<PagedKVCache> cache_;
   std::shared_ptr<LlamaCPUBackend> llama_backend_;
+  std::shared_ptr<SpeculativeDecoder> speculative_decoder_;
   std::mutex mutex_;
 };
 

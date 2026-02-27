@@ -21,12 +21,18 @@ class PagedKVCache {
   void Write(int page_id, const std::vector<float>& values);
   std::vector<float> Read(int page_id) const;
 
+  void SetOffloadPath(const std::string& path);
+
   std::size_t PageSizeBytes() const { return page_size_bytes_; }
 
  private:
   std::size_t page_size_bytes_;
   std::vector<KVPage> pages_;
   mutable std::mutex mutex_;
+  std::string offload_path_;
+
+  void PersistPage(int page_id, const std::vector<float>& values) const;
+  std::vector<float> LoadPage(int page_id) const;
 };
 
 }  // namespace inferflux

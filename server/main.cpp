@@ -3,6 +3,7 @@
 #include "runtime/backends/cpu/cpu_backend.h"
 #include "runtime/backends/cpu/llama_backend.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
+#include "runtime/speculative/speculative_decoder.h"
 #include "scheduler/scheduler.h"
 #include "server/auth/api_key_auth.h"
 #include "server/auth/oidc_validator.h"
@@ -58,6 +59,11 @@ int main(int argc, char** argv) {
   std::vector<std::string> guard_blocklist;
   std::string oidc_issuer;
   std::string oidc_audience;
+  bool speculative_enabled = false;
+  std::string speculative_draft_model;
+  int speculative_max_prefill_tokens = 256;
+  std::string nvme_offload_path;
+  std::string opa_endpoint;
 
   struct ApiKeyEntry {
     std::string key;
@@ -350,6 +356,9 @@ int main(int argc, char** argv) {
   inferflux::SimpleTokenizer tokenizer;
   auto device = std::make_shared<inferflux::CPUDeviceContext>();
   auto cache = std::make_shared<inferflux::PagedKVCache>(/*pages=*/32, /*page_size_bytes=*/16384);
+  if (!nvme_offload_path.empty()) {
+    cache->SetOffloadPath(nvme_offload_path);
+  }
   std::shared_ptr<inferflux::LlamaCPUBackend> llama_backend;
   std::string backend_label = "stub";
   if (!model_path.empty()) {
@@ -401,7 +410,17 @@ int main(int argc, char** argv) {
   }
   policy_store.Save();
 
-  inferflux::Scheduler scheduler(tokenizer, device, cache, llama_backend);
+  inferflux::SpeculativeConfig spec_config;
+  spec_config.enabled = speculative_enabled;
+  spec_config.max_prefill_tokens = speculative_max_prefill_tokens;
+  spec_config.draft_model = speculative_draft_model;
+  std::shared_ptr<inferflux::SpeculativeDecoder> speculative_decoder;
+  if (speculative_enabled) {
+    speculative_decoder =
+        std::make_shared<inferflux::SpeculativeDecoder>(spec_config, device, &tokenizer);
+  }
+
+  inferflux::Scheduler scheduler(tokenizer, device, cache, llama_backend, speculative_decoder);
   auto& metrics = inferflux::GlobalMetrics();
   metrics.SetBackend(backend_label);
   inferflux::OIDCValidator oidc_validator(oidc_issuer, oidc_audience);
@@ -423,7 +442,8 @@ int main(int argc, char** argv) {
                                rate_limit_per_minute > 0 ? &rate_limiter : nullptr,
                                guardrail.Enabled() ? &guardrail : nullptr,
                                audit_logger.Enabled() ? &audit_logger : nullptr,
-                               &policy_store);
+                               &policy_store,
+                               speculative_decoder);
 
   std::signal(SIGINT, SignalHandler);
   std::signal(SIGTERM, SignalHandler);

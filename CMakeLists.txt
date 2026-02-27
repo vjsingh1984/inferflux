@@ -19,6 +19,8 @@ add_library(inferflux_core
   runtime/backends/cpu/cpu_backend.h
   runtime/backends/cpu/llama_backend.cpp
   runtime/backends/cpu/llama_backend.h
+  runtime/speculative/speculative_decoder.cpp
+  runtime/speculative/speculative_decoder.h
   model/gguf/gguf_loader.cpp
   model/gguf/gguf_loader.h
   model/tokenizer/simple_tokenizer.cpp
@@ -41,6 +43,8 @@ add_library(inferflux_core
   server/policy/guardrail.h
   policy/policy_store.cpp
   policy/policy_store.h
+  policy/opa_client.cpp
+  policy/opa_client.h
 )
 
 target_include_directories(inferflux_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

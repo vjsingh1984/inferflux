@@ -1,5 +1,7 @@
 #pragma once
 
+#include "policy/opa_client.h"
+
 #include <mutex>
 #include <string>
 #include <vector>
@@ -22,6 +24,7 @@ class Guardrail {
   std::vector<std::string> blocklist_;
   std::string opa_endpoint_;
   mutable std::mutex mutex_;
+  OPAClient opa_client_;
   static std::vector<std::string> Normalize(const std::vector<std::string>& words);
 };
 

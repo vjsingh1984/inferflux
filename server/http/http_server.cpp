@@ -419,7 +419,8 @@ HttpServer::HttpServer(std::string host,
                        RateLimiter* rate_limiter,
                        Guardrail* guardrail,
                        AuditLogger* audit_logger,
-                       PolicyStore* policy_store)
+                       PolicyStore* policy_store,
+                       std::shared_ptr<SpeculativeDecoder> speculative_decoder)
     : host_(std::move(host)),
       port_(port),
       scheduler_(scheduler),
@@ -429,7 +430,8 @@ HttpServer::HttpServer(std::string host,
       rate_limiter_(rate_limiter),
       guardrail_(guardrail),
       audit_logger_(audit_logger),
-      policy_store_(policy_store) {}
+      policy_store_(policy_store),
+      speculative_decoder_(std::move(speculative_decoder)) {}
 
 HttpServer::~HttpServer() { Stop(); }
 

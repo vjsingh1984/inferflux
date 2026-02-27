@@ -54,9 +54,16 @@ bool Guardrail::Check(const std::string& text, std::string* reason) const {
     }
   }
   if (!opa_endpoint_.empty()) {
-    // Placeholder for future OPA integration. For now we simply log intent via reason when requested.
-    if (reason) {
-      *reason = "OPA endpoint configured (" + opa_endpoint_ + ") but not yet enforced";
+    OPAResult opa_result;
+    auto allow = opa_client_.Evaluate(text, &opa_result);
+    if (!opa_result.allow) {
+      if (reason) {
+        *reason = opa_result.reason.empty() ? "OPA denied prompt" : opa_result.reason;
+      }
+      return false;
+    }
+    if (!allow && reason && reason->empty()) {
+      *reason = "OPA fallback (allowed)";
     }
   }
   return true;
@@ -70,6 +77,7 @@ bool Guardrail::Enabled() const {
 void Guardrail::SetOPAEndpoint(const std::string& endpoint) {
   std::lock_guard<std::mutex> lock(mutex_);
   opa_endpoint_ = endpoint;
+  opa_client_ = OPAClient(endpoint);
 }
 
 std::string Guardrail::OPAEndpoint() const {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "policy/policy_store.h"
+#include "runtime/speculative/speculative_decoder.h"
 #include "scheduler/scheduler.h"
 #include "server/auth/api_key_auth.h"
 #include "server/auth/oidc_validator.h"
@@ -28,7 +29,8 @@ class HttpServer {
              RateLimiter* rate_limiter,
              Guardrail* guardrail,
              AuditLogger* audit_logger,
-             PolicyStore* policy_store);
+             PolicyStore* policy_store,
+             std::shared_ptr<SpeculativeDecoder> speculative_decoder);
   ~HttpServer();
 
   void Start();
@@ -59,6 +61,7 @@ class HttpServer {
   Guardrail* guardrail_;
   AuditLogger* audit_logger_;
   PolicyStore* policy_store_;
+  std::shared_ptr<SpeculativeDecoder> speculative_decoder_;
   std::atomic<bool> running_{false};
   std::thread worker_;
 };
