@@ -33,6 +33,7 @@ export INFERFLUX_AUDIT_LOG=logs/audit.log
 export INFERFLUX_OIDC_ISSUER=https://issuer.example.com
 export INFERFLUX_OIDC_AUDIENCE=inferflux
 export INFERFLUX_POLICY_STORE=config/policy_store.conf
+export INFERFLUX_POLICY_PASSPHRASE="super-secret-passphrase"
 ./build/inferctl status --host 127.0.0.1 --port 8080
 ./build/inferctl completion --prompt "Hello from InferFlux" --api-key "$INFERCTL_API_KEY" --model llama3
 ./build/inferctl chat --message "user:Hello" --stream --api-key "$INFERCTL_API_KEY"
@@ -64,9 +65,9 @@ auth:
       scopes: [generate, read, admin]
 ```
 
-Use admin-scoped keys with `inferctl admin ...` to modify guardrails and rate limits without restarts.
+Use admin-scoped keys with `inferctl admin ...` to modify guardrails, rate limits, and API keys without restarts.
 
-The persistent policy store lives at `config/policy_store.conf` (override via `INFERFLUX_POLICY_STORE`). Admin updates mutate the store so multiple replicas stay consistent even across restarts.
+The persistent policy store lives at `config/policy_store.conf` (override via `INFERFLUX_POLICY_STORE`) and can be AES-GCM encrypted transparently by setting `INFERFLUX_POLICY_PASSPHRASE`. Admin updates mutate the encrypted store so multiple replicas stay consistent even across restarts.
 
 To offload layers to Metal (MPS), set either `runtime.mps_layers` in `config/server.yaml` or export `INFERFLUX_MPS_LAYERS=<layer-count>` before launching `inferfluxd`. The metrics endpoint reports the active backend label (`cpu`, `mps`, or `stub`).
 

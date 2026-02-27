@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -15,7 +16,7 @@ struct ApiKeyPolicy {
 
 class PolicyStore {
  public:
-  explicit PolicyStore(std::string path);
+  PolicyStore(std::string path, std::string passphrase = "");
 
   bool Load();
   bool Save() const;
@@ -36,10 +37,14 @@ class PolicyStore {
   std::unordered_map<std::string, std::vector<std::string>> api_keys_;
   std::vector<std::string> guardrail_blocklist_;
   int rate_limit_per_minute_{0};
+  bool encryption_enabled_{false};
+  std::array<unsigned char, 32> key_{};
 
   void EnsureParentDir() const;
   static std::vector<std::string> SplitCSV(const std::string& line);
   static std::string JoinCSV(const std::vector<std::string>& values);
+  bool Encrypt(const std::string& plaintext, std::string* output) const;
+  bool Decrypt(const std::string& encrypted, std::string* plaintext) const;
 };
 
 }  // namespace inferflux

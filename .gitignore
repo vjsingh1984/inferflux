@@ -6,3 +6,4 @@ logs/
 server.log
 *.gguf
 .env.local
+config/policy_store.conf

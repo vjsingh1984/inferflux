@@ -314,7 +314,11 @@ int main(int argc, char** argv) {
   if (const char* env_policy = std::getenv("INFERFLUX_POLICY_STORE")) {
     policy_store_path = env_policy;
   }
-  inferflux::PolicyStore policy_store(policy_store_path);
+  std::string policy_passphrase;
+  if (const char* env_pass = std::getenv("INFERFLUX_POLICY_PASSPHRASE")) {
+    policy_passphrase = env_pass;
+  }
+  inferflux::PolicyStore policy_store(policy_store_path, policy_passphrase);
   policy_store.Load();
 
   auto stored_keys = policy_store.ApiKeys();
