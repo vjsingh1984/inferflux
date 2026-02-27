@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(ENABLE_CUDA "Enable CUDA runtime" ON)
 option(ENABLE_ROCM "Enable ROCm runtime" ON)
 option(ENABLE_MPS "Enable Metal/MPS runtime" ON)
+option(ENABLE_BLAS "Enable BLAS acceleration" ON)
 option(ENABLE_CPU "Enable CPU runtime" ON)
 
 add_library(inferflux_core
@@ -19,16 +20,26 @@ add_library(inferflux_core
   runtime/backends/cpu/cpu_backend.h
   runtime/backends/cpu/llama_backend.cpp
   runtime/backends/cpu/llama_backend.h
+  runtime/backends/cuda/cuda_device_context.cpp
+  runtime/backends/cuda/cuda_device_context.h
+  runtime/backends/cuda/cuda_backend.cpp
+  runtime/backends/cuda/cuda_backend.h
   runtime/backends/backend_manager.cpp
   runtime/backends/backend_manager.h
   runtime/speculative/speculative_decoder.cpp
   runtime/speculative/speculative_decoder.h
+  runtime/execution/batch_executor.cpp
+  runtime/execution/batch_executor.h
+  runtime/prefix_cache/prefix_cache.cpp
+  runtime/prefix_cache/prefix_cache.h
   model/gguf/gguf_loader.cpp
   model/gguf/gguf_loader.h
   model/tokenizer/simple_tokenizer.cpp
   model/tokenizer/simple_tokenizer.h
   scheduler/scheduler.cpp
   scheduler/scheduler.h
+  scheduler/single_model_router.cpp
+  scheduler/single_model_router.h
   server/http/http_server.cpp
   server/http/http_server.h
   server/auth/api_key_auth.cpp
@@ -53,9 +64,48 @@ add_library(inferflux_core
   net/http_client.h
 )
 
-target_include_directories(inferflux_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(inferflux_core PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/external
+)
 
 find_package(OpenSSL REQUIRED)
+find_package(CUDAToolkit QUIET)
+
+if(ENABLE_CUDA AND CUDAToolkit_FOUND)
+  message(STATUS "CUDA toolkit found: enabling CUDA build path")
+  set(LLAMA_CUDA ON CACHE BOOL "" FORCE)
+  target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_CUDA=1)
+  target_link_libraries(inferflux_core PUBLIC CUDA::cudart)
+else()
+  if(ENABLE_CUDA)
+    message(WARNING "ENABLE_CUDA=ON but CUDA toolkit not found; building without GPU support")
+  endif()
+  set(LLAMA_CUDA OFF CACHE BOOL "" FORCE)
+endif()
+
+if(ENABLE_MPS AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  message(STATUS "Metal/MPS enabled")
+  set(LLAMA_METAL ON CACHE BOOL "" FORCE)
+  target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_METAL=1)
+else()
+  set(LLAMA_METAL OFF CACHE BOOL "" FORCE)
+endif()
+
+if(ENABLE_BLAS)
+  find_package(BLAS)
+  if(BLAS_FOUND)
+    message(STATUS "BLAS backend found: ${BLAS_LIBRARIES}")
+    set(LLAMA_BLAS ON CACHE BOOL "" FORCE)
+    target_link_libraries(inferflux_core PUBLIC BLAS::BLAS)
+    target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_BLAS=1)
+  else()
+    message(WARNING "ENABLE_BLAS=ON but no BLAS implementation found; building without BLAS acceleration")
+    set(LLAMA_BLAS OFF CACHE BOOL "" FORCE)
+  endif()
+else()
+  set(LLAMA_BLAS OFF CACHE BOOL "" FORCE)
+endif()
 
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -67,7 +117,7 @@ target_include_directories(inferflux_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/include
   ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/common
 )
-target_link_libraries(inferflux_core PUBLIC OpenSSL::Crypto)
+target_link_libraries(inferflux_core PUBLIC OpenSSL::Crypto OpenSSL::SSL)
 
 add_executable(inferfluxd server/main.cpp)
 target_link_libraries(inferfluxd PRIVATE inferflux_core)
@@ -76,9 +126,21 @@ add_executable(inferctl cli/main.cpp)
 target_link_libraries(inferctl PRIVATE inferflux_core)
 
 enable_testing()
-add_executable(inferflux_tests tests/unit/test_tokenizer.cpp)
+add_executable(inferflux_tests
+  tests/unit/test_tokenizer.cpp
+  tests/unit/test_api_key_auth.cpp
+  tests/unit/test_rate_limiter.cpp
+  tests/unit/test_guardrail.cpp
+  tests/unit/test_audit_logger.cpp
+  tests/unit/test_metrics.cpp
+  tests/unit/test_scheduler.cpp
+  tests/unit/test_policy_store.cpp
+  tests/unit/test_oidc_validator.cpp
+  external/catch2/catch_amalgamated.cpp
+)
+target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
 target_link_libraries(inferflux_tests PRIVATE inferflux_core)
-add_test(NAME TokenizerTests COMMAND inferflux_tests)
+add_test(NAME UnitTests COMMAND inferflux_tests)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
