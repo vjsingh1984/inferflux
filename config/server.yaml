@@ -14,6 +14,12 @@ runtime:
   backend_priority: [cpu]
   tensor_parallel: 1
   mps_layers: 0
+  speculative_decoding:
+    enabled: false
+    draft_model: ""
+    max_prefill_tokens: 256
+  nvme_offload:
+    path: ""
   paged_kv:
     cpu_pages: 4096
     eviction: lru
@@ -29,6 +35,7 @@ guardrails:
   blocklist:
     - secret
     - confidential
+  opa_endpoint: ""
 logging:
   level: info
   format: json

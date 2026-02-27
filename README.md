@@ -71,7 +71,14 @@ The persistent policy store lives at `config/policy_store.conf` (override via `I
 
 To offload layers to Metal (MPS), set either `runtime.mps_layers` in `config/server.yaml` or export `INFERFLUX_MPS_LAYERS=<layer-count>` before launching `inferfluxd`. The metrics endpoint reports the active backend label (`cpu`, `mps`, or `stub`).
 
-See `docs/` for the PRD, design, and non-functional requirements, and `config/server.yaml` for a reference deployment configuration.
+## Configuration Highlights
+- `runtime.speculative_decoding` toggles draft-model speculation (enable flag, draft model path, max prefill tokens).
+- `runtime.nvme_offload.path` configures an NVMe-backed paged KV cache directory.
+- `guardrails.opa_endpoint` reserves a future OPA/Cedar decision endpoint for contextual policies.
+- `auth.api_keys[].scopes` map to RBAC scopes (`generate`, `read`, `admin`), and `INFERFLUX_POLICY_PASSPHRASE` encrypts the policy store.
+- `INFERFLUX_POLICY_STORE` overrides the location of the encrypted policy file (`config/policy_store.conf` by default).
+
+See `docs/` for the PRD, design, and non-functional requirements, and browse `docs/Roadmap.md` for milestone details.
 
 ## Tests
 - Unit tests: `ctest --test-dir build --output-on-failure`

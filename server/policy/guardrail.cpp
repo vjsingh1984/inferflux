@@ -53,12 +53,28 @@ bool Guardrail::Check(const std::string& text, std::string* reason) const {
       return false;
     }
   }
+  if (!opa_endpoint_.empty()) {
+    // Placeholder for future OPA integration. For now we simply log intent via reason when requested.
+    if (reason) {
+      *reason = "OPA endpoint configured (" + opa_endpoint_ + ") but not yet enforced";
+    }
+  }
   return true;
 }
 
 bool Guardrail::Enabled() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return !blocklist_.empty();
+}
+
+void Guardrail::SetOPAEndpoint(const std::string& endpoint) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  opa_endpoint_ = endpoint;
+}
+
+std::string Guardrail::OPAEndpoint() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return opa_endpoint_;
 }
 
 }  // namespace inferflux

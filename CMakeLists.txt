@@ -45,6 +45,8 @@ add_library(inferflux_core
 
 target_include_directories(inferflux_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+find_package(OpenSSL REQUIRED)
+
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
@@ -55,6 +57,7 @@ target_include_directories(inferflux_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/include
   ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/common
 )
+target_link_libraries(inferflux_core PUBLIC OpenSSL::Crypto)
 
 add_executable(inferfluxd server/main.cpp)
 target_link_libraries(inferfluxd PRIVATE inferflux_core)

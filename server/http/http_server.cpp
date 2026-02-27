@@ -628,11 +628,14 @@ void HttpServer::HandleClient(int client_fd) {
       return;
     }
     auto list = ExtractStringArray(body, "blocklist");
+    auto start = std::chrono::steady_clock::now();
     guardrail_->UpdateBlocklist(list);
     if (policy_store_) {
       policy_store_->SetGuardrailBlocklist(list);
       policy_store_->Save();
     }
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+    std::cout << "[policy] guardrail update applied in " << elapsed.count() << " ms" << std::endl;
     SendAll(client_fd, BuildResponse(R"({"status":"ok"})"));
     if (audit_logger_) {
       audit_logger_->Log(auth_ctx.subject, "", "guardrail_update", "updated blocklist");
@@ -659,6 +662,7 @@ void HttpServer::HandleClient(int client_fd) {
       SendAll(client_fd, BuildResponse(BuildErrorBody("tokens_per_minute is required"), 400, "Bad Request"));
       return;
     }
+    auto start = std::chrono::steady_clock::now();
     if (rate_limiter_) {
       rate_limiter_->UpdateLimit(*value);
     }
@@ -666,6 +670,8 @@ void HttpServer::HandleClient(int client_fd) {
       policy_store_->SetRateLimitPerMinute(*value);
       policy_store_->Save();
     }
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+    std::cout << "[policy] rate-limit update applied in " << elapsed.count() << " ms" << std::endl;
     SendAll(client_fd, BuildResponse(R"({"status":"ok"})"));
     if (audit_logger_) {
       audit_logger_->Log(auth_ctx.subject, "", "rate_limit_update", std::to_string(*value));
@@ -700,9 +706,12 @@ void HttpServer::HandleClient(int client_fd) {
       SendAll(client_fd, BuildResponse(BuildErrorBody("key is required"), 400, "Bad Request"));
       return;
     }
+    auto start = std::chrono::steady_clock::now();
     auth_->AddKey(key, scopes);
     policy_store_->SetApiKey(key, scopes);
     policy_store_->Save();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+    std::cout << "[policy] api-key upsert applied in " << elapsed.count() << " ms" << std::endl;
     SendAll(client_fd, BuildResponse(R"({"status":"ok"})"));
     if (audit_logger_) {
       audit_logger_->Log(auth_ctx.subject, "", "api_key_upsert", key);
@@ -723,9 +732,12 @@ void HttpServer::HandleClient(int client_fd) {
       SendAll(client_fd, BuildResponse(BuildErrorBody("key is required"), 400, "Bad Request"));
       return;
     }
+    auto start = std::chrono::steady_clock::now();
     auth_->RemoveKey(key);
     policy_store_->RemoveApiKey(key);
     policy_store_->Save();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+    std::cout << "[policy] api-key removal applied in " << elapsed.count() << " ms" << std::endl;
     SendAll(client_fd, BuildResponse(R"({"status":"ok"})"));
     if (audit_logger_) {
       audit_logger_->Log(auth_ctx.subject, "", "api_key_remove", key);

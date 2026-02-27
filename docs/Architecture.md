@@ -21,7 +21,7 @@
 ```
 
 ## Modules
-- **Runtime**: Provides `DeviceContext` abstraction, memory allocators, paged KV cache, speculative decoding, and fused attention/MoE kernels. Supports CUDA, ROCm, MPS (Metal), and CPU backends with adaptive sharding.
+- **Runtime**: Provides `DeviceContext` abstraction, memory allocators, paged KV cache, speculative decoding (draft models), NVMe-backed offload, and fused attention/MoE kernels. Supports CUDA, ROCm, MPS (Metal), and CPU backends with adaptive sharding.
 - **Model**: Handles tokenizer plugins, GGUF and safetensors loaders, quantization metadata, and adapter composition.
 - **Scheduler**: Implements continuous batching, prefill/decoding queues, request prioritization, and speculative decoding hooks.
 - **Server**: Hosts HTTP/gRPC/WebSocket frontends, SSE streaming, auth (OIDC/API-key), rate limiting, RBAC enforcement, and structured/audit logging.

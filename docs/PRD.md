@@ -43,3 +43,15 @@ InferFlux is a C++17 inference server designed to replace desktop and cloud LLM 
 ## Success Metrics
 - Tokens-per-second per GPU, average queue depth, KV cache hit rate, API error rate <0.5%.
 - Adoption: 3 pilot deployments (desktop, single-node GPU, Kubernetes cluster) for MVP.
+
+## Milestones & SLAs
+| Phase | Scope | KPI/Target |
+| --- | --- | --- |
+| **MVP (Q2)** | CPU/MPS backends, SSE streaming, policy store | ≥30 tok/s per request on CPU; policy update latency <250 ms; admin CLI task success 95% |
+| **Performance (Q3)** | CUDA/ROCm offload, speculative decoding, NVMe cache | ≥400 tok/s aggregate on L40S 7B Q4K; speculative draft reduces latency 30%; NVMe cache miss <5% |
+| **Enterprise (Q4)** | OPA integration, LoRA stacking, distributed scheduler | Guardrail verdict latency <500 ms; >99.95% policy replication consistency; admin UX SUS score ≥80 |
+
+SLA highlights:
+- **Tokens/sec under load**: maintain ≥400 tok/s on L40S for 7B Q4K with 80% GPU utilization.
+- **Policy propagation**: guardrail/rate-limit updates visible on all replicas within 2 seconds (P99).
+- **Admin UX**: CLI/web tasks (list/update guardrails, rate limits, API keys) complete within 3 steps and <5 seconds end-to-end.

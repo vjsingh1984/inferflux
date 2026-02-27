@@ -98,6 +98,8 @@ int main(int argc, char** argv) {
     bool in_guardrails = false;
     bool in_logging = false;
     bool in_api_keys = false;
+    bool in_speculative = false;
+    bool in_nvme = false;
     std::string current_key;
     std::vector<std::string> current_scopes;
     while (std::getline(input, line)) {
@@ -135,6 +137,8 @@ int main(int argc, char** argv) {
         in_logging = false;
         in_api_keys = false;
         in_runtime = true;
+        in_speculative = false;
+        in_nvme = false;
         continue;
       }
       if (trimmed == "guardrails:") {
@@ -143,6 +147,8 @@ int main(int argc, char** argv) {
         in_runtime = false;
         in_logging = false;
         in_guardrails = true;
+        in_speculative = false;
+        in_nvme = false;
         continue;
       }
       if (trimmed == "logging:") {
@@ -151,6 +157,8 @@ int main(int argc, char** argv) {
         in_runtime = false;
         in_guardrails = false;
         in_logging = true;
+        in_speculative = false;
+        in_nvme = false;
         continue;
       }
       if (trimmed == "adapters:") {
@@ -160,6 +168,8 @@ int main(int argc, char** argv) {
         in_guardrails = false;
         in_logging = false;
         in_api_keys = false;
+        in_speculative = false;
+        in_nvme = false;
         continue;
       }
       if (in_auth && trimmed.rfind("api_keys:", 0) == 0) {
@@ -197,6 +207,32 @@ int main(int argc, char** argv) {
         mps_layers = std::stoi(trimmed.substr(trimmed.find(':') + 1));
         continue;
       }
+      if (in_runtime && trimmed == "speculative_decoding:") {
+        in_speculative = true;
+        in_nvme = false;
+        continue;
+      }
+      if (in_speculative && trimmed.rfind("enabled:", 0) == 0) {
+        speculative_enabled = Trim(trimmed.substr(trimmed.find(':') + 1)) == "true";
+        continue;
+      }
+      if (in_speculative && trimmed.rfind("draft_model:", 0) == 0) {
+        speculative_draft_model = Trim(trimmed.substr(trimmed.find(':') + 1));
+        continue;
+      }
+      if (in_speculative && trimmed.rfind("max_prefill_tokens:", 0) == 0) {
+        speculative_max_prefill_tokens = std::stoi(trimmed.substr(trimmed.find(':') + 1));
+        continue;
+      }
+      if (in_runtime && trimmed == "nvme_offload:") {
+        in_nvme = true;
+        in_speculative = false;
+        continue;
+      }
+      if (in_nvme && trimmed.rfind("path:", 0) == 0) {
+        nvme_offload_path = Trim(trimmed.substr(trimmed.find(':') + 1));
+        continue;
+      }
       if (in_auth && trimmed.rfind("rate_limit_per_minute:", 0) == 0) {
         rate_limit_per_minute = std::stoi(trimmed.substr(trimmed.find(':') + 1));
         continue;
@@ -226,6 +262,10 @@ int main(int argc, char** argv) {
         if (!word.empty()) {
           guard_blocklist.push_back(word);
         }
+        continue;
+      }
+      if (in_guardrails && trimmed.rfind("opa_endpoint:", 0) == 0) {
+        opa_endpoint = Trim(trimmed.substr(trimmed.find(':') + 1));
         continue;
       }
       if (in_logging && trimmed.rfind("audit_log:", 0) == 0) {
@@ -284,6 +324,21 @@ int main(int argc, char** argv) {
   }
   if (const char* env_oidc_aud = std::getenv("INFERFLUX_OIDC_AUDIENCE")) {
     oidc_audience = env_oidc_aud;
+  }
+  if (const char* env_spec = std::getenv("INFERFLUX_SPECULATIVE_ENABLED")) {
+    speculative_enabled = std::string(env_spec) == "true";
+  }
+  if (const char* env_spec_draft = std::getenv("INFERFLUX_SPEC_DRAFT_MODEL")) {
+    speculative_draft_model = env_spec_draft;
+  }
+  if (const char* env_spec_prefill = std::getenv("INFERFLUX_SPEC_MAX_PREFILL")) {
+    speculative_max_prefill_tokens = std::stoi(env_spec_prefill);
+  }
+  if (const char* env_nvme = std::getenv("INFERFLUX_NVME_OFFLOAD_PATH")) {
+    nvme_offload_path = env_nvme;
+  }
+  if (const char* env_opa = std::getenv("INFERFLUX_OPA_ENDPOINT")) {
+    opa_endpoint = env_opa;
   }
   if (const char* env_port = std::getenv("INFERFLUX_PORT_OVERRIDE")) {
     port = std::stoi(env_port);
@@ -353,7 +408,17 @@ int main(int argc, char** argv) {
   inferflux::RateLimiter rate_limiter(rate_limit_per_minute);
   inferflux::Guardrail guardrail;
   guardrail.SetBlocklist(guard_blocklist);
+  guardrail.SetOPAEndpoint(opa_endpoint);
   inferflux::AuditLogger audit_logger(audit_log_path);
+  std::cout << "Speculative decoding: " << (speculative_enabled ? "enabled" : "disabled")
+            << " draft_model=" << (speculative_draft_model.empty() ? "<none>" : speculative_draft_model)
+            << " max_prefill_tokens=" << speculative_max_prefill_tokens << std::endl;
+  if (!nvme_offload_path.empty()) {
+    std::cout << "NVMe KV offload path: " << nvme_offload_path << std::endl;
+  }
+  if (!opa_endpoint.empty()) {
+    std::cout << "OPA guardrail endpoint: " << opa_endpoint << std::endl;
+  }
   inferflux::HttpServer server(host, port, &scheduler, auth, &metrics, &oidc_validator,
                                rate_limit_per_minute > 0 ? &rate_limiter : nullptr,
                                guardrail.Enabled() ? &guardrail : nullptr,
