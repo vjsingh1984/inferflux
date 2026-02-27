@@ -22,17 +22,20 @@ GenerateResponse Scheduler::Generate(const GenerateRequest& request) {
   auto prompt_tokens = tokenizer_.Encode(request.prompt);
   response.prompt_tokens = static_cast<int>(prompt_tokens.size());
 
+  std::vector<int> speculative_tokens;
   if (speculative_decoder_ && speculative_decoder_->Enabled()) {
-    auto speculative = speculative_decoder_->Draft(prompt_tokens, request.max_tokens);
-    if (!speculative.empty()) {
-      auto speculative_text = tokenizer_.Decode(speculative);
-      std::cout << "[speculative] pretrained draft: " << speculative_text << std::endl;
-    }
+    speculative_tokens = speculative_decoder_->Draft(prompt_tokens, request.max_tokens);
   }
 
   if (llama_backend_ && llama_backend_->IsReady()) {
-    auto text = llama_backend_->Generate(request.prompt, request.max_tokens);
-    response.completion = text.empty() ? "[llama.cpp backend returned empty response]" : text;
+    if (!speculative_tokens.empty()) {
+      speculative_tokens = speculative_decoder_->Validate(prompt_tokens, speculative_tokens,
+                                                         request.max_tokens, llama_backend_);
+      response.completion = tokenizer_.Decode(speculative_tokens);
+    } else {
+      auto text = llama_backend_->Generate(request.prompt, request.max_tokens);
+      response.completion = text.empty() ? "[llama.cpp backend returned empty response]" : text;
+    }
   } else {
     // Fallback stub that produces a human-readable reply.
     response.completion = "InferFlux (stub): I received your prompt \"" + request.prompt +

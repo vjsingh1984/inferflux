@@ -26,6 +26,10 @@ class SpeculativeDecoder {
   SpeculativeConfig Config() const { return config_; }
 
   std::vector<int> Draft(const std::vector<int>& prompt_tokens, int max_new_tokens);
+  std::vector<int> Validate(const std::vector<int>& prompt_tokens,
+                            const std::vector<int>& draft_tokens,
+                            int max_new_tokens,
+                            std::shared_ptr<LlamaCPUBackend> target_backend);
   std::string DraftModel() const { return config_.draft_model; }
 
  private:

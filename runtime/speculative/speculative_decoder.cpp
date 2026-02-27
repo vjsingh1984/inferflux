@@ -36,4 +36,18 @@ std::vector<int> SpeculativeDecoder::Draft(const std::vector<int>& prompt_tokens
   return speculative;
 }
 
+std::vector<int> SpeculativeDecoder::Validate(const std::vector<int>& prompt_tokens,
+                                              const std::vector<int>& draft_tokens,
+                                              int max_new_tokens,
+                                              std::shared_ptr<LlamaCPUBackend> target_backend) {
+  if (!target_backend || !target_backend->IsReady()) {
+    return draft_tokens;
+  }
+  auto prompt_text = tokenizer_->Decode(prompt_tokens);
+  auto draft_text = tokenizer_->Decode(draft_tokens);
+  auto validated = target_backend->Generate(prompt_text + draft_text, max_new_tokens);
+  auto tokens = tokenizer_->Encode(validated);
+  return tokens;
+}
+
 }  // namespace inferflux
