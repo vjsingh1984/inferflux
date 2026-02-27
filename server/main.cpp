@@ -1,4 +1,5 @@
 #include "model/tokenizer/simple_tokenizer.h"
+#include "policy/policy_store.h"
 #include "runtime/backends/cpu/cpu_backend.h"
 #include "runtime/backends/cpu/llama_backend.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
@@ -251,7 +252,7 @@ int main(int argc, char** argv) {
     while (std::getline(ss, key, ',')) {
       auto trimmed = Trim(key);
       if (!trimmed.empty()) {
-        auth->AddKey(trimmed);
+        api_key_entries.push_back({trimmed, {}});
       }
     }
   }
@@ -309,6 +310,38 @@ int main(int argc, char** argv) {
       std::cout << "InferFlux loaded model: " << model_path << " (backend=" << backend_label << ")" << std::endl;
     }
   }
+  std::string policy_store_path = "config/policy_store.conf";
+  if (const char* env_policy = std::getenv("INFERFLUX_POLICY_STORE")) {
+    policy_store_path = env_policy;
+  }
+  inferflux::PolicyStore policy_store(policy_store_path);
+  policy_store.Load();
+
+  auto stored_keys = policy_store.ApiKeys();
+  if (!stored_keys.empty()) {
+    api_key_entries.clear();
+    for (const auto& entry : stored_keys) {
+      api_key_entries.push_back({entry.key, entry.scopes});
+    }
+  }
+  for (const auto& entry : api_key_entries) {
+    auth->AddKey(entry.key, entry.scopes);
+    policy_store.SetApiKey(entry.key, entry.scopes);
+  }
+  int store_limit = policy_store.RateLimitPerMinute();
+  if (store_limit > 0) {
+    rate_limit_per_minute = store_limit;
+  } else if (rate_limit_per_minute > 0) {
+    policy_store.SetRateLimitPerMinute(rate_limit_per_minute);
+  }
+  auto store_guardrail = policy_store.GuardrailBlocklist();
+  if (!store_guardrail.empty()) {
+    guard_blocklist = store_guardrail;
+  } else if (!guard_blocklist.empty()) {
+    policy_store.SetGuardrailBlocklist(guard_blocklist);
+  }
+  policy_store.Save();
+
   inferflux::Scheduler scheduler(tokenizer, device, cache, llama_backend);
   auto& metrics = inferflux::GlobalMetrics();
   metrics.SetBackend(backend_label);
@@ -320,7 +353,8 @@ int main(int argc, char** argv) {
   inferflux::HttpServer server(host, port, &scheduler, auth, &metrics, &oidc_validator,
                                rate_limit_per_minute > 0 ? &rate_limiter : nullptr,
                                guardrail.Enabled() ? &guardrail : nullptr,
-                               audit_logger.Enabled() ? &audit_logger : nullptr);
+                               audit_logger.Enabled() ? &audit_logger : nullptr,
+                               &policy_store);
 
   std::signal(SIGINT, SignalHandler);
   std::signal(SIGTERM, SignalHandler);

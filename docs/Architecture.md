@@ -25,6 +25,7 @@
 - **Model**: Handles tokenizer plugins, GGUF and safetensors loaders, quantization metadata, and adapter composition.
 - **Scheduler**: Implements continuous batching, prefill/decoding queues, request prioritization, and speculative decoding hooks.
 - **Server**: Hosts HTTP/gRPC/WebSocket frontends, SSE streaming, auth (OIDC/API-key), rate limiting, RBAC enforcement, and structured/audit logging.
+- **Policy Store**: Persists API keys, scopes, guardrails, and rate limits, exposing admin APIs and CLI hooks for dynamic updates.
 - **CLI**: Offers `inferctl` commands to pull models, run local servers, and inspect runtime health.
 - **Security Services**: Integrations for secrets management, KMS-backed encryption of adapters, and policy plugins for guardrails/PII scrubbing.
 - **Observability**: Metrics registry, Prometheus exporter, OpenTelemetry spans, live debug UI, and hooks for autoscaler hints (queue depth, KV pages, backend mix).

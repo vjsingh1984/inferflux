@@ -40,4 +40,6 @@ std::vector<std::string> ApiKeyAuth::Scopes(const std::string& key) const {
   return std::vector<std::string>(it->second.begin(), it->second.end());
 }
 
+void ApiKeyAuth::RemoveKey(const std::string& key) { keys_.erase(key); }
+
 }  // namespace inferflux

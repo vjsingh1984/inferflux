@@ -466,7 +466,7 @@ int main(int argc, char** argv) {
         return 1;
       }
       std::string target = argv[2];
-      if (target == "guardrails") {
+    if (target == "guardrails") {
         bool list = false;
         std::string set_values;
         for (int i = 3; i < argc; ++i) {
@@ -521,6 +521,56 @@ int main(int argc, char** argv) {
         if (set_flag) {
           std::string payload = std::string("{\"tokens_per_minute\":") + std::to_string(new_limit) + "}";
           auto resp = SendHttpRequest("PUT", "/v1/admin/rate_limit", payload, host, port, api_key);
+          std::cout << resp << std::endl;
+          return 0;
+        }
+        PrintUsage();
+        return 1;
+      }
+      if (target == "api-keys" || target == "api-key") {
+        bool list = false;
+        bool remove = false;
+        bool add = false;
+        std::string new_key;
+        std::string scopes_csv;
+        for (int i = 3; i < argc; ++i) {
+          std::string arg = argv[i];
+          if (arg == "--list") {
+            list = true;
+          } else if (arg == "--add" && i + 1 < argc) {
+            new_key = argv[++i];
+            add = true;
+          } else if (arg == "--scopes" && i + 1 < argc) {
+            scopes_csv = argv[++i];
+          } else if (arg == "--remove" && i + 1 < argc) {
+            new_key = argv[++i];
+            remove = true;
+          }
+        }
+        if (list) {
+          auto resp = SendHttpRequest("GET", "/v1/admin/api_keys", "", host, port, api_key);
+          std::cout << resp << std::endl;
+          return 0;
+        }
+        if (add) {
+          std::vector<std::string> scopes;
+          std::stringstream ss(scopes_csv);
+          std::string token;
+          while (std::getline(ss, token, ',')) {
+            auto trimmed = Trim(token);
+            if (!trimmed.empty()) {
+              scopes.push_back(trimmed);
+            }
+          }
+          std::string payload = std::string("{\"key\":\"") + EscapeJson(new_key) + "\",\"scopes\":";
+          payload += BuildJsonArray(scopes) + "}";
+          auto resp = SendHttpRequest("POST", "/v1/admin/api_keys", payload, host, port, api_key);
+          std::cout << resp << std::endl;
+          return 0;
+        }
+        if (remove) {
+          std::string payload = std::string("{\"key\":\"") + EscapeJson(new_key) + "\"}";
+          auto resp = SendHttpRequest("DELETE", "/v1/admin/api_keys", payload, host, port, api_key);
           std::cout << resp << std::endl;
           return 0;
         }

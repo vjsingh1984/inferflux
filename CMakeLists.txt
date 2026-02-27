@@ -39,6 +39,8 @@ add_library(inferflux_core
   server/logging/audit_logger.h
   server/policy/guardrail.cpp
   server/policy/guardrail.h
+  policy/policy_store.cpp
+  policy/policy_store.h
 )
 
 target_include_directories(inferflux_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -32,6 +32,7 @@ export INFERFLUX_GUARDRAIL_BLOCKLIST=classified,pii
 export INFERFLUX_AUDIT_LOG=logs/audit.log
 export INFERFLUX_OIDC_ISSUER=https://issuer.example.com
 export INFERFLUX_OIDC_AUDIENCE=inferflux
+export INFERFLUX_POLICY_STORE=config/policy_store.conf
 ./build/inferctl status --host 127.0.0.1 --port 8080
 ./build/inferctl completion --prompt "Hello from InferFlux" --api-key "$INFERCTL_API_KEY" --model llama3
 ./build/inferctl chat --message "user:Hello" --stream --api-key "$INFERCTL_API_KEY"
@@ -39,6 +40,8 @@ export INFERFLUX_OIDC_AUDIENCE=inferflux
 ./build/inferctl admin guardrails --list --api-key "$INFERCTL_API_KEY"
 ./build/inferctl admin guardrails --set secret,pii --api-key "$INFERCTL_API_KEY"
 ./build/inferctl admin rate-limit --set 200 --api-key "$INFERCTL_API_KEY"
+./build/inferctl admin api-keys --list --api-key "$INFERCTL_API_KEY"
+./build/inferctl admin api-keys --add new-key --scopes generate,read --api-key "$INFERCTL_API_KEY"
 ```
 
 When `INFERFLUX_MODEL_PATH` (or `model.path` in `config/server.yaml`) points to a GGUF file, the server loads it through the integrated `llama.cpp` backend and returns human-readable completions. Without a model, a friendly stub response is returned for smoke tests.
@@ -50,7 +53,7 @@ The HTTP service now exposes:
 
 - `/metrics` with Prometheus counters for requests, errors, and token counts (tagged by backend type).
 - Streaming responses when `{ "stream": true }` is supplied to `/v1/completions` or `/v1/chat/completions`.
-- Admin APIs to inspect/update guardrail blocklists and rate limits, protected by RBAC scopes (`generate`, `read`, `admin`).
+- Admin APIs to inspect/update guardrail blocklists, rate limits, and API keys, protected by RBAC scopes (`generate`, `read`, `admin`).
 
 API keys are defined in `config/server.yaml` with explicit scopes:
 
@@ -62,6 +65,8 @@ auth:
 ```
 
 Use admin-scoped keys with `inferctl admin ...` to modify guardrails and rate limits without restarts.
+
+The persistent policy store lives at `config/policy_store.conf` (override via `INFERFLUX_POLICY_STORE`). Admin updates mutate the store so multiple replicas stay consistent even across restarts.
 
 To offload layers to Metal (MPS), set either `runtime.mps_layers` in `config/server.yaml` or export `INFERFLUX_MPS_LAYERS=<layer-count>` before launching `inferfluxd`. The metrics endpoint reports the active backend label (`cpu`, `mps`, or `stub`).
 

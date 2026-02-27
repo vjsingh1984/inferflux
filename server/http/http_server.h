@@ -1,5 +1,6 @@
 #pragma once
 
+#include "policy/policy_store.h"
 #include "scheduler/scheduler.h"
 #include "server/auth/api_key_auth.h"
 #include "server/auth/oidc_validator.h"
@@ -26,7 +27,8 @@ class HttpServer {
              OIDCValidator* oidc,
              RateLimiter* rate_limiter,
              Guardrail* guardrail,
-             AuditLogger* audit_logger);
+             AuditLogger* audit_logger,
+             PolicyStore* policy_store);
   ~HttpServer();
 
   void Start();
@@ -56,6 +58,7 @@ class HttpServer {
   RateLimiter* rate_limiter_;
   Guardrail* guardrail_;
   AuditLogger* audit_logger_;
+  PolicyStore* policy_store_;
   std::atomic<bool> running_{false};
   std::thread worker_;
 };

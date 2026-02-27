@@ -13,6 +13,7 @@ class ApiKeyAuth {
   bool IsAllowed(const std::string& key) const;
   bool HasKeys() const;
   std::vector<std::string> Scopes(const std::string& key) const;
+  void RemoveKey(const std::string& key);
 
  private:
   std::unordered_map<std::string, std::unordered_set<std::string>> keys_;

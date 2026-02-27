@@ -394,6 +394,20 @@ std::string BuildStringArray(const std::vector<std::string>& values) {
   out.append("]");
   return out;
 }
+
+std::string BuildApiKeysPayload(const std::vector<ApiKeyPolicy>& keys) {
+  std::string out = "{\"api_keys\":[";
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    if (i > 0) {
+      out.append(",");
+    }
+    out.append("{\"key\":\"").append(EscapeJson(keys[i].key)).append("\",\"scopes\":");
+    out.append(BuildStringArray(keys[i].scopes));
+    out.append("}");
+  }
+  out.append("]}");
+  return out;
+}
 }
 
 HttpServer::HttpServer(std::string host,
@@ -404,7 +418,8 @@ HttpServer::HttpServer(std::string host,
                        OIDCValidator* oidc,
                        RateLimiter* rate_limiter,
                        Guardrail* guardrail,
-                       AuditLogger* audit_logger)
+                       AuditLogger* audit_logger,
+                       PolicyStore* policy_store)
     : host_(std::move(host)),
       port_(port),
       scheduler_(scheduler),
@@ -413,7 +428,8 @@ HttpServer::HttpServer(std::string host,
       oidc_(oidc),
       rate_limiter_(rate_limiter),
       guardrail_(guardrail),
-      audit_logger_(audit_logger) {}
+      audit_logger_(audit_logger),
+      policy_store_(policy_store) {}
 
 HttpServer::~HttpServer() { Stop(); }
 
@@ -613,6 +629,10 @@ void HttpServer::HandleClient(int client_fd) {
     }
     auto list = ExtractStringArray(body, "blocklist");
     guardrail_->UpdateBlocklist(list);
+    if (policy_store_) {
+      policy_store_->SetGuardrailBlocklist(list);
+      policy_store_->Save();
+    }
     SendAll(client_fd, BuildResponse(R"({"status":"ok"})"));
     if (audit_logger_) {
       audit_logger_->Log(auth_ctx.subject, "", "guardrail_update", "updated blocklist");
@@ -642,9 +662,73 @@ void HttpServer::HandleClient(int client_fd) {
     if (rate_limiter_) {
       rate_limiter_->UpdateLimit(*value);
     }
+    if (policy_store_) {
+      policy_store_->SetRateLimitPerMinute(*value);
+      policy_store_->Save();
+    }
     SendAll(client_fd, BuildResponse(R"({"status":"ok"})"));
     if (audit_logger_) {
       audit_logger_->Log(auth_ctx.subject, "", "rate_limit_update", std::to_string(*value));
+    }
+    return;
+  }
+
+  if (method == "GET" && path == "/v1/admin/api_keys") {
+    if (!RequireScope(auth_ctx, "admin", client_fd, "admin scope required")) {
+      return;
+    }
+    if (!policy_store_) {
+      SendAll(client_fd, BuildResponse(R"({"error":"policy_store_disabled"})", 503, "Unavailable"));
+      return;
+    }
+    auto keys = policy_store_->ApiKeys();
+    SendAll(client_fd, BuildResponse(BuildApiKeysPayload(keys)));
+    return;
+  }
+
+  if (method == "POST" && path == "/v1/admin/api_keys") {
+    if (!RequireScope(auth_ctx, "admin", client_fd, "admin scope required")) {
+      return;
+    }
+    if (!policy_store_) {
+      SendAll(client_fd, BuildResponse(R"({"error":"policy_store_disabled"})", 503, "Unavailable"));
+      return;
+    }
+    auto key = ExtractJsonString(body, "key").value_or("");
+    auto scopes = ExtractStringArray(body, "scopes");
+    if (key.empty()) {
+      SendAll(client_fd, BuildResponse(BuildErrorBody("key is required"), 400, "Bad Request"));
+      return;
+    }
+    auth_->AddKey(key, scopes);
+    policy_store_->SetApiKey(key, scopes);
+    policy_store_->Save();
+    SendAll(client_fd, BuildResponse(R"({"status":"ok"})"));
+    if (audit_logger_) {
+      audit_logger_->Log(auth_ctx.subject, "", "api_key_upsert", key);
+    }
+    return;
+  }
+
+  if (method == "DELETE" && path == "/v1/admin/api_keys") {
+    if (!RequireScope(auth_ctx, "admin", client_fd, "admin scope required")) {
+      return;
+    }
+    if (!policy_store_) {
+      SendAll(client_fd, BuildResponse(R"({"error":"policy_store_disabled"})", 503, "Unavailable"));
+      return;
+    }
+    auto key = ExtractJsonString(body, "key").value_or("");
+    if (key.empty()) {
+      SendAll(client_fd, BuildResponse(BuildErrorBody("key is required"), 400, "Bad Request"));
+      return;
+    }
+    auth_->RemoveKey(key);
+    policy_store_->RemoveApiKey(key);
+    policy_store_->Save();
+    SendAll(client_fd, BuildResponse(R"({"status":"ok"})"));
+    if (audit_logger_) {
+      audit_logger_->Log(auth_ctx.subject, "", "api_key_remove", key);
     }
     return;
   }
