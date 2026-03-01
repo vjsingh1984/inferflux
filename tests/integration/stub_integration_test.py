@@ -537,6 +537,59 @@ class StubIntegrationTests(unittest.TestCase):
         conn.close()
         self.assertEqual(resp.status, 401)
 
+    # ── logprobs ──────────────────────────────────────────────────────────────
+
+    def test_logprobs_field_absent_by_default(self):
+        """choices[0].logprobs is null when logprobs not requested."""
+        resp, body = self._post("/v1/completions",
+                                {"prompt": "hi", "max_tokens": 5})
+        self.assertEqual(resp.status, 200, msg=body)
+        data = json.loads(body)
+        choice = data["choices"][0]
+        self.assertIn("logprobs", choice)
+        self.assertIsNone(choice["logprobs"])
+
+    def test_logprobs_chat_returns_content_list(self):
+        """Chat completions with logprobs=true returns logprobs field."""
+        resp, body = self._post("/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 5,
+            "logprobs": True,
+        })
+        self.assertEqual(resp.status, 200, msg=body)
+        data = json.loads(body)
+        choice = data["choices"][0]
+        self.assertIn("logprobs", choice)
+        lp = choice["logprobs"]
+        # In stub mode no backend is loaded so logprobs is null — verify shape only.
+        if lp is not None:
+            self.assertIn("content", lp)
+            self.assertIsInstance(lp["content"], list)
+
+    def test_logprobs_completions_int_form(self):
+        """Completions with logprobs=3 (top-3) sets logprobs field in response."""
+        resp, body = self._post("/v1/completions",
+                                {"prompt": "hello", "max_tokens": 5, "logprobs": 3})
+        self.assertEqual(resp.status, 200, msg=body)
+        data = json.loads(body)
+        choice = data["choices"][0]
+        self.assertIn("logprobs", choice)
+        lp = choice["logprobs"]
+        if lp is not None:
+            for key in ("tokens", "token_logprobs", "top_logprobs"):
+                self.assertIn(key, lp)
+
+    def test_no_logprobs_gives_null(self):
+        """Without logprobs flag the field is null for both endpoints."""
+        for path, payload in [
+            ("/v1/completions", {"prompt": "hi", "max_tokens": 5}),
+            ("/v1/chat/completions",
+             {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}),
+        ]:
+            resp, body = self._post(path, payload)
+            self.assertEqual(resp.status, 200, msg=body)
+            self.assertIsNone(json.loads(body)["choices"][0]["logprobs"])
+
 
 if __name__ == "__main__":
     unittest.main()

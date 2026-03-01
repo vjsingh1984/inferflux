@@ -3,9 +3,11 @@
 #include <llama.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
 
@@ -191,7 +193,8 @@ std::string LlamaCPUBackend::TokenToString(int token) const {
 std::string LlamaCPUBackend::Generate(
     const std::string &prompt, int max_tokens,
     const std::function<bool(const std::string &)> &on_chunk,
-    const std::function<bool()> &should_stop) {
+    const std::function<bool()> &should_stop, int logprob_top_n,
+    std::vector<TokenLogprob> *out_logprobs) {
   if (!IsReady()) {
     return {};
   }
@@ -239,6 +242,10 @@ std::string LlamaCPUBackend::Generate(
       break;
     }
     std::string piece = TokenToString(token);
+    // Collect logprob before the next llama_decode invalidates the logits ptr.
+    if (out_logprobs) {
+      out_logprobs->push_back(CollectLogprob(token, piece, logprob_top_n));
+    }
     output += piece;
     if (on_chunk) {
       if (!on_chunk(piece)) {
@@ -447,7 +454,8 @@ LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
 std::string LlamaCPUBackend::Decode(
     int n_past, int sequence_id, int max_tokens,
     const std::function<bool(const std::string &)> &on_chunk,
-    const std::function<bool()> &should_stop) {
+    const std::function<bool()> &should_stop, int logprob_top_n,
+    std::vector<TokenLogprob> *out_logprobs) {
   if (!context_ || !vocab_ || n_past < 0) {
     return {};
   }
@@ -475,6 +483,9 @@ std::string LlamaCPUBackend::Decode(
     if (token == eos)
       break;
     std::string piece = TokenToString(token);
+    if (out_logprobs) {
+      out_logprobs->push_back(CollectLogprob(token, piece, logprob_top_n));
+    }
     output += piece;
     if (on_chunk && !on_chunk(piece))
       break;
@@ -573,6 +584,53 @@ void LlamaCPUBackend::DisableGrammarConstraint() {
     llama_sampler_free(grammar_sampler_);
     grammar_sampler_ = nullptr;
   }
+}
+
+TokenLogprob LlamaCPUBackend::CollectLogprob(int token_id,
+                                             const std::string &token_str,
+                                             int top_n) const {
+  const float *logits = llama_get_logits(context_);
+  TokenLogprob tlp;
+  tlp.token = token_str;
+
+  if (!logits || n_vocab_ <= 0) {
+    return tlp;
+  }
+
+  // Numerically stable log-softmax: subtract max before exp.
+  float max_l = logits[0];
+  for (int i = 1; i < n_vocab_; ++i) {
+    if (logits[i] > max_l)
+      max_l = logits[i];
+  }
+  double sum_exp = 0.0;
+  for (int i = 0; i < n_vocab_; ++i) {
+    sum_exp += std::exp(static_cast<double>(logits[i] - max_l));
+  }
+  float log_denom = static_cast<float>(std::log(sum_exp)) + max_l;
+
+  tlp.logprob = logits[token_id] - log_denom;
+
+  // UTF-8 bytes of the token string.
+  tlp.bytes.reserve(token_str.size());
+  for (unsigned char c : token_str) {
+    tlp.bytes.push_back(static_cast<int>(c));
+  }
+
+  if (top_n > 0) {
+    int k = std::min(top_n, n_vocab_);
+    std::vector<int> indices(n_vocab_);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::partial_sort(indices.begin(), indices.begin() + k, indices.end(),
+                      [&](int a, int b) { return logits[a] > logits[b]; });
+    tlp.top_logprobs.reserve(k);
+    for (int i = 0; i < k; ++i) {
+      int alt_id = indices[i];
+      tlp.top_logprobs.push_back(
+          {TokenToString(alt_id), logits[alt_id] - log_denom});
+    }
+  }
+  return tlp;
 }
 
 // §2.3 — model-native chat template formatting.

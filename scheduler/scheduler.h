@@ -2,14 +2,15 @@
 
 #include "model/tokenizer/simple_tokenizer.h"
 #include "runtime/backends/cpu/cpu_backend.h"
-#include "runtime/speculative/speculative_decoder.h"
-#include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/disaggregated/kv_channel.h"
-#include "scheduler/model_router.h"
-#include "scheduler/fairness_controller.h"
-#include "scheduler/request_batch.h"
+#include "runtime/kv_cache/paged_kv_cache.h"
+#include "runtime/logprob.h"
 #include "runtime/prefix_cache/prefix_cache.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
+#include "runtime/speculative/speculative_decoder.h"
+#include "scheduler/fairness_controller.h"
+#include "scheduler/model_router.h"
+#include "scheduler/request_batch.h"
 
 #include <atomic>
 #include <chrono>
@@ -34,8 +35,9 @@ struct SpeculativeStats {
 
 struct DisaggregatedConfig {
   int prefill_pool_size{1};
-  // decode_pool_size > 0 enables the decode worker pool and sets use_decode_workers_=true.
-  // Default is 0 (decode runs on the WorkerLoop thread, matching pre-§2.5 behaviour).
+  // decode_pool_size > 0 enables the decode worker pool and sets
+  // use_decode_workers_=true. Default is 0 (decode runs on the WorkerLoop
+  // thread, matching pre-§2.5 behaviour).
   int decode_pool_size{0};
   // kv_transport is the channel over which prefill workers hand KV state to
   // decode workers.  KVChannel (in-process) is the default; ShmKVTransport
@@ -50,6 +52,9 @@ struct InferenceResult {
   bool no_backend{false};
   std::string model_id;
   SpeculativeStats speculative;
+  // Per-token logprobs; empty when logprob_top_n == 0 in the request or when
+  // the no_backend stub path is used.
+  std::vector<TokenLogprob> logprobs;
 };
 
 struct PendingRequest {
@@ -62,9 +67,8 @@ struct PendingRequest {
 };
 
 class Scheduler {
- public:
-  Scheduler(SimpleTokenizer tokenizer,
-            std::shared_ptr<CPUDeviceContext> device,
+public:
+  Scheduler(SimpleTokenizer tokenizer, std::shared_ptr<CPUDeviceContext> device,
             std::shared_ptr<PagedKVCache> cache,
             std::shared_ptr<ModelRouter> router = nullptr,
             std::shared_ptr<SpeculativeDecoder> speculative_decoder = nullptr,
@@ -74,10 +78,10 @@ class Scheduler {
   ~Scheduler();
 
   InferenceResult Generate(InferenceRequest request);
-  void UpdateFairnessConfig(const FairnessConfig& config);
+  void UpdateFairnessConfig(const FairnessConfig &config);
 
   // Expose the router for use by the HTTP admin endpoint (/v1/models).
-  ModelRouter* Router() const { return router_.get(); }
+  ModelRouter *Router() const { return router_.get(); }
 
   // Number of DecodeWorkerLoop threads currently running.  Zero means either
   // decode_pool_size=0 or all workers have exited (degraded/stopped state).
@@ -90,9 +94,11 @@ class Scheduler {
   // Configured pool size from DisaggregatedConfig::decode_pool_size.
   // HttpServer compares LiveDecodeWorkers() == ConfiguredDecodeWorkers() so
   // that even a single worker crash flips /readyz to not_ready.
-  int ConfiguredDecodeWorkers() const { return disagg_config_.decode_pool_size; }
+  int ConfiguredDecodeWorkers() const {
+    return disagg_config_.decode_pool_size;
+  }
 
- private:
+private:
   struct BatchSelection {
     RequestBatch batch;
     std::vector<std::shared_ptr<PendingRequest>> pending;
@@ -105,13 +111,14 @@ class Scheduler {
   void DecodeWorkerLoop();
   void StartDecodeWorkers();
   void StopDecodeWorkers();
-  void ApplyFairness(BatchSelection* selection);
+  void ApplyFairness(BatchSelection *selection);
   void UpdateQueueDepthLocked() const;
-  void ResolveBackends(const std::vector<std::shared_ptr<PendingRequest>>& batch);
+  void
+  ResolveBackends(const std::vector<std::shared_ptr<PendingRequest>> &batch);
 
   // Sequence slot allocator for §2.5 phased prefill/decode.
-  // Slots are borrowed during Prefill() and returned after full request completion.
-  // AllocSeqSlot() is called only from WorkerLoop (no lock needed).
+  // Slots are borrowed during Prefill() and returned after full request
+  // completion. AllocSeqSlot() is called only from WorkerLoop (no lock needed).
   // FreeSeqSlot() may also be called from DecodeWorkerLoop — callers must hold
   // queue_mutex_ when calling from a non-worker-loop context.
   int AllocSeqSlot();
@@ -137,8 +144,10 @@ class Scheduler {
   FairnessController fairness_controller_;
   FairnessConfig fairness_config_;
   DisaggregatedConfig disagg_config_;
-  std::vector<bool> seq_slots_free_;  // size = kMaxSequenceSlots; true = available
-  std::atomic<int> live_decode_workers_{0};  // live thread count; 0 = no pool or all exited
+  std::vector<bool>
+      seq_slots_free_; // size = kMaxSequenceSlots; true = available
+  std::atomic<int> live_decode_workers_{
+      0}; // live thread count; 0 = no pool or all exited
 };
 
-}  // namespace inferflux
+} // namespace inferflux

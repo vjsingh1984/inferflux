@@ -116,6 +116,11 @@ struct CompletionRequestPayload {
   std::string response_format_root{"root"};
   bool response_format_ok{true};
   std::string response_format_error;
+  // OpenAI logprobs fields.
+  // Chat: logprobs=true enables per-token logprobs; top_logprobs sets top-N.
+  // Completions: logprobs=N directly sets top-N (0 = selected token only).
+  bool logprobs{false};
+  int top_logprobs{0}; // number of alternatives per token (0-20)
 };
 
 CompletionRequestPayload ParseJsonPayload(const std::string &body) {
@@ -136,6 +141,28 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
     }
     if (j.contains("stream") && j["stream"].is_boolean()) {
       payload.stream = j["stream"].get<bool>();
+    }
+    // OpenAI logprobs:
+    //  Chat: logprobs (bool) + top_logprobs (int, 1-20)
+    //  Completions: logprobs (int, 0-5) — treat as top_logprobs count
+    if (j.contains("logprobs")) {
+      auto &lp = j["logprobs"];
+      if (lp.is_boolean()) {
+        payload.logprobs = lp.get<bool>();
+      } else if (lp.is_number_integer()) {
+        int n = lp.get<int>();
+        if (n > 0) {
+          payload.logprobs = true;
+          payload.top_logprobs = std::min(n, 20);
+        }
+      }
+    }
+    if (j.contains("top_logprobs") && j["top_logprobs"].is_number_integer()) {
+      int n = j["top_logprobs"].get<int>();
+      payload.top_logprobs = std::min(std::max(n, 0), 20);
+      if (payload.top_logprobs > 0) {
+        payload.logprobs = true;
+      }
     }
     // OpenAI-compatible: response_format controls structured output.
     if (j.contains("response_format") && j["response_format"].is_object()) {
@@ -452,6 +479,50 @@ BuildCompletionBody(const InferenceResult &result,
   j["model"] = request.model;
   j["usage"] = usage;
 
+  // Build logprobs object (null when not requested or no tokens collected).
+  // Chat completions format: {"content": [{token, logprob, bytes,
+  // top_logprobs}]} Completions format:      {tokens, token_logprobs,
+  // top_logprobs}
+  json logprobs_json = nullptr;
+  if (!result.logprobs.empty()) {
+    if (chat_mode) {
+      json content = json::array();
+      for (const auto &tlp : result.logprobs) {
+        json top_arr = json::array();
+        for (const auto &[alt_tok, alt_lp] : tlp.top_logprobs) {
+          // bytes for alternative token
+          std::vector<int> alt_bytes;
+          alt_bytes.reserve(alt_tok.size());
+          for (unsigned char c : alt_tok)
+            alt_bytes.push_back(static_cast<int>(c));
+          top_arr.push_back(
+              {{"token", alt_tok}, {"logprob", alt_lp}, {"bytes", alt_bytes}});
+        }
+        content.push_back({{"token", tlp.token},
+                           {"logprob", tlp.logprob},
+                           {"bytes", tlp.bytes},
+                           {"top_logprobs", top_arr}});
+      }
+      logprobs_json = {{"content", content}};
+    } else {
+      json tokens_arr = json::array();
+      json token_logprobs_arr = json::array();
+      json top_logprobs_arr = json::array();
+      for (const auto &tlp : result.logprobs) {
+        tokens_arr.push_back(tlp.token);
+        token_logprobs_arr.push_back(tlp.logprob);
+        json alt_map = json::object();
+        for (const auto &[alt_tok, alt_lp] : tlp.top_logprobs) {
+          alt_map[alt_tok] = alt_lp;
+        }
+        top_logprobs_arr.push_back(alt_map);
+      }
+      logprobs_json = {{"tokens", tokens_arr},
+                       {"token_logprobs", token_logprobs_arr},
+                       {"top_logprobs", top_logprobs_arr}};
+    }
+  }
+
   if (chat_mode) {
     if (tool_call.detected) {
       // §2.3: emit tool_calls array with finish_reason="tool_calls".
@@ -466,17 +537,20 @@ BuildCompletionBody(const InferenceResult &result,
                                     {{"role", "assistant"},
                                      {"content", nullptr},
                                      {"tool_calls", tc_arr}}},
+                                   {"logprobs", logprobs_json},
                                    {"finish_reason", "tool_calls"}}});
     } else {
       j["choices"] = json::array(
           {{{"index", 0},
             {"message",
              {{"role", "assistant"}, {"content", result.completion}}},
+            {"logprobs", logprobs_json},
             {"finish_reason", "stop"}}});
     }
   } else {
     j["choices"] = json::array({{{"index", 0},
                                  {"text", result.completion},
+                                 {"logprobs", logprobs_json},
                                  {"finish_reason", "stop"}}});
   }
   return j.dump();
@@ -1511,6 +1585,11 @@ void HttpServer::HandleClient(ClientSession &session) {
       req.response_format_root = parsed.response_format_root;
     }
     req.stream = parsed.stream;
+    if (parsed.logprobs) {
+      // top_logprobs==0 → collect selected-token logprob only (top_n=1
+      // internally).
+      req.logprob_top_n = std::max(parsed.top_logprobs, 1);
+    }
 
     // §2.2: attach decoded images (populated when messages contain image_url
     // parts).

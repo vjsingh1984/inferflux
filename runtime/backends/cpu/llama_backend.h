@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/logprob.h"
 #include "runtime/multimodal/image_preprocessor.h"
 
 #include <filesystem>
@@ -61,11 +62,12 @@ public:
 
   // Autoregressive decode starting from n_past (returned by Prefill) for
   // sequence_id. Grammar constraints must be set via EnableGrammarConstraint
-  // before calling.
+  // before calling.  logprob_top_n / out_logprobs work identically to Generate.
   std::string
   Decode(int n_past, int sequence_id, int max_tokens,
          const std::function<bool(const std::string &)> &on_chunk = {},
-         const std::function<bool()> &should_stop = {});
+         const std::function<bool()> &should_stop = {}, int logprob_top_n = 0,
+         std::vector<TokenLogprob> *out_logprobs = nullptr);
 
   // Release KV cache slots for the given sequence_id.
   void FreeSequence(int sequence_id);
@@ -87,10 +89,15 @@ public:
   int ExpertCount() const;
   int ActiveExperts() const;
 
+  // Generate completion for `prompt`.  When `logprob_top_n > 0`, one
+  // TokenLogprob entry per generated token is appended to *out_logprobs
+  // (logprob_top_n alternatives are stored in TokenLogprob::top_logprobs).
+  // Pass nullptr to disable collection (default).
   std::string
   Generate(const std::string &prompt, int max_tokens,
            const std::function<bool(const std::string &)> &on_chunk = {},
-           const std::function<bool()> &should_stop = {});
+           const std::function<bool()> &should_stop = {}, int logprob_top_n = 0,
+           std::vector<TokenLogprob> *out_logprobs = nullptr);
 
   // Vision-aware generation. Prompt must contain <__media__> markers matching
   // images. Falls back to Generate() when vision is not ready or images is
@@ -133,6 +140,12 @@ private:
   std::vector<int> Tokenize(const std::string &prompt, bool add_bos) const;
   std::string TokenToString(int token) const;
   int SampleGreedy() const;
+
+  // Build a TokenLogprob from the current context_ logits for `token_id`.
+  // Computes log-softmax and optionally finds top-`top_n` alternatives.
+  // Must be called immediately after llama_decode() and before the next decode.
+  TokenLogprob CollectLogprob(int token_id, const std::string &token_str,
+                              int top_n) const;
 
   llama_model *model_{nullptr};
   llama_context *context_{nullptr};
