@@ -48,7 +48,10 @@ Scheduler::Scheduler(SimpleTokenizer tokenizer,
       speculative_decoder_(std::move(speculative_decoder)),
       prefix_cache_(std::move(prefix_cache)),
       fairness_controller_(fairness_config), fairness_config_(fairness_config),
-      disagg_config_(disagg_config), seq_slots_free_(kMaxSequenceSlots, true) {
+      disagg_config_(disagg_config),
+      seq_slots_free_((1ULL << kMaxSequenceSlots) - 1) {
+  static_assert(kMaxSequenceSlots <= 64,
+                "seq_slots_free_ bitmask requires kMaxSequenceSlots <= 64");
   executor_ =
       std::make_unique<BatchExecutor>(&tokenizer_, device_, cache_, router_,
                                       speculative_decoder_, prefix_cache_);
@@ -265,8 +268,9 @@ void Scheduler::DecodeWorkerLoop() {
       }
 
       // Return KV memory and sequence slot.  Both must happen together.
-      // ExecuteRequest calls backend->FreeSequence() for slot release but
-      // intentionally leaves sequence_id set so we can call FreeSeqSlot here.
+      // ExecuteRequest intentionally does NOT call FreeSequence — it leaves
+      // sequence_id set so the scheduler (here or in ProcessBatch) handles
+      // both FreeSequence and FreeSeqSlot together in one place.
       {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (inference->sequence_id >= 0) {
@@ -471,11 +475,20 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       // instead of Generate().
       auto &inf = pending->inference;
       if (pending->resolved_backend && pending->resolved_backend->IsReady()) {
-        // KV prefix reuse (§ Item 5): if we have a warm sequence whose tokens
-        // are a strict prefix of this request's prompt, copy that KV state and
-        // only evaluate the suffix — skipping repeated prompt computation.
-        KVPrefixEntry *warm =
-            LookupKVPrefix(inf.prompt_tokens, pending->resolved_backend.get());
+        // Compute BPE tokens for prefix matching (INF-7).  We do this once per
+        // request: if bpe_prompt_tokens is already populated (e.g., a retry
+        // after channel-full rejection), reuse the cached result.
+        if (inf.bpe_prompt_tokens.empty()) {
+          inf.bpe_prompt_tokens =
+              pending->resolved_backend->TokenizeForCache(inf.prompt);
+        }
+        // KV prefix reuse (§ Item 5): if we have a warm sequence whose BPE
+        // tokens are a strict prefix of this request's BPE prompt tokens, copy
+        // that KV state and only evaluate the suffix — skipping repeated prompt
+        // computation.  Matching on BPE tokens ensures the prefix boundary
+        // aligns with the KV cache (fixes INF-7 SimpleTokenizer mismatch).
+        KVPrefixEntry *warm = LookupKVPrefix(inf.bpe_prompt_tokens,
+                                             pending->resolved_backend.get());
         // Allocate a dedicated sequence slot from the free-list.  Using a
         // free-list prevents two concurrent requests from sharing the same slot
         // (which would cause Prefill() to wipe the other request's KV state).
@@ -709,30 +722,25 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     if (inference->sequence_id >= 0) {
       bool donated = false;
       if (!use_decode_workers_ && !inference->fairness_yielded &&
-          static_cast<int>(inference->prompt_tokens.size()) >=
+          static_cast<int>(inference->bpe_prompt_tokens.size()) >=
               kMinPrefixTokens &&
           pending->resolved_backend) {
         // Guard: if sliding-window KV eviction fired during decode, prompt
-        // positions in this slot are no longer at [0, n_prompt_bpe_tokens).
+        // positions in this slot are no longer at [0, prompt_bpe_tokens).
         // Reusing such a slot via CopySequencePrefix would restore wrong KV
-        // state for the next request.  Must reason in BPE positions throughout:
-        // prompt_bpe_tokens (from PrefillResult::n_past) and completion_tokens
-        // are both llama.cpp counts.  Do NOT use prompt_tokens.size() here —
-        // that is the SimpleTokenizer word count which can be fewer than the
-        // BPE count, causing the guard to wrongly conclude the slot is safe.
+        // state for the next request.  Reason entirely in BPE positions:
+        // prompt_bpe_tokens (from PrefillResult::n_past) and
+        // result.completion_tokens are both llama.cpp counts.
         int ctx_size = pending->resolved_backend->ContextSize();
         bool eviction_safe =
             ctx_size > 0 && inference->prompt_bpe_tokens > 0 &&
             (inference->prompt_bpe_tokens + result.completion_tokens <
              ctx_size);
         if (eviction_safe) {
-          // DonateKVPrefix owns any eviction: it calls FreeSequence on the
-          // displaced entry's own backend so cross-model corruption is
-          // impossible.  Pass prompt_bpe_tokens (llama.cpp BPE count from
-          // Prefill) so the entry records correct KV positions, not the
-          // SimpleTokenizer word count in prompt_tokens.
+          // DonateKVPrefix stores bpe_prompt_tokens (BPE token IDs from
+          // TokenizeForCache) so LookupKVPrefix can match in BPE-token space.
           donated = DonateKVPrefix(
-              inference->sequence_id, inference->prompt_tokens,
+              inference->sequence_id, inference->bpe_prompt_tokens,
               inference->prompt_bpe_tokens, pending->resolved_backend);
         }
       }
@@ -852,19 +860,27 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
 }
 
 int Scheduler::AllocSeqSlot() {
-  for (int i = 0; i < static_cast<int>(seq_slots_free_.size()); ++i) {
-    if (seq_slots_free_[i]) {
-      seq_slots_free_[i] = false;
-      return i;
+  // CAS loop: find the lowest free bit, atomically clear it.  This is
+  // safe for concurrent callers (WorkerLoop + DecodeWorkerLoop) without
+  // holding queue_mutex_, because the operation is a single atomic RMW.
+  uint64_t current = seq_slots_free_.load(std::memory_order_acquire);
+  while (current != 0) {
+    int slot = __builtin_ctzll(current); // index of lowest set (free) bit
+    uint64_t desired = current & ~(1ULL << slot);
+    if (seq_slots_free_.compare_exchange_weak(current, desired,
+                                              std::memory_order_acquire,
+                                              std::memory_order_relaxed)) {
+      return slot;
     }
+    // compare_exchange_weak reloads current on failure; retry.
   }
   return -1; // All slots in use; caller falls back to the legacy Generate()
              // path.
 }
 
 void Scheduler::FreeSeqSlot(int slot) {
-  if (slot >= 0 && slot < static_cast<int>(seq_slots_free_.size())) {
-    seq_slots_free_[slot] = true;
+  if (slot >= 0 && slot < kMaxSequenceSlots) {
+    seq_slots_free_.fetch_or(1ULL << slot, std::memory_order_release);
   }
 }
 
@@ -885,21 +901,25 @@ void Scheduler::PurgeExpiredKVPrefixEntries() {
 }
 
 Scheduler::KVPrefixEntry *
-Scheduler::LookupKVPrefix(const std::vector<int> &tokens,
+Scheduler::LookupKVPrefix(const std::vector<int> &bpe_tokens,
                           LlamaCPUBackend *backend) {
   KVPrefixEntry *best = nullptr;
   for (auto &entry : kv_prefix_store_) {
-    // Only useful as a prefix when the cached entry is shorter than the query.
-    if (entry.tokens.empty() || entry.tokens.size() >= tokens.size())
+    // Only useful as a prefix when the cached entry is strictly shorter.
+    if (entry.bpe_tokens.empty() ||
+        entry.bpe_tokens.size() >= bpe_tokens.size())
       continue;
     // Skip entries whose backend has been unloaded (weak_ptr expired) or
     // that belong to a different model instance.
     auto locked = entry.backend.lock();
     if (!locked || locked.get() != backend)
       continue;
-    if (std::equal(entry.tokens.begin(), entry.tokens.end(), tokens.begin())) {
+    // Compare in BPE-token space (INF-7): guarantees the boundary aligns with
+    // the llama.cpp KV positions stored in this entry.
+    if (std::equal(entry.bpe_tokens.begin(), entry.bpe_tokens.end(),
+                   bpe_tokens.begin())) {
       // Prefer the longest matching prefix.
-      if (!best || entry.tokens.size() > best->tokens.size()) {
+      if (!best || entry.bpe_tokens.size() > best->bpe_tokens.size()) {
         best = &entry;
       }
     }
@@ -910,20 +930,21 @@ Scheduler::LookupKVPrefix(const std::vector<int> &tokens,
   return best;
 }
 
-bool Scheduler::DonateKVPrefix(int seq_id, const std::vector<int> &tokens,
+bool Scheduler::DonateKVPrefix(int seq_id, const std::vector<int> &bpe_tokens,
                                int n_kv_tokens,
                                std::shared_ptr<LlamaCPUBackend> backend) {
-  if (static_cast<int>(tokens.size()) < kMinPrefixTokens)
+  if (static_cast<int>(bpe_tokens.size()) < kMinPrefixTokens)
     return false;
-  // Decline if an identical (backend, tokens) entry is already cached.
+  // Decline if an identical (backend, bpe_tokens) entry is already cached.
   for (const auto &entry : kv_prefix_store_) {
-    if (entry.backend.lock().get() == backend.get() && entry.tokens == tokens)
+    if (entry.backend.lock().get() == backend.get() &&
+        entry.bpe_tokens == bpe_tokens)
       return false;
   }
   std::weak_ptr<LlamaCPUBackend> weak_backend(backend);
   if (static_cast<int>(kv_prefix_store_.size()) < kPrefixStoreCap) {
     kv_prefix_store_.push_back(
-        {seq_id, n_kv_tokens, tokens, ++kv_prefix_clock_, weak_backend});
+        {seq_id, n_kv_tokens, bpe_tokens, ++kv_prefix_clock_, weak_backend});
     return true;
   }
   // Evict the least-recently-used entry.  Lock its weak_ptr and call
@@ -939,7 +960,7 @@ bool Scheduler::DonateKVPrefix(int seq_id, const std::vector<int> &tokens,
     evicted_backend->FreeSequence(min_it->seq_id);
   }
   FreeSeqSlot(min_it->seq_id);
-  *min_it = {seq_id, n_kv_tokens, tokens, ++kv_prefix_clock_, weak_backend};
+  *min_it = {seq_id, n_kv_tokens, bpe_tokens, ++kv_prefix_clock_, weak_backend};
   return true;
 }
 

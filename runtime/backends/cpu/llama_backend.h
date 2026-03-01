@@ -196,6 +196,13 @@ public:
   int TokenCount(const std::string &text) const;
   void ForceReadyForTests() { test_ready_ = true; }
 
+  // Returns the BPE token ID vector for `prompt` (with BOS prepended).
+  // Used by the scheduler's KV prefix store so that prefix matching is done
+  // in BPE-token space instead of via the SimpleTokenizer proxy, avoiding the
+  // boundary-mismatch that arises when the two tokenizers disagree on word
+  // splits.  Returns an empty vector when no model is loaded (null context).
+  std::vector<int> TokenizeForCache(const std::string &prompt) const;
+
 private:
   std::vector<int> Tokenize(const std::string &prompt, bool add_bos) const;
   std::string TokenToString(int token) const;

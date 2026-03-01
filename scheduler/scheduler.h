@@ -137,8 +137,11 @@ private:
     // because those APIs operate on llama.cpp KV positions, not on
     // SimpleTokenizer word counts.
     int n_kv_tokens{0};
-    std::vector<int> tokens; // SimpleTokenizer tokens for prefix matching
-    uint64_t last_used{0};   // LRU clock value
+    // BPE token IDs (from LlamaCPUBackend::TokenizeForCache) for prefix
+    // matching.  Using BPE tokens instead of SimpleTokenizer tokens ensures
+    // the matched prefix aligns with the KV slot boundary (fixes INF-7).
+    std::vector<int> bpe_tokens;
+    uint64_t last_used{0}; // LRU clock value
     // The backend that owns the KV slot.  Reuse is only valid when the
     // incoming request resolves to the same backend instance; eviction must
     // call FreeSequence on this backend, not the caller's.
@@ -147,17 +150,17 @@ private:
     // null.
     std::weak_ptr<LlamaCPUBackend> backend;
   };
-  // Find the longest entry whose tokens are a strict prefix of `tokens` AND
-  // whose backend pointer matches `backend`.  Returns nullptr on no match.
-  // Updates last_used on the returned entry.
-  KVPrefixEntry *LookupKVPrefix(const std::vector<int> &tokens,
+  // Find the longest entry whose bpe_tokens are a strict prefix of
+  // `bpe_tokens` AND whose backend pointer matches `backend`.  Returns nullptr
+  // on no match.  Updates last_used on the returned entry.
+  KVPrefixEntry *LookupKVPrefix(const std::vector<int> &bpe_tokens,
                                 LlamaCPUBackend *backend);
   // Donate seq_id to the warm prefix store for `backend`.
+  // bpe_tokens are the BPE token IDs (TokenizeForCache result) for the prompt.
   // n_kv_tokens is PrefillResult::n_past — the llama.cpp BPE position count
-  // stored in the slot.  It must be passed separately because prompt_tokens
-  // uses SimpleTokenizer counts (different vocabulary, different lengths).
+  // stored in the slot.
   // Handles LRU eviction internally; returns true when accepted.
-  bool DonateKVPrefix(int seq_id, const std::vector<int> &tokens,
+  bool DonateKVPrefix(int seq_id, const std::vector<int> &bpe_tokens,
                       int n_kv_tokens,
                       std::shared_ptr<LlamaCPUBackend> backend);
   // Scan kv_prefix_store_ for entries whose backend weak_ptr has expired
@@ -188,8 +191,11 @@ private:
   FairnessController fairness_controller_;
   FairnessConfig fairness_config_;
   DisaggregatedConfig disagg_config_;
-  std::vector<bool>
-      seq_slots_free_; // size = kMaxSequenceSlots; true = available
+  // Bitmask free-list for phased-decode sequence slots.  Bit i = 1 means slot
+  // i is available.  Stored as an atomic so WorkerLoop (no lock) and
+  // DecodeWorkerLoop (under queue_mutex_) can safely call AllocSeqSlot /
+  // FreeSeqSlot without a data race on the underlying storage.
+  std::atomic<uint64_t> seq_slots_free_{};
   std::atomic<int> live_decode_workers_{
       0}; // live thread count; 0 = no pool or all exited
 };

@@ -144,6 +144,13 @@ int LlamaCPUBackend::TokenCount(const std::string &text) const {
   return static_cast<int>(tokens.size());
 }
 
+std::vector<int>
+LlamaCPUBackend::TokenizeForCache(const std::string &prompt) const {
+  // Returns the BPE token sequence (with BOS) for use in the KV prefix store.
+  // Returns empty when no model is loaded so the caller can skip prefix reuse.
+  return Tokenize(prompt, /*add_bos=*/true);
+}
+
 std::vector<int> LlamaCPUBackend::Tokenize(const std::string &prompt,
                                            bool add_bos) const {
   if (!model_) {

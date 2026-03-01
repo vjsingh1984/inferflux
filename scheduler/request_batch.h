@@ -58,6 +58,12 @@ struct InferenceRequest {
   // length. Used by DonateKVPrefix to record n_kv_tokens for
   // CopySequencePrefix.
   int prompt_bpe_tokens{-1};
+  // BPE token IDs produced by LlamaCPUBackend::TokenizeForCache() during the
+  // prefill block.  Used by LookupKVPrefix / DonateKVPrefix instead of
+  // prompt_tokens (SimpleTokenizer) to ensure prefix matching is done in the
+  // same BPE-token space as the KV cache, avoiding the boundary mismatch that
+  // arises when SimpleTokenizer and llama.cpp disagree on word splits (INF-7).
+  std::vector<int> bpe_prompt_tokens;
   // First output token pre-sampled by Prefill() while the logit buffer is
   // fresh.  Carrying it here avoids the logit-buffer race when multiple
   // sequences are prefilled sequentially (each Prefill() overwrites the
