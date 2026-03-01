@@ -97,18 +97,34 @@ static ToolMatch detect_multi_format(const std::string &text) {
   }
 
   // Format 4: [TOOL_CALLS] [{"name":...}]  (Mistral)
+  // Walk bracket depth to isolate the JSON array before any trailing
+  // [/TOOL_CALLS] sentinel, which nlohmann::json rejects as trailing garbage.
   {
     const std::string tag = "[TOOL_CALLS]";
     auto pos = text.find(tag);
     if (pos != std::string::npos) {
       auto bracket = text.find('[', pos + tag.size());
       if (bracket != std::string::npos) {
-        try {
-          auto arr = json::parse(text.substr(bracket));
-          if (arr.is_array() && !arr.empty() && arr[0].is_object() &&
-              fill_from_obj(arr[0], m))
-            return m;
-        } catch (...) {
+        std::size_t depth = 0;
+        std::size_t close = std::string::npos;
+        for (std::size_t i = bracket; i < text.size(); ++i) {
+          if (text[i] == '[')
+            ++depth;
+          else if (text[i] == ']') {
+            if (--depth == 0) {
+              close = i;
+              break;
+            }
+          }
+        }
+        if (close != std::string::npos) {
+          try {
+            auto arr = json::parse(text.substr(bracket, close - bracket + 1));
+            if (arr.is_array() && !arr.empty() && arr[0].is_object() &&
+                fill_from_obj(arr[0], m))
+              return m;
+          } catch (...) {
+          }
         }
       }
     }
@@ -248,6 +264,17 @@ TEST_CASE("DetectToolCall: malformed JSON does not crash", "[chat_template]") {
   REQUIRE_NOTHROW(detect_multi_format("{\"tool_call\": broken}"));
   REQUIRE_NOTHROW(detect_multi_format("<tool_call>bad</tool_call>"));
   REQUIRE_NOTHROW(detect_multi_format("[TOOL_CALLS] not-json"));
+}
+
+TEST_CASE("DetectToolCall: Mistral format with [/TOOL_CALLS] sentinel",
+          "[chat_template]") {
+  // Mistral-family models append [/TOOL_CALLS] after the JSON array.
+  // The parser must strip it before calling json::parse or detection fails.
+  std::string text =
+      R"([TOOL_CALLS] [{"name":"weather","arguments":{"city":"Paris"}}][/TOOL_CALLS])";
+  auto m = detect_multi_format(text);
+  REQUIRE(m.detected);
+  REQUIRE(m.function_name == "weather");
 }
 
 TEST_CASE("DetectToolCall: empty string returns no detection",

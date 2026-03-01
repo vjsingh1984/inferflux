@@ -377,18 +377,37 @@ ToolCallResult DetectToolCall(const std::string &text) {
   }
 
   // Format 4: [TOOL_CALLS] [{"name":"...","arguments":{...}}]  (Mistral)
+  // Mistral models may append [/TOOL_CALLS] after the JSON array.  Parsing
+  // text.substr(bracket) to end-of-string fails because nlohmann::json rejects
+  // trailing non-JSON content.  Walk the bracket depth to find the matching ']'
+  // and parse only that bounded substring.
   {
     static const std::string mistral_tag = "[TOOL_CALLS]";
     auto pos = text.find(mistral_tag);
     if (pos != std::string::npos) {
       auto bracket = text.find('[', pos + mistral_tag.size());
       if (bracket != std::string::npos) {
-        try {
-          auto arr = json::parse(text.substr(bracket));
-          if (arr.is_array() && !arr.empty() && arr[0].is_object() &&
-              fill_from_obj(arr[0]))
-            return result;
-        } catch (...) {
+        // Find matching closing bracket, tracking nesting depth.
+        std::size_t depth = 0;
+        std::size_t close = std::string::npos;
+        for (std::size_t i = bracket; i < text.size(); ++i) {
+          if (text[i] == '[')
+            ++depth;
+          else if (text[i] == ']') {
+            if (--depth == 0) {
+              close = i;
+              break;
+            }
+          }
+        }
+        if (close != std::string::npos) {
+          try {
+            auto arr = json::parse(text.substr(bracket, close - bracket + 1));
+            if (arr.is_array() && !arr.empty() && arr[0].is_object() &&
+                fill_from_obj(arr[0]))
+              return result;
+          } catch (...) {
+          }
         }
       }
     }

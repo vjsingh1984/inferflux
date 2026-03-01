@@ -110,6 +110,14 @@ if [ "${SKIP_TESTS:-0}" != "1" ]; then
     exit 1
   fi
   echo "[pre-commit] SSE-cancel: OK"
+
+  echo "[pre-commit] Running SHM smoke integration test..."
+  if ! ctest --test-dir "$REPO_ROOT/build" -R "ShmSmoke" \
+             --output-on-failure -Q 2>&1; then
+    echo "[pre-commit] SHM SMOKE TEST FAILED — fix before committing."
+    exit 1
+  fi
+  echo "[pre-commit] SHM smoke: OK"
 fi
 
 # ── 5. Chain global hook if present ──────────────────────────────────────────

@@ -167,7 +167,7 @@ Mistral. SGLang tested it on 96 H100s. NVIDIA Dynamo provides orchestration for 
 - **Remaining (multi-node):**
   - RDMA transport (multi-node, multi-pod): requires RDMA-capable NICs; replace SHM with ibverbs or UCX.
   - Chaos tests (inject SHM segment failures, validate graceful fallback).
-  - CI SHM smoke test (cross-process validation in CI).
+  - CI SHM smoke test: **Done** — `tests/integration/shm_smoke_test.py` launches inferfluxd with `INFERFLUX_DECODE_POOL_SIZE=2 INFERFLUX_KV_TRANSPORT=shm` and verifies completions succeed + `/metrics` exposes `inferflux_kv_transfer_duration_ms`; registered as `ShmSmoke` ctest target.
 
 ### 2.6 Expert Parallelism for MoE Models
 
@@ -316,7 +316,7 @@ grouped by the system area and ordered by severity within each group.
 | TST-1 | **[FIXED]** 57 Catch2 tests across 9 files: ApiKeyAuth(6), RateLimiter(4), Guardrail(6), AuditLogger(6), Metrics(9), Scheduler(7), PolicyStore(5), OIDC(9), Tokenizer(2) + originals. | `tests/unit/` | *(Fixed)* | `docs/NFR.md` §Testing |
 | TST-2 | **[FIXED]** Adopted Catch2 v3.7.1 amalgamated. All tests use TEST_CASE/REQUIRE. | `external/catch2/`, `CMakeLists.txt` | *(Fixed)* | — |
 | TST-3 | **[FIXED]** Stub-mode integration tests added (`stub_integration_test.py`, 17 tests). Wired as `StubIntegration` ctest target unconditionally. | `tests/integration/stub_integration_test.py`, `CMakeLists.txt` | *(Fixed)* | — |
-| TST-4 | Integration test `http_get` sends no auth header — may pass/fail depending on auth state | `tests/integration/sse_metrics_test.py` | Fix test helpers to include API key header | — |
+| TST-4 | **[FIXED]** `http_get` now sends `Authorization: Bearer dev-key-123` header in all integration tests. | `tests/integration/sse_metrics_test.py` | *(Fixed)* | — |
 
 ### 3.7 Code Quality — LOW
 
@@ -390,7 +390,7 @@ cache, speculative decoding, LoRA stacking, hot adapter reloads, autoscaler hint
 | P1 | **[NEW]** Request priority & fairness scheduling | **Done** — `FairnessController` with timeslice, preemption, resume; `ApplyFairness()` in scheduler; fairness metrics (tokens/preemption/yield/resume); `Span` hooks for yield/resume; `UpdateFairnessConfig()` live API; 3 unit tests (`[fairness]`) | §2.9 | `scheduler/fairness_controller.h`, `scheduler/scheduler.h` |
 | P1 | **[UPGRADE]** Tensor + pipeline parallelism | Not started | — | `runtime/backends/` |
 | P2 | YAML parser replacement (yaml-cpp) | **Done** | DAT-2 | `server/main.cpp` |
-| P2 | **[NEW]** SBOM generation per build | Not started | — | `CMakeLists.txt`, CI |
+| P2 | **[NEW]** SBOM generation per build | **Done** — `ENABLE_SBOM=ON` adds `scripts/generate_sbom.py` CMake target; produces `inferflux-sbom.cdx.json` (CycloneDX 1.5) + `inferflux-sbom.spdx` (SPDX 2.3); CI uploads as `sbom-<sha>` artifact | — | `CMakeLists.txt`, `scripts/generate_sbom.py`, CI |
 
 **Existing Q4 items from `docs/Roadmap.md` remain:** Distributed scheduler, OPA/Cedar
 integration, model registry + signed manifests, web admin console.
@@ -516,7 +516,7 @@ policy stores) will implement. All are header-only with no runtime cost until us
 | ARCH-2 | `ModelRouter` | `scheduler/model_router.h` | Abstract interface for multi-model serving. Defines `ListModels`, `LoadModel`, `UnloadModel`, `Resolve`. Prevents single-model-per-server dead end. | **Done** (interface only) |
 | ARCH-3 | `RequestBatch` | `scheduler/request_batch.h` | Per-request state (`InferenceRequest`) and batch grouping (`RequestBatch`) for continuous batching. Defines request phases, priority, timing, and streaming callbacks. | **Done** (interface only) |
 | ARCH-4 | Wire `ModelRouter` into `Scheduler` | `scheduler/scheduler.h` | Replace direct `LlamaCPUBackend` dependency with `ModelRouter` abstraction. | **Done** |
-| ARCH-5 | Wire `RequestBatch` into `Scheduler` | `scheduler/scheduler.h` | Replace `GenerateRequest`/`GenerateResponse` with `InferenceRequest` flow through `RequestBatch`. | In progress (HTTP + scheduler now emit `InferenceRequest`; batch builder/streaming pending) |
+| ARCH-5 | Wire `RequestBatch` into `Scheduler` | `scheduler/scheduler.h` | Replace `GenerateRequest`/`GenerateResponse` with `InferenceRequest` flow through `RequestBatch`. | **Done** — `InferenceRequest` flows end-to-end; `BuildBatchLocked` emits `RequestBatch` objects with token budgets and fairness aging; streaming + cancellation via `on_token` + `cancellation_flag`; prefill/decode phase metrics live. |
 | ARCH-6 | Create `SingleModelRouter` | `scheduler/single_model_router.cpp` | Default `ModelRouter` implementation wrapping a single backend. Drop-in replacement for current behavior. | **Done** |
 
 ### 7.1 ModelRouter Activation Plan (Foundation)
@@ -554,10 +554,10 @@ IDs (SEC-1, INF-2, etc.) in commit messages and PR descriptions for traceability
 
 | If you are... | Start with |
 |---------------|-----------|
-| Fixing security | SEC-5: wire HTTPS into HttpClient (ssl_ctx_ exists, ConnectAndSend needs TLS path for https:// URLs — needed for OIDC JWKS in production) |
-| Adding Q3 features | §2.1: parse `response_format` in http_server (small — BatchExecutor already handles json_mode); §2.3: tool calling (medium); §2.2: multimodal (large) |
-| Improving test coverage | TST-3 (stub integration tests without model), TST-4 (auth header in http_get), add PrefixCache unit tests |
-| Improving observability | OBS-2 (OpenTelemetry spans for prefill/decode) |
-| Improving core performance | True interleaved prefill/decode in BatchExecutor (INF-2 next phase) |
-| Refactoring code quality | DAT-2 (YAML parser → yaml-cpp), CQ-6 (config path relative to binary) |
-| Updating docs | See §5 Doc Update Tracker |
+| Fixing security | All SEC items done. Next: rotate API keys, add mutual TLS client cert validation. |
+| Adding Q3 features | All Q3 items done (§2.1–§2.4, §2.7–§2.9). |
+| Improving test coverage | CI SHM smoke test (cross-process `INFERFLUX_DECODE_POOL_SIZE=2 INFERFLUX_KV_TRANSPORT=shm` integration test). |
+| Improving observability | All OBS items done. Next: structured log format (JSON), alert rules for Prometheus. |
+| Improving core performance | True interleaved prefill/decode in BatchExecutor (INF-2 next phase — GPU hardware required). |
+| Refactoring code quality | DAT-3: remove GGUF stub loader (`model/gguf/gguf_loader.cpp`) — delegate all GGUF parsing to llama.cpp. |
+| Updating docs | See §5 Doc Update Tracker — all checklist items complete. |

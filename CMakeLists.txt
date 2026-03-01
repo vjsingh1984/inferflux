@@ -335,6 +335,13 @@ if(Python3_Interpreter_FOUND)
     TIMEOUT 60
     ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
 
+  add_test(NAME ShmSmoke
+           COMMAND ${Python3_EXECUTABLE} tests/integration/shm_smoke_test.py)
+  set_tests_properties(ShmSmoke PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60
+    ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
+
   if(NOT "$ENV{INFERFLUX_MODEL_PATH}" STREQUAL "")
     add_test(NAME IntegrationSSE COMMAND ${Python3_EXECUTABLE} tests/integration/sse_metrics_test.py)
     set_tests_properties(IntegrationSSE PROPERTIES
