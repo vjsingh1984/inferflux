@@ -299,38 +299,115 @@ std::string BuildToolSystemPrompt(const std::vector<Tool> &tools) {
   return s;
 }
 
-// §2.3: scans completion text for a tool_call JSON envelope.
+// §2.3: multi-format tool call detection.
+//
+// Recognised output formats (model-native):
+//   1. InferFlux preamble format  :
+//   {"tool_call":{"name":"...","arguments":{...}}}
+//   2. OpenAI-style / Generic JSON: {"name":"...","arguments":{...}}
+//   3. Hermes / Llama-3.1 XML     :
+//   <tool_call>{"name":"...","arguments":{...}}</tool_call>
+//   4. Mistral                    : [TOOL_CALLS]
+//   [{"name":"...","arguments":{...}}]
+//
+// Returns the first detected tool call or an empty result.
 ToolCallResult DetectToolCall(const std::string &text) {
   ToolCallResult result;
-  auto try_parse = [&](const std::string &s) -> bool {
+
+  // Helper: populate result from a parsed JSON object that has "name" key.
+  auto fill_from_obj = [&](const json &tc) -> bool {
+    if (!tc.contains("name") || !tc["name"].is_string())
+      return false;
+    result.function_name = tc["name"].get<std::string>();
+    result.call_id = "call_" + result.function_name + "_0";
+    const char *args_key =
+        tc.contains("arguments")
+            ? "arguments"
+            : (tc.contains("parameters") ? "parameters" : nullptr);
+    if (args_key && tc.contains(args_key)) {
+      result.arguments_json = tc[args_key].is_object()
+                                  ? tc[args_key].dump()
+                                  : tc[args_key].get<std::string>();
+    } else {
+      result.arguments_json = "{}";
+    }
+    result.detected = true;
+    return true;
+  };
+
+  // Format 1: {"tool_call":{...}}  (InferFlux preamble convention)
+  auto try_inferflux = [&](const std::string &s) -> bool {
     try {
       auto j = json::parse(s);
-      if (!j.contains("tool_call") || !j["tool_call"].is_object())
-        return false;
-      const auto &tc = j["tool_call"];
-      if (!tc.contains("name") || !tc["name"].is_string())
-        return false;
-      result.function_name = tc["name"].get<std::string>();
-      result.call_id = "call_" + result.function_name + "_0";
-      if (tc.contains("arguments")) {
-        result.arguments_json = tc["arguments"].is_object()
-                                    ? tc["arguments"].dump()
-                                    : tc["arguments"].get<std::string>();
-      } else {
-        result.arguments_json = "{}";
-      }
-      result.detected = true;
-      return true;
+      if (j.contains("tool_call") && j["tool_call"].is_object())
+        return fill_from_obj(j["tool_call"]);
     } catch (...) {
-      return false;
     }
+    return false;
   };
-  // Try exact parse first; then search for an embedded JSON object in the text.
-  if (try_parse(text))
+  if (try_inferflux(text))
     return result;
-  auto pos = text.find("{\"tool_call\"");
-  if (pos != std::string::npos && try_parse(text.substr(pos)))
-    return result;
+  {
+    auto pos = text.find("{\"tool_call\"");
+    if (pos != std::string::npos && try_inferflux(text.substr(pos)))
+      return result;
+  }
+
+  // Format 3: <tool_call>…</tool_call>  (Hermes / Llama-3.1)
+  {
+    static const std::string open_tag = "<tool_call>";
+    static const std::string close_tag = "</tool_call>";
+    auto a = text.find(open_tag);
+    auto b = text.find(close_tag);
+    if (a != std::string::npos && b != std::string::npos && b > a) {
+      std::string inner =
+          text.substr(a + open_tag.size(), b - a - open_tag.size());
+      // Trim whitespace
+      auto ws_start = inner.find_first_not_of(" \t\r\n");
+      auto ws_end = inner.find_last_not_of(" \t\r\n");
+      if (ws_start != std::string::npos)
+        inner = inner.substr(ws_start, ws_end - ws_start + 1);
+      try {
+        auto j = json::parse(inner);
+        if (j.is_object() && fill_from_obj(j))
+          return result;
+      } catch (...) {
+      }
+    }
+  }
+
+  // Format 4: [TOOL_CALLS] [{"name":"...","arguments":{...}}]  (Mistral)
+  {
+    static const std::string mistral_tag = "[TOOL_CALLS]";
+    auto pos = text.find(mistral_tag);
+    if (pos != std::string::npos) {
+      auto bracket = text.find('[', pos + mistral_tag.size());
+      if (bracket != std::string::npos) {
+        try {
+          auto arr = json::parse(text.substr(bracket));
+          if (arr.is_array() && !arr.empty() && arr[0].is_object() &&
+              fill_from_obj(arr[0]))
+            return result;
+        } catch (...) {
+        }
+      }
+    }
+  }
+
+  // Format 2: bare {"name":"...","arguments":{...}}  (generic OpenAI-style
+  // output)
+  {
+    auto pos = text.find("{\"name\"");
+    if (pos != std::string::npos) {
+      try {
+        auto j = json::parse(text.substr(pos));
+        if (j.is_object() && fill_from_obj(j))
+          return result;
+      } catch (...) {
+      }
+    }
+  }
+
   return result;
 }
 
@@ -1348,11 +1425,8 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
 
     InferenceRequest req;
-    if (!parsed.prompt.empty()) {
-      req.prompt = parsed.prompt;
-    } else if (!parsed.messages.empty()) {
-      req.prompt = FlattenMessages(parsed.messages);
-    }
+    // Note: req.prompt is set below after the tool/template block which
+    // handles both the messages chat path and the direct prompt path.
     if (parsed.max_tokens > 0) {
       req.max_tokens = parsed.max_tokens;
     }
@@ -1386,7 +1460,7 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
     }
 
-    // §2.3: inject tool schema as a system preamble when tools are provided.
+    // §2.3: tool schema injection + model-native chat template formatting.
     bool use_tools = (parsed.has_tool_schema || !parsed.tools.empty()) &&
                      parsed.tool_choice != "none";
     if (use_tools && std::getenv("INFERFLUX_LOG_TOOL_CALLS")) {
@@ -1398,10 +1472,60 @@ void HttpServer::HandleClient(ClientSession &session) {
       LogToolEvent("request tools=" + std::to_string(parsed.tools.size()) +
                    " choice=" + parsed.tool_choice);
     }
-    if (use_tools && !parsed.tools.empty()) {
-      std::string tool_prefix = BuildToolSystemPrompt(parsed.tools);
-      req.prompt =
-          req.prompt.empty() ? tool_prefix : tool_prefix + "\n" + req.prompt;
+
+    // §2.3 model-native chat template path.
+    // When a real model is loaded and the request came as a chat messages
+    // array, format the conversation using the model's built-in template
+    // (llama_chat_apply_template).  Tool definitions are injected as the first
+    // system message so the model-specific role tokens wrap them correctly.
+    // When no model is available (stub mode) or the template is unsupported, we
+    // fall back to FlattenMessages + BuildToolSystemPrompt (existing
+    // behaviour).
+    bool use_native_template = false;
+    if (parsed.prompt.empty() && !parsed.messages.empty()) {
+      auto *router = scheduler_->Router();
+      if (router) {
+        auto *info = router->Resolve(parsed.model);
+        if (info) {
+          auto backend = router->GetBackend(info->id);
+          if (backend && backend->IsReady()) {
+            // Build message list: prepend tool schema as system message if
+            // needed.
+            std::vector<std::pair<std::string, std::string>> msgs;
+            if (use_tools && !parsed.tools.empty()) {
+              msgs.push_back({"system", BuildToolSystemPrompt(parsed.tools)});
+            }
+            for (const auto &m : parsed.messages) {
+              if (!m.role.empty() || !m.content.empty()) {
+                msgs.push_back({m.role, m.content});
+              }
+            }
+            auto tmpl = backend->FormatChatMessages(
+                msgs, /*add_assistant_prefix=*/true);
+            if (tmpl.valid) {
+              req.prompt = tmpl.prompt;
+              use_native_template = true;
+              LogToolEvent("native_template=true msgs=" +
+                           std::to_string(msgs.size()));
+            }
+          }
+        }
+      }
+    }
+
+    if (!use_native_template) {
+      // Fallback: flat concatenation + preamble injection (stub / unsupported
+      // template models).
+      if (!parsed.prompt.empty()) {
+        req.prompt = parsed.prompt;
+      } else if (!parsed.messages.empty()) {
+        req.prompt = FlattenMessages(parsed.messages);
+      }
+      if (use_tools && !parsed.tools.empty()) {
+        std::string tool_prefix = BuildToolSystemPrompt(parsed.tools);
+        req.prompt =
+            req.prompt.empty() ? tool_prefix : tool_prefix + "\n" + req.prompt;
+      }
     }
 
     req.priority = static_cast<int>(auth_ctx.scopes.count("admin") ? 10 : 0);

@@ -83,7 +83,7 @@ fi
 if [ "${SKIP_TESTS:-0}" != "1" ]; then
   # Run each registered test target individually so per-tag failures are visible.
   # The set matches the add_test() calls in CMakeLists.txt.
-  UNIT_TARGETS="UnitTests FairnessTests MoETests FlashAttnTests ShmTransportTests"
+  UNIT_TARGETS="UnitTests FairnessTests MoETests FlashAttnTests ShmTransportTests ChatTemplateTests"
 
   echo "[pre-commit] Running unit tests..."
   PATTERN=$(echo $UNIT_TARGETS | tr ' ' '|')

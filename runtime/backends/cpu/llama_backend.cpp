@@ -11,9 +11,9 @@
 
 namespace {
 
-void BatchClear(llama_batch& batch) { batch.n_tokens = 0; }
+void BatchClear(llama_batch &batch) { batch.n_tokens = 0; }
 
-void BatchAdd(llama_batch& batch, llama_token id, llama_pos pos, bool logits) {
+void BatchAdd(llama_batch &batch, llama_token id, llama_pos pos, bool logits) {
   if (!batch.seq_id[batch.n_tokens]) {
     throw std::runtime_error("llama_batch capacity exceeded");
   }
@@ -26,7 +26,7 @@ void BatchAdd(llama_batch& batch, llama_token id, llama_pos pos, bool logits) {
 }
 
 // Sequence-aware variant for phased prefill/decode (§2.5 Option A).
-void BatchAddSeq(llama_batch& batch, llama_token id, llama_pos pos,
+void BatchAddSeq(llama_batch &batch, llama_token id, llama_pos pos,
                  llama_seq_id seq_id, bool logits) {
   if (!batch.seq_id[batch.n_tokens]) {
     throw std::runtime_error("llama_batch capacity exceeded");
@@ -39,7 +39,7 @@ void BatchAddSeq(llama_batch& batch, llama_token id, llama_pos pos,
   batch.n_tokens++;
 }
 
-}  // namespace
+} // namespace
 
 namespace inferflux {
 
@@ -60,7 +60,7 @@ void LlamaBackendRelease() {
     llama_backend_free();
   }
 }
-}  // namespace
+} // namespace
 
 LlamaCPUBackend::LlamaCPUBackend() { LlamaBackendAcquire(); }
 
@@ -83,18 +83,22 @@ LlamaCPUBackend::~LlamaCPUBackend() {
   LlamaBackendRelease();
 }
 
-bool LlamaCPUBackend::LoadModel(const std::filesystem::path& model_path, const LlamaBackendConfig& config) {
+bool LlamaCPUBackend::LoadModel(const std::filesystem::path &model_path,
+                                const LlamaBackendConfig &config) {
   test_ready_ = false;
   if (!std::filesystem::exists(model_path)) {
-    std::cerr << "[LlamaCPUBackend] model path does not exist: " << model_path << std::endl;
+    std::cerr << "[LlamaCPUBackend] model path does not exist: " << model_path
+              << std::endl;
     return false;
   }
   llama_model_params model_params = llama_model_default_params();
   model_params.n_gpu_layers = config.gpu_layers;
 
-  model_ = llama_model_load_from_file(model_path.string().c_str(), model_params);
+  model_ =
+      llama_model_load_from_file(model_path.string().c_str(), model_params);
   if (!model_) {
-    std::cerr << "[LlamaCPUBackend] failed to load model from " << model_path << std::endl;
+    std::cerr << "[LlamaCPUBackend] failed to load model from " << model_path
+              << std::endl;
     return false;
   }
 
@@ -103,14 +107,15 @@ bool LlamaCPUBackend::LoadModel(const std::filesystem::path& model_path, const L
   ctx_params.n_batch = config.batch_size;
 
   // Wire Flash Attention (§2.7): set llama.cpp context parameter directly.
-  // LLAMA_FLASH_ATTN_TYPE_ENABLED lets llama.cpp choose FA on any supported backend
-  // (Metal, CUDA); the tile parameter is stored for future FA3 CUDA integration.
+  // LLAMA_FLASH_ATTN_TYPE_ENABLED lets llama.cpp choose FA on any supported
+  // backend (Metal, CUDA); the tile parameter is stored for future FA3 CUDA
+  // integration.
   ctx_params.flash_attn_type = config.use_flash_attention
                                    ? LLAMA_FLASH_ATTN_TYPE_ENABLED
                                    : LLAMA_FLASH_ATTN_TYPE_DISABLED;
   if (config.use_flash_attention) {
-    std::cout << "[LlamaCPUBackend] FlashAttention enabled (tile=" << config.flash_attention_tile
-              << ")\n";
+    std::cout << "[LlamaCPUBackend] FlashAttention enabled (tile="
+              << config.flash_attention_tile << ")\n";
   }
 
   context_ = llama_init_from_model(model_, ctx_params);
@@ -128,12 +133,13 @@ bool LlamaCPUBackend::LoadModel(const std::filesystem::path& model_path, const L
   return true;
 }
 
-int LlamaCPUBackend::TokenCount(const std::string& text) const {
+int LlamaCPUBackend::TokenCount(const std::string &text) const {
   auto tokens = Tokenize(text, /*add_bos=*/false);
   return static_cast<int>(tokens.size());
 }
 
-std::vector<int> LlamaCPUBackend::Tokenize(const std::string& prompt, bool add_bos) const {
+std::vector<int> LlamaCPUBackend::Tokenize(const std::string &prompt,
+                                           bool add_bos) const {
   if (!model_) {
     return {};
   }
@@ -142,17 +148,19 @@ std::vector<int> LlamaCPUBackend::Tokenize(const std::string& prompt, bool add_b
   }
   std::vector<llama_token> tokens;
   tokens.resize(prompt.size() + 8);
-  int n = llama_tokenize(vocab_, prompt.c_str(), prompt.size(), tokens.data(), tokens.size(), add_bos, true);
+  int n = llama_tokenize(vocab_, prompt.c_str(), prompt.size(), tokens.data(),
+                         tokens.size(), add_bos, true);
   if (n < 0) {
     tokens.resize(-n);
-    n = llama_tokenize(vocab_, prompt.c_str(), prompt.size(), tokens.data(), tokens.size(), add_bos, true);
+    n = llama_tokenize(vocab_, prompt.c_str(), prompt.size(), tokens.data(),
+                       tokens.size(), add_bos, true);
   }
   tokens.resize(n);
   return {tokens.begin(), tokens.end()};
 }
 
 int LlamaCPUBackend::SampleGreedy() const {
-  const float* logits = llama_get_logits(context_);
+  const float *logits = llama_get_logits(context_);
   if (!logits) {
     return vocab_ ? llama_vocab_eos(vocab_) : 0;
   }
@@ -166,10 +174,12 @@ std::string LlamaCPUBackend::TokenToString(int token) const {
   }
   std::string buf;
   buf.resize(16);
-  int written = llama_token_to_piece(vocab_, token, buf.data(), buf.size(), 0, false);
+  int written =
+      llama_token_to_piece(vocab_, token, buf.data(), buf.size(), 0, false);
   if (written < 0) {
     buf.resize(static_cast<std::size_t>(-written));
-    if (llama_token_to_piece(vocab_, token, buf.data(), buf.size(), 0, false) < 0) {
+    if (llama_token_to_piece(vocab_, token, buf.data(), buf.size(), 0, false) <
+        0) {
       return {};
     }
   } else {
@@ -178,10 +188,10 @@ std::string LlamaCPUBackend::TokenToString(int token) const {
   return buf;
 }
 
-std::string LlamaCPUBackend::Generate(const std::string& prompt,
-                                      int max_tokens,
-                                      const std::function<bool(const std::string&)>& on_chunk,
-                                      const std::function<bool()>& should_stop) {
+std::string LlamaCPUBackend::Generate(
+    const std::string &prompt, int max_tokens,
+    const std::function<bool(const std::string &)> &on_chunk,
+    const std::function<bool()> &should_stop) {
   if (!IsReady()) {
     return {};
   }
@@ -190,15 +200,18 @@ std::string LlamaCPUBackend::Generate(const std::string& prompt,
     return {};
   }
 
-  int32_t batch_cap = std::max<int32_t>(config_.batch_size,
-                                        static_cast<int32_t>(prompt_tokens.size() + std::max(max_tokens, 1)));
+  int32_t batch_cap = std::max<int32_t>(
+      config_.batch_size,
+      static_cast<int32_t>(prompt_tokens.size() + std::max(max_tokens, 1)));
   llama_batch batch = llama_batch_init(batch_cap, 0, 1);
   llama_pos position = 0;
   for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-    BatchAdd(batch, prompt_tokens[i], position++, i == prompt_tokens.size() - 1);
+    BatchAdd(batch, prompt_tokens[i], position++,
+             i == prompt_tokens.size() - 1);
   }
   if (llama_decode(context_, batch) != 0) {
-    std::cerr << "[LlamaCPUBackend] llama_decode failed for prompt" << std::endl;
+    std::cerr << "[LlamaCPUBackend] llama_decode failed for prompt"
+              << std::endl;
     llama_batch_free(batch);
     return {};
   }
@@ -237,7 +250,8 @@ std::string LlamaCPUBackend::Generate(const std::string& prompt,
     }
     BatchAdd(batch, token, position++, true);
     if (llama_decode(context_, batch) != 0) {
-      std::cerr << "[LlamaCPUBackend] llama_decode failed while generating" << std::endl;
+      std::cerr << "[LlamaCPUBackend] llama_decode failed while generating"
+                << std::endl;
       break;
     }
     BatchClear(batch);
@@ -250,10 +264,11 @@ std::string LlamaCPUBackend::Generate(const std::string& prompt,
   return output;
 }
 
-bool LlamaCPUBackend::LoadMmproj(const std::filesystem::path& mmproj_path) {
+bool LlamaCPUBackend::LoadMmproj(const std::filesystem::path &mmproj_path) {
 #ifdef INFERFLUX_HAS_MTMD
   if (!model_) {
-    std::cerr << "[LlamaCPUBackend] LoadMmproj: text model must be loaded first\n";
+    std::cerr
+        << "[LlamaCPUBackend] LoadMmproj: text model must be loaded first\n";
     return false;
   }
   if (mtmd_ctx_) {
@@ -268,7 +283,8 @@ bool LlamaCPUBackend::LoadMmproj(const std::filesystem::path& mmproj_path) {
   params.warmup = false;
   mtmd_ctx_ = mtmd_init_from_file(mmproj_path.string().c_str(), model_, params);
   if (!mtmd_ctx_) {
-    std::cerr << "[LlamaCPUBackend] failed to load mmproj from " << mmproj_path << "\n";
+    std::cerr << "[LlamaCPUBackend] failed to load mmproj from " << mmproj_path
+              << "\n";
     return false;
   }
   vision_ready_ = mtmd_support_vision(mtmd_ctx_);
@@ -277,32 +293,34 @@ bool LlamaCPUBackend::LoadMmproj(const std::filesystem::path& mmproj_path) {
   return vision_ready_;
 #else
   (void)mmproj_path;
-  std::cerr << "[LlamaCPUBackend] ENABLE_MTMD=OFF; vision support unavailable\n";
+  std::cerr
+      << "[LlamaCPUBackend] ENABLE_MTMD=OFF; vision support unavailable\n";
   return false;
 #endif
 }
 
 std::string LlamaCPUBackend::GenerateWithImages(
-    const std::string& prompt,
-    const std::vector<DecodedImage>& images,
-    int max_tokens,
-    const std::function<bool(const std::string&)>& on_chunk,
-    const std::function<bool()>& should_stop) {
+    const std::string &prompt, const std::vector<DecodedImage> &images,
+    int max_tokens, const std::function<bool(const std::string &)> &on_chunk,
+    const std::function<bool()> &should_stop) {
 #ifdef INFERFLUX_HAS_MTMD
   if (!IsReady() || !vision_ready_ || !mtmd_ctx_ || images.empty()) {
     return Generate(prompt, max_tokens, on_chunk, should_stop);
   }
 
   // Build bitmap list from raw image bytes.
-  std::vector<mtmd_bitmap*> bitmaps;
+  std::vector<mtmd_bitmap *> bitmaps;
   bitmaps.reserve(images.size());
-  for (const auto& img : images) {
-    if (img.raw_bytes.empty()) continue;
-    auto* bmp = mtmd_helper_bitmap_init_from_buf(
+  for (const auto &img : images) {
+    if (img.raw_bytes.empty())
+      continue;
+    auto *bmp = mtmd_helper_bitmap_init_from_buf(
         mtmd_ctx_, img.raw_bytes.data(), img.raw_bytes.size());
     if (!bmp) {
-      std::cerr << "[LlamaCPUBackend] failed to decode image bitmap; falling back to text-only\n";
-      for (auto* b : bitmaps) mtmd_bitmap_free(b);
+      std::cerr << "[LlamaCPUBackend] failed to decode image bitmap; falling "
+                   "back to text-only\n";
+      for (auto *b : bitmaps)
+        mtmd_bitmap_free(b);
       return Generate(prompt, max_tokens, on_chunk, should_stop);
     }
     if (!img.image_id.empty()) {
@@ -316,16 +334,20 @@ std::string LlamaCPUBackend::GenerateWithImages(
   }
 
   // Tokenize prompt + image bitmaps into interleaved chunks.
-  auto* chunks = mtmd_input_chunks_init();
+  auto *chunks = mtmd_input_chunks_init();
   mtmd_input_text input_text;
   input_text.text = prompt.c_str();
   input_text.add_special = true;
   input_text.parse_special = true;
-  const mtmd_bitmap** bitmap_ptr = const_cast<const mtmd_bitmap**>(bitmaps.data());
-  int32_t rc = mtmd_tokenize(mtmd_ctx_, chunks, &input_text, bitmap_ptr, bitmaps.size());
-  for (auto* b : bitmaps) mtmd_bitmap_free(b);
+  const mtmd_bitmap **bitmap_ptr =
+      const_cast<const mtmd_bitmap **>(bitmaps.data());
+  int32_t rc =
+      mtmd_tokenize(mtmd_ctx_, chunks, &input_text, bitmap_ptr, bitmaps.size());
+  for (auto *b : bitmaps)
+    mtmd_bitmap_free(b);
   if (rc != 0) {
-    std::cerr << "[LlamaCPUBackend] mtmd_tokenize failed (rc=" << rc << "); falling back\n";
+    std::cerr << "[LlamaCPUBackend] mtmd_tokenize failed (rc=" << rc
+              << "); falling back\n";
     mtmd_input_chunks_free(chunks);
     return Generate(prompt, max_tokens, on_chunk, should_stop);
   }
@@ -337,7 +359,8 @@ std::string LlamaCPUBackend::GenerateWithImages(
                                /*logits_last=*/true, &n_past);
   mtmd_input_chunks_free(chunks);
   if (rc != 0) {
-    std::cerr << "[LlamaCPUBackend] mtmd_helper_eval_chunks failed (rc=" << rc << ")\n";
+    std::cerr << "[LlamaCPUBackend] mtmd_helper_eval_chunks failed (rc=" << rc
+              << ")\n";
     return {};
   }
 
@@ -354,21 +377,26 @@ std::string LlamaCPUBackend::GenerateWithImages(
   }
 
   while (tokens_remaining-- > 0) {
-    if (should_stop && should_stop()) break;
+    if (should_stop && should_stop())
+      break;
     int token = 0;
     if (grammar_sampler_) {
       token = llama_sampler_sample(grammar_sampler_, context_, -1);
     } else {
       token = SampleGreedy();
     }
-    if (token == eos) break;
+    if (token == eos)
+      break;
     std::string piece = TokenToString(token);
     output += piece;
-    if (on_chunk && !on_chunk(piece)) break;
-    if (should_stop && should_stop()) break;
+    if (on_chunk && !on_chunk(piece))
+      break;
+    if (should_stop && should_stop())
+      break;
     BatchAdd(batch, token, n_past++, true);
     if (llama_decode(context_, batch) != 0) {
-      std::cerr << "[LlamaCPUBackend] llama_decode failed (vision decode loop)\n";
+      std::cerr
+          << "[LlamaCPUBackend] llama_decode failed (vision decode loop)\n";
       break;
     }
     BatchClear(batch);
@@ -385,8 +413,8 @@ std::string LlamaCPUBackend::GenerateWithImages(
 #endif
 }
 
-LlamaCPUBackend::PrefillResult LlamaCPUBackend::Prefill(const std::string& prompt,
-                                                        int sequence_id) {
+LlamaCPUBackend::PrefillResult
+LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
   if (!context_ || !vocab_) {
     return {};
   }
@@ -395,7 +423,8 @@ LlamaCPUBackend::PrefillResult LlamaCPUBackend::Prefill(const std::string& promp
     return {};
   }
   // Clear any previous KV state for this sequence slot before filling it.
-  llama_memory_seq_rm(llama_get_memory(context_), static_cast<llama_seq_id>(sequence_id), -1, -1);
+  llama_memory_seq_rm(llama_get_memory(context_),
+                      static_cast<llama_seq_id>(sequence_id), -1, -1);
 
   int32_t batch_cap = std::max<int32_t>(
       config_.batch_size, static_cast<int32_t>(prompt_tokens.size() + 1));
@@ -406,8 +435,8 @@ LlamaCPUBackend::PrefillResult LlamaCPUBackend::Prefill(const std::string& promp
                 /*logits=*/i == prompt_tokens.size() - 1);
   }
   if (llama_decode(context_, batch) != 0) {
-    std::cerr << "[LlamaCPUBackend] Prefill: llama_decode failed for seq " << sequence_id
-              << std::endl;
+    std::cerr << "[LlamaCPUBackend] Prefill: llama_decode failed for seq "
+              << sequence_id << std::endl;
     llama_batch_free(batch);
     return {};
   }
@@ -415,11 +444,10 @@ LlamaCPUBackend::PrefillResult LlamaCPUBackend::Prefill(const std::string& promp
   return {static_cast<int>(prompt_tokens.size()), /*ok=*/true};
 }
 
-std::string LlamaCPUBackend::Decode(int n_past,
-                                    int sequence_id,
-                                    int max_tokens,
-                                    const std::function<bool(const std::string&)>& on_chunk,
-                                    const std::function<bool()>& should_stop) {
+std::string LlamaCPUBackend::Decode(
+    int n_past, int sequence_id, int max_tokens,
+    const std::function<bool(const std::string &)> &on_chunk,
+    const std::function<bool()> &should_stop) {
   if (!context_ || !vocab_ || n_past < 0) {
     return {};
   }
@@ -436,22 +464,27 @@ std::string LlamaCPUBackend::Decode(int n_past,
   }
 
   while (tokens_remaining-- > 0) {
-    if (should_stop && should_stop()) break;
+    if (should_stop && should_stop())
+      break;
     int token = 0;
     if (grammar_sampler_) {
       token = llama_sampler_sample(grammar_sampler_, context_, -1);
     } else {
       token = SampleGreedy();
     }
-    if (token == eos) break;
+    if (token == eos)
+      break;
     std::string piece = TokenToString(token);
     output += piece;
-    if (on_chunk && !on_chunk(piece)) break;
-    if (should_stop && should_stop()) break;
-    BatchAddSeq(batch, token, position++, static_cast<llama_seq_id>(sequence_id), true);
+    if (on_chunk && !on_chunk(piece))
+      break;
+    if (should_stop && should_stop())
+      break;
+    BatchAddSeq(batch, token, position++,
+                static_cast<llama_seq_id>(sequence_id), true);
     if (llama_decode(context_, batch) != 0) {
-      std::cerr << "[LlamaCPUBackend] Decode: llama_decode failed for seq " << sequence_id
-                << std::endl;
+      std::cerr << "[LlamaCPUBackend] Decode: llama_decode failed for seq "
+                << sequence_id << std::endl;
       break;
     }
     BatchClear(batch);
@@ -465,59 +498,72 @@ std::string LlamaCPUBackend::Decode(int n_past,
 }
 
 void LlamaCPUBackend::FreeSequence(int sequence_id) {
-  if (!context_) return;
-  llama_memory_seq_rm(llama_get_memory(context_), static_cast<llama_seq_id>(sequence_id), -1, -1);
+  if (!context_)
+    return;
+  llama_memory_seq_rm(llama_get_memory(context_),
+                      static_cast<llama_seq_id>(sequence_id), -1, -1);
 }
 
 std::vector<uint8_t> LlamaCPUBackend::SerializeSequence(int sequence_id) {
-  if (!context_) return {};
-  std::size_t size = llama_state_seq_get_size(context_, static_cast<llama_seq_id>(sequence_id));
-  if (size == 0) return {};
+  if (!context_)
+    return {};
+  std::size_t size = llama_state_seq_get_size(
+      context_, static_cast<llama_seq_id>(sequence_id));
+  if (size == 0)
+    return {};
   std::vector<uint8_t> buf(size);
   std::size_t written = llama_state_seq_get_data(
       context_, buf.data(), buf.size(), static_cast<llama_seq_id>(sequence_id));
-  if (written == 0) return {};
+  if (written == 0)
+    return {};
   buf.resize(written);
   return buf;
 }
 
 bool LlamaCPUBackend::HydrateSequence(int dest_sequence_id,
-                                      const std::vector<uint8_t>& blob) {
-  if (!context_ || blob.empty()) return false;
-  std::size_t read = llama_state_seq_set_data(
-      context_, blob.data(), blob.size(), static_cast<llama_seq_id>(dest_sequence_id));
+                                      const std::vector<uint8_t> &blob) {
+  if (!context_ || blob.empty())
+    return false;
+  std::size_t read =
+      llama_state_seq_set_data(context_, blob.data(), blob.size(),
+                               static_cast<llama_seq_id>(dest_sequence_id));
   return read > 0;
 }
 
-bool LlamaCPUBackend::IsMoE() const {
-  return ExpertCount() > 0;
-}
+bool LlamaCPUBackend::IsMoE() const { return ExpertCount() > 0; }
 
 int LlamaCPUBackend::ExpertCount() const {
-  if (!model_) return 0;
+  if (!model_)
+    return 0;
   char buf[32] = {};
-  int32_t len = llama_model_meta_val_str(model_, "llm.expert_count", buf, sizeof(buf));
-  if (len <= 0) return 0;
+  int32_t len =
+      llama_model_meta_val_str(model_, "llm.expert_count", buf, sizeof(buf));
+  if (len <= 0)
+    return 0;
   return std::atoi(buf);
 }
 
 int LlamaCPUBackend::ActiveExperts() const {
-  if (!model_) return 0;
+  if (!model_)
+    return 0;
   char buf[32] = {};
-  int32_t len = llama_model_meta_val_str(model_, "llm.expert_used_count", buf, sizeof(buf));
-  if (len <= 0) return 0;
+  int32_t len = llama_model_meta_val_str(model_, "llm.expert_used_count", buf,
+                                         sizeof(buf));
+  if (len <= 0)
+    return 0;
   return std::atoi(buf);
 }
 
-void LlamaCPUBackend::EnableGrammarConstraint(const std::string& grammar,
-                                              const std::string& root) {
+void LlamaCPUBackend::EnableGrammarConstraint(const std::string &grammar,
+                                              const std::string &root) {
   if (grammar.empty() || !context_ || !vocab_) {
     return;
   }
   DisableGrammarConstraint();
   auto params = llama_sampler_chain_default_params();
-  auto* chain = llama_sampler_chain_init(params);
-  llama_sampler_chain_add(chain, llama_sampler_init_grammar(vocab_, grammar.c_str(), root.c_str()));
+  auto *chain = llama_sampler_chain_init(params);
+  llama_sampler_chain_add(
+      chain, llama_sampler_init_grammar(vocab_, grammar.c_str(), root.c_str()));
   llama_sampler_chain_add(chain, llama_sampler_init_greedy());
   grammar_sampler_ = chain;
 }
@@ -529,4 +575,61 @@ void LlamaCPUBackend::DisableGrammarConstraint() {
   }
 }
 
-}  // namespace inferflux
+// §2.3 — model-native chat template formatting.
+// Uses llama_chat_apply_template() from llama.h (built into the llama lib,
+// no extra compilation units required).  The function reads the model's
+// built-in chat template from GGUF metadata (NULL tmpl argument selects the
+// model's own template).  Supported models include Llama 3.x, Mistral/Mixtral,
+// Qwen 2/2.5, Hermes, DeepSeek, Phi-3, ChatML, and others in the predefined
+// list; for unsupported models it returns valid=false and the caller falls
+// back to the plain text preamble.
+LlamaCPUBackend::ChatTemplateResult LlamaCPUBackend::FormatChatMessages(
+    const std::vector<std::pair<std::string, std::string>> &messages,
+    bool add_assistant_prefix) {
+  ChatTemplateResult result;
+  if (!model_ || messages.empty()) {
+    return result;
+  }
+
+  // Keep content strings alive for the duration of the C-struct array.
+  std::vector<std::string> contents;
+  contents.reserve(messages.size());
+  std::vector<llama_chat_message> chat;
+  chat.reserve(messages.size());
+  for (const auto &[role, content] : messages) {
+    contents.push_back(content);
+    chat.push_back({role.c_str(), contents.back().c_str()});
+  }
+
+  // Initial buffer: 2× total content length + headroom for role tokens.
+  int total_chars = 0;
+  for (const auto &[r, c] : messages) {
+    total_chars += static_cast<int>(r.size() + c.size());
+  }
+  int buf_size = std::max(4096, total_chars * 2 + 512);
+  std::vector<char> buf(buf_size);
+
+  // NULL template → use the model's built-in template.
+  int32_t n =
+      llama_chat_apply_template(nullptr, chat.data(), chat.size(),
+                                add_assistant_prefix, buf.data(), buf_size);
+  if (n < 0) {
+    // Template not in the predefined list; caller falls back to preamble.
+    return result;
+  }
+  if (n > buf_size) {
+    // Buffer was too small; retry with exact size.
+    buf.resize(static_cast<std::size_t>(n) + 1);
+    n = llama_chat_apply_template(nullptr, chat.data(), chat.size(),
+                                  add_assistant_prefix, buf.data(), n);
+    if (n < 0) {
+      return result;
+    }
+  }
+
+  result.prompt = std::string(buf.data(), static_cast<std::size_t>(n));
+  result.valid = true;
+  return result;
+}
+
+} // namespace inferflux

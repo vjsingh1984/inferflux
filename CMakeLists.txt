@@ -208,6 +208,7 @@ add_executable(inferflux_tests
   tests/unit/test_moe_routing.cpp
   tests/unit/test_flash_attn.cpp
   tests/unit/test_shm_transport.cpp
+  tests/unit/test_chat_template.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -221,6 +222,8 @@ add_test(NAME FlashAttnTests COMMAND inferflux_tests "[flash_attn]")
 set_tests_properties(FlashAttnTests PROPERTIES LABELS flash_attn)
 add_test(NAME ShmTransportTests COMMAND inferflux_tests "[shm_transport]")
 set_tests_properties(ShmTransportTests PROPERTIES LABELS shm_transport)
+add_test(NAME ChatTemplateTests COMMAND inferflux_tests "[chat_template]")
+set_tests_properties(ChatTemplateTests PROPERTIES LABELS chat_template)
 
 # ---------------------------------------------------------------------------
 # SBOM — generate CycloneDX / SPDX bill-of-materials after every build.
