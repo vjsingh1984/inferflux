@@ -72,6 +72,7 @@ jobs:
             -DENABLE_ROCM=OFF \
             -DENABLE_MPS=OFF \
             -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
             -DENABLE_MTMD=OFF \
             -DENABLE_SBOM=ON
 
@@ -135,6 +136,7 @@ jobs:
             -DENABLE_ROCM=OFF \
             -DENABLE_MPS=ON \
             -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
             -DENABLE_MTMD=OFF \
             -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
 
@@ -183,9 +185,49 @@ jobs:
             -DENABLE_ROCM=OFF \
             -DENABLE_MPS=OFF \
             -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
             -DENABLE_MTMD=OFF
 
       # Build only the server binary; unit tests can't run without a GPU.
+      - name: Build (compile-only)
+        run: cmake --build build --target inferfluxd -j$(nproc)
+
+  # ---------------------------------------------------------------------------
+  # Vulkan compile-check — verifies GGML_VULKAN=ON builds clean.
+  # Runs on ubuntu-latest with the official Vulkan SDK apt repository.
+  # No GPU is required to compile; runtime tests are skipped (advisory).
+  # ---------------------------------------------------------------------------
+  build-check-vulkan:
+    name: Build check (Vulkan)
+    runs-on: ubuntu-latest
+    continue-on-error: true   # Advisory — no Vulkan GPU in CI
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies + Vulkan SDK
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libssl-dev libyaml-cpp-dev \
+            libvulkan-dev vulkan-tools glslc
+
+      - name: Configure (Vulkan=ON)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_CUDA=OFF \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=ON \
+            -DENABLE_MTMD=OFF \
+            -DENABLE_SBOM=OFF
+
+      # Build inferfluxd only — no GPU for tests.
       - name: Build (compile-only)
         run: cmake --build build --target inferfluxd -j$(nproc)
 
@@ -231,6 +273,7 @@ jobs:
             -DENABLE_ROCM=OFF \
             -DENABLE_MPS=OFF \
             -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
             -DENABLE_MTMD=OFF \
             -DENABLE_SBOM=OFF
 

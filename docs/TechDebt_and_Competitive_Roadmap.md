@@ -50,6 +50,21 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 - **Multimodal/vision: D** — `ImagePreprocessor` (base64 + URL fetch + SHA-256 IDs + `<__media__>` markers); `LlamaCPUBackend::GenerateWithImages()` via libmtmd (`-DENABLE_MTMD=ON`); Prometheus counters. Actual vision inference requires compatible mmproj GGUF. Gap to C+: streaming multimodal, batch image inputs.
 - **Disaggregated prefill/decode: D** — Option A complete: phased `Prefill()`/`Decode()`/`FreeSequence()`, seq_slot free-list, decode worker pool, ShmKVTransport (`INFERFLUX_KV_TRANSPORT=shm`), Helm overlays, SHM CI smoke test. F→D. Remaining: cross-node RDMA, chaos tests.
 - **Model parallelism (TP/PP/EP): D** — EPDispatch/LocalEPDispatch stub, MoE detection (`IsMoE`/`ExpertCount`/`ActiveExperts`), `inferflux_moe_requests_total`. F→D. Remaining: multi-GPU expert sharding, TP.
+  - **Design/docs**
+    1. Draft `docs/design_ep_tp.md` (this doc) with target topologies (EP shards, TP stripes, PP stages), NCCL dependencies, and success metrics; cross-link here once merged.
+    2. Expand this scorecard entry with milestone checklist (EP v1, TP v1, failure-handling, operator rollout) so progress is trackable per release.
+  - **Expert-parallel execution**
+    1. Replace EPDispatch/LocalEPDispatch stubs with a real dispatcher interface (RPC surface, per-expert queues, Prometheus counters such as `inferflux_moe_expert_load_total`).
+    2. Extend `Scheduler::ResolveBackends` / `PendingRequest` to capture expert placement + load-balancing weights; add unit tests covering routing + fairness interaction.
+  - **Tensor / pipeline parallel**
+    1. Enable CUDA backend path with NCCL init + TP config knobs parsed in `server/main.cpp`; document env vars/flags.
+    2. Prototype 2-way TP inside `LlamaCUDABackend` (weight slicing + collective ops) and outline optional PP micro-batching stage.
+  - **Runtime resilience**
+    1. Add NCCL heartbeat/failover logic so scheduler reroutes or drains when a shard dies.
+    2. Add chaos/integration test that simulates GPU/NCCL failure to validate graceful degradation.
+  - **Documentation & rollout**
+    1. Update `docs/Architecture.md` with a “Model Parallelism” section once EP/TP MVP lands.
+    2. Add operator guide (`docs/operators/tp_ep_setup.md`) plus Helm values for configuring TP/EP (per-stage GPU counts, process layout).
 - **OpenAI API compat: B** — Chat completions, completions, SSE streaming, structured output, image_url, tool calls, model-native chat templates all done. Missing: `/v1/models` standard endpoint (currently admin-only at `/v1/admin/models`), logprobs, `n>1`, best_of.
 - **Enterprise auth/RBAC: B-** — OIDC RS256 (JWKS TTL cache), API-key SHA-256, rate-limiter, OPA client, encrypted policy store (AES-GCM), audit log (hash-by-default). Gap to B+: fine-grained per-model RBAC, key rotation UI.
 - **Observability: B** — 5 latency histograms, Prometheus `/metrics`, W3C traceparent, `Span` RAII, audit log, fairness/preemption metrics, KV-transfer histogram, MoE counter, flash-attention gauge. Gap to A: structured JSON logs, Grafana dashboard template, self-hosted GPU runner for live metric CI.
