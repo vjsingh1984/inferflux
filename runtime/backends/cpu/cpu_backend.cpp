@@ -6,6 +6,14 @@
 
 namespace inferflux {
 
+CPUDeviceContext::~CPUDeviceContext() {
+  std::lock_guard<std::mutex> lock(alloc_mutex_);
+  for (void* ptr : allocations_) {
+    std::free(ptr);
+  }
+  allocations_.clear();
+}
+
 std::unique_ptr<DeviceBuffer> CPUDeviceContext::Allocate(std::size_t bytes) {
   void* ptr = std::malloc(bytes);
   if (!ptr) {

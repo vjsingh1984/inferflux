@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -27,7 +28,26 @@ void BatchAdd(llama_batch& batch, llama_token id, llama_pos pos, bool logits) {
 
 namespace inferflux {
 
-LlamaCPUBackend::LlamaCPUBackend() { llama_backend_init(); }
+namespace {
+std::mutex g_llama_init_mutex;
+int g_llama_init_refcount = 0;
+
+void LlamaBackendAcquire() {
+  std::lock_guard<std::mutex> lock(g_llama_init_mutex);
+  if (g_llama_init_refcount++ == 0) {
+    llama_backend_init();
+  }
+}
+
+void LlamaBackendRelease() {
+  std::lock_guard<std::mutex> lock(g_llama_init_mutex);
+  if (--g_llama_init_refcount == 0) {
+    llama_backend_free();
+  }
+}
+}  // namespace
+
+LlamaCPUBackend::LlamaCPUBackend() { LlamaBackendAcquire(); }
 
 LlamaCPUBackend::~LlamaCPUBackend() {
   if (context_ != nullptr) {
@@ -39,10 +59,11 @@ LlamaCPUBackend::~LlamaCPUBackend() {
     model_ = nullptr;
   }
   vocab_ = nullptr;
-  llama_backend_free();
+  LlamaBackendRelease();
 }
 
 bool LlamaCPUBackend::LoadModel(const std::filesystem::path& model_path, const LlamaBackendConfig& config) {
+  test_ready_ = false;
   if (!std::filesystem::exists(model_path)) {
     std::cerr << "[LlamaCPUBackend] model path does not exist: " << model_path << std::endl;
     return false;
@@ -60,6 +81,11 @@ bool LlamaCPUBackend::LoadModel(const std::filesystem::path& model_path, const L
   ctx_params.n_ctx = config.ctx_size;
   ctx_params.n_batch = config.batch_size;
 
+  if (config.use_flash_attention) {
+    std::cout << "[LlamaCPUBackend] FlashAttention requested (tile=" << config.flash_attention_tile
+              << "). Integrate FA3 kernels via llama.cpp CUDA build to enable GPU acceleration.\n";
+  }
+
   context_ = llama_init_from_model(model_, ctx_params);
   if (!context_) {
     std::cerr << "[LlamaCPUBackend] failed to create context" << std::endl;
@@ -73,6 +99,11 @@ bool LlamaCPUBackend::LoadModel(const std::filesystem::path& model_path, const L
   n_vocab_ = llama_vocab_n_tokens(vocab_);
   config_ = config;
   return true;
+}
+
+int LlamaCPUBackend::TokenCount(const std::string& text) const {
+  auto tokens = Tokenize(text, /*add_bos=*/false);
+  return static_cast<int>(tokens.size());
 }
 
 std::vector<int> LlamaCPUBackend::Tokenize(const std::string& prompt, bool add_bos) const {
@@ -120,7 +151,10 @@ std::string LlamaCPUBackend::TokenToString(int token) const {
   return buf;
 }
 
-std::string LlamaCPUBackend::Generate(const std::string& prompt, int max_tokens) {
+std::string LlamaCPUBackend::Generate(const std::string& prompt,
+                                      int max_tokens,
+                                      const std::function<bool(const std::string&)>& on_chunk,
+                                      const std::function<bool()>& should_stop) {
   if (!IsReady()) {
     return {};
   }
@@ -148,11 +182,23 @@ std::string LlamaCPUBackend::Generate(const std::string& prompt, int max_tokens)
   int tokens_remaining = std::max(max_tokens, 1);
 
   while (tokens_remaining-- > 0) {
+    if (should_stop && should_stop()) {
+      break;
+    }
     int token = SampleGreedy();
     if (token == eos) {
       break;
     }
-    output += TokenToString(token);
+    std::string piece = TokenToString(token);
+    output += piece;
+    if (on_chunk) {
+      if (!on_chunk(piece)) {
+        break;
+      }
+    }
+    if (should_stop && should_stop()) {
+      break;
+    }
     BatchAdd(batch, token, position++, true);
     if (llama_decode(context_, batch) != 0) {
       std::cerr << "[LlamaCPUBackend] llama_decode failed while generating" << std::endl;

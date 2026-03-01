@@ -16,10 +16,11 @@ struct AsyncWriteTask {
 
 class AsyncFileWriter {
  public:
-  AsyncFileWriter();
+  explicit AsyncFileWriter(std::size_t max_queue_depth = 256);
   ~AsyncFileWriter();
 
-  void Start(std::size_t workers = 1);
+  void Configure(std::size_t workers, std::size_t max_queue_depth);
+  void Start(std::size_t workers = 0);
   void Stop();
   void Enqueue(AsyncWriteTask task);
 
@@ -30,8 +31,11 @@ class AsyncFileWriter {
   std::queue<AsyncWriteTask> tasks_;
   std::mutex mutex_;
   std::condition_variable cv_;
+  std::condition_variable producer_cv_;
   bool running_{false};
   bool stop_{false};
+  std::size_t preferred_workers_{1};
+  std::size_t max_queue_depth_{256};
 };
 
 }  // namespace inferflux

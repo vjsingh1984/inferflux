@@ -1,52 +1,339 @@
 #include "scheduler/scheduler.h"
 
+#include "scheduler/single_model_router.h"
+#include "server/metrics/metrics.h"
+#include "server/tracing/span.h"
+#include "runtime/execution/batch_executor.h"
+
 #include <algorithm>
 #include <iostream>
 
 namespace inferflux {
 
+namespace {
+constexpr std::size_t kMaxBatchSize = 4;
+constexpr std::size_t kMaxBatchTokens = 8192;
+constexpr double kFairnessAgingDivisorMs = 2000.0;  // every 2s of wait adds +1 to effective priority
+}
+
 Scheduler::Scheduler(SimpleTokenizer tokenizer,
                      std::shared_ptr<CPUDeviceContext> device,
                      std::shared_ptr<PagedKVCache> cache,
-                     std::shared_ptr<LlamaCPUBackend> llama_backend,
-                     std::shared_ptr<SpeculativeDecoder> speculative_decoder)
+                     std::shared_ptr<ModelRouter> router,
+                     std::shared_ptr<SpeculativeDecoder> speculative_decoder,
+                     std::shared_ptr<PrefixCache> prefix_cache,
+                     FairnessConfig fairness_config)
     : tokenizer_(std::move(tokenizer)),
       device_(std::move(device)),
       cache_(std::move(cache)),
-      llama_backend_(std::move(llama_backend)),
-      speculative_decoder_(std::move(speculative_decoder)) {}
+      router_(std::move(router)),
+      speculative_decoder_(std::move(speculative_decoder)),
+      prefix_cache_(std::move(prefix_cache)),
+      fairness_controller_(fairness_config),
+      fairness_config_(fairness_config) {
+  executor_ = std::make_unique<BatchExecutor>(&tokenizer_, device_, cache_, router_, speculative_decoder_, prefix_cache_);
+  worker_ = std::thread(&Scheduler::WorkerLoop, this);
+}
 
-GenerateResponse Scheduler::Generate(const GenerateRequest& request) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  GenerateResponse response;
-  auto prompt_tokens = tokenizer_.Encode(request.prompt);
-  response.prompt_tokens = static_cast<int>(prompt_tokens.size());
-
-  std::vector<int> speculative_tokens;
-  if (speculative_decoder_ && speculative_decoder_->Enabled()) {
-    speculative_tokens = speculative_decoder_->Draft(prompt_tokens, request.max_tokens);
+Scheduler::~Scheduler() {
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    stop_ = true;
   }
+  queue_cv_.notify_all();
+  if (worker_.joinable()) {
+    worker_.join();
+  }
+}
 
-  if (llama_backend_ && llama_backend_->IsReady()) {
-    if (!speculative_tokens.empty()) {
-      speculative_tokens = speculative_decoder_->Validate(prompt_tokens, speculative_tokens,
-                                                         request.max_tokens, llama_backend_);
-      response.completion = tokenizer_.Decode(speculative_tokens);
-    } else {
-      auto text = llama_backend_->Generate(request.prompt, request.max_tokens);
-      response.completion = text.empty() ? "[llama.cpp backend returned empty response]" : text;
+InferenceResult Scheduler::Generate(InferenceRequest request) {
+  auto pending = std::make_shared<PendingRequest>();
+  pending->inference = std::move(request);
+  pending->priority = pending->inference.priority;
+  pending->sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
+  pending->enqueue_time = std::chrono::steady_clock::now();
+  pending->inference.id = pending->sequence;
+  pending->inference.phase = RequestPhase::kPending;
+  pending->inference.enqueue_time = pending->enqueue_time;
+  if (pending->inference.max_tokens <= 0) {
+    pending->inference.max_tokens = 1;
+  }
+  pending->inference.remaining_decode_tokens = pending->inference.max_tokens;
+  pending->inference.accumulated_output.clear();
+  if (pending->inference.prompt_tokens.empty()) {
+    pending->inference.prompt_tokens = tokenizer_.Encode(pending->inference.prompt);
+  }
+  pending->inference.reported_prompt_tokens =
+      static_cast<int>(pending->inference.prompt_tokens.size());
+  pending->inference.output_tokens.clear();
+  pending->inference.first_token_time = {};
+  pending->inference.phase = RequestPhase::kPending;
+
+  auto future = pending->promise.get_future();
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    pending_.push_back(pending);
+    UpdateQueueDepthLocked();
+  }
+  queue_cv_.notify_one();
+  return future.get();
+}
+
+void Scheduler::UpdateFairnessConfig(const FairnessConfig& config) {
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    fairness_config_ = config;
+    fairness_controller_.UpdateConfig(config);
+  }
+}
+
+void Scheduler::WorkerLoop() {
+  while (true) {
+    BatchSelection selection;
+    {
+      std::unique_lock<std::mutex> lock(queue_mutex_);
+      queue_cv_.wait(lock, [&] { return stop_ || !pending_.empty(); });
+      if (stop_ && pending_.empty()) {
+        break;
+      }
+      selection = BuildBatchLocked();
     }
-  } else {
-    // Fallback stub that produces a human-readable reply.
-    response.completion = "InferFlux (stub): I received your prompt \"" + request.prompt +
-                          "\" and this is a placeholder response while the full backend initializes.";
+    if (!selection.pending.empty()) {
+      ProcessBatch(std::move(selection));
+    }
+  }
+}
+
+Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
+  BatchSelection selection;
+  if (pending_.empty()) {
+    return selection;
   }
 
-  auto completion_tokens = tokenizer_.Encode(response.completion);
-  response.completion_tokens = static_cast<int>(completion_tokens.size());
-  (void)cache_;      // reserved for future GPU implementations
-  (void)device_;     // placeholder; device scheduling handled in future revisions
-  return response;
+  auto now = std::chrono::steady_clock::now();
+  std::stable_sort(pending_.begin(),
+                   pending_.end(),
+                   [&](const auto& a, const auto& b) {
+                     double age_a = std::chrono::duration<double, std::milli>(now - a->enqueue_time).count();
+                     double age_b = std::chrono::duration<double, std::milli>(now - b->enqueue_time).count();
+                     double eff_a = static_cast<double>(a->priority) + age_a / kFairnessAgingDivisorMs;
+                     double eff_b = static_cast<double>(b->priority) + age_b / kFairnessAgingDivisorMs;
+                     if (eff_a != eff_b) {
+                       return eff_a > eff_b;
+                     }
+                     return a->sequence < b->sequence;
+                   });
+
+  std::vector<std::size_t> to_remove;
+  std::size_t token_budget = 0;
+  for (std::size_t i = 0; i < pending_.size(); ++i) {
+    auto& item = pending_[i];
+    std::size_t tokens = item->inference.prompt_tokens.size();
+    if (!selection.pending.empty() && token_budget + tokens > kMaxBatchTokens) {
+      continue;
+    }
+    selection.pending.push_back(item);
+    selection.batch.requests.push_back(&item->inference);
+    token_budget += tokens;
+    selection.total_tokens += tokens;
+    to_remove.push_back(i);
+    if (selection.pending.size() >= kMaxBatchSize) {
+      break;
+    }
+  }
+
+  for (std::size_t idx = to_remove.size(); idx-- > 0;) {
+    pending_.erase(pending_.begin() + static_cast<std::ptrdiff_t>(to_remove[idx]));
+  }
+  UpdateQueueDepthLocked();
+  return selection;
+}
+
+void Scheduler::ProcessBatch(BatchSelection selection) {
+  if (selection.pending.empty()) {
+    return;
+  }
+
+  ApplyFairness(&selection);
+  ResolveBackends(selection.pending);
+  auto batch_start = std::chrono::steady_clock::now();
+  selection.batch.batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
+  for (auto& req : selection.pending) {
+    req->inference.phase = RequestPhase::kPrefill;
+  }
+  for (auto& req : selection.pending) {
+    double wait_ms = std::chrono::duration<double, std::milli>(batch_start - req->enqueue_time).count();
+    GlobalMetrics().RecordQueueLatency(wait_ms);
+  }
+
+  if (selection.total_tokens == 0) {
+    for (const auto* req : selection.batch.requests) {
+      selection.total_tokens += req->prompt_tokens.size();
+      selection.total_tokens += req->output_tokens.size();
+    }
+  }
+  GlobalMetrics().RecordBatch(selection.batch.requests.size(), selection.total_tokens);
+
+  std::vector<std::shared_ptr<LlamaCPUBackend>> overrides;
+  overrides.reserve(selection.pending.size());
+  for (auto& pending : selection.pending) {
+    overrides.push_back(pending->resolved_backend);
+  }
+  auto responses = executor_->ExecuteBatch(selection.batch, overrides);
+  std::vector<std::shared_ptr<PendingRequest>> requeue;
+  requeue.reserve(selection.pending.size());
+  for (std::size_t i = 0; i < selection.pending.size(); ++i) {
+    auto& pending = selection.pending[i];
+    auto* inference = &pending->inference;
+    InferenceResult result;
+    if (i < responses.size()) {
+      result = std::move(responses[i]);
+    }
+    if (inference->fairness_yielded) {
+      const std::string slice_text = result.completion;
+      const int slice_tokens = result.completion_tokens;
+      auto now = std::chrono::steady_clock::now();
+      pending->enqueue_time = now;
+      inference->enqueue_time = now;
+      if (!slice_text.empty()) {
+        inference->prompt.append(slice_text);
+        inference->prompt_tokens = tokenizer_.Encode(inference->prompt);
+      }
+      SpanContext parent_ctx;
+      parent_ctx.trace_id = inference->trace_id;
+      Span fairness_span(
+          "scheduler.fairness.yield",
+          tracing::ChildContext(parent_ctx),
+          [req_id = inference->id,
+           remaining = inference->remaining_decode_tokens,
+           slice = inference->last_timeslice_tokens,
+           slice_tokens](const std::string& name,
+                         const SpanContext& ctx,
+                         double ms) {
+            std::cout << "[fairness] " << name
+                      << " request=" << req_id
+                      << " trace=" << ctx.trace_id
+                      << " limit=" << slice
+                      << " generated=" << slice_tokens
+                      << " remaining=" << remaining
+                      << " duration_ms=" << ms << std::endl;
+          });
+      fairness_span.Finish();
+      requeue.push_back(pending);
+      continue;
+    }
+    if (!inference->accumulated_output.empty()) {
+      result.completion = inference->accumulated_output;
+      if (inference->total_completion_tokens > 0) {
+        result.completion_tokens = inference->total_completion_tokens;
+      }
+    }
+    if (inference->reported_prompt_tokens >= 0) {
+      result.prompt_tokens = inference->reported_prompt_tokens;
+    }
+    pending->promise.set_value(std::move(result));
+  }
+  if (!requeue.empty()) {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      for (auto& pending : requeue) {
+        pending_.push_back(pending);
+      }
+      UpdateQueueDepthLocked();
+    }
+    queue_cv_.notify_all();
+  }
+  auto batch_exec_end = std::chrono::steady_clock::now();
+  double exec_ms = std::chrono::duration<double, std::milli>(batch_exec_end - batch_start).count();
+  GlobalMetrics().RecordBatchExecution(exec_ms);
+}
+
+void Scheduler::UpdateQueueDepthLocked() const {
+  GlobalMetrics().SetQueueDepth(static_cast<int>(pending_.size()));
+}
+ 
+void Scheduler::ApplyFairness(BatchSelection* selection) {
+  if (!selection || selection->pending.empty()) {
+    return;
+  }
+
+  std::vector<FairnessEntry> batch_entries;
+  batch_entries.reserve(selection->pending.size());
+  for (std::size_t i = 0; i < selection->pending.size(); ++i) {
+    auto& pending = selection->pending[i];
+    pending->inference.priority_level = pending->inference.priority;
+    if (pending->inference.total_completion_tokens > 0 &&
+        pending->inference.remaining_decode_tokens > 0) {
+      GlobalMetrics().RecordFairnessResume(pending->inference.priority_level);
+      SpanContext parent_ctx;
+      parent_ctx.trace_id = pending->inference.trace_id;
+      Span resume_span("scheduler.fairness.resume",
+                       tracing::ChildContext(parent_ctx),
+                       [req_id = pending->inference.id,
+                        remaining = pending->inference.remaining_decode_tokens](const std::string& name,
+                                                                                const SpanContext& ctx,
+                                                                                double ms) {
+                         std::cout << "[fairness] " << name
+                                   << " request=" << req_id
+                                   << " trace=" << ctx.trace_id
+                                   << " remaining=" << remaining
+                                   << " duration_ms=" << ms << std::endl;
+                       });
+      resume_span.Finish();
+    }
+    batch_entries.push_back(
+        FairnessEntry{&pending->inference, pending->inference.priority_level, i});
+  }
+  std::vector<FairnessEntry> queue_entries;
+  queue_entries.reserve(pending_.size());
+  for (std::size_t i = 0; i < pending_.size(); ++i) {
+    auto& pending = pending_[i];
+    pending->inference.priority_level = pending->inference.priority;
+    queue_entries.push_back(
+        FairnessEntry{&pending->inference, pending->inference.priority_level, i});
+  }
+
+  auto decision = fairness_controller_.Evaluate(batch_entries, queue_entries);
+  if (decision.swap &&
+      decision.batch_index < selection->pending.size() &&
+      decision.queue_index < pending_.size()) {
+    auto queued = pending_[decision.queue_index];
+    auto displaced = selection->pending[decision.batch_index];
+    selection->pending[decision.batch_index] = queued;
+    pending_.erase(pending_.begin() + static_cast<std::ptrdiff_t>(decision.queue_index));
+    pending_.push_back(displaced);
+    batch_entries[decision.batch_index].request = &queued->inference;
+    GlobalMetrics().RecordFairnessPreemption(queued->inference.priority_level);
+  }
+  fairness_controller_.ApplyTimeslice(&batch_entries);
+}
+
+void Scheduler::ResolveBackends(const std::vector<std::shared_ptr<PendingRequest>>& batch) {
+  if (!router_) {
+    for (auto& pending : batch) {
+      pending->resolved_backend.reset();
+      pending->inference.resolved_model.clear();
+    }
+    return;
+  }
+  for (auto& pending : batch) {
+    pending->resolved_backend.reset();
+    pending->inference.resolved_model.clear();
+    auto* info = router_->Resolve(pending->inference.model);
+    if (!info) {
+      GlobalMetrics().RecordModelRoute(pending->inference.model, "", false);
+      continue;
+    }
+    auto backend = router_->GetBackend(info->id);
+    if (backend && backend->IsReady()) {
+      pending->resolved_backend = backend;
+      pending->inference.resolved_model = info->id;
+      GlobalMetrics().RecordModelRoute(info->id, info->backend, true);
+    } else {
+      pending->inference.resolved_model = info->id;
+      GlobalMetrics().RecordModelRoute(info->id, info->backend, false);
+    }
+  }
 }
 
 }  // namespace inferflux

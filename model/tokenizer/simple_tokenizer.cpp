@@ -48,9 +48,13 @@ std::vector<std::string> SimpleTokenizer::Tokenize(const std::string& text) cons
 }
 
 std::vector<int> SimpleTokenizer::Encode(const std::string& text) {
+  auto words = Tokenize(text);
+  if (words.empty()) {
+    return {};
+  }
   std::vector<int> tokens;
   tokens.push_back(1);  // <bos>
-  for (const auto& word : Tokenize(text)) {
+  for (const auto& word : words) {
     tokens.push_back(AddToken(word));
   }
   return tokens;

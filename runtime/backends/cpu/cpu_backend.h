@@ -10,7 +10,7 @@ namespace inferflux {
 class CPUDeviceContext : public DeviceContext {
  public:
   CPUDeviceContext() = default;
-  ~CPUDeviceContext() override = default;
+  ~CPUDeviceContext() override;
 
   std::string Name() const override { return "cpu"; }
   bool IsAvailable() const override { return true; }

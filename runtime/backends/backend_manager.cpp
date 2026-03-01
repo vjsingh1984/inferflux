@@ -6,14 +6,21 @@ namespace inferflux {
 
 std::shared_ptr<LlamaCPUBackend> BackendManager::LoadBackend(const std::string& name,
                                                              const std::string& path,
-                                                             int gpu_layers) {
-  auto existing = GetBackend(name);
-  if (existing && existing->IsReady()) {
-    return existing;
+                                                             const LlamaBackendConfig& config,
+                                                             bool prefer_cuda) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = backends_.find(name);
+  if (it != backends_.end() && it->second && it->second->IsReady()) {
+    return it->second;
+  }
+  if (prefer_cuda) {
+#ifdef INFERFLUX_HAS_CUDA
+    std::cout << "[backend] CUDA support detected; GPU backend integration pending.\n";
+#else
+    std::cerr << "[backend] CUDA requested but binary was built without CUDA support.\n";
+#endif
   }
   auto backend = std::make_shared<LlamaCPUBackend>();
-  inferflux::LlamaBackendConfig config;
-  config.gpu_layers = gpu_layers;
   if (!backend->LoadModel(path, config)) {
     std::cerr << "BackendManager: failed to load model " << path << " for " << name << std::endl;
     return nullptr;
@@ -23,6 +30,7 @@ std::shared_ptr<LlamaCPUBackend> BackendManager::LoadBackend(const std::string& 
 }
 
 std::shared_ptr<LlamaCPUBackend> BackendManager::GetBackend(const std::string& name) const {
+  std::lock_guard<std::mutex> lock(mutex_);
   auto it = backends_.find(name);
   if (it == backends_.end()) {
     return nullptr;
