@@ -1,6 +1,6 @@
 #pragma once
 
-#include "policy/policy_store.h"
+#include "policy/policy_backend.h"
 #include "runtime/speculative/speculative_decoder.h"
 #include "scheduler/scheduler.h"
 #include "server/auth/api_key_auth.h"
@@ -11,15 +11,28 @@
 #include "server/policy/guardrail.h"
 
 #include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <vector>
+
+#include <openssl/ssl.h>
 
 namespace inferflux {
 
 class HttpServer {
  public:
+  struct TlsConfig {
+    bool enabled{false};
+    std::string cert_path;
+    std::string key_path;
+  };
+
   HttpServer(std::string host,
              int port,
              Scheduler* scheduler,
@@ -29,16 +42,24 @@ class HttpServer {
              RateLimiter* rate_limiter,
              Guardrail* guardrail,
              AuditLogger* audit_logger,
-             PolicyStore* policy_store,
-             std::shared_ptr<SpeculativeDecoder> speculative_decoder);
+             PolicyBackend* policy_store,
+             std::shared_ptr<SpeculativeDecoder> speculative_decoder,
+             TlsConfig tls_config,
+             int num_workers = 4);
   ~HttpServer();
 
   void Start();
   void Stop();
+  void SetModelReady(bool ready) { model_ready_.store(ready); }
 
  private:
+  struct ClientSession {
+    int fd{-1};
+    SSL* ssl{nullptr};
+  };
+
   void Run();
-  void HandleClient(int client_fd);
+  void HandleClient(ClientSession& session);
 
   struct AuthContext {
     std::string subject{"anonymous"};
@@ -48,8 +69,12 @@ class HttpServer {
   bool ResolveSubject(const std::string& header_blob, AuthContext* ctx) const;
   bool RequireScope(const AuthContext& ctx,
                     const std::string& scope,
-                    int client_fd,
+                    ClientSession& session,
                     const std::string& error_message);
+
+  bool SendAll(ClientSession& session, const std::string& payload);
+  ssize_t Receive(ClientSession& session, char* buffer, std::size_t length);
+  void CloseSession(ClientSession& session);
 
   std::string host_;
   int port_;
@@ -60,10 +85,21 @@ class HttpServer {
   RateLimiter* rate_limiter_;
   Guardrail* guardrail_;
   AuditLogger* audit_logger_;
-  PolicyStore* policy_store_;
+  PolicyBackend* policy_store_;
   std::shared_ptr<SpeculativeDecoder> speculative_decoder_;
+  bool tls_enabled_{false};
+  SSL_CTX* ssl_ctx_{nullptr};
   std::atomic<bool> running_{false};
-  std::thread worker_;
+  std::atomic<bool> model_ready_{false};
+  std::atomic<int> server_fd_{-1};
+  int num_workers_;
+  std::thread accept_thread_;
+  std::vector<std::thread> workers_;
+  std::queue<ClientSession> client_queue_;
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
+
+  void WorkerLoop();
 };
 
 }  // namespace inferflux

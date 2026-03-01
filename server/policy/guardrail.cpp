@@ -36,42 +36,42 @@ std::vector<std::string> Guardrail::Blocklist() const {
 
 bool Guardrail::Check(const std::string& text, std::string* reason) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (blocklist_.empty()) {
-    return true;
-  }
-  std::string lower = text;
-  std::transform(lower.begin(), lower.end(), lower.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  for (const auto& word : blocklist_) {
-    if (word.empty()) {
-      continue;
-    }
-    if (lower.find(word) != std::string::npos) {
-      if (reason) {
-        *reason = "Blocked content keyword: " + word;
+  std::string local_reason;
+  bool allowed = true;
+  if (!blocklist_.empty()) {
+    std::string lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const auto& word : blocklist_) {
+      if (word.empty()) {
+        continue;
       }
-      return false;
+      if (lower.find(word) != std::string::npos) {
+        local_reason = "Blocked content keyword: " + word;
+        allowed = false;
+        break;
+      }
     }
   }
-  if (!opa_endpoint_.empty()) {
+  if (allowed && !opa_endpoint_.empty()) {
     OPAResult opa_result;
-    auto allow = opa_client_.Evaluate(text, &opa_result);
+    auto evaluated = opa_client_.Evaluate(text, &opa_result);
     if (!opa_result.allow) {
-      if (reason) {
-        *reason = opa_result.reason.empty() ? "OPA denied prompt" : opa_result.reason;
-      }
-      return false;
-    }
-    if (!allow && reason && reason->empty()) {
-      *reason = "OPA fallback (allowed)";
+      local_reason = opa_result.reason.empty() ? "OPA denied prompt" : opa_result.reason;
+      allowed = false;
+    } else if (!evaluated && local_reason.empty()) {
+      local_reason = opa_result.reason;
     }
   }
-  return true;
+  if (!allowed && reason) {
+    *reason = local_reason;
+  }
+  return allowed;
 }
 
 bool Guardrail::Enabled() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return !blocklist_.empty();
+  return !blocklist_.empty() || !opa_endpoint_.empty();
 }
 
 void Guardrail::SetOPAEndpoint(const std::string& endpoint) {
