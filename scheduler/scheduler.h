@@ -132,8 +132,12 @@ private:
   // Only accessed from the WorkerLoop thread — no mutex required.
   struct KVPrefixEntry {
     int seq_id{-1};
-    int n_tokens{0};         // number of prefix tokens in the KV slot
-    std::vector<int> tokens; // full prompt token vector (used for matching)
+    // BPE position count stored in the KV slot: equals PrefillResult::n_past
+    // from the donor request.  Used for CopySequencePrefix and PrefillPartial
+    // because those APIs operate on llama.cpp KV positions, not on
+    // SimpleTokenizer word counts.
+    int n_kv_tokens{0};
+    std::vector<int> tokens; // SimpleTokenizer tokens for prefix matching
     uint64_t last_used{0};   // LRU clock value
     // The backend that owns the KV slot.  Reuse is only valid when the
     // incoming request resolves to the same backend instance; eviction must
@@ -149,13 +153,17 @@ private:
   KVPrefixEntry *LookupKVPrefix(const std::vector<int> &tokens,
                                 LlamaCPUBackend *backend);
   // Donate seq_id to the warm prefix store for `backend`.
-  // Handles LRU eviction internally: the displaced entry's FreeSequence() is
-  // called on its own backend (not the caller's), preventing cross-model
-  // memory corruption.
-  // Returns true if the slot was accepted (caller must NOT free seq_id).
-  // Returns false if declined (too short / duplicate); caller frees normally.
+  // n_kv_tokens is PrefillResult::n_past — the llama.cpp BPE position count
+  // stored in the slot.  It must be passed separately because prompt_tokens
+  // uses SimpleTokenizer counts (different vocabulary, different lengths).
+  // Handles LRU eviction internally; returns true when accepted.
   bool DonateKVPrefix(int seq_id, const std::vector<int> &tokens,
+                      int n_kv_tokens,
                       std::shared_ptr<LlamaCPUBackend> backend);
+  // Scan kv_prefix_store_ for entries whose backend weak_ptr has expired
+  // (model was unloaded) and free their seq_slots.  Call at the start of each
+  // ProcessBatch prefill sweep so phantom entries cannot starve AllocSeqSlot().
+  void PurgeExpiredKVPrefixEntries();
 
   std::vector<KVPrefixEntry> kv_prefix_store_;
   uint64_t kv_prefix_clock_{0};

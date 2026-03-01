@@ -461,6 +461,9 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   staged_decode.reserve(selection.pending.size());
   std::vector<std::shared_ptr<PendingRequest>> decode_ready;
   decode_ready.reserve(selection.pending.size());
+  // Purge any KV prefix entries whose backend has been unloaded so their
+  // seq_slots are returned to the free-list before we try to allocate new ones.
+  PurgeExpiredKVPrefixEntries();
   for (auto &pending : selection.pending) {
     if (pending->inference.phase == RequestPhase::kPrefill) {
       // Option A phased prefill: run prompt evaluation on the local backend now
@@ -481,18 +484,24 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           LlamaCPUBackend::PrefillResult pr;
           if (warm) {
             // Copy the warm prefix into the new slot, then evaluate the suffix.
+            // Use n_kv_tokens (BPE positions from original Prefill) — NOT
+            // tokens.size() (SimpleTokenizer count, different vocabulary).
             pending->resolved_backend->CopySequencePrefix(warm->seq_id, seq_id,
-                                                          warm->n_tokens);
+                                                          warm->n_kv_tokens);
             pr = pending->resolved_backend->PrefillPartial(inf.prompt, seq_id,
-                                                           warm->n_tokens);
+                                                           warm->n_kv_tokens);
             if (pr.ok) {
-              GlobalMetrics().RecordKVPrefixReuse(warm->n_tokens);
+              GlobalMetrics().RecordKVPrefixReuse(warm->n_kv_tokens);
             }
           } else {
             pr = pending->resolved_backend->Prefill(inf.prompt, seq_id);
           }
           if (pr.ok) {
             inf.n_past = pr.n_past;
+            // Capture the BPE prompt length now, before Decode() increments
+            // n_past.  DonateKVPrefix needs this to record the correct KV
+            // position range for CopySequencePrefix / PrefillPartial.
+            inf.prompt_bpe_tokens = pr.n_past;
             inf.sequence_id = seq_id;
             inf.first_token = pr.first_token;
             inf.first_piece = pr.first_piece;
@@ -712,13 +721,15 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         int n_prompt = static_cast<int>(inference->prompt_tokens.size());
         bool eviction_safe =
             ctx_size > 0 && (n_prompt + result.completion_tokens < ctx_size);
-        if (eviction_safe) {
+        if (eviction_safe && inference->prompt_bpe_tokens > 0) {
           // DonateKVPrefix owns any eviction: it calls FreeSequence on the
           // displaced entry's own backend so cross-model corruption is
-          // impossible.
-          donated =
-              DonateKVPrefix(inference->sequence_id, inference->prompt_tokens,
-                             pending->resolved_backend);
+          // impossible.  Pass prompt_bpe_tokens (llama.cpp BPE count from
+          // Prefill) so the entry records correct KV positions, not the
+          // SimpleTokenizer word count in prompt_tokens.
+          donated = DonateKVPrefix(
+              inference->sequence_id, inference->prompt_tokens,
+              inference->prompt_bpe_tokens, pending->resolved_backend);
         }
       }
       if (!donated) {
@@ -853,6 +864,22 @@ void Scheduler::FreeSeqSlot(int slot) {
   }
 }
 
+void Scheduler::PurgeExpiredKVPrefixEntries() {
+  // Walk the store and erase entries whose backend weak_ptr has expired.
+  // Without this, an unloaded model's donated seq_ids remain marked as busy
+  // in seq_slots_free_ until a new donation evicts them — which can starve
+  // AllocSeqSlot() when all kPrefixStoreCap slots are held by dead entries.
+  auto it = kv_prefix_store_.begin();
+  while (it != kv_prefix_store_.end()) {
+    if (it->backend.expired()) {
+      FreeSeqSlot(it->seq_id);
+      it = kv_prefix_store_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 Scheduler::KVPrefixEntry *
 Scheduler::LookupKVPrefix(const std::vector<int> &tokens,
                           LlamaCPUBackend *backend) {
@@ -880,6 +907,7 @@ Scheduler::LookupKVPrefix(const std::vector<int> &tokens,
 }
 
 bool Scheduler::DonateKVPrefix(int seq_id, const std::vector<int> &tokens,
+                               int n_kv_tokens,
                                std::shared_ptr<LlamaCPUBackend> backend) {
   if (static_cast<int>(tokens.size()) < kMinPrefixTokens)
     return false;
@@ -890,8 +918,8 @@ bool Scheduler::DonateKVPrefix(int seq_id, const std::vector<int> &tokens,
   }
   std::weak_ptr<LlamaCPUBackend> weak_backend(backend);
   if (static_cast<int>(kv_prefix_store_.size()) < kPrefixStoreCap) {
-    kv_prefix_store_.push_back({seq_id, static_cast<int>(tokens.size()), tokens,
-                                ++kv_prefix_clock_, weak_backend});
+    kv_prefix_store_.push_back(
+        {seq_id, n_kv_tokens, tokens, ++kv_prefix_clock_, weak_backend});
     return true;
   }
   // Evict the least-recently-used entry.  Lock its weak_ptr and call
@@ -907,8 +935,7 @@ bool Scheduler::DonateKVPrefix(int seq_id, const std::vector<int> &tokens,
     evicted_backend->FreeSequence(min_it->seq_id);
   }
   FreeSeqSlot(min_it->seq_id);
-  *min_it = {seq_id, static_cast<int>(tokens.size()), tokens,
-             ++kv_prefix_clock_, weak_backend};
+  *min_it = {seq_id, n_kv_tokens, tokens, ++kv_prefix_clock_, weak_backend};
   return true;
 }
 

@@ -52,6 +52,12 @@ struct InferenceRequest {
   // Generate().
   int n_past{-1}; // KV position after prefill; -1 = use legacy Generate() path.
   int sequence_id{-1}; // KV cache sequence slot; -1 = unassigned.
+  // BPE token count from Prefill() (= pr.n_past at prefill time).  Stored
+  // separately because n_past is updated by each Decode() step and by fairness
+  // slice rewrites, so by donation time it no longer reflects the prompt
+  // length. Used by DonateKVPrefix to record n_kv_tokens for
+  // CopySequencePrefix.
+  int prompt_bpe_tokens{-1};
   // First output token pre-sampled by Prefill() while the logit buffer is
   // fresh.  Carrying it here avoids the logit-buffer race when multiple
   // sequences are prefilled sequentially (each Prefill() overwrites the
