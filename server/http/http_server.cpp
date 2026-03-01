@@ -12,6 +12,7 @@
 
 #include <cerrno>
 #include <atomic>
+#include <cstddef>
 #include <cctype>
 #include <chrono>
 #include <cstring>
@@ -83,6 +84,12 @@ struct ToolCallResult {
   std::string arguments_json;  // JSON-encoded arguments object.
 };
 
+namespace {
+
+constexpr std::size_t kMaxResponseFormatBytes = 16 * 1024;  // 16 KB cap for schemas/grammars.
+
+}  // namespace
+
 struct CompletionRequestPayload {
   std::string prompt;
   std::string model{"unknown"};
@@ -99,6 +106,8 @@ struct CompletionRequestPayload {
   std::string response_format_schema;
   std::string response_format_grammar;
   std::string response_format_root{"root"};
+  bool response_format_ok{true};
+  std::string response_format_error;
 };
 
 CompletionRequestPayload ParseJsonPayload(const std::string& body) {
@@ -126,21 +135,48 @@ CompletionRequestPayload ParseJsonPayload(const std::string& body) {
       if (rf.contains("type") && rf["type"].is_string()) {
         payload.has_response_format = true;
         payload.response_format_type = rf["type"].get<std::string>();
-        if (payload.response_format_type == "json_object") {
+        auto type = payload.response_format_type;
+
+        if (type == "json_object" || type == "json_schema") {
           payload.json_mode = true;
+          if (rf.contains("schema")) {
+            payload.response_format_schema = rf["schema"].dump();
+          }
+          if (rf.contains("json_schema")) {
+            payload.response_format_schema = rf["json_schema"].dump();
+          }
+          if (payload.response_format_schema.size() > kMaxResponseFormatBytes) {
+            payload.response_format_ok = false;
+            payload.response_format_error = "response_format schema exceeds 16KB limit";
+          }
+          if (type == "json_schema" && payload.response_format_schema.empty()) {
+            payload.response_format_ok = false;
+            payload.response_format_error = "response_format json_schema requires a schema definition";
+          }
+        } else if (type == "grammar") {
+          if (rf.contains("grammar") && rf["grammar"].is_string()) {
+            payload.response_format_grammar = rf["grammar"].get<std::string>();
+            if (payload.response_format_grammar.size() > kMaxResponseFormatBytes) {
+              payload.response_format_ok = false;
+              payload.response_format_error = "response_format grammar exceeds 16KB limit";
+            }
+          } else {
+            payload.response_format_ok = false;
+            payload.response_format_error = "response_format grammar missing 'grammar' string";
+          }
+          if (rf.contains("root") && rf["root"].is_string()) {
+            payload.response_format_root = rf["root"].get<std::string>();
+          }
+        } else if (type == "text" || type.empty()) {
+          payload.has_response_format = false;  // treat as default behavior.
+        } else {
+          payload.response_format_ok = false;
+          payload.response_format_error =
+              "Unsupported response_format.type '" + type + "'";
         }
-        if (rf.contains("schema")) {
-          payload.response_format_schema = rf["schema"].dump();
-        }
-        if (rf.contains("json_schema")) {
-          payload.response_format_schema = rf["json_schema"].dump();
-        }
-        if (rf.contains("grammar") && rf["grammar"].is_string()) {
-          payload.response_format_grammar = rf["grammar"].get<std::string>();
-        }
-        if (rf.contains("root") && rf["root"].is_string()) {
-          payload.response_format_root = rf["root"].get<std::string>();
-        }
+      } else {
+        payload.response_format_ok = false;
+        payload.response_format_error = "response_format.type must be a string";
       }
     }
     if (j.contains("messages") && j["messages"].is_array()) {
@@ -1114,6 +1150,12 @@ void HttpServer::HandleClient(ClientSession& session) {
         }
       }
     };
+    if (!parsed.response_format_ok) {
+      auto payload = BuildResponse(BuildErrorBody(parsed.response_format_error), 400, "Bad Request");
+      SendAll(session, payload);
+      return;
+    }
+
     InferenceRequest req;
     if (!parsed.prompt.empty()) {
       req.prompt = parsed.prompt;
@@ -1125,6 +1167,13 @@ void HttpServer::HandleClient(ClientSession& session) {
     }
     req.model = parsed.model;
     req.json_mode = parsed.json_mode;
+    if (parsed.has_response_format) {
+      req.has_response_format = true;
+      req.response_format_type = parsed.response_format_type;
+      req.response_format_schema = parsed.response_format_schema;
+      req.response_format_grammar = parsed.response_format_grammar;
+      req.response_format_root = parsed.response_format_root;
+    }
     req.stream = parsed.stream;
 
     // W3C Trace Context (OBS-2): propagate trace-id from incoming traceparent header.
