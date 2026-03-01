@@ -57,21 +57,66 @@ BatchExecutor::BatchExecutor(
 std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
     const RequestBatch &batch,
     const std::vector<std::shared_ptr<LlamaCPUBackend>> &backend_overrides) {
-  std::vector<InferenceResult> results;
-  results.reserve(batch.requests.size());
+  std::size_t n = batch.requests.size();
+  std::vector<InferenceResult> results(n);
+  std::vector<bool> handled(n, false);
   double total_prefill_ms = 0.0;
   double total_decode_ms = 0.0;
-  for (std::size_t i = 0; i < batch.requests.size(); ++i) {
+
+  // Identify requests eligible for multi-sequence batch decode.
+  // Eligibility: phased decode (n_past >= 0, seq_id >= 0), same backend,
+  // no grammar constraints, no logprob collection, no response format.
+  // Grammar uses per-backend grammar_sampler_ — not safe to interleave.
+  std::vector<std::size_t> eligible_indices;
+  std::shared_ptr<LlamaCPUBackend> shared_be;
+  bool homogeneous_backend = true;
+  for (std::size_t i = 0; i < n; ++i) {
+    auto *req = batch.requests[i];
+    auto be = (i < backend_overrides.size()) ? backend_overrides[i] : nullptr;
+    if (!be) {
+      be = ResolveBackend(req->model, nullptr);
+    }
+    if (req->n_past >= 0 && req->sequence_id >= 0 &&
+        !req->response_constraint.has_grammar && !req->collect_logprobs &&
+        !req->has_response_format && be && be->IsReady()) {
+      if (!shared_be) {
+        shared_be = be;
+      } else if (be.get() != shared_be.get()) {
+        homogeneous_backend = false;
+      }
+      eligible_indices.push_back(i);
+    }
+  }
+
+  if (eligible_indices.size() >= 2 && homogeneous_backend && shared_be) {
+    std::vector<InferenceRequest *> eligible_reqs;
+    eligible_reqs.reserve(eligible_indices.size());
+    for (auto idx : eligible_indices) {
+      eligible_reqs.push_back(batch.requests[idx]);
+    }
+    auto outcomes = ExecuteBatchDecodePhased(eligible_reqs, shared_be);
+    for (std::size_t j = 0; j < eligible_indices.size(); ++j) {
+      results[eligible_indices[j]] = std::move(outcomes[j].result);
+      total_decode_ms += outcomes[j].decode_ms;
+      handled[eligible_indices[j]] = true;
+    }
+  }
+
+  // Process remaining requests individually (non-eligible or batch size < 2).
+  for (std::size_t i = 0; i < n; ++i) {
+    if (handled[i])
+      continue;
     auto *request = batch.requests[i];
     std::shared_ptr<LlamaCPUBackend> backend_override;
     if (i < backend_overrides.size()) {
       backend_override = backend_overrides[i];
     }
     auto outcome = ExecuteRequest(*request, backend_override);
-    results.push_back(std::move(outcome.result));
+    results[i] = std::move(outcome.result);
     total_prefill_ms += outcome.prefill_ms;
     total_decode_ms += outcome.decode_ms;
   }
+
   if (total_prefill_ms > 0) {
     GlobalMetrics().RecordPrefillDuration(total_prefill_ms);
   }
@@ -229,10 +274,12 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
           inference.collect_logprobs ? &response.logprobs : nullptr;
       if (inference.n_past >= 0 && inference.sequence_id >= 0) {
         // Phased path: prompt was already prefilled by the scheduler; run
-        // decode only.
+        // decode only.  Pass first_token so Decode() starts from the
+        // pre-sampled token rather than re-sampling from a potentially stale
+        // logit buffer.
         text = backend->Decode(inference.n_past, inference.sequence_id,
                                decode_limit, chunk_cb, should_stop,
-                               logprob_top_n, lp_out);
+                               logprob_top_n, lp_out, inference.first_token);
       } else if (inference.has_images && backend->SupportsVision()) {
         text = backend->GenerateWithImages(inference.prompt, inference.images,
                                            decode_limit, chunk_cb, should_stop);
@@ -357,18 +404,189 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   inference.first_token_time = std::chrono::steady_clock::now();
   inference.service_tokens += response.completion_tokens;
 
-  // Release the KV sequence slot when the request is fully complete (not a
-  // fairness yield). On a fairness yield the slot is kept alive so the next
-  // slice can call Decode() again.
-  if (!inference.fairness_yielded && inference.sequence_id >= 0) {
-    if (backend) {
-      backend->FreeSequence(inference.sequence_id);
-    }
-    inference.sequence_id = -1;
-    inference.n_past = -1;
-  }
+  // KV memory release and slot bookkeeping (FreeSequence + FreeSeqSlot) are
+  // intentionally handled by the scheduler (ProcessBatch / DecodeWorkerLoop)
+  // so they always happen together.  The executor only manages the compute
+  // path; leaving sequence_id set here allows the scheduler to act on it.
 
   return outcome;
+}
+
+std::vector<BatchExecutor::ExecutionOutcome>
+BatchExecutor::ExecuteBatchDecodePhased(
+    std::vector<InferenceRequest *> &eligible,
+    std::shared_ptr<LlamaCPUBackend> backend) {
+  std::size_t n = eligible.size();
+  std::vector<ExecutionOutcome> outcomes(n);
+
+  // Per-request runtime state for the decode loop.
+  struct ReqState {
+    bool active{true};
+    int tokens_generated{0};
+    int decode_limit{0};
+    int current_token{-1}; // token to feed in the next BatchDecodeStep
+    bool slice_active{false};
+  };
+  std::vector<ReqState> states(n);
+
+  auto decode_start = std::chrono::steady_clock::now();
+
+  for (std::size_t i = 0; i < n; ++i) {
+    auto *req = eligible[i];
+    auto &out = outcomes[i].result;
+    req->fairness_yielded = false;
+    out.model_id =
+        req->resolved_model.empty() ? req->model : req->resolved_model;
+    out.prompt_tokens = static_cast<int>(req->prompt_tokens.size());
+
+    // Compute per-request decode limit respecting fairness timeslice.
+    int limit = req->max_tokens;
+    if (req->remaining_decode_tokens >= 0) {
+      limit = std::min(limit, req->remaining_decode_tokens);
+    }
+    int slice = req->timeslice_tokens;
+    req->last_timeslice_tokens = slice;
+    req->timeslice_tokens = 0;
+    if (slice > 0) {
+      limit = std::min(limit, slice);
+    }
+    if (limit <= 0)
+      limit = 1;
+    states[i].decode_limit = limit;
+    states[i].slice_active = (slice > 0);
+
+    // Emit the first token (pre-sampled by Prefill while its logits were
+    // fresh).
+    if (req->first_token >= 0) {
+      states[i].current_token = req->first_token;
+      out.completion += req->first_piece;
+      states[i].tokens_generated = 1;
+      if (req->on_token) {
+        GlobalMetrics().RecordStreamTokens(1);
+        req->on_token(req->first_piece);
+      }
+      // Immediately check cancellation after the first token callback.
+      if (req->cancellation_flag && req->cancellation_flag->load()) {
+        states[i].active = false;
+      }
+    } else {
+      // EOS at prefill time — nothing to generate.
+      states[i].active = false;
+      out.completion = "[backend returned empty response]";
+    }
+  }
+
+  // Multi-sequence decode loop: one llama_decode() per token step.
+  while (true) {
+    std::vector<LlamaCPUBackend::BatchDecodeInput> batch_inputs;
+    std::vector<std::size_t> active_idx;
+
+    for (std::size_t i = 0; i < n; ++i) {
+      if (!states[i].active)
+        continue;
+      auto *req = eligible[i];
+      if (req->cancellation_flag && req->cancellation_flag->load()) {
+        states[i].active = false;
+        continue;
+      }
+      if (states[i].tokens_generated >= states[i].decode_limit) {
+        states[i].active = false;
+        continue;
+      }
+      batch_inputs.push_back(
+          {req->sequence_id, req->n_past, states[i].current_token});
+      active_idx.push_back(i);
+    }
+
+    if (active_idx.empty())
+      break;
+
+    auto step = backend->BatchDecodeStep(batch_inputs);
+    if (step.empty())
+      break; // llama_decode failed
+
+    for (std::size_t j = 0; j < active_idx.size(); ++j) {
+      std::size_t i = active_idx[j];
+      auto *req = eligible[i];
+      req->n_past =
+          batch_inputs[j].n_past; // updated in-place by BatchDecodeStep
+
+      const auto &sr = step[j];
+      if (sr.token < 0) {
+        states[i].active = false; // EOS
+        continue;
+      }
+      states[i].current_token = sr.token;
+      states[i].tokens_generated++;
+      outcomes[i].result.completion += sr.piece;
+      if (req->on_token) {
+        GlobalMetrics().RecordStreamTokens(1);
+        req->on_token(sr.piece);
+        // Recheck cancellation after the streaming callback (connection may
+        // have closed mid-chunk).
+        if (req->cancellation_flag && req->cancellation_flag->load()) {
+          states[i].active = false;
+        }
+      }
+    }
+  }
+
+  double decode_ms = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - decode_start)
+                         .count();
+
+  // Finalise per-request results.
+  for (std::size_t i = 0; i < n; ++i) {
+    auto *req = eligible[i];
+    auto &out = outcomes[i].result;
+    int gen = states[i].tokens_generated;
+    out.completion_tokens = gen;
+    outcomes[i].decode_ms = decode_ms / static_cast<double>(n);
+
+    // Fairness token accounting.
+    bool first_slice = (req->total_completion_tokens == 0);
+    int fairness_delta = gen;
+    if (first_slice) {
+      int prompt_comp = out.prompt_tokens;
+      if (prompt_comp <= 0 && req->reported_prompt_tokens >= 0) {
+        prompt_comp = req->reported_prompt_tokens;
+      }
+      fairness_delta += prompt_comp;
+    }
+    if (fairness_delta > 0) {
+      GlobalMetrics().RecordFairnessTokens(req->priority_level, fairness_delta);
+    }
+    req->service_tokens += gen;
+    req->total_completion_tokens += gen;
+
+    // Fairness yield decision.
+    bool exhausted = states[i].slice_active && gen >= states[i].decode_limit;
+    if (states[i].slice_active && exhausted &&
+        req->remaining_decode_tokens > 0) {
+      req->fairness_yielded = true;
+      GlobalMetrics().RecordFairnessYield(req->priority_level, gen,
+                                          req->remaining_decode_tokens);
+      req->phase = RequestPhase::kPending;
+    } else {
+      req->phase = RequestPhase::kFinished;
+    }
+
+    // Accumulate and track remaining decode budget.
+    if (!out.completion.empty() &&
+        out.completion != "[backend returned empty response]") {
+      req->accumulated_output.append(out.completion);
+      if (req->remaining_decode_tokens >= 0) {
+        req->remaining_decode_tokens =
+            std::max(0, req->remaining_decode_tokens - gen);
+      }
+    }
+
+    req->first_token_time = std::chrono::steady_clock::now();
+    // sequence_id left intact — scheduler handles FreeSequence + FreeSeqSlot.
+  }
+
+  GlobalMetrics().RecordDecodeDuration(decode_ms);
+  return outcomes;
 }
 
 std::shared_ptr<LlamaCPUBackend>

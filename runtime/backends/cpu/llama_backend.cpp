@@ -107,6 +107,10 @@ bool LlamaCPUBackend::LoadModel(const std::filesystem::path &model_path,
   llama_context_params ctx_params = llama_context_default_params();
   ctx_params.n_ctx = config.ctx_size;
   ctx_params.n_batch = config.batch_size;
+  // Pre-allocate logit output rows for all concurrent sequences so that
+  // BatchDecodeStep() can call llama_get_logits_ith(ctx, i) correctly.
+  ctx_params.n_seq_max =
+      static_cast<uint32_t>(std::max(config.max_parallel_sequences, 1));
 
   // Wire Flash Attention (§2.7): set llama.cpp context parameter directly.
   // LLAMA_FLASH_ATTN_TYPE_ENABLED lets llama.cpp choose FA on any supported
@@ -463,15 +467,27 @@ LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
     llama_batch_free(batch);
     return {};
   }
+  // Sample the first output token while the logit buffer is fresh.
+  // This must happen before any subsequent Prefill() call, which would
+  // overwrite the buffer and cause a logit-buffer race in multi-seq batches.
+  PrefillResult result;
+  result.n_past = static_cast<int>(prompt_tokens.size());
+  result.ok = true;
+  llama_token eos = llama_vocab_eos(vocab_);
+  int first_tok = SampleGreedy();
+  if (first_tok >= 0 && first_tok != eos) {
+    result.first_token = first_tok;
+    result.first_piece = TokenToString(first_tok);
+  }
   llama_batch_free(batch);
-  return {static_cast<int>(prompt_tokens.size()), /*ok=*/true};
+  return result;
 }
 
 std::string LlamaCPUBackend::Decode(
     int n_past, int sequence_id, int max_tokens,
     const std::function<bool(const std::string &)> &on_chunk,
     const std::function<bool()> &should_stop, int logprob_top_n,
-    std::vector<TokenLogprob> *out_logprobs) {
+    std::vector<TokenLogprob> *out_logprobs, int first_token) {
   if (!context_ || !vocab_ || n_past < 0) {
     return {};
   }
@@ -485,6 +501,39 @@ std::string LlamaCPUBackend::Decode(
 
   if (grammar_sampler_) {
     llama_sampler_reset(grammar_sampler_);
+  }
+
+  // If a first token was pre-sampled by Prefill() (to avoid the logit-buffer
+  // race in multi-sequence prefill), emit and feed it before the loop.
+  if (first_token >= 0 && first_token != eos && tokens_remaining > 0) {
+    std::string piece = TokenToString(first_token);
+    if (out_logprobs) {
+      out_logprobs->push_back(
+          CollectLogprob(first_token, piece, logprob_top_n));
+    }
+    output += piece;
+    tokens_remaining--;
+    if (on_chunk && !on_chunk(piece)) {
+      llama_batch_free(batch);
+      if (grammar_sampler_)
+        llama_sampler_reset(grammar_sampler_);
+      return output;
+    }
+    if (should_stop && should_stop()) {
+      llama_batch_free(batch);
+      if (grammar_sampler_)
+        llama_sampler_reset(grammar_sampler_);
+      return output;
+    }
+    BatchAddSeq(batch, first_token, position++,
+                static_cast<llama_seq_id>(sequence_id), true);
+    if (llama_decode(context_, batch) != 0) {
+      llama_batch_free(batch);
+      if (grammar_sampler_)
+        llama_sampler_reset(grammar_sampler_);
+      return output;
+    }
+    BatchClear(batch);
   }
 
   while (tokens_remaining-- > 0) {
@@ -540,6 +589,63 @@ std::string LlamaCPUBackend::Decode(
     llama_sampler_reset(grammar_sampler_);
   }
   return output;
+}
+
+std::vector<LlamaCPUBackend::BatchDecodeOutput>
+LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
+  if (!context_ || !vocab_ || inputs.empty()) {
+    return {};
+  }
+  int n = static_cast<int>(inputs.size());
+  llama_batch batch = llama_batch_init(n, 0, 1);
+
+  for (int i = 0; i < n; ++i) {
+    auto &inp = inputs[i];
+    // Per-sequence context-window eviction (mirrors the logic in Decode()).
+    llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx(context_));
+    if (inp.n_past >= static_cast<int>(n_ctx) - 1 && n_ctx > 1) {
+      llama_pos keep = n_ctx / 2;
+      llama_pos discard = static_cast<llama_pos>(inp.n_past) - keep + 1;
+      if (discard > 0) {
+        llama_memory_seq_rm(llama_get_memory(context_),
+                            static_cast<llama_seq_id>(inp.sequence_id), 0,
+                            discard);
+        llama_memory_seq_add(llama_get_memory(context_),
+                             static_cast<llama_seq_id>(inp.sequence_id),
+                             discard, static_cast<llama_pos>(-1), -discard);
+        inp.n_past -= static_cast<int>(discard);
+      }
+    }
+    BatchAddSeq(batch, inp.feed_token, static_cast<llama_pos>(inp.n_past),
+                static_cast<llama_seq_id>(inp.sequence_id), /*logits=*/true);
+  }
+
+  if (llama_decode(context_, batch) != 0) {
+    std::cerr << "[LlamaCPUBackend] BatchDecodeStep: llama_decode failed\n";
+    llama_batch_free(batch);
+    return {};
+  }
+  llama_batch_free(batch);
+
+  llama_token eos = llama_vocab_eos(vocab_);
+  std::vector<BatchDecodeOutput> results(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    inputs[i].n_past++; // advance position for the next step
+    const float *logits = llama_get_logits_ith(context_, i);
+    if (!logits) {
+      results[static_cast<std::size_t>(i)].token = -1;
+      continue;
+    }
+    auto max_it = std::max_element(logits, logits + n_vocab_);
+    int tok = static_cast<int>(std::distance(logits, max_it));
+    if (tok == eos) {
+      results[static_cast<std::size_t>(i)].token = -1;
+    } else {
+      results[static_cast<std::size_t>(i)].token = tok;
+      results[static_cast<std::size_t>(i)].piece = TokenToString(tok);
+    }
+  }
+  return results;
 }
 
 void LlamaCPUBackend::FreeSequence(int sequence_id) {

@@ -167,6 +167,44 @@ TEST_CASE(
 }
 
 // ---------------------------------------------------------------------------
+// §Item 4: Multi-sequence batch decode — struct defaults and guard paths
+// ---------------------------------------------------------------------------
+
+TEST_CASE("PrefillResult first_token defaults to -1", "[phased_batch]") {
+  LlamaCPUBackend::PrefillResult r;
+  REQUIRE(r.first_token == -1);
+  REQUIRE(r.first_piece.empty());
+}
+
+TEST_CASE("InferenceRequest first_token defaults to -1", "[phased_batch]") {
+  InferenceRequest req;
+  REQUIRE(req.first_token == -1);
+  REQUIRE(req.first_piece.empty());
+}
+
+TEST_CASE("BatchDecodeStep returns empty when context is null",
+          "[phased_batch]") {
+  LlamaCPUBackend backend; // context_ == nullptr
+  std::vector<LlamaCPUBackend::BatchDecodeInput> inputs = {{0, 4, 5}};
+  auto results = backend.BatchDecodeStep(inputs);
+  REQUIRE(results.empty());
+}
+
+TEST_CASE("BatchDecodeStep returns empty for empty input", "[phased_batch]") {
+  LlamaCPUBackend backend;
+  std::vector<LlamaCPUBackend::BatchDecodeInput> inputs;
+  REQUIRE(backend.BatchDecodeStep(inputs).empty());
+}
+
+TEST_CASE("InferenceRequest first_token is assignable", "[phased_batch]") {
+  InferenceRequest req;
+  req.first_token = 42;
+  req.first_piece = "hello";
+  REQUIRE(req.first_token == 42);
+  REQUIRE(req.first_piece == "hello");
+}
+
+// ---------------------------------------------------------------------------
 // Context window management
 // ---------------------------------------------------------------------------
 

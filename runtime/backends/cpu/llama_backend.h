@@ -26,6 +26,9 @@ struct LlamaBackendConfig {
   int flash_attention_tile = 128;
   std::string
       mmproj_path; // Path to multimodal projector; empty = vision disabled.
+  // Maximum number of KV-cache sequences that can be live simultaneously.
+  // Must be >= kMaxSequenceSlots (16) for multi-sequence batch decode.
+  int max_parallel_sequences{16};
 };
 
 class LlamaCPUBackend {
@@ -49,6 +52,27 @@ public:
         0}; // KV position after prompt evaluation (= prompt token count).
     bool ok{
         false}; // false on error: context not ready, or llama_decode failed.
+    // First output token sampled from prefill logits while they are fresh.
+    // -1 means EOS was the first token (empty generation) or an error occurred.
+    // Storing this here avoids a logit-buffer race when multiple sequences are
+    // prefilled sequentially: the second Prefill() overwrites the logit buffer,
+    // so seq0's first token must be captured before seq1 is prefilled.
+    int first_token{-1};
+    std::string first_piece; // text of first_token; empty when first_token==-1
+  };
+
+  // Input/output for one step of multi-sequence batch decode.
+  // BatchDecodeStep() feeds feed_token at n_past for each sequence, runs one
+  // llama_decode() call covering all sequences, then samples the next token for
+  // each sequence using llama_get_logits_ith().  n_past is updated in-place.
+  struct BatchDecodeInput {
+    int sequence_id;
+    int n_past; // current KV position; incremented in-place by BatchDecodeStep
+    int feed_token; // token to insert at n_past (from prior step / Prefill)
+  };
+  struct BatchDecodeOutput {
+    int token{-1};     // next sampled token; -1 = EOS or error
+    std::string piece; // text of token; empty when token == -1
   };
 
   // Phased prefill/decode API (§2.5 Option A — in-process disaggregated
@@ -63,11 +87,23 @@ public:
   // Autoregressive decode starting from n_past (returned by Prefill) for
   // sequence_id. Grammar constraints must be set via EnableGrammarConstraint
   // before calling.  logprob_top_n / out_logprobs work identically to Generate.
+  // first_token: when >= 0, this token (pre-sampled by Prefill while logits
+  // were fresh) is emitted and fed back before the auto-regressive loop starts,
+  // correcting the logit-buffer race that arises after multi-sequence prefill.
   std::string
   Decode(int n_past, int sequence_id, int max_tokens,
          const std::function<bool(const std::string &)> &on_chunk = {},
          const std::function<bool()> &should_stop = {}, int logprob_top_n = 0,
-         std::vector<TokenLogprob> *out_logprobs = nullptr);
+         std::vector<TokenLogprob> *out_logprobs = nullptr,
+         int first_token = -1);
+
+  // Execute one shared decode step for N sequences simultaneously.
+  // For each input, inserts feed_token at n_past, calls one llama_decode()
+  // covering all N sequences, then samples the next token per sequence using
+  // llama_get_logits_ith().  inputs[i].n_past is incremented in-place.
+  // Returns empty vector on context-not-loaded or llama_decode failure.
+  std::vector<BatchDecodeOutput>
+  BatchDecodeStep(std::vector<BatchDecodeInput> &inputs);
 
   // Release KV cache slots for the given sequence_id.
   void FreeSequence(int sequence_id);

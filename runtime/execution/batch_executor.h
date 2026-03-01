@@ -17,30 +17,42 @@
 namespace inferflux {
 
 class BatchExecutor {
- public:
-  BatchExecutor(SimpleTokenizer* tokenizer,
+public:
+  BatchExecutor(SimpleTokenizer *tokenizer,
                 std::shared_ptr<CPUDeviceContext> device,
                 std::shared_ptr<PagedKVCache> cache,
                 std::shared_ptr<ModelRouter> router,
                 std::shared_ptr<SpeculativeDecoder> speculative_decoder,
                 std::shared_ptr<RadixPrefixCache> prefix_cache);
 
-  std::vector<InferenceResult> ExecuteBatch(const RequestBatch& batch,
-                                            const std::vector<std::shared_ptr<LlamaCPUBackend>>& backend_overrides);
+  std::vector<InferenceResult> ExecuteBatch(
+      const RequestBatch &batch,
+      const std::vector<std::shared_ptr<LlamaCPUBackend>> &backend_overrides);
 
- private:
+private:
   struct ExecutionOutcome {
     InferenceResult result;
     double prefill_ms{0};
     double decode_ms{0};
   };
 
-  ExecutionOutcome ExecuteRequest(InferenceRequest& inference,
-                                  std::shared_ptr<LlamaCPUBackend> backend_override);
-  std::shared_ptr<LlamaCPUBackend> ResolveBackend(const std::string& requested_model,
-                                                  std::string* resolved_id);
+  ExecutionOutcome
+  ExecuteRequest(InferenceRequest &inference,
+                 std::shared_ptr<LlamaCPUBackend> backend_override);
 
-  SimpleTokenizer* tokenizer_;
+  // Multi-sequence batch decode for eligible phased-decode requests that share
+  // the same backend.  Runs one llama_decode() per token step covering all N
+  // sequences simultaneously instead of N sequential single-sequence decodes.
+  // Eligibility: n_past >= 0, sequence_id >= 0, no grammar, no logprobs.
+  // Returns one ExecutionOutcome per request in the same order as `eligible`.
+  std::vector<ExecutionOutcome>
+  ExecuteBatchDecodePhased(std::vector<InferenceRequest *> &eligible,
+                           std::shared_ptr<LlamaCPUBackend> backend);
+
+  std::shared_ptr<LlamaCPUBackend>
+  ResolveBackend(const std::string &requested_model, std::string *resolved_id);
+
+  SimpleTokenizer *tokenizer_;
   std::shared_ptr<CPUDeviceContext> device_;
   std::shared_ptr<PagedKVCache> cache_;
   std::shared_ptr<ModelRouter> router_;
@@ -48,4 +60,4 @@ class BatchExecutor {
   std::shared_ptr<RadixPrefixCache> prefix_cache_;
 };
 
-}  // namespace inferflux
+} // namespace inferflux

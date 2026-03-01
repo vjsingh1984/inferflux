@@ -51,8 +51,15 @@ struct InferenceRequest {
   // BatchExecutor::ExecuteRequest() calls Decode() when n_past >= 0 instead of
   // Generate().
   int n_past{-1}; // KV position after prefill; -1 = use legacy Generate() path.
-  int sequence_id{-1};    // KV cache sequence slot; -1 = unassigned.
-  bool has_images{false}; // §2.2: true when request contains image_url parts.
+  int sequence_id{-1}; // KV cache sequence slot; -1 = unassigned.
+  // First output token pre-sampled by Prefill() while the logit buffer is
+  // fresh.  Carrying it here avoids the logit-buffer race when multiple
+  // sequences are prefilled sequentially (each Prefill() overwrites the
+  // buffer). -1 = not set (EOS was first token, or fallback Generate() path is
+  // used).
+  int first_token{-1};
+  std::string first_piece; // text of first_token; empty when first_token == -1
+  bool has_images{false};  // §2.2: true when request contains image_url parts.
   bool stream{false};
   bool cancelled{false};
   RequestPhase phase{RequestPhase::kPending};
