@@ -1,5 +1,7 @@
 #pragma once
 
+#include "policy/policy_backend.h"
+
 #include <array>
 #include <mutex>
 #include <optional>
@@ -14,22 +16,24 @@ struct ApiKeyPolicy {
   std::vector<std::string> scopes;
 };
 
-class PolicyStore {
+class PolicyStore : public PolicyBackend {
  public:
   PolicyStore(std::string path, std::string passphrase = "");
 
-  bool Load();
-  bool Save() const;
+  bool Load() override;
+  bool Save() const override;
 
-  std::vector<ApiKeyPolicy> ApiKeys() const;
-  void SetApiKey(const std::string& key, const std::vector<std::string>& scopes);
-  bool RemoveApiKey(const std::string& key);
+  std::vector<PolicyKeyEntry> ApiKeys() const override;
+  void SetApiKey(const std::string& key, const std::vector<std::string>& scopes) override;
+  bool RemoveApiKey(const std::string& key) override;
 
-  std::vector<std::string> GuardrailBlocklist() const;
-  void SetGuardrailBlocklist(const std::vector<std::string>& blocklist);
+  std::vector<std::string> GuardrailBlocklist() const override;
+  void SetGuardrailBlocklist(const std::vector<std::string>& blocklist) override;
 
-  int RateLimitPerMinute() const;
-  void SetRateLimitPerMinute(int limit);
+  int RateLimitPerMinute() const override;
+  void SetRateLimitPerMinute(int limit) override;
+
+  std::string Name() const override { return "ini"; }
 
  private:
   std::string path_;

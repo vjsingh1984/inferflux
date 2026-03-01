@@ -1,7 +1,20 @@
 #include "server/auth/oidc_validator.h"
 
-#include <cctype>
+#include <nlohmann/json.hpp>
+
+#include <openssl/bn.h>
+#include <openssl/core_names.h>
+#include <openssl/evp.h>
+#include <openssl/param_build.h>
+#include <openssl/rsa.h>
+
+#include <chrono>
+#include <map>
+#include <memory>
 #include <stdexcept>
+#include <string>
+
+using json = nlohmann::json;
 
 namespace inferflux {
 
@@ -47,30 +60,192 @@ std::string OIDCValidator::Base64UrlDecode(const std::string& input) {
   return output;
 }
 
-std::string OIDCValidator::ExtractField(const std::string& payload, const std::string& field) {
-  std::string needle = "\"" + field + "\"";
-  auto key_pos = payload.find(needle);
-  if (key_pos == std::string::npos) return {};
-  auto colon = payload.find(':', key_pos + needle.size());
-  if (colon == std::string::npos) return {};
-  auto start = payload.find('"', colon);
-  if (start == std::string::npos) return {};
-  ++start;
-  std::string value;
-  bool escape = false;
-  for (std::size_t i = start; i < payload.size(); ++i) {
-    char c = payload[i];
-    if (!escape && c == '\\') {
-      escape = true;
-      continue;
-    }
-    if (!escape && c == '"') {
-      break;
-    }
-    value.push_back(c);
-    escape = false;
+bool OIDCValidator::VerifyRS256(const std::string& header_payload,
+                                const std::string& signature_b64url,
+                                const std::string& n_b64url,
+                                const std::string& e_b64url) {
+  std::string sig_bytes = Base64UrlDecode(signature_b64url);
+  std::string n_bytes = Base64UrlDecode(n_b64url);
+  std::string e_bytes = Base64UrlDecode(e_b64url);
+  if (sig_bytes.empty() || n_bytes.empty() || e_bytes.empty()) {
+    return false;
   }
-  return value;
+
+  std::unique_ptr<BIGNUM, decltype(&BN_free)> bn_n(
+      BN_bin2bn(reinterpret_cast<const unsigned char*>(n_bytes.data()),
+                static_cast<int>(n_bytes.size()), nullptr),
+      &BN_free);
+  std::unique_ptr<BIGNUM, decltype(&BN_free)> bn_e(
+      BN_bin2bn(reinterpret_cast<const unsigned char*>(e_bytes.data()),
+                static_cast<int>(e_bytes.size()), nullptr),
+      &BN_free);
+  if (!bn_n || !bn_e) {
+    return false;
+  }
+
+  RSA* rsa = nullptr;
+  EVP_PKEY* pkey = nullptr;
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+  rsa = RSA_new();
+  if (!rsa) {
+    return false;
+  }
+  if (RSA_set0_key(rsa, bn_n.release(), bn_e.release(), nullptr) != 1) {
+    RSA_free(rsa);
+    return false;
+  }
+  pkey = EVP_PKEY_new();
+  if (!pkey) {
+    RSA_free(rsa);
+    return false;
+  }
+  if (EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+    EVP_PKEY_free(pkey);
+    RSA_free(rsa);
+    return false;
+  }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+  bool ok = false;
+  EVP_MD_CTX* md_ctx = EVP_MD_CTX_new();
+  if (md_ctx) {
+    EVP_PKEY_CTX* pctx = nullptr;
+    if (EVP_DigestVerifyInit(md_ctx, &pctx, EVP_sha256(), nullptr, pkey) == 1) {
+#if defined(RSA_PKCS1_PADDING)
+      if (pctx) {
+        EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING);
+        EVP_PKEY_CTX_set_signature_md(pctx, EVP_sha256());
+      }
+#endif
+      if (EVP_DigestVerifyUpdate(md_ctx, header_payload.data(), header_payload.size()) == 1 &&
+          EVP_DigestVerifyFinal(md_ctx,
+                                reinterpret_cast<const unsigned char*>(sig_bytes.data()),
+                                sig_bytes.size()) == 1) {
+        ok = true;
+      }
+    }
+    EVP_MD_CTX_free(md_ctx);
+  }
+  EVP_PKEY_free(pkey);  // also frees rsa
+  return ok;
+}
+
+bool OIDCValidator::AudienceMatches(const json& payload) const {
+  if (!payload.contains("aud")) {
+    return false;
+  }
+  const auto& aud_field = payload["aud"];
+  if (aud_field.is_string()) {
+    return aud_field.get<std::string>() == audience_;
+  }
+  if (aud_field.is_array()) {
+    for (const auto& entry : aud_field) {
+      if (entry.is_string() && entry.get<std::string>() == audience_) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool OIDCValidator::FetchJwksFromNetwork(std::map<std::string, JwkKey>* out) const {
+  try {
+    HttpResponse resp = http_client_.Get(JwksUrl());
+    if (resp.status != 200) {
+      return false;
+    }
+    return LoadJwksJson(resp.body, out);
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+bool OIDCValidator::LoadJwksJson(const std::string& body, std::map<std::string, JwkKey>* out) const {
+  try {
+    json doc = json::parse(body);
+    if (!doc.contains("keys") || !doc["keys"].is_array()) {
+      return false;
+    }
+    std::map<std::string, JwkKey> parsed;
+    for (const auto& key : doc["keys"]) {
+      if (!key.contains("kty") || key["kty"] != "RSA") continue;
+      if (key.contains("use") && key["use"].is_string() && key["use"] != "sig") continue;
+      if (!key.contains("n") || !key.contains("e")) continue;
+      JwkKey jwk;
+      jwk.kid = key.value("kid", "");
+      jwk.n = key["n"].get<std::string>();
+      jwk.e = key["e"].get<std::string>();
+      parsed[jwk.kid] = jwk;
+    }
+    if (parsed.empty()) {
+      return false;
+    }
+    *out = std::move(parsed);
+    return true;
+  } catch (const json::exception&) {
+    return false;
+  }
+}
+
+bool OIDCValidator::EnsureJwks(const std::string& desired_kid) const {
+  std::unique_lock<std::mutex> lock(jwks_mutex_);
+  auto now = std::chrono::steady_clock::now();
+  if (jwks_loaded_ && now < jwks_expiry_ &&
+      (desired_kid.empty() || jwks_.find(desired_kid) != jwks_.end())) {
+    return true;
+  }
+  lock.unlock();
+
+  std::map<std::string, JwkKey> fresh;
+  if (!FetchJwksFromNetwork(&fresh)) {
+    return false;
+  }
+
+  lock.lock();
+  jwks_ = std::move(fresh);
+  jwks_loaded_ = true;
+  jwks_expiry_ = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+  return desired_kid.empty() || jwks_.find(desired_kid) != jwks_.end();
+}
+
+bool OIDCValidator::ResolveKey(const std::string& kid, JwkKey* key) const {
+  std::lock_guard<std::mutex> lock(jwks_mutex_);
+  if (!jwks_loaded_) {
+    return false;
+  }
+  if (!kid.empty()) {
+    auto it = jwks_.find(kid);
+    if (it == jwks_.end()) {
+      return false;
+    }
+    *key = it->second;
+    return true;
+  }
+  if (jwks_.size() != 1) {
+    return false;
+  }
+  *key = jwks_.begin()->second;
+  return true;
+}
+
+std::string OIDCValidator::JwksUrl() const {
+  if (issuer_.empty()) {
+    return "";
+  }
+  if (issuer_.back() == '/') {
+    return issuer_ + ".well-known/jwks.json";
+  }
+  return issuer_ + "/.well-known/jwks.json";
 }
 
 bool OIDCValidator::Validate(const std::string& token, std::string* subject_out) const {
@@ -82,20 +257,109 @@ bool OIDCValidator::Validate(const std::string& token, std::string* subject_out)
   if (first_dot == std::string::npos || second_dot == std::string::npos) {
     return false;
   }
-  std::string payload = Base64UrlDecode(token.substr(first_dot + 1, second_dot - first_dot - 1));
-  if (payload.empty()) {
+  std::string header_str = Base64UrlDecode(token.substr(0, first_dot));
+  std::string payload_str = Base64UrlDecode(token.substr(first_dot + 1, second_dot - first_dot - 1));
+  if (header_str.empty() || payload_str.empty()) {
     return false;
   }
-  auto iss = ExtractField(payload, "iss");
-  auto aud = ExtractField(payload, "aud");
-  auto sub = ExtractField(payload, "sub");
-  if (iss != issuer_ || aud != audience_) {
+
+  json header;
+  json payload;
+  try {
+    header = json::parse(header_str);
+    payload = json::parse(payload_str);
+  } catch (const json::exception&) {
     return false;
   }
+
+  if (header.value("alg", "") != "RS256") {
+    return false;
+  }
+
+  // Validate issuer and audience claims.
+  std::string iss = payload.value("iss", "");
+  if (iss != issuer_ || !AudienceMatches(payload)) {
+    return false;
+  }
+
+  // Validate temporal claims (exp, nbf).
+  auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                 std::chrono::system_clock::now().time_since_epoch())
+                 .count();
+  if (payload.contains("exp") && payload["exp"].is_number()) {
+    int64_t exp = payload["exp"].get<int64_t>();
+    if (now > exp) {
+      return false;
+    }
+  }
+  if (payload.contains("nbf") && payload["nbf"].is_number()) {
+    int64_t nbf = payload["nbf"].get<int64_t>();
+    if (now < nbf) {
+      return false;
+    }
+  }
+
+  std::string kid = header.value("kid", "");
+  if (!EnsureJwks(kid)) {
+    return false;
+  }
+  JwkKey jwk;
+  if (!ResolveKey(kid, &jwk)) {
+    return false;
+  }
+
+  std::string header_payload = token.substr(0, second_dot);
+  std::string signature_b64 = token.substr(second_dot + 1);
+  bool signature_ok = false;
+  if (signature_verifier_override_) {
+    signature_ok = signature_verifier_override_(header_payload, signature_b64, jwk);
+  } else {
+    signature_ok = VerifyRS256(header_payload, signature_b64, jwk.n, jwk.e);
+  }
+  if (!signature_ok) {
+    return false;
+  }
+
   if (subject_out) {
+    std::string sub = payload.value("sub", "");
     *subject_out = sub.empty() ? "oidc-user" : sub;
   }
   return true;
+}
+
+void OIDCValidator::LoadJwksForTesting(const std::string& jwks_json) const {
+  std::map<std::string, JwkKey> parsed;
+  if (!LoadJwksJson(jwks_json, &parsed)) {
+    throw std::runtime_error("invalid JWKS json for testing");
+  }
+  std::lock_guard<std::mutex> lock(jwks_mutex_);
+  jwks_ = std::move(parsed);
+  jwks_loaded_ = true;
+  jwks_expiry_ = std::chrono::steady_clock::now() + std::chrono::hours(1);
+}
+
+bool OIDCValidator::HasCachedKeyForTesting(const std::string& kid) const {
+  std::lock_guard<std::mutex> lock(jwks_mutex_);
+  return jwks_.find(kid) != jwks_.end();
+}
+
+bool OIDCValidator::EnsureJwksForTesting(const std::string& kid) const {
+  return EnsureJwks(kid);
+}
+
+bool OIDCValidator::VerifySignatureForTesting(const std::string& header_payload,
+                                              const std::string& signature_b64url,
+                                              const std::string& kid) const {
+  JwkKey jwk;
+  if (!ResolveKey(kid, &jwk)) {
+    return false;
+  }
+  return VerifyRS256(header_payload, signature_b64url, jwk.n, jwk.e);
+}
+
+void OIDCValidator::SetSignatureVerifierForTesting(
+    std::function<bool(const std::string&, const std::string&, const JwkKey&)> verifier) const {
+  signature_verifier_override_ = std::move(verifier);
 }
 
 }  // namespace inferflux

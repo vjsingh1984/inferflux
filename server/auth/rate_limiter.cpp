@@ -34,4 +34,14 @@ void RateLimiter::UpdateLimit(int tokens_per_minute) {
   entries_.clear();
 }
 
+bool RateLimiter::Enabled() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return tokens_per_minute_ > 0;
+}
+
+int RateLimiter::CurrentLimit() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return static_cast<int>(tokens_per_minute_);
+}
+
 }  // namespace inferflux

@@ -1,4 +1,5 @@
 #include "policy/policy_store.h"
+#include "server/auth/api_key_auth.h"
 
 #include <filesystem>
 #include <fstream>
@@ -180,9 +181,9 @@ bool PolicyStore::Save() const {
   return true;
 }
 
-std::vector<ApiKeyPolicy> PolicyStore::ApiKeys() const {
+std::vector<PolicyKeyEntry> PolicyStore::ApiKeys() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  std::vector<ApiKeyPolicy> keys;
+  std::vector<PolicyKeyEntry> keys;
   keys.reserve(api_keys_.size());
   for (const auto& [key, scopes] : api_keys_) {
     keys.push_back({key, scopes});
@@ -192,12 +193,13 @@ std::vector<ApiKeyPolicy> PolicyStore::ApiKeys() const {
 
 void PolicyStore::SetApiKey(const std::string& key, const std::vector<std::string>& scopes) {
   std::lock_guard<std::mutex> lock(mutex_);
-  api_keys_[key] = scopes;
+  // Hash the plaintext key before storing — never persist raw keys to disk.
+  api_keys_[ApiKeyAuth::HashKey(key)] = scopes;
 }
 
 bool PolicyStore::RemoveApiKey(const std::string& key) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return api_keys_.erase(key) > 0;
+  return api_keys_.erase(ApiKeyAuth::HashKey(key)) > 0;
 }
 
 std::vector<std::string> PolicyStore::GuardrailBlocklist() const {

@@ -12,9 +12,9 @@ class RateLimiter {
   explicit RateLimiter(int tokens_per_minute);
 
   bool Allow(const std::string& key);
-  bool Enabled() const { return tokens_per_minute_ > 0; }
+  bool Enabled() const;
   void UpdateLimit(int tokens_per_minute);
-  int CurrentLimit() const { return tokens_per_minute_; }
+  int CurrentLimit() const;
 
  private:
   struct Entry {
@@ -25,7 +25,7 @@ class RateLimiter {
   double tokens_per_minute_;
   double refill_per_second_;
   std::unordered_map<std::string, Entry> entries_;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
 };
 
 }  // namespace inferflux

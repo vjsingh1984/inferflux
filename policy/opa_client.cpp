@@ -1,12 +1,42 @@
 #include "policy/opa_client.h"
 
+#include <nlohmann/json.hpp>
+
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 
 #include "net/http_client.h"
 
+using json = nlohmann::json;
+
 namespace inferflux {
+
+namespace {
+void ParseOPAResponse(const std::string& body, OPAResult* result) {
+  try {
+    auto j = json::parse(body);
+    if (j.contains("allow") && j["allow"].is_boolean()) {
+      result->allow = j["allow"].get<bool>();
+    }
+    if (j.contains("reason") && j["reason"].is_string()) {
+      result->reason = j["reason"].get<std::string>();
+    }
+    // Also check nested result object (OPA v1 API returns {result: {allow: ...}}).
+    if (j.contains("result") && j["result"].is_object()) {
+      auto& r = j["result"];
+      if (r.contains("allow") && r["allow"].is_boolean()) {
+        result->allow = r["allow"].get<bool>();
+      }
+      if (r.contains("reason") && r["reason"].is_string()) {
+        result->reason = r["reason"].get<std::string>();
+      }
+    }
+  } catch (const json::exception&) {
+    // Leave result unchanged on parse failure.
+  }
+}
+}  // namespace
 
 OPAClient::OPAClient(std::string endpoint) : endpoint_(std::move(endpoint)) {}
 
@@ -31,24 +61,7 @@ bool OPAClient::Evaluate(const std::string& prompt, OPAResult* result) const {
       return true;
     }
     std::string body((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    auto allow_pos = body.find("\"allow\"");
-    if (allow_pos != std::string::npos) {
-      auto true_pos = body.find("true", allow_pos);
-      auto false_pos = body.find("false", allow_pos);
-      if (false_pos != std::string::npos &&
-          (true_pos == std::string::npos || false_pos < true_pos)) {
-        result->allow = false;
-      }
-    }
-    auto reason_pos = body.find("\"reason\"");
-    if (reason_pos != std::string::npos) {
-      auto colon = body.find(':', reason_pos);
-      auto quote = body.find('"', colon);
-      auto closing = body.find('"', quote + 1);
-      if (quote != std::string::npos && closing != std::string::npos) {
-        result->reason = body.substr(quote + 1, closing - quote - 1);
-      }
-    }
+    ParseOPAResponse(body, result);
     if (!result->allow && result->reason.empty()) {
       result->reason = "OPA policy denied prompt";
     }
@@ -56,28 +69,11 @@ bool OPAClient::Evaluate(const std::string& prompt, OPAResult* result) const {
   }
   if (endpoint_.rfind("http://", 0) == 0) {
     HttpClient client;
-    std::string payload = std::string("{\"input\":{\"prompt\":\"") + prompt + "\"}}";
+    json payload = {{"input", {{"prompt", prompt}}}};
     try {
-      auto http_resp = client.Post(endpoint_, payload, {{"Content-Type", "application/json"}});
+      auto http_resp = client.Post(endpoint_, payload.dump(), {{"Content-Type", "application/json"}});
       if (http_resp.status >= 200 && http_resp.status < 300) {
-        auto allow_pos = http_resp.body.find("\"allow\":");
-        if (allow_pos != std::string::npos) {
-          auto false_pos = http_resp.body.find("false", allow_pos);
-          auto true_pos = http_resp.body.find("true", allow_pos);
-          if (false_pos != std::string::npos &&
-              (true_pos == std::string::npos || false_pos < true_pos)) {
-            result->allow = false;
-          }
-        }
-        auto reason_pos = http_resp.body.find("\"reason\":");
-        if (reason_pos != std::string::npos) {
-          auto colon = http_resp.body.find(':', reason_pos);
-          auto quote = http_resp.body.find('"', colon + 1);
-          auto closing = http_resp.body.find('"', quote + 1);
-          if (colon != std::string::npos && quote != std::string::npos && closing != std::string::npos) {
-            result->reason = http_resp.body.substr(quote + 1, closing - quote - 1);
-          }
-        }
+        ParseOPAResponse(http_resp.body, result);
         return result->allow;
       }
       result->reason = "OPA HTTP error: " + std::to_string(http_resp.status);
