@@ -83,25 +83,41 @@ This plan unlocks PRD user stories that require per-tenant routing, enables Work
 6. **Streaming & cancellation (Done)** — HTTP SSE uses `InferenceRequest.on_token` callbacks and shared cancellation flags.
 7. **Fairness & preemption (Next)** — priority aging feeds a preemption queue; add starvation tests and SSE cancellation fuzzing before GPU overlap work.
 
-## Fairness & Preemption Plan
-### Current Gaps (Before)
-- Priority aging influences queue ordering but once a batch starts, there is no yield/preemption. Long prompts can still starve high-priority requests even on CPU/MPS hardware.
-- Cancellation currently hinges on SSE disconnects; there is no fairness controller to requeue/abort inflight requests with policy awareness.
+## Fairness & Preemption — **Implemented** (§2.9)
 
-### Target Design (After)
-- Introduce a `FairnessController` that scores pending requests by priority + wait time, enforces per-priority token budgets, and can signal `BatchExecutor` to yield after a timeslice.
-- `RequestBatch` carries fairness metadata (priority level, service tokens consumed, cancellation flag). Yielded requests are reinserted with updated timestamps so aging continues.
-- Metrics expose fairness data (`inferflux_preemptions_total`, per-priority token counters) so operators can see the impact of policy changes.
+### Design
+- `FairnessController` (`scheduler/fairness_controller.h/.cpp`) scores pending vs in-flight requests by priority + wait-time, enforces per-priority timeslice token budgets, and signals `BatchExecutor` to yield after a timeslice.
+- `InferenceRequest` carries fairness fields: `priority_level`, `timeslice_tokens`, `remaining_decode_tokens`, `accumulated_output`, and `fairness_yielded`. Yielded requests are requeued with refreshed timestamps so priority aging continues.
+- `Scheduler::ApplyFairness()` evaluates `FairnessDecision` after `BuildBatchLocked`; yielded requests are set `fairness_yielded=true` and reinserted into `pending_` without completing their futures.
+- `Scheduler::UpdateFairnessConfig()` accepts live `FairnessConfig` updates so operators can tune thresholds without a restart.
 
-### Execution Checklist
-1. **Fairness metadata** — extend `InferenceRequest` with `priority_level`, `service_tokens`, and `timeslice_tokens`. Add tracing/log hooks to show fairness decisions.
-2. **Controller hook** — implement a fairness controller invoked after `BuildBatchLocked` that can drop/deferral requests and trim batches to respect per-priority quotas.
-3. **Timeslice support** — teach `BatchExecutor` to stop after `timeslice_tokens` for any request marked as “yieldable”, re-queueing the request with remaining tokens.
-4. **Cancellation tests** — extend `tests/integration/sse_cancel_test.py` and add scheduler unit tests that simulate cancellation during preemption to ensure no deadlocks.
-5. **Metrics & observability** — add counters/histograms for preemptions, per-priority tokens, and fairness queue depth. Update `/metrics` documentation accordingly.
-6. **Config + docs** — document new knobs (`scheduler.fairness.timeslice_ms`, `priority_weights`) in PRD/Roadmap, and add troubleshooting guidance for operators tuning fairness.
+### Configuration Knobs (`scheduler.fairness.*`)
+| Knob | Env Var | Default | Effect |
+| --- | --- | --- | --- |
+| `enable_preemption` | `INFERFLUX_FAIRNESS_PREEMPT` | `false` | Allow preempting in-flight low-priority requests |
+| `high_priority_threshold` | `INFERFLUX_FAIRNESS_HIGH_PRI` | `5` | Priority level at or above which requests are high-priority |
+| `max_timeslice_tokens` | `INFERFLUX_FAIRNESS_TIMESLICE` | `0` (disabled) | Max decode tokens per scheduling slice for low-priority requests |
 
-This plan completes ARCH-5, unlocks PRD Continuous Batching and Roadmap Workstream A deliverables (prefill/decode overlap, GPU scheduling), and lays the groundwork for Q4 fairness/SLO scheduling.
+### Priority Queue Design
+- Requests enter `pending_` with `priority` (integer, higher = more important) and `enqueue_time`.
+- `BuildBatchLocked` sorts candidates by effective priority = `priority + age_boost`, where `age_boost` increments by 1 per 2 seconds of wait — preventing starvation.
+- Batch is capped at `kMaxBatchSize=4` requests and `kMaxBatchTokens=8192` tokens.
+- `FairnessController::ApplyTimeslice()` caps remaining decode length for low-priority requests when `max_timeslice_tokens > 0`.
+
+### Metrics
+- `inferflux_fairness_preemptions_total` — requests preempted (swapped out for higher-priority)
+- `inferflux_fairness_yields_total` — requests yielded at timeslice boundary
+- `inferflux_fairness_resumes_total` — yielded requests resumed after requeue
+- `inferflux_fairness_tokens_total{priority=”<level>”}` — tokens generated per priority level
+- `Span` events: `scheduler.fairness.yield` and `scheduler.fairness.resume` with trace IDs
+
+### Implementation Checklist
+1. [x] `InferenceRequest` extended with `priority_level`, `timeslice_tokens`, `remaining_decode_tokens`, `accumulated_output`, `fairness_yielded`.
+2. [x] `FairnessController` implemented with `ApplyTimeslice()` and `FairnessDecision` output.
+3. [x] `BatchExecutor` stops after `timeslice_tokens` and signals yield; `ProcessBatch` assembles `accumulated_output` across slices.
+4. [x] 3 `[fairness]` unit tests in `test_scheduler.cpp` covering timeslice cap, yield/resume flow, and priority ordering.
+5. [x] Fairness metrics (`RecordFairnessTokens`, `RecordFairnessPreemption`, `RecordFairnessYield`, `RecordFairnessResume`) wired in `MetricsRegistry`.
+6. [x] `Span` hooks on yield and resume events for trace correlation.
 
 ### Fairness Telemetry (OBS-1)
 - `/metrics` now exports `inferflux_fairness_preemptions_total`, `inferflux_fairness_yields_total`, and `inferflux_fairness_resumes_total` so operators can trace when the scheduler swaps or slices requests.

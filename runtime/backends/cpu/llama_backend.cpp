@@ -24,6 +24,20 @@ void BatchAdd(llama_batch& batch, llama_token id, llama_pos pos, bool logits) {
   batch.n_tokens++;
 }
 
+// Sequence-aware variant for phased prefill/decode (§2.5 Option A).
+void BatchAddSeq(llama_batch& batch, llama_token id, llama_pos pos,
+                 llama_seq_id seq_id, bool logits) {
+  if (!batch.seq_id[batch.n_tokens]) {
+    throw std::runtime_error("llama_batch capacity exceeded");
+  }
+  batch.token[batch.n_tokens] = id;
+  batch.pos[batch.n_tokens] = pos;
+  batch.n_seq_id[batch.n_tokens] = 1;
+  batch.seq_id[batch.n_tokens][0] = seq_id;
+  batch.logits[batch.n_tokens] = logits ? 1 : 0;
+  batch.n_tokens++;
+}
+
 }  // namespace
 
 namespace inferflux {
@@ -362,6 +376,90 @@ std::string LlamaCPUBackend::GenerateWithImages(
   (void)images;
   return Generate(prompt, max_tokens, on_chunk, should_stop);
 #endif
+}
+
+LlamaCPUBackend::PrefillResult LlamaCPUBackend::Prefill(const std::string& prompt,
+                                                        int sequence_id) {
+  if (!context_ || !vocab_) {
+    return {};
+  }
+  auto prompt_tokens = Tokenize(prompt, /*add_bos=*/true);
+  if (prompt_tokens.empty()) {
+    return {};
+  }
+  // Clear any previous KV state for this sequence slot before filling it.
+  llama_memory_seq_rm(llama_get_memory(context_), static_cast<llama_seq_id>(sequence_id), -1, -1);
+
+  int32_t batch_cap = std::max<int32_t>(
+      config_.batch_size, static_cast<int32_t>(prompt_tokens.size() + 1));
+  llama_batch batch = llama_batch_init(batch_cap, 0, 1);
+  for (std::size_t i = 0; i < prompt_tokens.size(); ++i) {
+    BatchAddSeq(batch, prompt_tokens[i], static_cast<llama_pos>(i),
+                static_cast<llama_seq_id>(sequence_id),
+                /*logits=*/i == prompt_tokens.size() - 1);
+  }
+  if (llama_decode(context_, batch) != 0) {
+    std::cerr << "[LlamaCPUBackend] Prefill: llama_decode failed for seq " << sequence_id
+              << std::endl;
+    llama_batch_free(batch);
+    return {};
+  }
+  llama_batch_free(batch);
+  return {static_cast<int>(prompt_tokens.size()), /*ok=*/true};
+}
+
+std::string LlamaCPUBackend::Decode(int n_past,
+                                    int sequence_id,
+                                    int max_tokens,
+                                    const std::function<bool(const std::string&)>& on_chunk,
+                                    const std::function<bool()>& should_stop) {
+  if (!context_ || !vocab_ || n_past < 0) {
+    return {};
+  }
+  int32_t batch_cap = std::max<int32_t>(config_.batch_size, max_tokens + 1);
+  llama_batch batch = llama_batch_init(batch_cap, 0, 1);
+  llama_pos position = static_cast<llama_pos>(n_past);
+
+  std::string output;
+  llama_token eos = llama_vocab_eos(vocab_);
+  int tokens_remaining = std::max(max_tokens, 1);
+
+  if (grammar_sampler_) {
+    llama_sampler_reset(grammar_sampler_);
+  }
+
+  while (tokens_remaining-- > 0) {
+    if (should_stop && should_stop()) break;
+    int token = 0;
+    if (grammar_sampler_) {
+      token = llama_sampler_sample(grammar_sampler_, context_, -1);
+    } else {
+      token = SampleGreedy();
+    }
+    if (token == eos) break;
+    std::string piece = TokenToString(token);
+    output += piece;
+    if (on_chunk && !on_chunk(piece)) break;
+    if (should_stop && should_stop()) break;
+    BatchAddSeq(batch, token, position++, static_cast<llama_seq_id>(sequence_id), true);
+    if (llama_decode(context_, batch) != 0) {
+      std::cerr << "[LlamaCPUBackend] Decode: llama_decode failed for seq " << sequence_id
+                << std::endl;
+      break;
+    }
+    BatchClear(batch);
+  }
+
+  llama_batch_free(batch);
+  if (grammar_sampler_) {
+    llama_sampler_reset(grammar_sampler_);
+  }
+  return output;
+}
+
+void LlamaCPUBackend::FreeSequence(int sequence_id) {
+  if (!context_) return;
+  llama_memory_seq_rm(llama_get_memory(context_), static_cast<llama_seq_id>(sequence_id), -1, -1);
 }
 
 void LlamaCPUBackend::EnableGrammarConstraint(const std::string& grammar,

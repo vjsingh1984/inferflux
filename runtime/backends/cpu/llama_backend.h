@@ -40,6 +40,31 @@ class LlamaCPUBackend {
   // True when a mmproj has been loaded and supports vision input.
   bool SupportsVision() const { return vision_ready_; }
 
+  // Result of a phased prefill pass (§2.5 Option A).
+  struct PrefillResult {
+    int n_past{0};   // KV position after prompt evaluation (= prompt token count).
+    bool ok{false};  // false on error: context not ready, or llama_decode failed.
+  };
+
+  // Phased prefill/decode API (§2.5 Option A — in-process disaggregated execution).
+  // Each concurrent request gets a unique sequence_id (use request_id % kMaxSequenceSlots).
+  // Prefill() clears the sequence slot first, so reuse of the same id is safe.
+
+  // Evaluate all prompt tokens for sequence_id and populate the KV cache.
+  // Returns {ok=false} when the context is not loaded or the prompt is empty.
+  PrefillResult Prefill(const std::string& prompt, int sequence_id);
+
+  // Autoregressive decode starting from n_past (returned by Prefill) for sequence_id.
+  // Grammar constraints must be set via EnableGrammarConstraint before calling.
+  std::string Decode(int n_past,
+                     int sequence_id,
+                     int max_tokens,
+                     const std::function<bool(const std::string&)>& on_chunk = {},
+                     const std::function<bool()>& should_stop = {});
+
+  // Release KV cache slots for the given sequence_id.
+  void FreeSequence(int sequence_id);
+
   std::string Generate(const std::string& prompt,
                        int max_tokens,
                        const std::function<bool(const std::string&)>& on_chunk = {},

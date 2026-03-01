@@ -41,6 +41,11 @@ struct InferenceRequest {
   int last_timeslice_tokens{0};     // Last applied fairness slice limit (observability).
   bool fairness_yielded{false};     // True when the last slice yielded for fairness.
   bool json_mode{false};
+  // Phased prefill/decode state (§2.5 Option A).
+  // Set by Scheduler::ProcessBatch after calling LlamaCPUBackend::Prefill().
+  // BatchExecutor::ExecuteRequest() calls Decode() when n_past >= 0 instead of Generate().
+  int n_past{-1};      // KV position after prefill; -1 = use legacy Generate() path.
+  int sequence_id{-1}; // KV cache sequence slot; -1 = unassigned.
   bool has_images{false};   // §2.2: true when request contains image_url parts.
   bool stream{false};
   bool cancelled{false};

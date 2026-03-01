@@ -197,6 +197,7 @@ add_executable(inferflux_tests
   tests/unit/test_radix_prefix_cache.cpp
   tests/unit/test_span.cpp
   tests/unit/test_kv_channel.cpp
+  tests/unit/test_phased_execution.cpp
   tests/unit/test_multimodal.cpp
   external/catch2/catch_amalgamated.cpp
 )

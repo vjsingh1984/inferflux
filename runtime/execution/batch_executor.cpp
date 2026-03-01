@@ -218,7 +218,11 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
         should_stop = [flag]() { return flag->load(); };
       }
       std::string text;
-      if (inference.has_images && backend->SupportsVision()) {
+      if (inference.n_past >= 0 && inference.sequence_id >= 0) {
+        // Phased path: prompt was already prefilled by the scheduler; run decode only.
+        text = backend->Decode(inference.n_past, inference.sequence_id,
+                               decode_limit, chunk_cb, should_stop);
+      } else if (inference.has_images && backend->SupportsVision()) {
         text = backend->GenerateWithImages(inference.prompt, inference.images,
                                            decode_limit, chunk_cb, should_stop);
       } else {
@@ -242,6 +246,10 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
     auto completion_tokens = tokenizer_->Encode(response.completion);
     response.completion_tokens = static_cast<int>(completion_tokens.size());
     inference.output_tokens = std::move(completion_tokens);
+  }
+  // Advance n_past so the next fairness slice continues from the right KV position.
+  if (inference.n_past >= 0 && response.completion_tokens > 0) {
+    inference.n_past += response.completion_tokens;
   }
   bool first_slice = (inference.total_completion_tokens == 0);
   int fairness_delta = response.completion_tokens;
@@ -326,6 +334,17 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
 
   inference.first_token_time = std::chrono::steady_clock::now();
   inference.service_tokens += response.completion_tokens;
+
+  // Release the KV sequence slot when the request is fully complete (not a fairness yield).
+  // On a fairness yield the slot is kept alive so the next slice can call Decode() again.
+  if (!inference.fairness_yielded && inference.sequence_id >= 0) {
+    if (backend) {
+      backend->FreeSequence(inference.sequence_id);
+    }
+    inference.sequence_id = -1;
+    inference.n_past = -1;
+  }
+
   return outcome;
 }
 

@@ -39,12 +39,12 @@ layer above it.
 - **Goals**: OpenAI-compatible API serving via llama.cpp, drop-in compatibility with existing SDKs, enterprise-grade auth/policy/audit, multi-backend runtime (CPU/CUDA/ROCm/MPS), observability (Prometheus metrics), and safe hot-reloads.
 - **Non-Goals**: Training, fine-tuning pipelines, bespoke frontend UX, or reimplementing inference kernels that llama.cpp already provides.
 
-### Current Status (May 2025)
+### Current Status (early 2026)
 - **Streaming & Cancellation**: `InferenceRequest.on_token` now drives SSE responses directly from the scheduler, with shared cancellation flags so dropped clients stop generation in-flight.
 - **Batch Observability**: Prefill/decode timing and streamed token counters are exposed via `/metrics`; `inferflux_stream_tokens_total` vs `inferflux_stream_cache_hits_total` highlight live SSE health.
 - **Tool Calling Stubs**: When no backend is loaded the server synthesizes JSON tool-call envelopes so agent frameworks still receive valid scaffolding (logged via `INFERFLUX_LOG_TOOL_CALLS`).
-- **Next Focus**: CPU/MPS fairness + preemption (priority queue aging, cancellation regression tests), llama.cpp tokenizer metrics, and GPU work once compatible hardware is available.
-- **Upcoming knobs (Q3)**: `scheduler.fairness.*` config path will control priority thresholds, timeslice tokens, and per-priority budgets so operators can tune fairness on CPU/MPS hardware before CUDA validation lands.
+- **Fairness Scheduling (Done)**: `FairnessController` enforces per-priority timeslices and preemption; `scheduler.fairness.*` config knobs (`enable_preemption`, `high_priority_threshold`, `max_timeslice_tokens`) are live and updatable at runtime via `Scheduler::UpdateFairnessConfig()`. Fairness counters (`inferflux_fairness_preemptions_total`, `inferflux_fairness_yields_total`, `inferflux_fairness_resumes_total`, per-priority token gauges) are exported via `/metrics`.
+- **Next Focus**: GPU work once compatible hardware is available; disaggregated prefill/decode (§2.5) is blocked on KV export/hydration API availability in llama.cpp.
 
 ### Strategic Modules In Flight
 - **Constrained Decoder**: Grammar/JSON-aware decoding path inserted between scheduler and runtime to deliver the 99.5% schema KPI.

@@ -9,6 +9,7 @@ InferFlux ships with a native policy store that persists API keys, scopes, rate 
 - **Rate Limiting**: `/v1/admin/rate_limit` tunes per-minute quotas without restarts.
 - **API Key Lifecycle**: `/v1/admin/api_keys` lists/adds/removes keys, keeping the store in sync with in-memory auth.
 - **AES-GCM Encryption**: Optional `INFERFLUX_POLICY_PASSPHRASE` transparently encrypts the policy store on disk.
+- **OPA-only Guardrail Configs**: `Guardrail::Enabled()` returns `true` when either the blocklist is non-empty **or** an OPA endpoint is configured — so deployments that rely solely on an OPA policy engine (no local blocklist) are correctly detected as having guardrails active. A guardrail is disabled only when both the blocklist and the OPA endpoint are absent.
 
 ## Roadmap
 1. **Persistent backends**: swap the INI file for pluggable stores (SQLite, Postgres, Vault) with watch streams.

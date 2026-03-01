@@ -43,15 +43,16 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 **Scorecard status notes (May 2025):**
 - Production throughput, continuous batching, and KV cache efficiency remain at **F** until GPU-aware execution, prefill/decode overlap, and FA3 kernels from §2.5/§2.7 land.
 - Prefix caching bumped to **B-**: `RadixPrefixCache` (compressed trie over token sequences) is live, wired into `BatchExecutor` and `Scheduler`, with LRU eviction, partial-match metrics (`prefix_matched_tokens_total`, `prefix_partial_hits_total`), and 12 unit tests. Actual KV page reuse requires llama.cpp multi-sequence integration (§2.4 follow-up).
-- Structured output bumped to **B-** now that HTTP parsing, schema-to-grammar conversion, and llama grammar sampling are wired through scheduler/runtime (§2.1); tool/function calling remains **F** until streaming/tool deltas are emitted from the model output path (§2.3).
+- Structured output bumped to **B-** now that HTTP parsing, schema-to-grammar conversion, and llama grammar sampling are wired through scheduler/runtime (§2.1).
+- Tool/function calling bumped to **C+**: `tools[]`/`tool_choice` are parsed, schema injected as system preamble, `tool_calls` array emitted with `finish_reason=tool_calls`. Streaming tool deltas and model-native chat templates (§2.3 follow-up) are the remaining gap to reach B.
 - Multimodal/vision bumped to **D**: `ImagePreprocessor` parses OpenAI `image_url` content arrays, decodes base64 data URIs, fetches HTTP URLs, and injects `<__media__>` markers (§2.2). `LlamaCPUBackend` supports `LoadMmproj()` / `GenerateWithImages()` via libmtmd when built with `-DENABLE_MTMD=ON`. Prometheus counters `inferflux_multimodal_images_total` and `inferflux_multimodal_requests_total` track usage. Actual vision inference requires a compatible mmproj GGUF and `ENABLE_MTMD=ON` at build time.
 - Quantization breadth and hardware breadth are **D** since only CPU/MPS paths run; CUDA/ROCm/Intel enablement in §2.7/§2.11 is unresolved.
 - Disaggregated prefill/decode and model parallelism are **F** because no distributed runtime exists yet (§2.5/§2.6).
 - OpenAI API compatibility holds at **C**—basic chat completion works; image_url content parts are now parsed (§2.2); tool/function calling gaps remain (§2.3).
 - Enterprise auth/RBAC at **B-** reflects working OIDC/API-key flows but lacks fine-grained RBAC UX improvements noted in Policy backlog.
 - Observability is **B** thanks to metrics/tracing/logging closures in OBS-1 through OBS-4.
-- Ease of local setup is **C** until `inferctl pull` and streamlined installers from §2.8 land.
-- Model management UX is **F** because no registry/pull flow exists beyond manual config (§2.8).
+- Ease of local setup is **C**; `inferctl pull` (§2.8) now downloads GGUF models from HuggingFace Hub — streamlined installers remain for a future pass.
+- Model management UX bumped from **F** to **D**; `inferctl pull` with progress reporting and quantization selection (Q4_K_M preferred) is live (§2.8); full registry UI and listing commands remain.
 - Test coverage/CI maturity stays **D**; only targeted unit suites exist, no CI matrix.
 
 InferFlux has strong *architectural vision* (enterprise auth, policy store, multi-backend) but
@@ -140,8 +141,7 @@ and agent workloads.
   completion node when `size > capacity`.
 - **Thread safety:** `std::shared_mutex` — shared lock for `Lookup`, exclusive for `Insert`/eviction.
 - **Tests:** 12 `[radix_cache]` unit tests in `tests/unit/test_radix_prefix_cache.cpp`.
-- **Still TODO:** Attach KV page IDs to trie nodes once llama.cpp multi-sequence support lands
-  (true zero-copy prefix reuse). Update `docs/NFR.md` §Performance with cache hit rate KPIs.
+- **Still TODO:** Attach KV page IDs to trie nodes once llama.cpp multi-sequence support lands (true zero-copy prefix reuse). `docs/NFR.md` §Performance KPI table updated.
 
 ### 2.5 Disaggregated Prefill/Decode
 
@@ -208,7 +208,7 @@ show SLO-aware scheduling prevents starvation under load. vLLM has priority-awar
 - **Tracing:** W3C `Span` hooks emitted on fairness yield and resume events.
 - **Live config:** `Scheduler::UpdateFairnessConfig()` accepts new `FairnessConfig` at runtime.
 - **Tests:** 3 `[fairness]`-tagged unit tests in `test_scheduler.cpp`.
-- **Still TODO:** `docs/PRD.md` §Functional Requirements priority parameter, `docs/Architecture.md` §Scheduler priority queue design.
+- **Docs complete:** `docs/PRD.md` Current Status updated; `docs/Architecture.md` §Fairness & Preemption fully documents the implemented design.
 
 ### 2.10 Streaming Telemetry & Tool Logging
 
@@ -387,7 +387,7 @@ identified above. Check items off as they are addressed.
 - [X] §Functional Requirements: Add tool calling (`tools`, `tool_choice` params) — §2.3
 - [X] §Functional Requirements: Add multimodal input (image content parts) — §2.2
 - [X] §Functional Requirements: Add `inferctl pull` workflow — §2.8
-- [ ] §Functional Requirements: Add request priority parameter — §2.9
+- [X] §Functional Requirements: Add request priority parameter — §2.9
 - [ ] §Goals: Mention MoE model support explicitly — §2.6
 - [X] §User Stories: Add agent workflow story (tool calling) — §2.3
 - [X] §User Stories: Add vision model story — §2.2
@@ -411,17 +411,17 @@ identified above. Check items off as they are addressed.
 - [ ] §Deployment View: Add disaggregated prefill/decode topology — §2.5
 - [X] §Runtime: Add prefix cache subsystem — §2.4
 - [ ] §Runtime: Document attention kernel strategy (FA3) — §2.7
-- [ ] §Scheduler: Add priority queue design — §2.9
+- [X] §Scheduler: Add priority queue design — §2.9
 
 ### `docs/NFR.md`
 
-- [ ] §Performance: Add latency target for constrained vs unconstrained decoding — §2.1
-- [ ] §Performance: Add prefix cache hit rate KPIs — §2.4
+- [X] §Performance: Add latency target for constrained vs unconstrained decoding — §2.1
+- [X] §Performance: Add prefix cache hit rate KPIs — §2.4
 - [ ] §Scalability: Add KV transfer latency targets for disaggregation — §2.5
-- [ ] §Security: Require TLS support — SEC-5
+- [X] §Security: Require TLS support — SEC-5
 - [X] §Security: Require JWT signature verification — SEC-1
-- [ ] §Operability: Add histogram and gauge metric requirements — OBS-1
-- [ ] §Testing: Require unit test coverage targets per module — TST-1
+- [X] §Operability: Add histogram and gauge metric requirements — OBS-1
+- [X] §Testing: Require unit test coverage targets per module — TST-1
 
 ### `docs/Roadmap.md`
 
@@ -436,7 +436,7 @@ identified above. Check items off as they are addressed.
 
 ### `docs/Policy.md`
 
-- [ ] §Capabilities: Document Guardrail::Enabled() fix for OPA-only configs — CQ-3
+- [X] §Capabilities: Document Guardrail::Enabled() fix for OPA-only configs — CQ-3
 - [X] §Capabilities: Note JSON injection fix in OPA client — SEC-3
 
 ---

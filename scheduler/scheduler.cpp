@@ -16,6 +16,9 @@ namespace {
 constexpr std::size_t kMaxBatchSize = 4;
 constexpr std::size_t kMaxBatchTokens = 8192;
 constexpr double kFairnessAgingDivisorMs = 2000.0;  // every 2s of wait adds +1 to effective priority
+// Number of distinct KV sequence slots available for phased prefill/decode.
+// Must exceed kMaxBatchSize; mod-based assignment keeps concurrent requests collision-free.
+constexpr int kMaxSequenceSlots = 16;
 
 std::vector<uint8_t> SerializeTokens(const std::vector<int>& tokens) {
   std::vector<uint8_t> payload(tokens.size() * sizeof(int));
@@ -226,13 +229,26 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   decode_ready.reserve(selection.pending.size());
   for (auto& pending : selection.pending) {
     if (pending->inference.phase == RequestPhase::kPrefill) {
+      // Option A phased prefill: run prompt evaluation on the local backend now so that
+      // the decode slice (ExecuteRequest) can call Decode() from n_past instead of Generate().
+      auto& inf = pending->inference;
+      if (pending->resolved_backend && pending->resolved_backend->IsReady()) {
+        int seq_id = static_cast<int>(inf.id % static_cast<uint64_t>(kMaxSequenceSlots));
+        auto pr = pending->resolved_backend->Prefill(inf.prompt, seq_id);
+        if (pr.ok) {
+          inf.n_past = pr.n_past;
+          inf.sequence_id = seq_id;
+        }
+      }
       bool enqueued = false;
       if (disagg_config_.kv_channel) {
         disaggregated::KVPacket packet;
-        packet.request_id = pending->inference.id;
-        packet.prompt_tokens = SerializeTokens(pending->inference.prompt_tokens);
-        packet.kv_blob = SerializeTokens(pending->inference.prompt_tokens);
-        packet.metadata = pending->inference.model;
+        packet.request_id = inf.id;
+        packet.prompt_tokens = SerializeTokens(inf.prompt_tokens);
+        packet.kv_blob = SerializeTokens(inf.prompt_tokens);
+        packet.n_past = inf.n_past;
+        packet.sequence_id = inf.sequence_id;
+        packet.metadata = inf.model;
         enqueued = disagg_config_.kv_channel->Enqueue(std::move(packet));
       } else {
         enqueued = true;
@@ -241,7 +257,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         staged_decode.push_back(pending);
         continue;
       } else {
-        pending->inference.phase = RequestPhase::kPending;
+        inf.phase = RequestPhase::kPending;
         std::lock_guard<std::mutex> lock(queue_mutex_);
         pending_prefill_.push_back(pending);
       }
