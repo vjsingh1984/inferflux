@@ -11,11 +11,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <cerrno>
 #include <atomic>
-#include <cstddef>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -36,22 +36,25 @@ namespace {
 // Returns the trimmed value of an HTTP header from the raw header block, or
 // empty string if the header is not present. Header name is case-sensitive
 // (use Title-Case, e.g. "traceparent").
-std::string GetHeaderValue(const std::string& headers, const std::string& name) {
+std::string GetHeaderValue(const std::string &headers,
+                           const std::string &name) {
   auto pos = headers.find(name + ":");
-  if (pos == std::string::npos) return {};
+  if (pos == std::string::npos)
+    return {};
   auto end = headers.find("\r\n", pos);
-  std::string val = headers.substr(pos + name.size() + 1, end - pos - name.size() - 1);
+  std::string val =
+      headers.substr(pos + name.size() + 1, end - pos - name.size() - 1);
   // Trim leading/trailing whitespace.
   auto s = val.find_first_not_of(" \t");
   auto e = val.find_last_not_of(" \t\r\n");
   return (s == std::string::npos) ? "" : val.substr(s, e - s + 1);
 }
 
-std::string BuildResponse(const std::string& body,
-                          int status = 200,
-                          const std::string& status_text = "OK",
-                          const std::string& extra_headers = "") {
-  std::string headers = "HTTP/1.1 " + std::to_string(status) + " " + status_text + "\r\n";
+std::string BuildResponse(const std::string &body, int status = 200,
+                          const std::string &status_text = "OK",
+                          const std::string &extra_headers = "") {
+  std::string headers =
+      "HTTP/1.1 " + std::to_string(status) + " " + status_text + "\r\n";
   headers += "Content-Type: application/json\r\n";
   headers += "Access-Control-Allow-Origin: *\r\n";
   if (!extra_headers.empty()) {
@@ -70,11 +73,11 @@ struct ChatMessage {
 struct ToolFunction {
   std::string name;
   std::string description;
-  json parameters;  // JSON Schema object (may be null/empty).
+  json parameters; // JSON Schema object (may be null/empty).
 };
 
 struct Tool {
-  std::string type{"function"};  // Only "function" is supported.
+  std::string type{"function"}; // Only "function" is supported.
   ToolFunction function;
 };
 
@@ -82,14 +85,15 @@ struct ToolCallResult {
   bool detected{false};
   std::string call_id;
   std::string function_name;
-  std::string arguments_json;  // JSON-encoded arguments object.
+  std::string arguments_json; // JSON-encoded arguments object.
 };
 
 namespace {
 
-constexpr std::size_t kMaxResponseFormatBytes = 16 * 1024;  // 16 KB cap for schemas/grammars.
+constexpr std::size_t kMaxResponseFormatBytes =
+    16 * 1024; // 16 KB cap for schemas/grammars.
 
-}  // namespace
+} // namespace
 
 struct CompletionRequestPayload {
   std::string prompt;
@@ -97,13 +101,14 @@ struct CompletionRequestPayload {
   int max_tokens{256};
   std::vector<ChatMessage> messages;
   bool stream{false};
-  bool json_mode{false};           // true when response_format.type == "json_object"
-  std::vector<Tool> tools;         // §2.3: function definitions available to the model
+  bool json_mode{false};   // true when response_format.type == "json_object"
+  std::vector<Tool> tools; // §2.3: function definitions available to the model
   std::string first_tool_name;
   bool has_tool_schema{false};
   std::string tool_choice{"auto"}; // "auto" | "none" | "required"
-  bool has_images{false};          // §2.2: true when any message contained image_url parts.
-  std::vector<DecodedImage> images;  // §2.2: decoded images in prompt order.
+  bool has_images{
+      false}; // §2.2: true when any message contained image_url parts.
+  std::vector<DecodedImage> images; // §2.2: decoded images in prompt order.
   bool has_response_format{false};
   std::string response_format_type;
   std::string response_format_schema;
@@ -113,7 +118,7 @@ struct CompletionRequestPayload {
   std::string response_format_error;
 };
 
-CompletionRequestPayload ParseJsonPayload(const std::string& body) {
+CompletionRequestPayload ParseJsonPayload(const std::string &body) {
   CompletionRequestPayload payload;
   if (body.empty()) {
     return payload;
@@ -134,7 +139,7 @@ CompletionRequestPayload ParseJsonPayload(const std::string& body) {
     }
     // OpenAI-compatible: response_format controls structured output.
     if (j.contains("response_format") && j["response_format"].is_object()) {
-      auto& rf = j["response_format"];
+      auto &rf = j["response_format"];
       if (rf.contains("type") && rf["type"].is_string()) {
         payload.has_response_format = true;
         payload.response_format_type = rf["type"].get<std::string>();
@@ -150,28 +155,33 @@ CompletionRequestPayload ParseJsonPayload(const std::string& body) {
           }
           if (payload.response_format_schema.size() > kMaxResponseFormatBytes) {
             payload.response_format_ok = false;
-            payload.response_format_error = "response_format schema exceeds 16KB limit";
+            payload.response_format_error =
+                "response_format schema exceeds 16KB limit";
           }
           if (type == "json_schema" && payload.response_format_schema.empty()) {
             payload.response_format_ok = false;
-            payload.response_format_error = "response_format json_schema requires a schema definition";
+            payload.response_format_error =
+                "response_format json_schema requires a schema definition";
           }
         } else if (type == "grammar") {
           if (rf.contains("grammar") && rf["grammar"].is_string()) {
             payload.response_format_grammar = rf["grammar"].get<std::string>();
-            if (payload.response_format_grammar.size() > kMaxResponseFormatBytes) {
+            if (payload.response_format_grammar.size() >
+                kMaxResponseFormatBytes) {
               payload.response_format_ok = false;
-              payload.response_format_error = "response_format grammar exceeds 16KB limit";
+              payload.response_format_error =
+                  "response_format grammar exceeds 16KB limit";
             }
           } else {
             payload.response_format_ok = false;
-            payload.response_format_error = "response_format grammar missing 'grammar' string";
+            payload.response_format_error =
+                "response_format grammar missing 'grammar' string";
           }
           if (rf.contains("root") && rf["root"].is_string()) {
             payload.response_format_root = rf["root"].get<std::string>();
           }
         } else if (type == "text" || type.empty()) {
-          payload.has_response_format = false;  // treat as default behavior.
+          payload.has_response_format = false; // treat as default behavior.
         } else {
           payload.response_format_ok = false;
           payload.response_format_error =
@@ -183,7 +193,7 @@ CompletionRequestPayload ParseJsonPayload(const std::string& body) {
       }
     }
     if (j.contains("messages") && j["messages"].is_array()) {
-      for (const auto& msg : j["messages"]) {
+      for (const auto &msg : j["messages"]) {
         ChatMessage m;
         if (msg.contains("role") && msg["role"].is_string()) {
           m.role = msg["role"].get<std::string>();
@@ -192,12 +202,14 @@ CompletionRequestPayload ParseJsonPayload(const std::string& body) {
           if (msg["content"].is_string()) {
             m.content = msg["content"].get<std::string>();
           } else if (msg["content"].is_array()) {
-            // §2.2: OpenAI multipart content — extract text and image_url parts.
-            auto mm = ImagePreprocessor::ProcessContentArray(msg["content"].dump());
+            // §2.2: OpenAI multipart content — extract text and image_url
+            // parts.
+            auto mm =
+                ImagePreprocessor::ProcessContentArray(msg["content"].dump());
             m.content = mm.text;
             if (!mm.images.empty()) {
               payload.has_images = true;
-              for (auto& img : mm.images) {
+              for (auto &img : mm.images) {
                 payload.images.push_back(std::move(img));
               }
             }
@@ -211,14 +223,15 @@ CompletionRequestPayload ParseJsonPayload(const std::string& body) {
     // §2.3: parse tool definitions.
     if (j.contains("tools") && j["tools"].is_array()) {
       payload.has_tool_schema = true;
-      for (const auto& t : j["tools"]) {
-        if (!t.is_object()) continue;
+      for (const auto &t : j["tools"]) {
+        if (!t.is_object())
+          continue;
         Tool tool;
         if (t.contains("type") && t["type"].is_string()) {
           tool.type = t["type"].get<std::string>();
         }
         if (t.contains("function") && t["function"].is_object()) {
-          const auto& f = t["function"];
+          const auto &f = t["function"];
           if (f.contains("name") && f["name"].is_string()) {
             tool.function.name = f["name"].get<std::string>();
           }
@@ -245,15 +258,15 @@ CompletionRequestPayload ParseJsonPayload(const std::string& body) {
         payload.tool_choice = "required";
       }
     }
-  } catch (const json::exception&) {
+  } catch (const json::exception &) {
     // Return defaults on parse failure.
   }
   return payload;
 }
 
-std::string FlattenMessages(const std::vector<ChatMessage>& messages) {
+std::string FlattenMessages(const std::vector<ChatMessage> &messages) {
   std::string prompt;
-  for (const auto& message : messages) {
+  for (const auto &message : messages) {
     if (!prompt.empty()) {
       prompt.append("\n");
     }
@@ -265,10 +278,11 @@ std::string FlattenMessages(const std::vector<ChatMessage>& messages) {
   return prompt;
 }
 
-// §2.3: builds a system-level preamble that teaches the model the tool-call protocol.
-std::string BuildToolSystemPrompt(const std::vector<Tool>& tools) {
+// §2.3: builds a system-level preamble that teaches the model the tool-call
+// protocol.
+std::string BuildToolSystemPrompt(const std::vector<Tool> &tools) {
   std::string s = "You have access to the following tools:\n\n";
-  for (const auto& t : tools) {
+  for (const auto &t : tools) {
     s += "- " + t.function.name;
     if (!t.function.description.empty()) {
       s += ": " + t.function.description;
@@ -278,20 +292,24 @@ std::string BuildToolSystemPrompt(const std::vector<Tool>& tools) {
       s += "  Parameters: " + t.function.parameters.dump() + "\n";
     }
   }
-  s += "\nWhen you want to call a tool, respond with ONLY this JSON (no other text):\n";
-  s += "{\"tool_call\":{\"name\":\"<function_name>\",\"arguments\":{<args>}}}\n";
+  s += "\nWhen you want to call a tool, respond with ONLY this JSON (no other "
+       "text):\n";
+  s +=
+      "{\"tool_call\":{\"name\":\"<function_name>\",\"arguments\":{<args>}}}\n";
   return s;
 }
 
 // §2.3: scans completion text for a tool_call JSON envelope.
-ToolCallResult DetectToolCall(const std::string& text) {
+ToolCallResult DetectToolCall(const std::string &text) {
   ToolCallResult result;
-  auto try_parse = [&](const std::string& s) -> bool {
+  auto try_parse = [&](const std::string &s) -> bool {
     try {
       auto j = json::parse(s);
-      if (!j.contains("tool_call") || !j["tool_call"].is_object()) return false;
-      const auto& tc = j["tool_call"];
-      if (!tc.contains("name") || !tc["name"].is_string()) return false;
+      if (!j.contains("tool_call") || !j["tool_call"].is_object())
+        return false;
+      const auto &tc = j["tool_call"];
+      if (!tc.contains("name") || !tc["name"].is_string())
+        return false;
       result.function_name = tc["name"].get<std::string>();
       result.call_id = "call_" + result.function_name + "_0";
       if (tc.contains("arguments")) {
@@ -308,25 +326,28 @@ ToolCallResult DetectToolCall(const std::string& text) {
     }
   };
   // Try exact parse first; then search for an embedded JSON object in the text.
-  if (try_parse(text)) return result;
+  if (try_parse(text))
+    return result;
   auto pos = text.find("{\"tool_call\"");
-  if (pos != std::string::npos && try_parse(text.substr(pos))) return result;
+  if (pos != std::string::npos && try_parse(text.substr(pos)))
+    return result;
   return result;
 }
 
-std::string BuildCompletionBody(const InferenceResult& result,
-                                const CompletionRequestPayload& request,
-                                bool chat_mode,
-                                const ToolCallResult& tool_call = ToolCallResult{}) {
+std::string
+BuildCompletionBody(const InferenceResult &result,
+                    const CompletionRequestPayload &request, bool chat_mode,
+                    const ToolCallResult &tool_call = ToolCallResult{}) {
   auto now = std::chrono::system_clock::now();
-  auto ts = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+  auto ts =
+      std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch())
+          .count();
   std::string id_prefix = chat_mode ? "chatcmpl-" : "cmpl-";
 
   json usage = {
-    {"prompt_tokens", result.prompt_tokens},
-    {"completion_tokens", result.completion_tokens},
-    {"total_tokens", result.prompt_tokens + result.completion_tokens}
-  };
+      {"prompt_tokens", result.prompt_tokens},
+      {"completion_tokens", result.completion_tokens},
+      {"total_tokens", result.prompt_tokens + result.completion_tokens}};
 
   json j;
   j["id"] = id_prefix + std::to_string(ts);
@@ -338,38 +359,38 @@ std::string BuildCompletionBody(const InferenceResult& result,
   if (chat_mode) {
     if (tool_call.detected) {
       // §2.3: emit tool_calls array with finish_reason="tool_calls".
-      json tc_arr = json::array({{
-        {"id", tool_call.call_id},
-        {"type", "function"},
-        {"function", {{"name", tool_call.function_name}, {"arguments", tool_call.arguments_json}}}
-      }});
-      j["choices"] = json::array({{
-        {"index", 0},
-        {"message", {{"role", "assistant"}, {"content", nullptr}, {"tool_calls", tc_arr}}},
-        {"finish_reason", "tool_calls"}
-      }});
+      json tc_arr =
+          json::array({{{"id", tool_call.call_id},
+                        {"type", "function"},
+                        {"function",
+                         {{"name", tool_call.function_name},
+                          {"arguments", tool_call.arguments_json}}}}});
+      j["choices"] = json::array({{{"index", 0},
+                                   {"message",
+                                    {{"role", "assistant"},
+                                     {"content", nullptr},
+                                     {"tool_calls", tc_arr}}},
+                                   {"finish_reason", "tool_calls"}}});
     } else {
-      j["choices"] = json::array({
-        {{"index", 0},
-         {"message", {{"role", "assistant"}, {"content", result.completion}}},
-         {"finish_reason", "stop"}}
-      });
+      j["choices"] = json::array(
+          {{{"index", 0},
+            {"message",
+             {{"role", "assistant"}, {"content", result.completion}}},
+            {"finish_reason", "stop"}}});
     }
   } else {
-    j["choices"] = json::array({
-      {{"index", 0},
-       {"text", result.completion},
-       {"finish_reason", "stop"}}
-    });
+    j["choices"] = json::array({{{"index", 0},
+                                 {"text", result.completion},
+                                 {"finish_reason", "stop"}}});
   }
   return j.dump();
 }
 
-std::string BuildErrorBody(const std::string& error) {
+std::string BuildErrorBody(const std::string &error) {
   return json({{"error", error}}).dump();
 }
 
-std::vector<std::string> SplitForStreaming(const std::string& text) {
+std::vector<std::string> SplitForStreaming(const std::string &text) {
   std::vector<std::string> chunks;
   std::string current;
   for (char c : text) {
@@ -388,10 +409,8 @@ std::vector<std::string> SplitForStreaming(const std::string& text) {
   return chunks;
 }
 
-std::string BuildStreamChunk(const std::string& id,
-                             const std::string& model,
-                             std::time_t ts,
-                             const std::string& content,
+std::string BuildStreamChunk(const std::string &id, const std::string &model,
+                             std::time_t ts, const std::string &content,
                              bool finish) {
   json j;
   j["id"] = id;
@@ -400,13 +419,12 @@ std::string BuildStreamChunk(const std::string& id,
   j["model"] = model;
 
   if (finish) {
-    j["choices"] = json::array({
-      {{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}
-    });
+    j["choices"] = json::array(
+        {{{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}});
   } else {
-    j["choices"] = json::array({
-      {{"index", 0}, {"delta", {{"content", content}}}, {"finish_reason", nullptr}}
-    });
+    j["choices"] = json::array({{{"index", 0},
+                                 {"delta", {{"content", content}}},
+                                 {"finish_reason", nullptr}}});
   }
   return "data: " + j.dump() + "\n\n";
 }
@@ -417,10 +435,9 @@ std::string BuildStreamChunk(const std::string& id,
 //   2. tool_calls[0] with id + type + function.name + empty arguments
 //   3. tool_calls[0] function.arguments (full JSON string)
 //   4. finish_reason=tool_calls, empty delta
-std::string BuildToolCallStreamChunks(const std::string& id,
-                                       const std::string& model,
-                                       std::time_t ts,
-                                       const ToolCallResult& tc) {
+std::string BuildToolCallStreamChunks(const std::string &id,
+                                      const std::string &model, std::time_t ts,
+                                      const ToolCallResult &tc) {
   std::string out;
   auto base = [&]() -> json {
     json j;
@@ -434,97 +451,76 @@ std::string BuildToolCallStreamChunks(const std::string& id,
   // Chunk 1: role=assistant, content=null
   {
     json j = base();
-    j["choices"] = json::array({{
-      {"index", 0},
-      {"delta", {{"role", "assistant"}, {"content", nullptr}}},
-      {"finish_reason", nullptr}
-    }});
+    j["choices"] =
+        json::array({{{"index", 0},
+                      {"delta", {{"role", "assistant"}, {"content", nullptr}}},
+                      {"finish_reason", nullptr}}});
     out += "data: " + j.dump() + "\n\n";
   }
 
   // Chunk 2: tool_calls[0] — id, type, function name, empty arguments
   {
     json j = base();
-    json tc_delta = json::array({{
-      {"index", 0},
-      {"id", tc.call_id},
-      {"type", "function"},
-      {"function", {{"name", tc.function_name}, {"arguments", ""}}}
-    }});
-    j["choices"] = json::array({{
-      {"index", 0},
-      {"delta", {{"tool_calls", tc_delta}}},
-      {"finish_reason", nullptr}
-    }});
+    json tc_delta = json::array(
+        {{{"index", 0},
+          {"id", tc.call_id},
+          {"type", "function"},
+          {"function", {{"name", tc.function_name}, {"arguments", ""}}}}});
+    j["choices"] = json::array({{{"index", 0},
+                                 {"delta", {{"tool_calls", tc_delta}}},
+                                 {"finish_reason", nullptr}}});
     out += "data: " + j.dump() + "\n\n";
   }
 
   // Chunk 3: function arguments
   if (!tc.arguments_json.empty()) {
     json j = base();
-    json arg_delta = json::array({{
-      {"index", 0},
-      {"function", {{"arguments", tc.arguments_json}}}
-    }});
-    j["choices"] = json::array({{
-      {"index", 0},
-      {"delta", {{"tool_calls", arg_delta}}},
-      {"finish_reason", nullptr}
-    }});
+    json arg_delta = json::array(
+        {{{"index", 0}, {"function", {{"arguments", tc.arguments_json}}}}});
+    j["choices"] = json::array({{{"index", 0},
+                                 {"delta", {{"tool_calls", arg_delta}}},
+                                 {"finish_reason", nullptr}}});
     out += "data: " + j.dump() + "\n\n";
   }
 
   // Chunk 4: finish_reason=tool_calls
   {
     json j = base();
-    j["choices"] = json::array({{
-      {"index", 0},
-      {"delta", json::object()},
-      {"finish_reason", "tool_calls"}
-    }});
+    j["choices"] = json::array({{{"index", 0},
+                                 {"delta", json::object()},
+                                 {"finish_reason", "tool_calls"}}});
     out += "data: " + j.dump() + "\n\n";
   }
 
   return out;
 }
 
-std::string BuildApiKeysPayload(const std::vector<PolicyKeyEntry>& keys) {
+std::string BuildApiKeysPayload(const std::vector<PolicyKeyEntry> &keys) {
   json arr = json::array();
-  for (const auto& k : keys) {
+  for (const auto &k : keys) {
     arr.push_back({{"key", k.key}, {"scopes", k.scopes}});
   }
   return json({{"api_keys", arr}}).dump();
 }
-}  // namespace
+} // namespace
 
-HttpServer::HttpServer(std::string host,
-                       int port,
-                       Scheduler* scheduler,
+HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
                        std::shared_ptr<ApiKeyAuth> auth,
-                       MetricsRegistry* metrics,
-                       OIDCValidator* oidc,
-                       RateLimiter* rate_limiter,
-                       Guardrail* guardrail,
-                       AuditLogger* audit_logger,
-                       PolicyBackend* policy_store,
+                       MetricsRegistry *metrics, OIDCValidator *oidc,
+                       RateLimiter *rate_limiter, Guardrail *guardrail,
+                       AuditLogger *audit_logger, PolicyBackend *policy_store,
                        std::shared_ptr<SpeculativeDecoder> speculative_decoder,
-                       TlsConfig tls_config,
-                       int num_workers)
-    : host_(std::move(host)),
-      port_(port),
-      scheduler_(scheduler),
-      auth_(std::move(auth)),
-      metrics_(metrics),
-      oidc_(oidc),
-      rate_limiter_(rate_limiter),
-      guardrail_(guardrail),
-      audit_logger_(audit_logger),
-      policy_store_(policy_store),
+                       TlsConfig tls_config, int num_workers)
+    : host_(std::move(host)), port_(port), scheduler_(scheduler),
+      auth_(std::move(auth)), metrics_(metrics), oidc_(oidc),
+      rate_limiter_(rate_limiter), guardrail_(guardrail),
+      audit_logger_(audit_logger), policy_store_(policy_store),
       speculative_decoder_(std::move(speculative_decoder)),
       num_workers_(num_workers > 0 ? num_workers : 4) {
   if (tls_config.enabled) {
     if (tls_config.cert_path.empty() || tls_config.key_path.empty()) {
-      std::cerr << "[http] TLS enabled without cert/key; falling back to HTTP" << std::endl;
+      std::cerr << "[http] TLS enabled without cert/key; falling back to HTTP"
+                << std::endl;
     } else {
       SSL_load_error_strings();
       OpenSSL_add_ssl_algorithms();
@@ -533,17 +529,23 @@ HttpServer::HttpServer(std::string host,
         std::cerr << "[http] Failed to initialize TLS context" << std::endl;
       } else {
         SSL_CTX_set_ecdh_auto(ssl_ctx_, 1);
-        if (SSL_CTX_use_certificate_file(ssl_ctx_, tls_config.cert_path.c_str(), SSL_FILETYPE_PEM) <= 0) {
-          std::cerr << "[http] Failed to load TLS certificate: " << tls_config.cert_path << std::endl;
+        if (SSL_CTX_use_certificate_file(ssl_ctx_, tls_config.cert_path.c_str(),
+                                         SSL_FILETYPE_PEM) <= 0) {
+          std::cerr << "[http] Failed to load TLS certificate: "
+                    << tls_config.cert_path << std::endl;
           SSL_CTX_free(ssl_ctx_);
           ssl_ctx_ = nullptr;
-        } else if (SSL_CTX_use_PrivateKey_file(ssl_ctx_, tls_config.key_path.c_str(), SSL_FILETYPE_PEM) <= 0) {
-          std::cerr << "[http] Failed to load TLS key: " << tls_config.key_path << std::endl;
+        } else if (SSL_CTX_use_PrivateKey_file(ssl_ctx_,
+                                               tls_config.key_path.c_str(),
+                                               SSL_FILETYPE_PEM) <= 0) {
+          std::cerr << "[http] Failed to load TLS key: " << tls_config.key_path
+                    << std::endl;
           SSL_CTX_free(ssl_ctx_);
           ssl_ctx_ = nullptr;
         } else {
           tls_enabled_ = true;
-          std::cout << "[http] TLS enabled using cert=" << tls_config.cert_path << std::endl;
+          std::cout << "[http] TLS enabled using cert=" << tls_config.cert_path
+                    << std::endl;
         }
       }
     }
@@ -586,7 +588,7 @@ void HttpServer::Stop() {
   if (accept_thread_.joinable()) {
     accept_thread_.join();
   }
-  for (auto& w : workers_) {
+  for (auto &w : workers_) {
     if (w.joinable()) {
       w.join();
     }
@@ -606,7 +608,8 @@ void HttpServer::WorkerLoop() {
     ClientSession session;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
-      queue_cv_.wait(lock, [this] { return !client_queue_.empty() || !running_; });
+      queue_cv_.wait(lock,
+                     [this] { return !client_queue_.empty() || !running_; });
       if (!running_ && client_queue_.empty()) {
         return;
       }
@@ -636,7 +639,7 @@ void HttpServer::Run() {
   addr.sin_port = htons(static_cast<uint16_t>(port_));
   addr.sin_addr.s_addr = inet_addr(host_.c_str());
 
-  if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+  if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
     std::perror("bind");
     ::close(fd);
     return;
@@ -653,9 +656,10 @@ void HttpServer::Run() {
   while (running_) {
     sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
-    int client_fd = ::accept(fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+    int client_fd =
+        ::accept(fd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
     if (client_fd < 0) {
-      break;  // Socket closed by Stop() or error — exit loop.
+      break; // Socket closed by Stop() or error — exit loop.
     }
     if (!running_) {
       ::close(client_fd);
@@ -664,7 +668,7 @@ void HttpServer::Run() {
     ClientSession session;
     session.fd = client_fd;
     if (tls_enabled_) {
-      SSL* ssl = SSL_new(ssl_ctx_);
+      SSL *ssl = SSL_new(ssl_ctx_);
       if (!ssl) {
         ::close(client_fd);
         continue;
@@ -691,10 +695,12 @@ void HttpServer::Run() {
   }
 }
 
-bool HttpServer::ResolveSubject(const std::string& headers, AuthContext* ctx) const {
+bool HttpServer::ResolveSubject(const std::string &headers,
+                                AuthContext *ctx) const {
   ctx->subject = "anonymous";
   ctx->scopes.clear();
-  bool require_auth = (auth_ && auth_->HasKeys()) || (oidc_ && oidc_->Enabled());
+  bool require_auth =
+      (auth_ && auth_->HasKeys()) || (oidc_ && oidc_->Enabled());
   if (!require_auth) {
     ctx->scopes.insert("read");
     ctx->scopes.insert("generate");
@@ -731,16 +737,16 @@ bool HttpServer::ResolveSubject(const std::string& headers, AuthContext* ctx) co
   return false;
 }
 
-bool HttpServer::RequireScope(const AuthContext& ctx,
-                              const std::string& scope,
-                              ClientSession& session,
-                              const std::string& error_message) {
+bool HttpServer::RequireScope(const AuthContext &ctx, const std::string &scope,
+                              ClientSession &session,
+                              const std::string &error_message) {
   if (ctx.scopes.find(scope) != ctx.scopes.end()) {
     return true;
   }
-  auto payload = BuildResponse(BuildErrorBody(error_message.empty() ? "insufficient_scope" : error_message),
-                               403,
-                               "Forbidden");
+  auto payload =
+      BuildResponse(BuildErrorBody(error_message.empty() ? "insufficient_scope"
+                                                         : error_message),
+                    403, "Forbidden");
   SendAll(session, payload);
   if (audit_logger_) {
     audit_logger_->Log(ctx.subject, "", "insufficient_scope", error_message);
@@ -748,11 +754,11 @@ bool HttpServer::RequireScope(const AuthContext& ctx,
   return false;
 }
 
-void HttpServer::HandleClient(ClientSession& session) {
+void HttpServer::HandleClient(ClientSession &session) {
   // RAII guard: decrement connections and record latency on all exit paths.
   auto req_start = std::chrono::steady_clock::now();
   struct ConnectionGuard {
-    MetricsRegistry* metrics;
+    MetricsRegistry *metrics;
     std::chrono::steady_clock::time_point start;
     ~ConnectionGuard() {
       if (metrics) {
@@ -767,9 +773,10 @@ void HttpServer::HandleClient(ClientSession& session) {
     metrics_->IncrementConnections();
   }
 
-  // Dynamically read the full HTTP request: headers + body based on Content-Length.
+  // Dynamically read the full HTTP request: headers + body based on
+  // Content-Length.
   constexpr std::size_t kInitialBuf = 4096;
-  constexpr std::size_t kMaxRequest = 16 * 1024 * 1024;  // 16 MB hard limit
+  constexpr std::size_t kMaxRequest = 16 * 1024 * 1024; // 16 MB hard limit
   std::string request;
   request.resize(kInitialBuf);
   std::size_t total = 0;
@@ -779,7 +786,8 @@ void HttpServer::HandleClient(ClientSession& session) {
   while (header_end_pos == std::string::npos) {
     if (total >= request.size()) {
       if (request.size() >= kMaxRequest) {
-        auto response = BuildResponse(BuildErrorBody("request_too_large"), 413, "Payload Too Large");
+        auto response = BuildResponse(BuildErrorBody("request_too_large"), 413,
+                                      "Payload Too Large");
         SendAll(session, response);
         return;
       }
@@ -790,7 +798,7 @@ void HttpServer::HandleClient(ClientSession& session) {
       return;
     }
     total += static_cast<std::size_t>(bytes);
-    request.resize(total);  // Shrink to actual for find()
+    request.resize(total); // Shrink to actual for find()
     header_end_pos = request.find("\r\n\r\n");
     if (header_end_pos == std::string::npos) {
       // Grow for next iteration.
@@ -807,21 +815,24 @@ void HttpServer::HandleClient(ClientSession& session) {
       cl_pos = request.find("content-length:");
     }
     if (cl_pos != std::string::npos && cl_pos < header_end_pos) {
-      auto val_start = cl_pos + 15;  // strlen("Content-Length:")
+      auto val_start = cl_pos + 15; // strlen("Content-Length:")
       while (val_start < header_end_pos && request[val_start] == ' ') {
         ++val_start;
       }
       auto val_end = request.find("\r\n", val_start);
       if (val_end != std::string::npos) {
         try {
-          content_length = std::stoull(request.substr(val_start, val_end - val_start));
-        } catch (...) {}
+          content_length =
+              std::stoull(request.substr(val_start, val_end - val_start));
+        } catch (...) {
+        }
       }
     }
   }
 
   if (content_length > kMaxRequest) {
-    auto response = BuildResponse(BuildErrorBody("request_too_large"), 413, "Payload Too Large");
+    auto response = BuildResponse(BuildErrorBody("request_too_large"), 413,
+                                  "Payload Too Large");
     SendAll(session, response);
     return;
   }
@@ -840,20 +851,25 @@ void HttpServer::HandleClient(ClientSession& session) {
   request.resize(total);
 
   auto header_end = header_end_pos;
-  std::string headers = header_end == std::string::npos ? request : request.substr(0, header_end);
-  std::string body = header_end == std::string::npos ? std::string() : request.substr(header_end + 4);
+  std::string headers =
+      header_end == std::string::npos ? request : request.substr(0, header_end);
+  std::string body = header_end == std::string::npos
+                         ? std::string()
+                         : request.substr(header_end + 4);
   auto first_line_end = headers.find("\r\n");
   std::string first_line = headers.substr(0, first_line_end);
   auto method_end = first_line.find(' ');
   auto path_end = first_line.find(' ', method_end + 1);
   std::string method = first_line.substr(0, method_end);
-  std::string path = first_line.substr(method_end + 1, path_end - method_end - 1);
+  std::string path =
+      first_line.substr(method_end + 1, path_end - method_end - 1);
 
   // Unauthenticated health/readiness probes.
   if (method == "GET" && path == "/healthz") {
     bool ready = model_ready_.load();
     json j = {{"status", ready ? "ok" : "degraded"}, {"model_ready", ready}};
-    SendAll(session, BuildResponse(j.dump(), ready ? 200 : 503, ready ? "OK" : "Service Unavailable"));
+    SendAll(session, BuildResponse(j.dump(), ready ? 200 : 503,
+                                   ready ? "OK" : "Service Unavailable"));
     return;
   }
   if (method == "GET" && path == "/livez") {
@@ -882,23 +898,29 @@ void HttpServer::HandleClient(ClientSession& session) {
       // crash immediately makes this false.
       bool pool_warm = scheduler_ &&
                        scheduler_->ConfiguredDecodeWorkers() > 0 &&
-                       scheduler_->LiveDecodeWorkers() == scheduler_->ConfiguredDecodeWorkers();
+                       scheduler_->LiveDecodeWorkers() ==
+                           scheduler_->ConfiguredDecodeWorkers();
       ready = model_loaded && pool_warm;
-      if (!ready) reason = !model_loaded ? "no model backend loaded" : "decode pool not ready";
+      if (!ready)
+        reason =
+            !model_loaded ? "no model backend loaded" : "decode pool not ready";
     } else {
-      // Unified or prefill node: ready when at least one model backend is loaded.
+      // Unified or prefill node: ready when at least one model backend is
+      // loaded.
       if (scheduler_ && scheduler_->Router()) {
         ready = !scheduler_->Router()->DefaultModelId().empty();
       } else {
         ready = model_ready_.load();
       }
-      if (!ready) reason = "no model backend loaded";
+      if (!ready)
+        reason = "no model backend loaded";
     }
-    std::string role_str = (role == PoolRole::kPrefill) ? "prefill"
-                         : (role == PoolRole::kDecode)  ? "decode"
-                                                        : "unified";
+    std::string role_str = (role == PoolRole::kPrefill)  ? "prefill"
+                           : (role == PoolRole::kDecode) ? "decode"
+                                                         : "unified";
     json body = {{"status", ready ? "ready" : "not_ready"}, {"role", role_str}};
-    if (!ready) body["reason"] = reason;
+    if (!ready)
+      body["reason"] = reason;
     int status_code = ready ? 200 : 503;
     std::string status_text = ready ? "OK" : "Service Unavailable";
     SendAll(session, BuildResponse(body.dump(), status_code, status_text));
@@ -920,18 +942,23 @@ void HttpServer::HandleClient(ClientSession& session) {
 
   AuthContext auth_ctx;
   if (!ResolveSubject(headers, &auth_ctx)) {
-    auto response = BuildResponse(BuildErrorBody("unauthorized"), 401, "Unauthorized");
+    auto response =
+        BuildResponse(BuildErrorBody("unauthorized"), 401, "Unauthorized");
     SendAll(session, response);
     if (audit_logger_) {
-      audit_logger_->Log(auth_ctx.subject, "", "unauthorized", "missing or invalid credentials");
+      audit_logger_->Log(auth_ctx.subject, "", "unauthorized",
+                         "missing or invalid credentials");
     }
     return;
   }
-  if (rate_limiter_ && rate_limiter_->Enabled() && !rate_limiter_->Allow(auth_ctx.subject)) {
-    auto response = BuildResponse(BuildErrorBody("rate_limited"), 429, "Too Many Requests");
+  if (rate_limiter_ && rate_limiter_->Enabled() &&
+      !rate_limiter_->Allow(auth_ctx.subject)) {
+    auto response =
+        BuildResponse(BuildErrorBody("rate_limited"), 429, "Too Many Requests");
     SendAll(session, response);
     if (audit_logger_) {
-      audit_logger_->Log(auth_ctx.subject, "", "rate_limited", "token bucket exceeded");
+      audit_logger_->Log(auth_ctx.subject, "", "rate_limited",
+                         "token bucket exceeded");
     }
     return;
   }
@@ -942,7 +969,8 @@ void HttpServer::HandleClient(ClientSession& session) {
     }
     std::string metrics_body = metrics_ ? metrics_->RenderPrometheus() : "";
     std::string metrics_headers =
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: " +
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; "
+        "version=0.0.4\r\nContent-Length: " +
         std::to_string(metrics_body.size()) + "\r\n\r\n";
     SendAll(session, metrics_headers + metrics_body);
     return;
@@ -950,7 +978,8 @@ void HttpServer::HandleClient(ClientSession& session) {
 
   if (method == "GET" && path == "/v1/admin/guardrails") {
     if (!guardrail_) {
-      SendAll(session, BuildResponse(BuildErrorBody("guardrail_disabled"), 503, "Unavailable"));
+      SendAll(session, BuildResponse(BuildErrorBody("guardrail_disabled"), 503,
+                                     "Unavailable"));
       return;
     }
     if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
@@ -963,7 +992,8 @@ void HttpServer::HandleClient(ClientSession& session) {
 
   if (method == "PUT" && path == "/v1/admin/guardrails") {
     if (!guardrail_) {
-      SendAll(session, BuildResponse(BuildErrorBody("guardrail_disabled"), 503, "Unavailable"));
+      SendAll(session, BuildResponse(BuildErrorBody("guardrail_disabled"), 503,
+                                     "Unavailable"));
       return;
     }
     if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
@@ -975,18 +1005,22 @@ void HttpServer::HandleClient(ClientSession& session) {
       if (j.contains("blocklist") && j["blocklist"].is_array()) {
         list = j["blocklist"].get<std::vector<std::string>>();
       }
-    } catch (const json::exception&) {}
+    } catch (const json::exception &) {
+    }
     auto start = std::chrono::steady_clock::now();
     guardrail_->UpdateBlocklist(list);
     if (policy_store_) {
       policy_store_->SetGuardrailBlocklist(list);
       policy_store_->Save();
     }
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
-    std::cout << "[policy] guardrail update applied in " << elapsed.count() << " ms" << std::endl;
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    std::cout << "[policy] guardrail update applied in " << elapsed.count()
+              << " ms" << std::endl;
     SendAll(session, BuildResponse(json({{"status", "ok"}}).dump()));
     if (audit_logger_) {
-      audit_logger_->Log(auth_ctx.subject, "", "guardrail_update", "updated blocklist");
+      audit_logger_->Log(auth_ctx.subject, "", "guardrail_update",
+                         "updated blocklist");
     }
     return;
   }
@@ -996,7 +1030,8 @@ void HttpServer::HandleClient(ClientSession& session) {
       return;
     }
     int limit = rate_limiter_ ? rate_limiter_->CurrentLimit() : 0;
-    SendAll(session, BuildResponse(json({{"tokens_per_minute", limit}}).dump()));
+    SendAll(session,
+            BuildResponse(json({{"tokens_per_minute", limit}}).dump()));
     return;
   }
 
@@ -1008,13 +1043,17 @@ void HttpServer::HandleClient(ClientSession& session) {
     bool valid = false;
     try {
       auto j = json::parse(body);
-      if (j.contains("tokens_per_minute") && j["tokens_per_minute"].is_number_integer()) {
+      if (j.contains("tokens_per_minute") &&
+          j["tokens_per_minute"].is_number_integer()) {
         value = j["tokens_per_minute"].get<int>();
         valid = true;
       }
-    } catch (const json::exception&) {}
+    } catch (const json::exception &) {
+    }
     if (!valid) {
-      SendAll(session, BuildResponse(BuildErrorBody("tokens_per_minute is required"), 400, "Bad Request"));
+      SendAll(session,
+              BuildResponse(BuildErrorBody("tokens_per_minute is required"),
+                            400, "Bad Request"));
       return;
     }
     auto start = std::chrono::steady_clock::now();
@@ -1025,11 +1064,14 @@ void HttpServer::HandleClient(ClientSession& session) {
       policy_store_->SetRateLimitPerMinute(value);
       policy_store_->Save();
     }
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
-    std::cout << "[policy] rate-limit update applied in " << elapsed.count() << " ms" << std::endl;
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    std::cout << "[policy] rate-limit update applied in " << elapsed.count()
+              << " ms" << std::endl;
     SendAll(session, BuildResponse(json({{"status", "ok"}}).dump()));
     if (audit_logger_) {
-      audit_logger_->Log(auth_ctx.subject, "", "rate_limit_update", std::to_string(value));
+      audit_logger_->Log(auth_ctx.subject, "", "rate_limit_update",
+                         std::to_string(value));
     }
     return;
   }
@@ -1039,7 +1081,8 @@ void HttpServer::HandleClient(ClientSession& session) {
       return;
     }
     if (!policy_store_) {
-      SendAll(session, BuildResponse(BuildErrorBody("policy_store_disabled"), 503, "Unavailable"));
+      SendAll(session, BuildResponse(BuildErrorBody("policy_store_disabled"),
+                                     503, "Unavailable"));
       return;
     }
     auto keys = policy_store_->ApiKeys();
@@ -1052,7 +1095,8 @@ void HttpServer::HandleClient(ClientSession& session) {
       return;
     }
     if (!policy_store_) {
-      SendAll(session, BuildResponse(BuildErrorBody("policy_store_disabled"), 503, "Unavailable"));
+      SendAll(session, BuildResponse(BuildErrorBody("policy_store_disabled"),
+                                     503, "Unavailable"));
       return;
     }
     std::string key;
@@ -1065,17 +1109,21 @@ void HttpServer::HandleClient(ClientSession& session) {
       if (j.contains("scopes") && j["scopes"].is_array()) {
         scopes = j["scopes"].get<std::vector<std::string>>();
       }
-    } catch (const json::exception&) {}
+    } catch (const json::exception &) {
+    }
     if (key.empty()) {
-      SendAll(session, BuildResponse(BuildErrorBody("key is required"), 400, "Bad Request"));
+      SendAll(session, BuildResponse(BuildErrorBody("key is required"), 400,
+                                     "Bad Request"));
       return;
     }
     auto start = std::chrono::steady_clock::now();
     auth_->AddKey(key, scopes);
     policy_store_->SetApiKey(key, scopes);
     policy_store_->Save();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
-    std::cout << "[policy] api-key upsert applied in " << elapsed.count() << " ms" << std::endl;
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    std::cout << "[policy] api-key upsert applied in " << elapsed.count()
+              << " ms" << std::endl;
     SendAll(session, BuildResponse(json({{"status", "ok"}}).dump()));
     if (audit_logger_) {
       audit_logger_->Log(auth_ctx.subject, "", "api_key_upsert", key);
@@ -1088,7 +1136,8 @@ void HttpServer::HandleClient(ClientSession& session) {
       return;
     }
     if (!policy_store_) {
-      SendAll(session, BuildResponse(BuildErrorBody("policy_store_disabled"), 503, "Unavailable"));
+      SendAll(session, BuildResponse(BuildErrorBody("policy_store_disabled"),
+                                     503, "Unavailable"));
       return;
     }
     std::string key;
@@ -1097,17 +1146,21 @@ void HttpServer::HandleClient(ClientSession& session) {
       if (j.contains("key") && j["key"].is_string()) {
         key = j["key"].get<std::string>();
       }
-    } catch (const json::exception&) {}
+    } catch (const json::exception &) {
+    }
     if (key.empty()) {
-      SendAll(session, BuildResponse(BuildErrorBody("key is required"), 400, "Bad Request"));
+      SendAll(session, BuildResponse(BuildErrorBody("key is required"), 400,
+                                     "Bad Request"));
       return;
     }
     auto start = std::chrono::steady_clock::now();
     auth_->RemoveKey(key);
     policy_store_->RemoveApiKey(key);
     policy_store_->Save();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
-    std::cout << "[policy] api-key removal applied in " << elapsed.count() << " ms" << std::endl;
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    std::cout << "[policy] api-key removal applied in " << elapsed.count()
+              << " ms" << std::endl;
     SendAll(session, BuildResponse(json({{"status", "ok"}}).dump()));
     if (audit_logger_) {
       audit_logger_->Log(auth_ctx.subject, "", "api_key_remove", key);
@@ -1119,9 +1172,10 @@ void HttpServer::HandleClient(ClientSession& session) {
     if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
       return;
     }
-    auto* router = scheduler_ ? scheduler_->Router() : nullptr;
+    auto *router = scheduler_ ? scheduler_->Router() : nullptr;
     if (!router) {
-      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503, "Service Unavailable"));
+      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503,
+                                     "Service Unavailable"));
       return;
     }
     auto models = router->ListModels();
@@ -1129,14 +1183,12 @@ void HttpServer::HandleClient(ClientSession& session) {
     json payload;
     payload["default_model"] = default_id;
     payload["models"] = json::array();
-    for (const auto& info : models) {
-      payload["models"].push_back({
-          {"id", info.id},
-          {"path", info.path},
-          {"backend", info.backend},
-          {"ready", info.ready},
-          {"default", info.id == default_id}
-      });
+    for (const auto &info : models) {
+      payload["models"].push_back({{"id", info.id},
+                                   {"path", info.path},
+                                   {"backend", info.backend},
+                                   {"ready", info.ready},
+                                   {"default", info.id == default_id}});
     }
     SendAll(session, BuildResponse(payload.dump()));
     return;
@@ -1146,9 +1198,10 @@ void HttpServer::HandleClient(ClientSession& session) {
     if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
       return;
     }
-    auto* router = scheduler_ ? scheduler_->Router() : nullptr;
+    auto *router = scheduler_ ? scheduler_->Router() : nullptr;
     if (!router) {
-      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503, "Service Unavailable"));
+      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503,
+                                     "Service Unavailable"));
       return;
     }
     std::string path_value;
@@ -1171,26 +1224,31 @@ void HttpServer::HandleClient(ClientSession& session) {
           set_default = j["default"].get<bool>();
         } else if (j["default"].is_string()) {
           std::string val = j["default"].get<std::string>();
-          for (auto& ch : val) {
-            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+          for (auto &ch : val) {
+            ch =
+                static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
           }
           set_default = (val == "true" || val == "1" || val == "yes");
         }
       }
-    } catch (const json::exception&) {}
+    } catch (const json::exception &) {
+    }
     if (path_value.empty()) {
-      SendAll(session, BuildResponse(BuildErrorBody("path is required"), 400, "Bad Request"));
+      SendAll(session, BuildResponse(BuildErrorBody("path is required"), 400,
+                                     "Bad Request"));
       return;
     }
     auto id = router->LoadModel(path_value, backend_hint, requested_id);
     if (id.empty()) {
-      SendAll(session, BuildResponse(BuildErrorBody("load_failed"), 500, "Internal Server Error"));
+      SendAll(session, BuildResponse(BuildErrorBody("load_failed"), 500,
+                                     "Internal Server Error"));
       return;
     }
     if (set_default) {
       router->SetDefaultModel(id);
     }
-    SendAll(session, BuildResponse(json({{"status", "ok"}, {"id", id}}).dump()));
+    SendAll(session,
+            BuildResponse(json({{"status", "ok"}, {"id", id}}).dump()));
     if (audit_logger_) {
       audit_logger_->Log(auth_ctx.subject, id, "model_load", path_value);
     }
@@ -1201,9 +1259,10 @@ void HttpServer::HandleClient(ClientSession& session) {
     if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
       return;
     }
-    auto* router = scheduler_ ? scheduler_->Router() : nullptr;
+    auto *router = scheduler_ ? scheduler_->Router() : nullptr;
     if (!router) {
-      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503, "Service Unavailable"));
+      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503,
+                                     "Service Unavailable"));
       return;
     }
     std::string id;
@@ -1212,18 +1271,22 @@ void HttpServer::HandleClient(ClientSession& session) {
       if (j.contains("id") && j["id"].is_string()) {
         id = j["id"].get<std::string>();
       }
-    } catch (const json::exception&) {}
+    } catch (const json::exception &) {
+    }
     if (id.empty()) {
-      SendAll(session, BuildResponse(BuildErrorBody("id is required"), 400, "Bad Request"));
+      SendAll(session, BuildResponse(BuildErrorBody("id is required"), 400,
+                                     "Bad Request"));
       return;
     }
     if (!router->UnloadModel(id)) {
-      SendAll(session, BuildResponse(BuildErrorBody("model_not_found"), 404, "Not Found"));
+      SendAll(session, BuildResponse(BuildErrorBody("model_not_found"), 404,
+                                     "Not Found"));
       return;
     }
     SendAll(session, BuildResponse(json({{"status", "ok"}}).dump()));
     if (audit_logger_) {
-      audit_logger_->Log(auth_ctx.subject, id, "model_unload", "Removed via admin API");
+      audit_logger_->Log(auth_ctx.subject, id, "model_unload",
+                         "Removed via admin API");
     }
     return;
   }
@@ -1232,9 +1295,10 @@ void HttpServer::HandleClient(ClientSession& session) {
     if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
       return;
     }
-    auto* router = scheduler_ ? scheduler_->Router() : nullptr;
+    auto *router = scheduler_ ? scheduler_->Router() : nullptr;
     if (!router) {
-      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503, "Service Unavailable"));
+      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503,
+                                     "Service Unavailable"));
       return;
     }
     std::string id;
@@ -1243,26 +1307,33 @@ void HttpServer::HandleClient(ClientSession& session) {
       if (j.contains("id") && j["id"].is_string()) {
         id = j["id"].get<std::string>();
       }
-    } catch (const json::exception&) {}
+    } catch (const json::exception &) {
+    }
     if (id.empty()) {
-      SendAll(session, BuildResponse(BuildErrorBody("id is required"), 400, "Bad Request"));
+      SendAll(session, BuildResponse(BuildErrorBody("id is required"), 400,
+                                     "Bad Request"));
       return;
     }
     if (!router->SetDefaultModel(id)) {
-      SendAll(session, BuildResponse(BuildErrorBody("model_not_found"), 404, "Not Found"));
+      SendAll(session, BuildResponse(BuildErrorBody("model_not_found"), 404,
+                                     "Not Found"));
       return;
     }
-    SendAll(session, BuildResponse(json({{"status", "ok"}, {"default_model", id}}).dump()));
+    SendAll(
+        session,
+        BuildResponse(json({{"status", "ok"}, {"default_model", id}}).dump()));
     return;
   }
 
-  if (method == "POST" && (path == "/v1/completions" || path == "/v1/chat/completions")) {
-    if (!RequireScope(auth_ctx, "generate", session, "generate scope required")) {
+  if (method == "POST" &&
+      (path == "/v1/completions" || path == "/v1/chat/completions")) {
+    if (!RequireScope(auth_ctx, "generate", session,
+                      "generate scope required")) {
       return;
     }
     auto parsed = ParseJsonPayload(body);
-    auto LogToolEvent = [](const std::string& line) {
-      if (const char* path = std::getenv("INFERFLUX_LOG_TOOL_CALLS")) {
+    auto LogToolEvent = [](const std::string &line) {
+      if (const char *path = std::getenv("INFERFLUX_LOG_TOOL_CALLS")) {
         std::ofstream out(path, std::ios::app);
         if (out) {
           out << line << std::endl;
@@ -1270,7 +1341,8 @@ void HttpServer::HandleClient(ClientSession& session) {
       }
     };
     if (!parsed.response_format_ok) {
-      auto payload = BuildResponse(BuildErrorBody(parsed.response_format_error), 400, "Bad Request");
+      auto payload = BuildResponse(BuildErrorBody(parsed.response_format_error),
+                                   400, "Bad Request");
       SendAll(session, payload);
       return;
     }
@@ -1295,14 +1367,17 @@ void HttpServer::HandleClient(ClientSession& session) {
     }
     req.stream = parsed.stream;
 
-    // §2.2: attach decoded images (populated when messages contain image_url parts).
+    // §2.2: attach decoded images (populated when messages contain image_url
+    // parts).
     if (parsed.has_images) {
       req.has_images = true;
       req.images = std::move(parsed.images);
-      GlobalMetrics().RecordImagePreprocess(static_cast<int>(req.images.size()), 0.0);
+      GlobalMetrics().RecordImagePreprocess(static_cast<int>(req.images.size()),
+                                            0.0);
     }
 
-    // W3C Trace Context (OBS-2): propagate trace-id from incoming traceparent header.
+    // W3C Trace Context (OBS-2): propagate trace-id from incoming traceparent
+    // header.
     {
       std::string tp_header = GetHeaderValue(headers, "traceparent");
       if (!tp_header.empty()) {
@@ -1312,10 +1387,12 @@ void HttpServer::HandleClient(ClientSession& session) {
     }
 
     // §2.3: inject tool schema as a system preamble when tools are provided.
-    bool use_tools = (parsed.has_tool_schema || !parsed.tools.empty()) && parsed.tool_choice != "none";
+    bool use_tools = (parsed.has_tool_schema || !parsed.tools.empty()) &&
+                     parsed.tool_choice != "none";
     if (use_tools && std::getenv("INFERFLUX_LOG_TOOL_CALLS")) {
       std::cout << "[tools] request provided " << parsed.tools.size()
-                << " tool definition(s); choice=" << parsed.tool_choice << std::endl;
+                << " tool definition(s); choice=" << parsed.tool_choice
+                << std::endl;
     }
     if (use_tools) {
       LogToolEvent("request tools=" + std::to_string(parsed.tools.size()) +
@@ -1323,22 +1400,29 @@ void HttpServer::HandleClient(ClientSession& session) {
     }
     if (use_tools && !parsed.tools.empty()) {
       std::string tool_prefix = BuildToolSystemPrompt(parsed.tools);
-      req.prompt = req.prompt.empty() ? tool_prefix : tool_prefix + "\n" + req.prompt;
+      req.prompt =
+          req.prompt.empty() ? tool_prefix : tool_prefix + "\n" + req.prompt;
     }
 
     req.priority = static_cast<int>(auth_ctx.scopes.count("admin") ? 10 : 0);
     if (req.prompt.empty()) {
-      auto payload = BuildResponse(BuildErrorBody("prompt or messages are required"), 400, "Bad Request");
+      auto payload =
+          BuildResponse(BuildErrorBody("prompt or messages are required"), 400,
+                        "Bad Request");
       SendAll(session, payload);
       return;
     }
-    bool chat_mode = (path == "/v1/chat/completions") || !parsed.messages.empty();
+    bool chat_mode =
+        (path == "/v1/chat/completions") || !parsed.messages.empty();
     std::string guard_reason;
-    if (guardrail_ && guardrail_->Enabled() && !guardrail_->Check(req.prompt, &guard_reason)) {
-      auto payload = BuildResponse(BuildErrorBody(guard_reason), 400, "Bad Request");
+    if (guardrail_ && guardrail_->Enabled() &&
+        !guardrail_->Check(req.prompt, &guard_reason)) {
+      auto payload =
+          BuildResponse(BuildErrorBody(guard_reason), 400, "Bad Request");
       SendAll(session, payload);
       if (audit_logger_) {
-        audit_logger_->Log(auth_ctx.subject, parsed.model, "blocked", guard_reason);
+        audit_logger_->Log(auth_ctx.subject, parsed.model, "blocked",
+                           guard_reason);
       }
       return;
     }
@@ -1349,7 +1433,8 @@ void HttpServer::HandleClient(ClientSession& session) {
     SpanContext request_ctx = tracing::ChildContext(parent_ctx);
     std::string trace_response_header;
     if (request_ctx.valid()) {
-      trace_response_header = "traceparent: " + request_ctx.ToTraceparent() + "\r\n";
+      trace_response_header =
+          "traceparent: " + request_ctx.ToTraceparent() + "\r\n";
     }
 
     std::string stream_id;
@@ -1358,42 +1443,53 @@ void HttpServer::HandleClient(ClientSession& session) {
     auto stream_active = std::make_shared<std::atomic<bool>>(false);
     auto stream_had_chunk = std::make_shared<std::atomic<bool>>(false);
     auto stream_cancel_flag = std::make_shared<std::atomic<bool>>(false);
+    // Declared here (outer scope) so they're visible in both the streaming
+    // setup block and the post-Generate streaming completion block.
+    auto token_buffer = std::make_shared<std::vector<std::string>>();
+    bool buffer_tokens = use_tools;
     if (parsed.stream) {
       stream_ts = std::chrono::duration_cast<std::chrono::seconds>(
-                      std::chrono::system_clock::now().time_since_epoch()).count();
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
       stream_active->store(true);
       stream_id = std::string("chatcmpl-") + std::to_string(stream_ts);
-      std::string stream_headers =
-          "HTTP/1.1 200 OK\r\n"
-          "Content-Type: text/event-stream\r\n"
-          "Cache-Control: no-cache\r\n"
-          "Connection: keep-alive\r\n" + trace_response_header + "\r\n";
+      std::string stream_headers = "HTTP/1.1 200 OK\r\n"
+                                   "Content-Type: text/event-stream\r\n"
+                                   "Cache-Control: no-cache\r\n"
+                                   "Connection: keep-alive\r\n" +
+                                   trace_response_header + "\r\n";
       if (!SendAll(session, stream_headers)) {
         return;
       }
       req.cancellation_flag = stream_cancel_flag;
-      ClientSession* stream_session = &session;
+      ClientSession *stream_session = &session;
       std::string stream_model = parsed.model;
-      // §2.3: when tools are active, suppress raw token streaming — the model
-      // emits tool_call JSON which must be buffered and re-emitted as structured
-      // tool_calls deltas after the full completion is assembled.
-      bool suppress_stream_content = use_tools;
-      req.on_token = [this,
-                      stream_session,
-                      stream_mutex,
-                      stream_active,
-                      stream_had_chunk,
-                      stream_cancel_flag,
-                      stream_id,
-                      stream_model,
-                      stream_ts,
-                      suppress_stream_content](const std::string& chunk) {
-        if (suppress_stream_content || chunk.empty() || !stream_active->load()) {
+      // §2.3: when tools are active we cannot stream tokens as content deltas
+      // because we don't know until the full completion arrives whether the
+      // model produced a tool_call JSON envelope or plain text.  Buffer all
+      // tokens during generation; after Generate() returns either:
+      //   a) tool_call detected  → discard buffer, emit tool_calls delta
+      //   sequence b) no tool_call        → replay buffer as content deltas,
+      //   then stop chunk
+      // When use_tools=false the buffer is never populated and the normal
+      // per-token streaming path runs unchanged.
+      req.on_token = [this, stream_session, stream_mutex, stream_active,
+                      stream_had_chunk, stream_cancel_flag, stream_id,
+                      stream_model, stream_ts, token_buffer,
+                      buffer_tokens](const std::string &chunk) {
+        if (chunk.empty() || !stream_active->load()) {
+          return;
+        }
+        if (buffer_tokens) {
+          // Accumulate without sending; will be replayed or discarded below.
+          std::lock_guard<std::mutex> lock(*stream_mutex);
+          token_buffer->push_back(chunk);
           return;
         }
         auto pieces = SplitForStreaming(chunk);
-        for (const auto& piece : pieces) {
-          std::string payload = BuildStreamChunk(stream_id, stream_model, stream_ts, piece, false);
+        for (const auto &piece : pieces) {
+          std::string payload = BuildStreamChunk(stream_id, stream_model,
+                                                 stream_ts, piece, false);
           std::lock_guard<std::mutex> lock(*stream_mutex);
           if (!stream_active->load()) {
             return;
@@ -1418,34 +1514,43 @@ void HttpServer::HandleClient(ClientSession& session) {
           // SSE headers were already sent. Complete the stream body rather than
           // sending a second HTTP response (which would corrupt the framing).
           ToolCallResult nb_tc;
-          if (use_tools && (!parsed.tools.empty() || !parsed.first_tool_name.empty())) {
-            std::string fname = !parsed.tools.empty() ? parsed.tools.front().function.name
-                                                      : parsed.first_tool_name;
-            if (fname.empty()) fname = "stub_tool";
+          if (use_tools &&
+              (!parsed.tools.empty() || !parsed.first_tool_name.empty())) {
+            std::string fname = !parsed.tools.empty()
+                                    ? parsed.tools.front().function.name
+                                    : parsed.first_tool_name;
+            if (fname.empty())
+              fname = "stub_tool";
             nb_tc.detected = true;
             nb_tc.function_name = fname;
             nb_tc.call_id = "call_stub_" + fname;
-            nb_tc.arguments_json = json{{"reason", "no_model_available"}}.dump();
+            nb_tc.arguments_json =
+                json{{"reason", "no_model_available"}}.dump();
           }
           {
             std::lock_guard<std::mutex> lock(*stream_mutex);
             if (nb_tc.detected) {
-              SendAll(session, BuildToolCallStreamChunks(stream_id, parsed.model, stream_ts, nb_tc));
+              SendAll(session, BuildToolCallStreamChunks(
+                                   stream_id, parsed.model, stream_ts, nb_tc));
             } else {
-              SendAll(session, BuildStreamChunk(stream_id, parsed.model, stream_ts,
-                                                result.completion, false));
-              SendAll(session, BuildStreamChunk(stream_id, parsed.model, stream_ts, "", true));
+              SendAll(session,
+                      BuildStreamChunk(stream_id, parsed.model, stream_ts,
+                                       result.completion, false));
+              SendAll(session, BuildStreamChunk(stream_id, parsed.model,
+                                                stream_ts, "", true));
             }
             SendAll(session, "data: [DONE]\n\n");
           }
           stream_active->store(false);
         } else {
-          auto payload = BuildResponse(BuildCompletionBody(result, parsed, chat_mode),
-                                       200, "OK", trace_response_header);
+          auto payload =
+              BuildResponse(BuildCompletionBody(result, parsed, chat_mode), 200,
+                            "OK", trace_response_header);
           SendAll(session, payload);
         }
         if (audit_logger_) {
-          audit_logger_->Log(auth_ctx.subject, parsed.model, "no_backend", result.completion);
+          audit_logger_->Log(auth_ctx.subject, parsed.model, "no_backend",
+                             result.completion);
         }
         return;
       }
@@ -1456,19 +1561,23 @@ void HttpServer::HandleClient(ClientSession& session) {
                                     result.speculative.reused_tokens);
       }
       if (audit_logger_) {
-        audit_logger_->LogRequest(auth_ctx.subject, parsed.model,
-                                  req.prompt, result.completion,
-                                  result.prompt_tokens, result.completion_tokens);
+        audit_logger_->LogRequest(auth_ctx.subject, parsed.model, req.prompt,
+                                  result.completion, result.prompt_tokens,
+                                  result.completion_tokens);
       }
-      // §2.3: detect tool call in model output (used by non-streaming responses).
+      // §2.3: detect tool call in model output (used by non-streaming
+      // responses).
       ToolCallResult tool_call;
       if (use_tools) {
         bool stub_completion =
             result.no_backend ||
-            result.completion.find("No model backend is loaded") != std::string::npos;
-        LogToolEvent("tool_state no_backend=" + std::to_string(result.no_backend) +
-                     " contains_stub=" +
-                     std::to_string(result.completion.find("No model backend is loaded") != std::string::npos));
+            result.completion.find("No model backend is loaded") !=
+                std::string::npos;
+        LogToolEvent("tool_state no_backend=" +
+                     std::to_string(result.no_backend) + " contains_stub=" +
+                     std::to_string(
+                         result.completion.find("No model backend is loaded") !=
+                         std::string::npos));
         if (stub_completion &&
             (!parsed.tools.empty() || !parsed.first_tool_name.empty())) {
           std::string fallback_name = !parsed.tools.empty()
@@ -1488,9 +1597,7 @@ void HttpServer::HandleClient(ClientSession& session) {
           LogToolEvent(log_line);
           std::cout << log_line << std::endl;
           if (audit_logger_) {
-            audit_logger_->Log(auth_ctx.subject,
-                               parsed.model,
-                               "tool_call_stub",
+            audit_logger_->Log(auth_ctx.subject, parsed.model, "tool_call_stub",
                                arguments.dump());
           }
         } else {
@@ -1502,10 +1609,26 @@ void HttpServer::HandleClient(ClientSession& session) {
           std::lock_guard<std::mutex> lock(*stream_mutex);
           if (stream_active->load()) {
             if (tool_call.detected) {
-              // §2.3: emit structured tool_calls delta sequence (role → name → args → finish).
-              SendAll(session, BuildToolCallStreamChunks(stream_id, parsed.model, stream_ts, tool_call));
+              // §2.3: emit structured tool_calls delta sequence (role → name →
+              // args → finish).
+              SendAll(session,
+                      BuildToolCallStreamChunks(stream_id, parsed.model,
+                                                stream_ts, tool_call));
+            } else if (buffer_tokens && !token_buffer->empty()) {
+              // Model produced plain text despite tools[] being present (no
+              // tool call detected).  Replay the buffered tokens as content
+              // deltas.
+              for (const auto &tok : *token_buffer) {
+                for (const auto &piece : SplitForStreaming(tok)) {
+                  SendAll(session, BuildStreamChunk(stream_id, parsed.model,
+                                                    stream_ts, piece, false));
+                }
+              }
+              SendAll(session, BuildStreamChunk(stream_id, parsed.model,
+                                                stream_ts, "", true));
             } else {
-              SendAll(session, BuildStreamChunk(stream_id, parsed.model, stream_ts, "", true));
+              SendAll(session, BuildStreamChunk(stream_id, parsed.model,
+                                                stream_ts, "", true));
             }
             SendAll(session, "data: [DONE]\n\n");
           }
@@ -1513,11 +1636,12 @@ void HttpServer::HandleClient(ClientSession& session) {
         stream_active->store(false);
         return;
       } else {
-        auto payload = BuildResponse(BuildCompletionBody(result, parsed, chat_mode, tool_call),
-                                     200, "OK", trace_response_header);
+        auto payload = BuildResponse(
+            BuildCompletionBody(result, parsed, chat_mode, tool_call), 200,
+            "OK", trace_response_header);
         SendAll(session, payload);
       }
-    } catch (const std::exception& ex) {
+    } catch (const std::exception &ex) {
       if (metrics_) {
         metrics_->RecordError();
       }
@@ -1537,8 +1661,8 @@ void HttpServer::HandleClient(ClientSession& session) {
   }
 }
 
-bool HttpServer::SendAll(ClientSession& session, const std::string& payload) {
-  const char* data = payload.c_str();
+bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
+  const char *data = payload.c_str();
   std::size_t remaining = payload.size();
   while (remaining > 0) {
     int sent = 0;
@@ -1566,7 +1690,8 @@ bool HttpServer::SendAll(ClientSession& session, const std::string& payload) {
   return true;
 }
 
-ssize_t HttpServer::Receive(ClientSession& session, char* buffer, std::size_t length) {
+ssize_t HttpServer::Receive(ClientSession &session, char *buffer,
+                            std::size_t length) {
   if (session.ssl) {
     while (true) {
       int received = SSL_read(session.ssl, buffer, static_cast<int>(length));
@@ -1589,7 +1714,7 @@ ssize_t HttpServer::Receive(ClientSession& session, char* buffer, std::size_t le
   }
 }
 
-void HttpServer::CloseSession(ClientSession& session) {
+void HttpServer::CloseSession(ClientSession &session) {
   if (session.ssl) {
     SSL_shutdown(session.ssl);
     SSL_free(session.ssl);
@@ -1601,4 +1726,4 @@ void HttpServer::CloseSession(ClientSession& session) {
   }
 }
 
-}  // namespace inferflux
+} // namespace inferflux
