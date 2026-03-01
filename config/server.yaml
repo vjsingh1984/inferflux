@@ -10,16 +10,28 @@ model:
   format: gguf
   quantization: q4_k_m
   tokenizer: sentencepiece
+models:
+  - id: llama3-8b
+    path: models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
+    backend: cpu
+    default: true
 runtime:
   backend_priority: [cpu]
   tensor_parallel: 1
   mps_layers: 0
+  fairness:
+    enable_preemption: false
+    high_priority_threshold: 5
+    max_timeslice_tokens: 0
   speculative_decoding:
     enabled: false
     draft_model: ""
     max_prefill_tokens: 256
+    chunk_size: 4
   nvme_offload:
     path: ""
+    workers: 1
+    queue_depth: 256
   paged_kv:
     cpu_pages: 4096
     eviction: lru

@@ -1,15 +1,20 @@
-#include <arpa/inet.h>
-#include <netinet/in.h>
+#include "net/http_client.h"
+
+#include <nlohmann/json.hpp>
+
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
-#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
-#include <utility>
 #include <vector>
+
+using json = nlohmann::json;
 
 namespace {
 
@@ -27,254 +32,72 @@ struct ChatMessage {
   std::string content;
 };
 
-std::string EscapeJson(const std::string& value) {
-  std::string out;
-  out.reserve(value.size());
-  for (char c : value) {
-    switch (c) {
-      case '"':
-        out += "\\\"";
-        break;
-      case '\\':
-        out += "\\\\";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      case '\r':
-        out += "\\r";
-        break;
-      case '\t':
-        out += "\\t";
-        break;
-      default:
-        out.push_back(c);
-        break;
-    }
-  }
-  return out;
+std::string BuildUrl(const std::string& host, int port, const std::string& path) {
+  return "http://" + host + ":" + std::to_string(port) + path;
 }
 
-std::string DecodeJsonString(const std::string& value) {
-  std::string out;
-  bool escape = false;
-  for (char c : value) {
-    if (escape) {
-      switch (c) {
-        case 'n':
-          out.push_back('\n');
-          break;
-        case 'r':
-          out.push_back('\r');
-          break;
-        case 't':
-          out.push_back('\t');
-          break;
-        case '\\':
-          out.push_back('\\');
-          break;
-        case '"':
-          out.push_back('"');
-          break;
-        default:
-          out.push_back(c);
-          break;
-      }
-      escape = false;
-    } else if (c == '\\') {
-      escape = true;
-    } else {
-      out.push_back(c);
-    }
-  }
-  return out;
-}
-
-std::string ExtractJsonString(const std::string& body, const std::string& key) {
-  std::string needle = "\"" + key + "\":\"";
-  auto pos = body.find(needle);
-  if (pos == std::string::npos) {
-    return {};
-  }
-  pos += needle.size();
-  std::string out;
-  bool escape = false;
-  for (std::size_t i = pos; i < body.size(); ++i) {
-    char c = body[i];
-    if (!escape && c == '\\') {
-      escape = true;
-      continue;
-    }
-    if (!escape && c == '"') {
-      break;
-    }
-    if (escape) {
-      switch (c) {
-        case 'n':
-          out.push_back('\n');
-          break;
-        case 'r':
-          out.push_back('\r');
-          break;
-        case 't':
-          out.push_back('\t');
-          break;
-        case '\\':
-          out.push_back('\\');
-          break;
-        case '"':
-          out.push_back('"');
-          break;
-        default:
-          out.push_back(c);
-          break;
-      }
-      escape = false;
-    } else {
-      out.push_back(c);
-    }
-  }
-  return out;
-}
-
-int Connect(const std::string& host, int port) {
-  int sock = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (sock < 0) {
-    throw std::runtime_error("unable to create socket");
-  }
-  sockaddr_in addr;
-  std::memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(port));
-  addr.sin_addr.s_addr = inet_addr(host.c_str());
-  if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    ::close(sock);
-    throw std::runtime_error("unable to connect");
-  }
-  return sock;
-}
-
-std::string Receive(int sock) {
-  std::string data;
-  char buf[4096];
-  ssize_t read_bytes = 0;
-  while ((read_bytes = ::recv(sock, buf, sizeof(buf), 0)) > 0) {
-    data.append(buf, buf + read_bytes);
-    if (read_bytes < static_cast<ssize_t>(sizeof(buf))) {
-      break;
-    }
-  }
-  return data;
-}
-
-std::string BuildChatPayload(const std::vector<ChatMessage>& messages,
-                             const std::string& model,
-                             int max_tokens,
-                             bool stream) {
-  std::ostringstream out;
-  out << "{\"model\":\"" << EscapeJson(model.empty() ? "unknown" : model) << "\",\"max_tokens\":" << max_tokens
-      << ",\"stream\":" << (stream ? "true" : "false") << ",\"messages\":[";
-  for (std::size_t i = 0; i < messages.size(); ++i) {
-    if (i > 0) {
-      out << ",";
-    }
-    out << "{\"role\":\"" << EscapeJson(messages[i].role.empty() ? "user" : messages[i].role) << "\",\"content\":\""
-        << EscapeJson(messages[i].content) << "\"}";
-  }
-  out << "]}";
-  return out.str();
-}
-
-std::string BuildJsonArray(const std::vector<std::string>& items) {
-  std::ostringstream out;
-  out << "[";
-  for (std::size_t i = 0; i < items.size(); ++i) {
-    if (i > 0) {
-      out << ",";
-    }
-    out << "\"" << EscapeJson(items[i]) << "\"";
-  }
-  out << "]";
-  return out.str();
-}
-
-std::string SendHttpRequest(const std::string& method,
-                            const std::string& path,
-                            const std::string& payload,
-                            const std::string& host,
-                            int port,
-                            const std::string& api_key,
-                            const std::string& content_type = "application/json") {
-  int sock = Connect(host, port);
-  std::ostringstream request;
-  request << method << " " << path << " HTTP/1.1\r\n";
-  request << "Host: " << host << "\r\n";
-  if (!content_type.empty()) {
-    request << "Content-Type: " << content_type << "\r\n";
-  }
+std::map<std::string, std::string> AuthHeaders(const std::string& api_key) {
+  std::map<std::string, std::string> headers;
   if (!api_key.empty()) {
-    request << "Authorization: Bearer " << api_key << "\r\n";
+    headers["Authorization"] = "Bearer " + api_key;
   }
-  request << "Content-Length: " << payload.size() << "\r\n\r\n";
-  request << payload;
-  auto serialized = request.str();
-  ::send(sock, serialized.c_str(), serialized.size(), 0);
-  auto response = Receive(sock);
-  ::close(sock);
-  return response;
+  return headers;
 }
 
-std::string BuildCompletionPayload(const std::string& prompt,
-                                   const std::string& model,
-                                   int max_tokens,
-                                   bool stream) {
-  std::ostringstream out;
-  out << "{\"prompt\":\"" << EscapeJson(prompt) << "\",\"max_tokens\":" << max_tokens << ",\"stream\":"
-      << (stream ? "true" : "false");
-  if (!model.empty()) {
-    out << ",\"model\":\"" << EscapeJson(model) << "\"";
+json BuildChatPayload(const std::vector<ChatMessage>& messages,
+                      const std::string& model,
+                      int max_tokens,
+                      bool stream) {
+  json j;
+  j["model"] = model.empty() ? "unknown" : model;
+  j["max_tokens"] = max_tokens;
+  j["stream"] = stream;
+  j["messages"] = json::array();
+  for (const auto& msg : messages) {
+    j["messages"].push_back({
+        {"role", msg.role.empty() ? "user" : msg.role},
+        {"content", msg.content}
+    });
   }
-  out << "}";
-  return out.str();
+  return j;
+}
+
+json BuildCompletionPayload(const std::string& prompt,
+                            const std::string& model,
+                            int max_tokens,
+                            bool stream) {
+  json j;
+  j["prompt"] = prompt;
+  j["max_tokens"] = max_tokens;
+  j["stream"] = stream;
+  if (!model.empty()) {
+    j["model"] = model;
+  }
+  return j;
 }
 
 void PrintUsage() {
   std::cout << "Usage:\n"
+            << "  inferctl pull <owner/model-name>\n"
+            << "      Download the best GGUF from HuggingFace Hub (~/.cache/inferflux/models/).\n"
+            << "      Prints the local path on success.\n"
             << "  inferctl status [--host 127.0.0.1] [--port 8080] [--api-key KEY]\n"
             << "  inferctl completion --prompt 'Hello' [--model MODEL] [--max-tokens N] [--stream]\n"
                "                      [--host 127.0.0.1] [--port 8080] [--api-key KEY]\n"
             << "  inferctl chat --message 'user:Hello' [--message 'assistant:Hi'] [--model MODEL]\n"
                "               [--max-tokens N] [--stream] [--interactive]\n"
             << "  inferctl admin guardrails [--list | --set word1,word2] [--host ... --port ... --api-key KEY]\n"
-            << "  inferctl admin rate-limit [--get | --set N] [--host ... --port ... --api-key KEY]\n";
-}
-
-bool ReceiveStandard(int sock, bool print_raw, std::string* body_out) {
-  std::string raw;
-  char buf[4096];
-  ssize_t read_bytes = 0;
-  while ((read_bytes = ::recv(sock, buf, sizeof(buf), 0)) > 0) {
-    raw.append(buf, buf + read_bytes);
-  }
-  if (print_raw) {
-    std::cout << raw << std::endl;
-  }
-  if (body_out) {
-    auto header_end = raw.find("\r\n\r\n");
-    if (header_end != std::string::npos) {
-      *body_out = raw.substr(header_end + 4);
-    }
-  }
-  return true;
+            << "  inferctl admin rate-limit [--get | --set N] [--host ... --port ... --api-key KEY]\n"
+            << "  inferctl admin models --list | --load PATH [--backend TYPE] [--id NAME] [--default]\n"
+               "                       | --unload ID | --set-default ID [--host ... --port ... --api-key KEY]\n"
+            << "  inferctl admin api-keys [--list | --add KEY --scopes read,admin | --remove KEY]\n";
 }
 
 bool ProcessStreamChunks(std::string& buffer, std::string* accumulated) {
   bool done = false;
-  std::size_t search_pos = 0;
   while (true) {
-    auto data_pos = buffer.find("data:", search_pos);
+    auto data_pos = buffer.find("data:");
     if (data_pos == std::string::npos) {
-      buffer.erase(0, std::min(search_pos, buffer.size()));
       break;
     }
     auto end_pos = buffer.find("\n\n", data_pos);
@@ -282,35 +105,37 @@ bool ProcessStreamChunks(std::string& buffer, std::string* accumulated) {
       buffer.erase(0, data_pos);
       break;
     }
-    std::string chunk = buffer.substr(data_pos + 5, end_pos - (data_pos + 5));
+    std::string chunk = Trim(buffer.substr(data_pos + 5, end_pos - (data_pos + 5)));
     buffer.erase(0, end_pos + 2);
-    while (!chunk.empty() && (chunk.front() == ' ' || chunk.front() == '\r')) {
-      chunk.erase(chunk.begin());
-    }
-    while (!chunk.empty() && (chunk.back() == '\r' || chunk.back() == '\n')) {
-      chunk.pop_back();
-    }
     if (chunk == "[DONE]") {
       done = true;
       break;
     }
-    auto content = ExtractJsonString(chunk, "content");
-    if (!content.empty()) {
-      std::cout << content << std::flush;
-      if (accumulated) {
-        accumulated->append(content);
+    try {
+      auto j = json::parse(chunk);
+      if (j.contains("choices") && j["choices"].is_array() && !j["choices"].empty()) {
+        auto& delta = j["choices"][0];
+        if (delta.contains("delta") && delta["delta"].contains("content")) {
+          std::string content = delta["delta"]["content"].get<std::string>();
+          std::cout << content << std::flush;
+          if (accumulated) {
+            accumulated->append(content);
+          }
+        }
       }
-    }
+    } catch (const json::exception&) {}
   }
   return done;
 }
 
-bool ReceiveStream(int sock, std::string* accumulated) {
+bool ReceiveStream(inferflux::HttpClient& client,
+                   inferflux::HttpClient::RawConnection& conn,
+                   std::string* accumulated) {
   std::string buffer;
   char temp[4096];
   ssize_t read_bytes = 0;
   bool headers_done = false;
-  while ((read_bytes = ::recv(sock, temp, sizeof(temp), 0)) > 0) {
+  while ((read_bytes = client.RecvRaw(conn, temp, sizeof(temp))) > 0) {
     buffer.append(temp, temp + read_bytes);
     if (!headers_done) {
       auto header_end = buffer.find("\r\n\r\n");
@@ -326,32 +151,8 @@ bool ReceiveStream(int sock, std::string* accumulated) {
     }
   }
   std::cout << std::endl;
+  client.CloseRaw(conn);
   return true;
-}
-
-bool SendRequest(const std::string& host,
-                 int port,
-                 const std::string& api_key,
-                 const std::string& path,
-                 const std::string& payload,
-                 bool stream,
-                 bool print_raw,
-                 std::string* body_out) {
-  int sock = Connect(host, port);
-  std::ostringstream request;
-  request << "POST " << path << " HTTP/1.1\r\n";
-  request << "Host: " << host << "\r\n";
-  request << "Content-Type: application/json\r\n";
-  if (!api_key.empty()) {
-    request << "Authorization: Bearer " << api_key << "\r\n";
-  }
-  request << "Content-Length: " << payload.size() << "\r\n\r\n";
-  request << payload;
-  auto serialized = request.str();
-  ::send(sock, serialized.c_str(), serialized.size(), 0);
-  bool ok = stream ? ReceiveStream(sock, body_out) : ReceiveStandard(sock, print_raw, body_out);
-  ::close(sock);
-  return ok;
 }
 
 void InteractiveChat(const std::string& host,
@@ -360,6 +161,7 @@ void InteractiveChat(const std::string& host,
                      const std::string& model,
                      int max_tokens,
                      bool stream) {
+  inferflux::HttpClient client;
   std::vector<ChatMessage> history;
   std::cout << "Interactive chat session. Type /exit to quit." << std::endl;
   std::string line;
@@ -375,27 +177,294 @@ void InteractiveChat(const std::string& host,
       continue;
     }
     history.push_back({"user", line});
+    auto payload = BuildChatPayload(history, model, max_tokens, stream);
+    std::string url = BuildUrl(host, port, "/v1/chat/completions");
     std::string assistant;
-    if (!SendRequest(host,
-                     port,
-                     api_key,
-                     "/v1/chat/completions",
-                     BuildChatPayload(history, model, max_tokens, stream),
-                     stream,
-                     false,
-                     &assistant)) {
-      break;
-    }
-    if (!stream) {
-      auto content = ExtractJsonString(assistant, "content");
-      if (content.empty()) {
-        content = ExtractJsonString(assistant, "completion");
+    if (stream) {
+      auto conn = client.SendRaw("POST", url, payload.dump(), AuthHeaders(api_key));
+      ReceiveStream(client, conn, &assistant);
+    } else {
+      auto resp = client.Post(url, payload.dump(), AuthHeaders(api_key));
+      try {
+        auto j = json::parse(resp.body);
+        if (j.contains("choices") && j["choices"].is_array() && !j["choices"].empty()) {
+          auto& choice = j["choices"][0];
+          if (choice.contains("message") && choice["message"].contains("content")) {
+            assistant = choice["message"]["content"].get<std::string>();
+          }
+        }
+      } catch (const json::exception&) {
+        assistant = resp.body;
       }
-      std::cout << content << std::endl;
-      assistant = content;
+      std::cout << assistant << std::endl;
     }
     history.push_back({"assistant", assistant});
   }
+}
+
+// ---- inferctl pull helpers ----
+
+std::string GetCacheDir() {
+  const char* xdg = std::getenv("XDG_CACHE_HOME");
+  if (xdg && xdg[0] != '\0') {
+    return std::string(xdg) + "/inferflux/models";
+  }
+  const char* home = std::getenv("HOME");
+  return std::string(home ? home : "/tmp") + "/.cache/inferflux/models";
+}
+
+// Prefer quantization quality order: Q4_K_M > Q4_K_S > Q4_K > Q4_0 > Q4 > Q5_K_M > Q5 > Q8 > any .gguf
+std::string SelectBestGguf(const std::vector<std::string>& files) {
+  auto score = [](const std::string& name) -> int {
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower.find("q4_k_m") != std::string::npos) return 100;
+    if (lower.find("q4_k_s") != std::string::npos) return 90;
+    if (lower.find("q4_k") != std::string::npos) return 85;
+    if (lower.find("q4_0") != std::string::npos) return 80;
+    if (lower.find("q4") != std::string::npos) return 75;
+    if (lower.find("q5_k_m") != std::string::npos) return 70;
+    if (lower.find("q5") != std::string::npos) return 65;
+    if (lower.find("q8_0") != std::string::npos) return 50;
+    if (lower.find(".gguf") != std::string::npos) return 10;
+    return -1;
+  };
+  std::string best;
+  int best_score = -1;
+  for (const auto& f : files) {
+    int s = score(f);
+    if (s > best_score) {
+      best_score = s;
+      best = f;
+    }
+  }
+  return best;
+}
+
+void PrintProgress(long long downloaded, long long total) {
+  if (total <= 0) {
+    std::cerr << "\r  " << (downloaded / (1024 * 1024)) << " MB downloaded" << std::flush;
+    return;
+  }
+  int pct = static_cast<int>(downloaded * 100 / total);
+  const int kBarWidth = 40;
+  int filled = pct * kBarWidth / 100;
+  std::cerr << "\r[";
+  for (int i = 0; i < filled; ++i) std::cerr << '=';
+  for (int i = filled; i < kBarWidth; ++i) std::cerr << ' ';
+  std::cerr << "] " << pct << "%  "
+            << (downloaded / (1024 * 1024)) << "/"
+            << (total / (1024 * 1024)) << " MB" << std::flush;
+}
+
+struct DownloadHeaders {
+  int status{0};
+  std::string location;
+  long long content_length{-1};
+};
+
+DownloadHeaders ParseDownloadHeaders(const std::string& header_block) {
+  DownloadHeaders h;
+  std::istringstream iss(header_block);
+  std::string line;
+  bool first = true;
+  while (std::getline(iss, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (first) {
+      first = false;
+      auto sp = line.find(' ');
+      if (sp != std::string::npos) {
+        try { h.status = std::stoi(line.substr(sp + 1)); } catch (...) {}
+      }
+      continue;
+    }
+    auto colon = line.find(':');
+    if (colon == std::string::npos) continue;
+    std::string key = Trim(line.substr(0, colon));
+    std::string val = Trim(line.substr(colon + 1));
+    std::string key_lower = key;
+    std::transform(key_lower.begin(), key_lower.end(), key_lower.begin(), ::tolower);
+    if (key_lower == "location") h.location = val;
+    else if (key_lower == "content-length") {
+      try { h.content_length = std::stoll(val); } catch (...) {}
+    }
+  }
+  return h;
+}
+
+// Streams a GET response body to dest_path, following up to max_redirects redirects.
+// Returns 0 on success, 1 on error.
+int DownloadToFile(inferflux::HttpClient& client,
+                   const std::string& url,
+                   const std::string& dest_path) {
+  std::string current_url = url;
+  const int kMaxRedirects = 5;
+  for (int attempt = 0; attempt <= kMaxRedirects; ++attempt) {
+    auto conn = client.SendRaw("GET", current_url, "", {});
+
+    // Extend recv timeout to 5 minutes for large file downloads.
+    if (conn.sock >= 0) {
+      struct timeval tv{300, 0};
+      setsockopt(conn.sock, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&tv), sizeof(tv));
+    }
+
+    // Read until we have the full response headers.
+    char buf[65536];
+    std::string header_buf;
+    std::string leftover;
+    bool found_end = false;
+    while (!found_end) {
+      ssize_t n = client.RecvRaw(conn, buf, sizeof(buf));
+      if (n <= 0) break;
+      header_buf.append(buf, static_cast<std::size_t>(n));
+      auto pos = header_buf.find("\r\n\r\n");
+      if (pos != std::string::npos) {
+        leftover = header_buf.substr(pos + 4);
+        header_buf.erase(pos);
+        found_end = true;
+      }
+    }
+    if (!found_end) {
+      client.CloseRaw(conn);
+      std::cerr << "Failed to read response headers from " << current_url << "\n";
+      return 1;
+    }
+
+    auto hdrs = ParseDownloadHeaders(header_buf);
+
+    if (hdrs.status == 301 || hdrs.status == 302 ||
+        hdrs.status == 307 || hdrs.status == 308) {
+      client.CloseRaw(conn);
+      if (hdrs.location.empty()) {
+        std::cerr << "Redirect with no Location header\n";
+        return 1;
+      }
+      current_url = hdrs.location;
+      std::cerr << "Following redirect...\n";
+      continue;
+    }
+
+    if (hdrs.status != 200) {
+      client.CloseRaw(conn);
+      std::cerr << "HTTP error " << hdrs.status << " downloading " << current_url << "\n";
+      return 1;
+    }
+
+    // Stream body to a .tmp file, then atomically rename.
+    std::string tmp_path = dest_path + ".tmp";
+    std::ofstream out(tmp_path, std::ios::binary);
+    if (!out) {
+      client.CloseRaw(conn);
+      std::cerr << "Cannot create file: " << tmp_path << "\n";
+      return 1;
+    }
+
+    long long downloaded = 0;
+    long long total = hdrs.content_length;
+
+    if (!leftover.empty()) {
+      out.write(leftover.data(), static_cast<std::streamsize>(leftover.size()));
+      downloaded += static_cast<long long>(leftover.size());
+      PrintProgress(downloaded, total);
+    }
+
+    while (true) {
+      ssize_t n = client.RecvRaw(conn, buf, sizeof(buf));
+      if (n <= 0) break;
+      out.write(buf, n);
+      downloaded += n;
+      PrintProgress(downloaded, total);
+    }
+
+    client.CloseRaw(conn);
+    out.close();
+    std::cerr << "\n";
+
+    if (total > 0 && downloaded < total) {
+      std::filesystem::remove(tmp_path);
+      std::cerr << "Download incomplete (" << downloaded << "/" << total << " bytes)\n";
+      return 1;
+    }
+
+    std::filesystem::rename(tmp_path, dest_path);
+    return 0;
+  }
+
+  std::cerr << "Too many redirects for " << url << "\n";
+  return 1;
+}
+
+int CmdPull(const std::string& repo) {
+  if (repo.find('/') == std::string::npos) {
+    std::cerr << "Repository must be in owner/model-name format (e.g. TheBloke/Llama-2-7B-GGUF)\n";
+    return 1;
+  }
+
+  inferflux::HttpClient client;
+
+  // Step 1: Fetch repository metadata from HuggingFace Hub API.
+  std::string api_url = "https://huggingface.co/api/models/" + repo;
+  std::cerr << "Fetching model info for " << repo << "...\n";
+  auto resp = client.Get(api_url, {{"Accept", "application/json"}});
+  if (resp.status != 200) {
+    std::cerr << "HuggingFace API error " << resp.status << " for " << repo << "\n";
+    return 1;
+  }
+
+  // Step 2: Parse siblings to collect GGUF filenames.
+  std::vector<std::string> gguf_files;
+  try {
+    auto j = json::parse(resp.body);
+    if (j.contains("siblings") && j["siblings"].is_array()) {
+      for (const auto& s : j["siblings"]) {
+        if (!s.contains("rfilename")) continue;
+        std::string fname = s["rfilename"].get<std::string>();
+        std::string lower = fname;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.find(".gguf") != std::string::npos) {
+          gguf_files.push_back(fname);
+        }
+      }
+    }
+  } catch (const json::exception& e) {
+    std::cerr << "Failed to parse HuggingFace API response: " << e.what() << "\n";
+    return 1;
+  }
+
+  if (gguf_files.empty()) {
+    std::cerr << "No GGUF files found in " << repo << "\n";
+    return 1;
+  }
+
+  // Step 3: Select the best-quantised file.
+  std::string selected = SelectBestGguf(gguf_files);
+  std::cerr << "Selected: " << selected << "\n";
+
+  // Step 4: Resolve destination path.
+  std::string cache_dir = GetCacheDir();
+  std::string dest_dir  = cache_dir + "/" + repo;
+  std::filesystem::create_directories(dest_dir);
+  std::string dest_path = dest_dir + "/" + selected;
+
+  if (std::filesystem::exists(dest_path)) {
+    std::cerr << "Already cached: " << dest_path << "\n";
+    std::cout << dest_path << "\n";
+    return 0;
+  }
+
+  // Step 5: Stream-download with progress.
+  // HuggingFace resolve URL: https://huggingface.co/{repo}/resolve/main/{filename}
+  std::string download_url =
+      "https://huggingface.co/" + repo + "/resolve/main/" + selected;
+  std::cerr << "Downloading " << selected << "...\n";
+
+  int rc = DownloadToFile(client, download_url, dest_path);
+  if (rc != 0) return rc;
+
+  std::cerr << "Saved to: " << dest_path << "\n";
+  std::cout << dest_path << "\n";
+  return 0;
 }
 
 }  // namespace
@@ -411,7 +480,7 @@ int main(int argc, char** argv) {
   std::string prompt;
   std::string api_key;
   std::string model;
-  int max_tokens = 32;
+  int max_tokens = 256;
   bool stream_mode = false;
   bool interactive_mode = false;
   std::vector<ChatMessage> chat_messages;
@@ -455,7 +524,19 @@ int main(int argc, char** argv) {
     }
   }
 
+  // pull does not require a running server — handle before try/client block.
+  if (command == "pull") {
+    if (argc < 3) {
+      std::cerr << "Usage: inferctl pull <owner/model-name>\n";
+      return 1;
+    }
+    return CmdPull(argv[2]);
+  }
+
   try {
+    inferflux::HttpClient client;
+    auto headers = AuthHeaders(api_key);
+
     if (command == "admin") {
       if (argc < 3) {
         PrintUsage();
@@ -466,20 +547,17 @@ int main(int argc, char** argv) {
         return 1;
       }
       std::string target = argv[2];
-    if (target == "guardrails") {
+      if (target == "guardrails") {
         bool list = false;
         std::string set_values;
         for (int i = 3; i < argc; ++i) {
           std::string arg = argv[i];
-          if (arg == "--list") {
-            list = true;
-          } else if (arg == "--set" && i + 1 < argc) {
-            set_values = argv[++i];
-          }
+          if (arg == "--list") list = true;
+          else if (arg == "--set" && i + 1 < argc) set_values = argv[++i];
         }
         if (list) {
-          auto resp = SendHttpRequest("GET", "/v1/admin/guardrails", "", host, port, api_key);
-          std::cout << resp << std::endl;
+          auto resp = client.Get(BuildUrl(host, port, "/v1/admin/guardrails"), headers);
+          std::cout << resp.body << std::endl;
           return 0;
         }
         if (!set_values.empty()) {
@@ -488,13 +566,11 @@ int main(int argc, char** argv) {
           std::string token;
           while (std::getline(ss, token, ',')) {
             auto trimmed = Trim(token);
-            if (!trimmed.empty()) {
-              words.push_back(trimmed);
-            }
+            if (!trimmed.empty()) words.push_back(trimmed);
           }
-          std::string payload = std::string("{\"blocklist\":") + BuildJsonArray(words) + "}";
-          auto resp = SendHttpRequest("PUT", "/v1/admin/guardrails", payload, host, port, api_key);
-          std::cout << resp << std::endl;
+          auto resp = client.Put(BuildUrl(host, port, "/v1/admin/guardrails"),
+                                 json({{"blocklist", words}}).dump(), headers);
+          std::cout << resp.body << std::endl;
           return 0;
         }
         PrintUsage();
@@ -506,50 +582,98 @@ int main(int argc, char** argv) {
         int new_limit = 0;
         for (int i = 3; i < argc; ++i) {
           std::string arg = argv[i];
-          if (arg == "--get") {
-            get = true;
-          } else if (arg == "--set" && i + 1 < argc) {
-            new_limit = std::stoi(argv[++i]);
-            set_flag = true;
-          }
+          if (arg == "--get") get = true;
+          else if (arg == "--set" && i + 1 < argc) { new_limit = std::stoi(argv[++i]); set_flag = true; }
         }
         if (get) {
-          auto resp = SendHttpRequest("GET", "/v1/admin/rate_limit", "", host, port, api_key);
-          std::cout << resp << std::endl;
+          auto resp = client.Get(BuildUrl(host, port, "/v1/admin/rate_limit"), headers);
+          std::cout << resp.body << std::endl;
           return 0;
         }
         if (set_flag) {
-          std::string payload = std::string("{\"tokens_per_minute\":") + std::to_string(new_limit) + "}";
-          auto resp = SendHttpRequest("PUT", "/v1/admin/rate_limit", payload, host, port, api_key);
-          std::cout << resp << std::endl;
+          auto resp = client.Put(BuildUrl(host, port, "/v1/admin/rate_limit"),
+                                 json({{"tokens_per_minute", new_limit}}).dump(), headers);
+          std::cout << resp.body << std::endl;
+          return 0;
+        }
+        PrintUsage();
+        return 1;
+      }
+      if (target == "models") {
+        bool list = false;
+        std::string load_path;
+        std::string load_backend;
+        std::string load_id;
+        bool load_default = false;
+        std::string unload_id;
+        std::string set_default_id;
+        for (int i = 3; i < argc; ++i) {
+          std::string arg = argv[i];
+          if (arg == "--list") {
+            list = true;
+          } else if (arg == "--load" && i + 1 < argc) {
+            load_path = argv[++i];
+          } else if (arg == "--backend" && i + 1 < argc) {
+            load_backend = argv[++i];
+          } else if (arg == "--id" && i + 1 < argc) {
+            load_id = argv[++i];
+          } else if (arg == "--default") {
+            load_default = true;
+          } else if (arg == "--unload" && i + 1 < argc) {
+            unload_id = argv[++i];
+          } else if (arg == "--set-default" && i + 1 < argc) {
+            set_default_id = argv[++i];
+          }
+        }
+        if (list) {
+          auto resp = client.Get(BuildUrl(host, port, "/v1/admin/models"), headers);
+          std::cout << resp.body << std::endl;
+          return 0;
+        }
+        if (!load_path.empty()) {
+          json payload;
+          payload["path"] = load_path;
+          if (!load_backend.empty()) {
+            payload["backend"] = load_backend;
+          }
+          if (!load_id.empty()) {
+            payload["id"] = load_id;
+          }
+          if (load_default) {
+            payload["default"] = true;
+          }
+          auto resp = client.Post(BuildUrl(host, port, "/v1/admin/models"), payload.dump(), headers);
+          std::cout << resp.body << std::endl;
+          return 0;
+        }
+        if (!unload_id.empty()) {
+          auto resp = client.Delete(BuildUrl(host, port, "/v1/admin/models"),
+                                    json({{"id", unload_id}}).dump(), headers);
+          std::cout << resp.body << std::endl;
+          return 0;
+        }
+        if (!set_default_id.empty()) {
+          auto resp = client.Put(BuildUrl(host, port, "/v1/admin/models/default"),
+                                 json({{"id", set_default_id}}).dump(), headers);
+          std::cout << resp.body << std::endl;
           return 0;
         }
         PrintUsage();
         return 1;
       }
       if (target == "api-keys" || target == "api-key") {
-        bool list = false;
-        bool remove = false;
-        bool add = false;
-        std::string new_key;
-        std::string scopes_csv;
+        bool list = false, remove = false, add = false;
+        std::string new_key, scopes_csv;
         for (int i = 3; i < argc; ++i) {
           std::string arg = argv[i];
-          if (arg == "--list") {
-            list = true;
-          } else if (arg == "--add" && i + 1 < argc) {
-            new_key = argv[++i];
-            add = true;
-          } else if (arg == "--scopes" && i + 1 < argc) {
-            scopes_csv = argv[++i];
-          } else if (arg == "--remove" && i + 1 < argc) {
-            new_key = argv[++i];
-            remove = true;
-          }
+          if (arg == "--list") list = true;
+          else if (arg == "--add" && i + 1 < argc) { new_key = argv[++i]; add = true; }
+          else if (arg == "--scopes" && i + 1 < argc) scopes_csv = argv[++i];
+          else if (arg == "--remove" && i + 1 < argc) { new_key = argv[++i]; remove = true; }
         }
         if (list) {
-          auto resp = SendHttpRequest("GET", "/v1/admin/api_keys", "", host, port, api_key);
-          std::cout << resp << std::endl;
+          auto resp = client.Get(BuildUrl(host, port, "/v1/admin/api_keys"), headers);
+          std::cout << resp.body << std::endl;
           return 0;
         }
         if (add) {
@@ -558,20 +682,17 @@ int main(int argc, char** argv) {
           std::string token;
           while (std::getline(ss, token, ',')) {
             auto trimmed = Trim(token);
-            if (!trimmed.empty()) {
-              scopes.push_back(trimmed);
-            }
+            if (!trimmed.empty()) scopes.push_back(trimmed);
           }
-          std::string payload = std::string("{\"key\":\"") + EscapeJson(new_key) + "\",\"scopes\":";
-          payload += BuildJsonArray(scopes) + "}";
-          auto resp = SendHttpRequest("POST", "/v1/admin/api_keys", payload, host, port, api_key);
-          std::cout << resp << std::endl;
+          auto resp = client.Post(BuildUrl(host, port, "/v1/admin/api_keys"),
+                                  json({{"key", new_key}, {"scopes", scopes}}).dump(), headers);
+          std::cout << resp.body << std::endl;
           return 0;
         }
         if (remove) {
-          std::string payload = std::string("{\"key\":\"") + EscapeJson(new_key) + "\"}";
-          auto resp = SendHttpRequest("DELETE", "/v1/admin/api_keys", payload, host, port, api_key);
-          std::cout << resp << std::endl;
+          auto resp = client.Delete(BuildUrl(host, port, "/v1/admin/api_keys"),
+                                    json({{"key", new_key}}).dump(), headers);
+          std::cout << resp.body << std::endl;
           return 0;
         }
         PrintUsage();
@@ -581,15 +702,8 @@ int main(int argc, char** argv) {
       return 1;
     }
     if (command == "status") {
-      int sock = Connect(host, port);
-      std::string request = "GET /healthz HTTP/1.1\r\nHost: " + host + "\r\n";
-      if (!api_key.empty()) {
-        request += "Authorization: Bearer " + api_key + "\r\n";
-      }
-      request += "\r\n";
-      ::send(sock, request.c_str(), request.size(), 0);
-      ReceiveStandard(sock, true, nullptr);
-      ::close(sock);
+      auto resp = client.Get(BuildUrl(host, port, "/healthz"), headers);
+      std::cout << resp.body << std::endl;
       return 0;
     }
     if (command == "completion") {
@@ -597,17 +711,14 @@ int main(int argc, char** argv) {
         std::cerr << "--prompt is required" << std::endl;
         return 1;
       }
-      std::string body;
-      SendRequest(host,
-                  port,
-                  api_key,
-                  "/v1/completions",
-                  BuildCompletionPayload(prompt, model, max_tokens, stream_mode),
-                  stream_mode,
-                  !stream_mode,
-                  stream_mode ? nullptr : &body);
-      if (!stream_mode && !interactive_mode) {
-        // already printed raw response
+      auto payload = BuildCompletionPayload(prompt, model, max_tokens, stream_mode);
+      std::string url = BuildUrl(host, port, "/v1/completions");
+      if (stream_mode) {
+        auto conn = client.SendRaw("POST", url, payload.dump(), headers);
+        ReceiveStream(client, conn, nullptr);
+      } else {
+        auto resp = client.Post(url, payload.dump(), headers);
+        std::cout << resp.body << std::endl;
       }
       return 0;
     }
@@ -623,17 +734,14 @@ int main(int argc, char** argv) {
         }
         chat_messages.push_back(ChatMessage{"user", prompt});
       }
-      std::string body;
-      SendRequest(host,
-                  port,
-                  api_key,
-                  "/v1/chat/completions",
-                  BuildChatPayload(chat_messages, model, max_tokens, stream_mode),
-                  stream_mode,
-                  false,
-                  stream_mode ? nullptr : &body);
-      if (!stream_mode) {
-        std::cout << body << std::endl;
+      auto payload = BuildChatPayload(chat_messages, model, max_tokens, stream_mode);
+      std::string url = BuildUrl(host, port, "/v1/chat/completions");
+      if (stream_mode) {
+        auto conn = client.SendRaw("POST", url, payload.dump(), headers);
+        ReceiveStream(client, conn, nullptr);
+      } else {
+        auto resp = client.Post(url, payload.dump(), headers);
+        std::cout << resp.body << std::endl;
       }
       return 0;
     }
