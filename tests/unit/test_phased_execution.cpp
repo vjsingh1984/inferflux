@@ -244,3 +244,47 @@ TEST_CASE("InferenceRequest logprob fields: collect with top-5 alternatives",
   REQUIRE(req.collect_logprobs);
   REQUIRE(req.logprob_top_n == 5);
 }
+
+// ---------------------------------------------------------------------------
+// KV prefix reuse guard-path tests (§ Item 5)
+// These verify the null-context guard paths and default struct values.
+// End-to-end correctness (actual KV copy + partial prefill) requires a loaded
+// model and is covered by integration tests.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("CopySequencePrefix is no-op when context is null", "[kv_reuse]") {
+  LlamaCPUBackend backend;
+  // Must not crash when no model is loaded.
+  REQUIRE_NOTHROW(backend.CopySequencePrefix(0, 1, 10));
+}
+
+TEST_CASE("CopySequencePrefix is no-op after ForceReadyForTests",
+          "[kv_reuse]") {
+  LlamaCPUBackend backend;
+  backend.ForceReadyForTests(); // sets test_ready_=true but context_ stays null
+  REQUIRE_NOTHROW(backend.CopySequencePrefix(0, 1, 5));
+}
+
+TEST_CASE("PrefillPartial returns ok=false when context is null",
+          "[kv_reuse]") {
+  LlamaCPUBackend backend;
+  auto pr = backend.PrefillPartial("hello world", 0, 0);
+  REQUIRE_FALSE(pr.ok);
+  REQUIRE(pr.n_past == 0);
+  REQUIRE(pr.first_token == -1);
+}
+
+TEST_CASE("PrefillPartial returns ok=false for empty prompt", "[kv_reuse]") {
+  LlamaCPUBackend backend;
+  auto pr = backend.PrefillPartial("", 0, 0);
+  REQUIRE_FALSE(pr.ok);
+}
+
+TEST_CASE("PrefillResult kv_reuse defaults: first_token=-1, ok=false",
+          "[kv_reuse]") {
+  LlamaCPUBackend::PrefillResult r;
+  REQUIRE(r.first_token == -1);
+  REQUIRE(r.first_piece.empty());
+  REQUIRE_FALSE(r.ok);
+  REQUIRE(r.n_past == 0);
+}

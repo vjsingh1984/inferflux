@@ -483,6 +483,64 @@ LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
   return result;
 }
 
+void LlamaCPUBackend::CopySequencePrefix(int src_seq, int dst_seq,
+                                         int n_tokens) {
+  if (!context_)
+    return;
+  // Clear dst slot first so no stale KV cells survive from a previous request.
+  llama_memory_seq_rm(llama_get_memory(context_),
+                      static_cast<llama_seq_id>(dst_seq), -1, -1);
+  // Copy positions [0, n_tokens) from src to dst.
+  llama_memory_seq_cp(
+      llama_get_memory(context_), static_cast<llama_seq_id>(src_seq),
+      static_cast<llama_seq_id>(dst_seq), static_cast<llama_pos>(0),
+      static_cast<llama_pos>(n_tokens));
+}
+
+LlamaCPUBackend::PrefillResult
+LlamaCPUBackend::PrefillPartial(const std::string &prompt, int sequence_id,
+                                int n_past_start) {
+  if (!context_ || !vocab_)
+    return {};
+  auto prompt_tokens = Tokenize(prompt, /*add_bos=*/true);
+  if (prompt_tokens.empty())
+    return {};
+  int n_total = static_cast<int>(prompt_tokens.size());
+  if (n_past_start >= n_total) {
+    // Prefix covers the entire prompt; no suffix tokens to evaluate and no
+    // fresh logits from which to sample first_token.
+    PrefillResult r;
+    r.ok = true;
+    r.n_past = n_total;
+    return r;
+  }
+  int32_t suffix_len = n_total - n_past_start;
+  int32_t batch_cap = std::max<int32_t>(config_.batch_size, suffix_len + 1);
+  llama_batch batch = llama_batch_init(batch_cap, 0, 1);
+  for (int i = n_past_start; i < n_total; ++i) {
+    BatchAddSeq(batch, prompt_tokens[i], static_cast<llama_pos>(i),
+                static_cast<llama_seq_id>(sequence_id),
+                /*logits=*/i == n_total - 1);
+  }
+  if (llama_decode(context_, batch) != 0) {
+    std::cerr << "[LlamaCPUBackend] PrefillPartial: llama_decode failed seq "
+              << sequence_id << std::endl;
+    llama_batch_free(batch);
+    return {};
+  }
+  PrefillResult result;
+  result.n_past = n_total;
+  result.ok = true;
+  llama_token eos = llama_vocab_eos(vocab_);
+  int first_tok = SampleGreedy();
+  if (first_tok >= 0 && first_tok != eos) {
+    result.first_token = first_tok;
+    result.first_piece = TokenToString(first_tok);
+  }
+  llama_batch_free(batch);
+  return result;
+}
+
 std::string LlamaCPUBackend::Decode(
     int n_past, int sequence_id, int max_tokens,
     const std::function<bool(const std::string &)> &on_chunk,

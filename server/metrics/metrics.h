@@ -1,7 +1,7 @@
 #pragma once
 
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -14,10 +14,11 @@ namespace inferflux {
 // Prometheus-compatible: cumulative counts per bucket + _sum + _count.
 struct LatencyHistogram {
   // Upper bounds in milliseconds: 10, 50, 100, 250, 500, 1000, 2500, 5000, +Inf
-  static constexpr std::array<double, 8> kBuckets{10.0, 50.0, 100.0, 250.0,
-                                                   500.0, 1000.0, 2500.0, 5000.0};
-  // Cumulative bucket counts (bucket[i] = requests finishing within kBuckets[i] ms).
-  std::array<std::atomic<uint64_t>, 9> counts{};  // 8 finite + 1 +Inf
+  static constexpr std::array<double, 8> kBuckets{
+      10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0};
+  // Cumulative bucket counts (bucket[i] = requests finishing within kBuckets[i]
+  // ms).
+  std::array<std::atomic<uint64_t>, 9> counts{}; // 8 finite + 1 +Inf
   std::atomic<uint64_t> sum_ms{0};
   std::atomic<uint64_t> total{0};
 
@@ -25,8 +26,8 @@ struct LatencyHistogram {
 };
 
 class MetricsRegistry {
- public:
-  void SetBackend(const std::string& backend);
+public:
+  void SetBackend(const std::string &backend);
 
   // Counters (existing).
   void RecordSuccess(int prompt_tokens, int completion_tokens);
@@ -37,22 +38,23 @@ class MetricsRegistry {
   void RecordPrefixLookup(bool hit);
   void RecordPrefixMatchedTokens(int tokens);
   void RecordPartialPrefixHit();
+  // KV prefix reuse (§ Item 5): called when CopySequencePrefix+PrefillPartial
+  // replaces a full Prefill.  tokens_saved = number of prefix tokens skipped.
+  void RecordKVPrefixReuse(int tokens_saved);
   void RecordStreamTokens(std::size_t tokens);
   void RecordStreamCacheHit();
   void RecordFairnessTokens(int priority_level, std::size_t tokens);
   void RecordFairnessPreemption(int priority_level);
-  void RecordFairnessYield(int priority_level, std::size_t emitted_tokens, std::size_t remaining_tokens);
+  void RecordFairnessYield(int priority_level, std::size_t emitted_tokens,
+                           std::size_t remaining_tokens);
   void RecordFairnessResume(int priority_level);
   void RecordQueueLatency(double wait_ms);
   void RecordBatchExecution(double exec_ms);
-  void RecordModelLoad(const std::string& model_id,
-                       const std::string& backend,
+  void RecordModelLoad(const std::string &model_id, const std::string &backend,
                        double load_seconds);
-  void RecordModelReady(const std::string& model_id,
-                        const std::string& backend,
+  void RecordModelReady(const std::string &model_id, const std::string &backend,
                         bool ready);
-  void RecordModelRoute(const std::string& model_id,
-                        const std::string& backend,
+  void RecordModelRoute(const std::string &model_id, const std::string &backend,
                         bool hit);
 
   // Multimodal (§2.2): record image preprocessing events.
@@ -66,8 +68,9 @@ class MetricsRegistry {
   // Called once at server startup after LlamaBackendConfig is applied.
   void SetFlashAttentionEnabled(bool enabled);
 
-  // KV transfer latency (§2.5 item 12): elapsed time from KVPacket::enqueue_time
-  // to when a decode worker dequeues it from KVChannel / ShmKVTransport.
+  // KV transfer latency (§2.5 item 12): elapsed time from
+  // KVPacket::enqueue_time to when a decode worker dequeues it from KVChannel /
+  // ShmKVTransport.
   void RecordKVTransfer(double transfer_ms);
 
   // Latency recording — call with full request duration in milliseconds.
@@ -88,7 +91,7 @@ class MetricsRegistry {
 
   std::string RenderPrometheus() const;
 
- private:
+private:
   mutable std::mutex backend_mutex_;
   std::string backend_{"cpu"};
 
@@ -107,6 +110,8 @@ class MetricsRegistry {
   std::atomic<uint64_t> prefix_misses_{0};
   std::atomic<uint64_t> prefix_matched_tokens_{0};
   std::atomic<uint64_t> prefix_partial_hits_{0};
+  std::atomic<uint64_t> kv_prefix_reuse_count_{0};
+  std::atomic<uint64_t> kv_prefix_reuse_tokens_{0};
   std::atomic<uint64_t> stream_tokens_{0};
   std::atomic<uint64_t> stream_cache_hits_{0};
   std::atomic<uint64_t> fairness_preemptions_{0};
@@ -115,18 +120,23 @@ class MetricsRegistry {
   mutable std::mutex fairness_metrics_mutex_;
   std::unordered_map<int, uint64_t> fairness_tokens_;
   std::atomic<uint64_t> model_route_misses_{0};
-  std::atomic<uint64_t> multimodal_images_{0};    // §2.2: total images preprocessed.
-  std::atomic<uint64_t> multimodal_requests_{0};  // §2.2: total requests with images.
-  std::atomic<uint64_t> moe_requests_{0};         // §2.6: requests routed to MoE models.
-  std::atomic<uint64_t> flash_attention_enabled_{0};  // §2.7: gauge — 0=disabled, 1=enabled.
+  std::atomic<uint64_t> multimodal_images_{
+      0}; // §2.2: total images preprocessed.
+  std::atomic<uint64_t> multimodal_requests_{
+      0}; // §2.2: total requests with images.
+  std::atomic<uint64_t> moe_requests_{
+      0}; // §2.6: requests routed to MoE models.
+  std::atomic<uint64_t> flash_attention_enabled_{
+      0}; // §2.7: gauge — 0=disabled, 1=enabled.
 
   // Latency histograms.
   LatencyHistogram request_latency_;
   LatencyHistogram queue_latency_;
   LatencyHistogram batch_exec_latency_;
-  LatencyHistogram prefill_latency_;    // OBS-2: prefill phase
-  LatencyHistogram decode_latency_;    // OBS-2: decode phase
-  LatencyHistogram kv_transfer_latency_;  // §2.5 item 12: prefill→decode KV hand-off
+  LatencyHistogram prefill_latency_; // OBS-2: prefill phase
+  LatencyHistogram decode_latency_;  // OBS-2: decode phase
+  LatencyHistogram
+      kv_transfer_latency_; // §2.5 item 12: prefill→decode KV hand-off
 
   // Gauges.
   std::atomic<int> active_connections_{0};
@@ -146,6 +156,6 @@ class MetricsRegistry {
   std::unordered_map<std::string, ModelStats> model_stats_;
 };
 
-MetricsRegistry& GlobalMetrics();
+MetricsRegistry &GlobalMetrics();
 
-}  // namespace inferflux
+} // namespace inferflux

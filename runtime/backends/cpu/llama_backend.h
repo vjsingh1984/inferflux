@@ -105,6 +105,24 @@ public:
   std::vector<BatchDecodeOutput>
   BatchDecodeStep(std::vector<BatchDecodeInput> &inputs);
 
+  // Copy KV cache entries for positions [0, n_tokens) from src_seq to dst_seq.
+  // dst_seq is cleared first so no stale cells remain.  Used by the KV prefix
+  // reuse path: CopySequencePrefix + PrefillPartial replaces a full Prefill
+  // call when a warm matching prefix is available in the prefix store.
+  // No-op when the context is not loaded.
+  void CopySequencePrefix(int src_seq, int dst_seq, int n_tokens);
+
+  // Partial prefill that evaluates only the suffix of prompt starting at
+  // n_past_start.  Positions [0, n_past_start) must already be populated in
+  // sequence_id's KV slot (via CopySequencePrefix).  Returns {ok=false} when
+  // the context is not loaded, the prompt is empty, or llama_decode fails.
+  // If n_past_start >= total prompt token count, returns
+  // {ok=true, n_past=count, first_token=-1}: the prefix already covers the
+  // full prompt so no suffix evaluation is needed (and no fresh logits are
+  // available to sample a first token).
+  PrefillResult PrefillPartial(const std::string &prompt, int sequence_id,
+                               int n_past_start);
+
   // Release KV cache slots for the given sequence_id.
   void FreeSequence(int sequence_id);
 
