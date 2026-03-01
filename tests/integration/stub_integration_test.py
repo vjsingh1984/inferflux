@@ -502,5 +502,41 @@ class StubIntegrationTests(unittest.TestCase):
                       "inferflux_errors_total counter missing from /metrics after streaming request")
 
 
+    # ── /v1/models (OpenAI-standard) ─────────────────────────────────────────
+
+    def test_models_list_returns_openai_format(self):
+        """GET /v1/models returns OpenAI-compatible {object:'list', data:[]} shape."""
+        resp, body = self._get("/v1/models")
+        self.assertEqual(resp.status, 200, msg=body)
+        data = json.loads(body)
+        self.assertEqual(data.get("object"), "list")
+        self.assertIn("data", data)
+        self.assertIsInstance(data["data"], list)
+
+    def test_models_list_each_entry_has_required_fields(self):
+        """Each entry in /v1/models data array has id, object, created, owned_by."""
+        resp, body = self._get("/v1/models")
+        self.assertEqual(resp.status, 200, msg=body)
+        for entry in json.loads(body)["data"]:
+            self.assertIn("id", entry)
+            self.assertEqual(entry.get("object"), "model")
+            self.assertIn("created", entry)
+            self.assertEqual(entry.get("owned_by"), "inferflux")
+
+    def test_models_unknown_id_returns_404(self):
+        """GET /v1/models/<unknown> returns 404."""
+        resp, body = self._get("/v1/models/no-such-model-xyz")
+        self.assertEqual(resp.status, 404, msg=body)
+
+    def test_models_requires_auth(self):
+        """GET /v1/models without auth header returns 401."""
+        conn = http.client.HTTPConnection("127.0.0.1", SERVER_PORT, timeout=5)
+        conn.request("GET", "/v1/models")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

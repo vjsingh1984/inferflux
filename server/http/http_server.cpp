@@ -1421,6 +1421,58 @@ void HttpServer::HandleClient(ClientSession &session) {
     return;
   }
 
+  // ── OpenAI-standard /v1/models
+  // ────────────────────────────────────────────── GET /v1/models          —
+  // list all registered models (read scope) GET /v1/models/{id}     — describe
+  // a single model (read scope)
+  //
+  // Distinct from the admin-only /v1/admin/models (load/unload/default).
+  // Every OpenAI-compatible SDK (LangChain, LlamaIndex, openai-python) calls
+  // this endpoint to discover available models.
+  if (method == "GET" &&
+      (path == "/v1/models" ||
+       (path.size() > 12 && path.substr(0, 12) == "/v1/models/"))) {
+    if (!RequireScope(auth_ctx, "read", session, "read scope required")) {
+      return;
+    }
+    auto *router = scheduler_ ? scheduler_->Router() : nullptr;
+    auto models = router ? router->ListModels() : std::vector<ModelInfo>{};
+    // Epoch for created timestamp — use a stable server-start approximation.
+    const auto created_ts = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+
+    if (path == "/v1/models") {
+      json data = json::array();
+      for (const auto &m : models) {
+        data.push_back({{"id", m.id},
+                        {"object", "model"},
+                        {"created", created_ts},
+                        {"owned_by", "inferflux"}});
+      }
+      SendAll(session,
+              BuildResponse(json({{"object", "list"}, {"data", data}}).dump()));
+      return;
+    }
+
+    // /v1/models/{id}
+    std::string model_id = path.substr(12); // strip "/v1/models/"
+    for (const auto &m : models) {
+      if (m.id == model_id) {
+        SendAll(session, BuildResponse(json({{"id", m.id},
+                                             {"object", "model"},
+                                             {"created", created_ts},
+                                             {"owned_by", "inferflux"}})
+                                           .dump()));
+        return;
+      }
+    }
+    SendAll(session,
+            BuildResponse(BuildErrorBody("model_not_found"), 404, "Not Found"));
+    return;
+  }
+
   if (method == "POST" &&
       (path == "/v1/completions" || path == "/v1/chat/completions")) {
     if (!RequireScope(auth_ctx, "generate", session,

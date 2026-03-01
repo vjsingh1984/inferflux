@@ -128,7 +128,9 @@ endif()
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
-set(LLAMA_CUDA OFF CACHE BOOL "" FORCE)
+# NOTE: LLAMA_CUDA, LLAMA_METAL, and LLAMA_BLAS are set by the hardware-detection
+# blocks above.  Do NOT override them here — the former stale reset was a bug
+# that silently disabled GPU support even when CUDAToolkit was found.
 add_subdirectory(external/llama.cpp EXCLUDE_FROM_ALL)
 target_link_libraries(inferflux_core PUBLIC llama)
 target_include_directories(inferflux_core PUBLIC

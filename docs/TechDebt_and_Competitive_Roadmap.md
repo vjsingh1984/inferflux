@@ -20,41 +20,42 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | Capability                    | vLLM | SGLang | TRT-LLM | llama.cpp | Ollama | InferFlux | Target Grade | Owner |
 |-------------------------------|:----:|:------:|:-------:|:---------:|:------:|:---------:|:------------:|-------|
 | Production throughput         |  A   |   A+   |   A+    |     C     |   D    |   **F**   | B (Q4) | Runtime |
-| Continuous batching           |  A   |   A+   |   A     |    N/A    |  N/A   |   **F**   | B (Q3) | Scheduler |
-| KV cache efficiency           |  B+  |   A+   |   A     |    N/A    |  N/A   |   **F**   | B (Q3) | Runtime |
-| Prefix Caching                |  A   |   A+   |   A     |     B     |   B    |   **B-**  | A (Q3)       | Runtime |
-| Speculative decoding          |  A   |   A    |   A     |    B+     |   B    |   **D**   | B (Q3) | Runtime |
+| Continuous batching           |  A   |   A+   |   A     |    N/A    |  N/A   |   **D**   | B (Q3) | Scheduler |
+| KV cache efficiency           |  B+  |   A+   |   A     |    N/A    |  N/A   |   **D**   | B (Q3) | Runtime |
+| Prefix Caching                |  A   |   A+   |   A     |     B     |   B    |   **B-**  | A (Q3) | Runtime |
+| Speculative decoding          |  A   |   A    |   A     |    B+     |   B    |   **C**   | B (Q3) | Runtime |
 | Structured output / JSON mode |  A   |   A+   |   B+    |    B+     |   B    |   **B-**  | B+ (Q3) | Runtime |
 | Multimodal / vision           |  A   |   A    |   B+    |    B+     |   B+   |   **D**   | C+ (Q3) | Runtime |
-| Tool / function calling       |  A   |   A    |   B     |    C      |   B    |   **F**   | B (Q3) | Server |
+| Tool / function calling       |  A   |   A    |   B     |    C      |   B    |   **B**   | B (Q3) | Server |
 | Quantization breadth          |  A+  |   B+   |   A     |    A+     |   A    |   **D**   | B (Q4) | Runtime |
-| Hardware breadth              |  A+  |   B+   |   C     |    A+     |   B    |   **D**  | B (Q4) | Runtime |
-| Disaggregated prefill/decode  |  A   |   A+   |   A     |    N/A    |  N/A   |   **F**   | C (Q4) | Distributed Runtime |
-| Model parallelism (TP/PP/EP)  |  A   |   A+   |   A     |    C      |   C    |   **F**   | C (Q4) | Distributed Runtime |
+| Hardware breadth              |  A+  |   B+   |   C     |    A+     |   B    |   **D**   | B (Q4) | Runtime |
+| Disaggregated prefill/decode  |  A   |   A+   |   A     |    N/A    |  N/A   |   **D**   | C (Q4) | Distributed Runtime |
+| Model parallelism (TP/PP/EP)  |  A   |   A+   |   A     |    C      |   C    |   **D**   | C (Q4) | Distributed Runtime |
 | OpenAI API compatibility      |  A   |   A    |   B     |    B      |   A    |   **B**   | B (Q3) | Server |
 | Enterprise auth & RBAC        |  B   |   C    |   B     |    F      |   F    |   **B-**  | B+ (Q3) | Policy |
 | Observability                 |  A   |   B    |   A     |    D      |   D    |   **B**   | B (Q3) | Observability |
 | Ease of local setup           |  B+  |   B    |   C     |    C      |   A+   |   **C**   | B (Q3) | CLI |
-| Model management UX           |  B   |   B    |   C     |    C      |   A+   |   **F**   | C+ (Q3) | CLI |
+| Model management UX           |  B   |   B    |   C     |    C      |   A+   |   **D**   | C+ (Q3) | CLI |
 | Test coverage & CI maturity   |  A   |   A    |   A     |    A      |   B    |   **B**   | B (Q3) | QA |
 
-**Overall grade: D (early prototype)**
+**Overall grade: C- (up from D; API feature parity achieved, core inference pipeline CPU-only)**
 
-**Scorecard status notes (May 2025):**
-- Production throughput, continuous batching, and KV cache efficiency remain at **F** until GPU-aware execution, prefill/decode overlap, and FA3 kernels from §2.5/§2.7 land.
-- Prefix caching bumped to **B-**: `RadixPrefixCache` (compressed trie over token sequences) is live, wired into `BatchExecutor` and `Scheduler`, with LRU eviction, partial-match metrics (`prefix_matched_tokens_total`, `prefix_partial_hits_total`), and 12 unit tests. Actual KV page reuse requires llama.cpp multi-sequence integration (§2.4 follow-up).
-- Structured output bumped to **B-** now that HTTP parsing, schema-to-grammar conversion, and llama grammar sampling are wired through scheduler/runtime (§2.1).
-- Tool/function calling bumped to **B**: `tools[]`/`tool_choice` parsed, schema injected as system preamble, `tool_calls` array emitted with `finish_reason=tool_calls`. Streaming tool call deltas (§2.3) done: four-chunk OpenAI delta sequence (role → function-name → arguments → `finish_reason=tool_calls`). Model-native chat templates (§2.3) done: `LlamaCPUBackend::FormatChatMessages()` calls `llama_chat_apply_template()` (NULL template = model's built-in GGUF metadata); multi-format tool call detection covers InferFlux preamble, bare generic JSON, Hermes/Llama-3.1 `<tool_call>` XML, and Mistral `[TOOL_CALLS]` formats; http_server tries native template first, falls back to `FlattenMessages`+preamble.
-- Multimodal/vision bumped to **D**: `ImagePreprocessor` parses OpenAI `image_url` content arrays, decodes base64 data URIs, fetches HTTP URLs, and injects `<__media__>` markers (§2.2). `LlamaCPUBackend` supports `LoadMmproj()` / `GenerateWithImages()` via libmtmd when built with `-DENABLE_MTMD=ON`. Prometheus counters `inferflux_multimodal_images_total` and `inferflux_multimodal_requests_total` track usage. Actual vision inference requires a compatible mmproj GGUF and `ENABLE_MTMD=ON` at build time.
-- Quantization breadth and hardware breadth are **D** since only CPU/MPS paths run; CUDA/ROCm/Intel enablement in §2.7/§2.11 is unresolved.
-- §2.5 fully done: phased prefill/decode, decode workers, KV serialisation, SHM transport, dual-pool `/readyz`, `inferflux_kv_transfer_duration_ms` histogram, Helm overlays. Grade moves toward **D** (still no GPU throughput); cross-node RDMA pending.
-- §2.6 (MoE expert parallelism) is partially done: `IsMoE()`/`ExpertCount()`/`ActiveExperts()` on `LlamaCPUBackend`, `ModelInfo` MoE fields populated in `SingleModelRouter`, `RecordMoERequest()` Prometheus counter, `EPDispatch`/`LocalEPDispatch` stub interface. Grade moves from **F** to **D** — multi-GPU expert sharding remains.
-- OpenAI API compatibility bumped to **B**—basic chat completion, SSE streaming, structured output, image_url content parts (§2.2), streaming tool call deltas, and model-native chat templates (§2.3) all done.
-- Enterprise auth/RBAC at **B-** reflects working OIDC/API-key flows but lacks fine-grained RBAC UX improvements noted in Policy backlog.
-- Observability is **B** thanks to metrics/tracing/logging closures in OBS-1 through OBS-4.
-- Ease of local setup is **C**; `inferctl pull` (§2.8) now downloads GGUF models from HuggingFace Hub — streamlined installers remain for a future pass.
-- Model management UX bumped from **F** to **D**; `inferctl pull` with progress reporting and quantization selection (Q4_K_M preferred) is live (§2.8); full registry UI and listing commands remain.
-- Test coverage/CI maturity bumped to **B**; CI now has five jobs: CPU `build-and-test` (ubuntu-latest, full ctest + SBOM), `build-check-mps` (macos-latest, MPS, full unit tests), `build-check-cuda` (CUDA 12.3 compile-check, advisory), `coverage` (gcov/lcov Debug build + Codecov upload), and `clang-format`. Coverage pipeline: `ENABLE_COVERAGE=ON` adds `--coverage -O0 -fno-inline` flags + links `--coverage`; `cmake --build --target coverage` zeroes counters, runs ctest, merges lcov traces, strips external/tests/usr, generates HTML report and lcov.info; `.codecov.yml` enforces 60% target / 5pp threshold; HTML report uploaded as `coverage-html-<sha>` artifact (14-day retention). Remaining gap to A: live GPU test execution (self-hosted runner), CI SHM smoke test.
+**Scorecard status notes (March 2026):**
+- **Production throughput: F** — CPU/MPS only via llama.cpp; no GPU kernel path, no true prefill/decode overlap. Unblocked only by CUDA hardware. Grade stays F.
+- **Continuous batching: D** — `WorkerLoop` batches up to 4 concurrent requests per cycle (batch-level concurrency, fairness-aware); individual requests decode sequentially on-CPU. No GPU-level in-flight token overlap (requires vLLM-style paged KV scheduler).
+- **KV cache efficiency: D** — `RadixPrefixCache` provides completion-level caching (trie over token IDs, LRU eviction, partial-match metrics). No actual GPU KV page reuse (requires llama.cpp multi-sequence or custom paged attention). F→D.
+- **Speculative decoding: C** — `SpeculativeDecoder` is wired through `BatchExecutor`; draft model runs via `draft_backend_->Generate()`, validator accepts/rejects chunks; `speculative.*` metrics on `InferenceResult`. Active when `config_.enabled=true` and `draft_backend_->IsReady()`. D→C.
+- **Structured output: B-** — HTTP parsing, schema→GBNF adapter (`StructuredOutputAdapter`), llama grammar sampling wired end-to-end (§2.1). Gap to B+: streaming grammar enforcement, nested `$defs` schemas.
+- **Tool/function calling: B** — `tools[]`/`tool_choice` parsed; schema injected as system preamble; `tool_calls` array with `finish_reason=tool_calls`; streaming four-chunk OpenAI delta sequence; model-native chat templates via `llama_chat_apply_template(nullptr,...)`; multi-format detection (InferFlux, bare generic, Hermes XML, Mistral `[TOOL_CALLS]`) with `[/TOOL_CALLS]` sentinel fix. Gap to A: parallel tool calls (`tool_choice: required`).
+- **Multimodal/vision: D** — `ImagePreprocessor` (base64 + URL fetch + SHA-256 IDs + `<__media__>` markers); `LlamaCPUBackend::GenerateWithImages()` via libmtmd (`-DENABLE_MTMD=ON`); Prometheus counters. Actual vision inference requires compatible mmproj GGUF. Gap to C+: streaming multimodal, batch image inputs.
+- **Disaggregated prefill/decode: D** — Option A complete: phased `Prefill()`/`Decode()`/`FreeSequence()`, seq_slot free-list, decode worker pool, ShmKVTransport (`INFERFLUX_KV_TRANSPORT=shm`), Helm overlays, SHM CI smoke test. F→D. Remaining: cross-node RDMA, chaos tests.
+- **Model parallelism (TP/PP/EP): D** — EPDispatch/LocalEPDispatch stub, MoE detection (`IsMoE`/`ExpertCount`/`ActiveExperts`), `inferflux_moe_requests_total`. F→D. Remaining: multi-GPU expert sharding, TP.
+- **OpenAI API compat: B** — Chat completions, completions, SSE streaming, structured output, image_url, tool calls, model-native chat templates all done. Missing: `/v1/models` standard endpoint (currently admin-only at `/v1/admin/models`), logprobs, `n>1`, best_of.
+- **Enterprise auth/RBAC: B-** — OIDC RS256 (JWKS TTL cache), API-key SHA-256, rate-limiter, OPA client, encrypted policy store (AES-GCM), audit log (hash-by-default). Gap to B+: fine-grained per-model RBAC, key rotation UI.
+- **Observability: B** — 5 latency histograms, Prometheus `/metrics`, W3C traceparent, `Span` RAII, audit log, fairness/preemption metrics, KV-transfer histogram, MoE counter, flash-attention gauge. Gap to A: structured JSON logs, Grafana dashboard template, self-hosted GPU runner for live metric CI.
+- **Ease of local setup: C** — `inferctl pull` downloads best GGUF from HuggingFace Hub (Q4_K_M preferred). Gap to B: one-command installer, shell completions, Docker image push to registry.
+- **Model management UX: D** — `inferctl pull` live, `inferctl admin models --list/--load` via `/v1/admin/models`. Missing: OpenAI-standard `/v1/models` endpoint (every SDK calls this), `inferctl models list`, hot reload.
+- **Test/CI: B** — 9 ctest targets (5 unit + 4 integration incl. SHM smoke), 5-job CI (build-test/MPS/CUDA-check/coverage/clang-format), SBOM artifact, Codecov (60% target). Gap to A: live GPU test runner, property-based tests.
 
 InferFlux has strong *architectural vision* (enterprise auth, policy store, multi-backend) but
 the implementation is at stub/MVP stage. The competitive gap is largest in the core inference
