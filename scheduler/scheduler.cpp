@@ -703,12 +703,23 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           static_cast<int>(inference->prompt_tokens.size()) >=
               kMinPrefixTokens &&
           pending->resolved_backend) {
-        // DonateKVPrefix owns any eviction: it calls FreeSequence on the
-        // displaced entry's own backend so cross-model corruption is
-        // impossible.
-        donated =
-            DonateKVPrefix(inference->sequence_id, inference->prompt_tokens,
-                           pending->resolved_backend);
+        // Guard: if sliding-window KV eviction fired during decode, prompt
+        // positions in this slot are no longer at [0, n_prompt_tokens).
+        // Reusing such a slot via CopySequencePrefix would restore wrong KV
+        // state for the next request.  Skip donation when the total token
+        // budget (prompt + completion) reached the context size.
+        int ctx_size = pending->resolved_backend->ContextSize();
+        int n_prompt = static_cast<int>(inference->prompt_tokens.size());
+        bool eviction_safe =
+            ctx_size > 0 && (n_prompt + result.completion_tokens < ctx_size);
+        if (eviction_safe) {
+          // DonateKVPrefix owns any eviction: it calls FreeSequence on the
+          // displaced entry's own backend so cross-model corruption is
+          // impossible.
+          donated =
+              DonateKVPrefix(inference->sequence_id, inference->prompt_tokens,
+                             pending->resolved_backend);
+        }
       }
       if (!donated) {
         if (pending->resolved_backend) {
@@ -850,9 +861,10 @@ Scheduler::LookupKVPrefix(const std::vector<int> &tokens,
     // Only useful as a prefix when the cached entry is shorter than the query.
     if (entry.tokens.empty() || entry.tokens.size() >= tokens.size())
       continue;
-    // Only reuse within the same backend instance: a seq_id has no meaning
-    // across different KV caches.
-    if (entry.backend.get() != backend)
+    // Skip entries whose backend has been unloaded (weak_ptr expired) or
+    // that belong to a different model instance.
+    auto locked = entry.backend.lock();
+    if (!locked || locked.get() != backend)
       continue;
     if (std::equal(entry.tokens.begin(), entry.tokens.end(), tokens.begin())) {
       // Prefer the longest matching prefix.
@@ -873,27 +885,30 @@ bool Scheduler::DonateKVPrefix(int seq_id, const std::vector<int> &tokens,
     return false;
   // Decline if an identical (backend, tokens) entry is already cached.
   for (const auto &entry : kv_prefix_store_) {
-    if (entry.backend.get() == backend.get() && entry.tokens == tokens)
+    if (entry.backend.lock().get() == backend.get() && entry.tokens == tokens)
       return false;
   }
+  std::weak_ptr<LlamaCPUBackend> weak_backend(backend);
   if (static_cast<int>(kv_prefix_store_.size()) < kPrefixStoreCap) {
     kv_prefix_store_.push_back({seq_id, static_cast<int>(tokens.size()), tokens,
-                                ++kv_prefix_clock_, backend});
+                                ++kv_prefix_clock_, weak_backend});
     return true;
   }
-  // Evict the least-recently-used entry.  Free its KV slot on its own backend
-  // — not the caller's — to avoid cross-model memory corruption.
+  // Evict the least-recently-used entry.  Lock its weak_ptr and call
+  // FreeSequence on the owning backend — not the caller's — to avoid
+  // cross-model memory corruption.  If the backend has already been unloaded
+  // (lock() returns null), skip FreeSequence but still reclaim the slot index.
   auto min_it =
       std::min_element(kv_prefix_store_.begin(), kv_prefix_store_.end(),
                        [](const KVPrefixEntry &a, const KVPrefixEntry &b) {
                          return a.last_used < b.last_used;
                        });
-  if (min_it->backend) {
-    min_it->backend->FreeSequence(min_it->seq_id);
+  if (auto evicted_backend = min_it->backend.lock()) {
+    evicted_backend->FreeSequence(min_it->seq_id);
   }
   FreeSeqSlot(min_it->seq_id);
   *min_it = {seq_id, static_cast<int>(tokens.size()), tokens,
-             ++kv_prefix_clock_, backend};
+             ++kv_prefix_clock_, weak_backend};
   return true;
 }
 

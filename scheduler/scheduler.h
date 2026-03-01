@@ -138,7 +138,10 @@ private:
     // The backend that owns the KV slot.  Reuse is only valid when the
     // incoming request resolves to the same backend instance; eviction must
     // call FreeSequence on this backend, not the caller's.
-    std::shared_ptr<LlamaCPUBackend> backend;
+    // Held as weak_ptr so that model unloads do not get pinned by the store.
+    // Callers must lock() before use and skip entries whose lock() returns
+    // null.
+    std::weak_ptr<LlamaCPUBackend> backend;
   };
   // Find the longest entry whose tokens are a strict prefix of `tokens` AND
   // whose backend pointer matches `backend`.  Returns nullptr on no match.
