@@ -62,6 +62,10 @@ class MetricsRegistry {
   // MoE (§2.6): record a request dispatched to a MoE model.
   void RecordMoERequest();
 
+  // Flash Attention (§2.7): set the FA enabled gauge (0=disabled, 1=enabled).
+  // Called once at server startup after LlamaBackendConfig is applied.
+  void SetFlashAttentionEnabled(bool enabled);
+
   // Latency recording — call with full request duration in milliseconds.
   void RecordLatency(double request_ms);
 
@@ -110,6 +114,7 @@ class MetricsRegistry {
   std::atomic<uint64_t> multimodal_images_{0};    // §2.2: total images preprocessed.
   std::atomic<uint64_t> multimodal_requests_{0};  // §2.2: total requests with images.
   std::atomic<uint64_t> moe_requests_{0};         // §2.6: requests routed to MoE models.
+  std::atomic<uint64_t> flash_attention_enabled_{0};  // §2.7: gauge — 0=disabled, 1=enabled.
 
   // Latency histograms.
   LatencyHistogram request_latency_;

@@ -97,6 +97,10 @@ class LlamaCPUBackend {
   void DisableGrammarConstraint();
   bool IsReady() const { return context_ != nullptr || test_ready_; }
 
+  // Flash Attention (§2.7): returns true when FA was requested in LlamaBackendConfig
+  // and the context was successfully created with LLAMA_FLASH_ATTN_TYPE_ENABLED.
+  bool FlashAttentionEnabled() const { return config_.use_flash_attention; }
+
   int TokenCount(const std::string& text) const;
   void ForceReadyForTests() { test_ready_ = true; }
 

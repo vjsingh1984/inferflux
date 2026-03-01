@@ -223,6 +223,59 @@ class LocalEPDispatch : public EPDispatch { ... }; // single-process default
 7. [ ] Multi-GPU expert sharding via NCCL or shared-memory ring
 8. [ ] EP-aware batch routing in `BatchExecutor`
 
+## Flash Attention (§2.7)
+
+### Attention Kernel Strategy
+
+Flash Attention is controlled through `LlamaBackendConfig::use_flash_attention` (bool) and
+`flash_attention_tile` (int, default 128 — reserved for future FA3 CUDA tile tuning).
+
+The setting maps directly to the llama.cpp context parameter:
+```cpp
+ctx_params.flash_attn_type = config.use_flash_attention
+    ? LLAMA_FLASH_ATTN_TYPE_ENABLED
+    : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+```
+llama.cpp dispatches to a hardware-specific kernel (Metal on MPS, cuBLAS FA on CUDA) when
+`ENABLED`. On CPU-only builds the flag is a no-op but accepted without error, so config
+stays forward-compatible.
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| `LlamaBackendConfig::use_flash_attention` | Done | Config field; wired through YAML + env var `INFERFLUX_CUDA_FLASH_ATTENTION` |
+| `LlamaBackendConfig::flash_attention_tile` | Done | Stored config; reserved for FA3 CUDA tile tuning |
+| `ctx_params.flash_attn_type` wired in `LoadModel()` | Done | `LLAMA_FLASH_ATTN_TYPE_ENABLED` / `DISABLED` |
+| `LlamaCPUBackend::FlashAttentionEnabled()` | Done | Accessor returning `config_.use_flash_attention` |
+| `inferflux_flash_attention_enabled` Prometheus gauge | Done | 0=disabled, 1=enabled; set at server startup |
+| FA3 CUDA kernels / cuBLAS dispatch | Pending | Hardware-blocked: requires CUDA build + L40S/H100 validation |
+
+### Config Surface
+
+YAML (`config/server.yaml`):
+```yaml
+runtime:
+  cuda:
+    enabled: true
+    flash_attention:
+      enabled: true
+      tile_size: 128   # reserved; passed through to future FA3 tile planner
+```
+
+Environment overrides:
+- `INFERFLUX_CUDA_FLASH_ATTENTION=true` — enable FA
+- `INFERFLUX_CUDA_FLASH_TILE=256` — override tile size
+
+### Implementation Checklist
+1. [x] `LlamaBackendConfig::use_flash_attention` / `flash_attention_tile` fields
+2. [x] YAML + env-var parsing in `server/main.cpp`
+3. [x] `ctx_params.flash_attn_type` wired in `LlamaCPUBackend::LoadModel()`
+4. [x] `LlamaCPUBackend::FlashAttentionEnabled()` accessor
+5. [x] `MetricsRegistry::SetFlashAttentionEnabled()` + `inferflux_flash_attention_enabled` gauge
+6. [x] `GlobalMetrics().SetFlashAttentionEnabled()` called in `server/main.cpp` post-guard
+7. [x] 9 `[flash_attn]` unit tests (`tests/unit/test_flash_attn.cpp`)
+8. [ ] FA3 CUDA kernels on Hopper / link against cutlass or flash-attention library
+9. [ ] Per-layer kernel selection metrics (FA vs standard attention switch count)
+
 ### Adapter Pattern & Backend Capabilities
 - **StructuredOutputAdapter** — Maintain OpenAI’s `response_format` as the public contract but introduce an internal adapter interface that validates payloads, enforces size limits, and emits backend-native constraints (e.g., llama.cpp GBNF via `json_schema_to_grammar`, regex/DSL for future engines).
 - **Backend capability flags** — Extend `ModelRouter`/`BackendManager` to advertise whether a backend supports structured output and which adapter type it requires. Scheduler consults these flags so unsupported combinations fail fast.

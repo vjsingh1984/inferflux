@@ -179,6 +179,10 @@ void MetricsRegistry::RecordMoERequest() {
   moe_requests_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void MetricsRegistry::SetFlashAttentionEnabled(bool enabled) {
+  flash_attention_enabled_.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 void MetricsRegistry::RecordLatency(double request_ms) {
   request_latency_.Record(request_ms);
 }
@@ -479,6 +483,11 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# HELP inferflux_moe_requests_total Requests dispatched to MoE models\n";
   out << "# TYPE inferflux_moe_requests_total counter\n";
   out << "inferflux_moe_requests_total " << moe_requests_.load() << "\n";
+
+  // --- Flash Attention (§2.7) ---
+  out << "# HELP inferflux_flash_attention_enabled Flash Attention active for this instance (0=disabled, 1=enabled)\n";
+  out << "# TYPE inferflux_flash_attention_enabled gauge\n";
+  out << "inferflux_flash_attention_enabled " << flash_attention_enabled_.load() << "\n";
 
   // --- Gauges ---
   out << "# HELP inferflux_active_connections Current number of active HTTP connections\n";

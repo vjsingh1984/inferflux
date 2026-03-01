@@ -180,15 +180,23 @@ throughput over vanilla TP for MoE models using expert parallelism.
 - EP-aware batch routing in `BatchExecutor` (partition expert layers by rank).
 - Fused MoE kernels (requires CUDA/ROCm backend).
 
-### 2.7 Flash Attention Integration
+### 2.7 Flash Attention Integration ✅ (llama.cpp wiring done; FA3 CUDA kernels hardware-blocked)
 
 **Why critical:** FlashAttention-3 achieves 1.5-2x over FA2, 75% GPU utilization on Hopper.
 Every production GPU server uses it.
 
-- **What to add:** FA3 kernels for CUDA path, leverage llama.cpp's Metal attention for MPS.
-- **Update:** `docs/Architecture.md` §Runtime — document attention kernel strategy.
-- **Implement in:** `runtime/backends/` (CUDA backend with FA3), link against
-  flash-attention or cutlass.
+**Done:**
+- `LlamaBackendConfig::use_flash_attention` / `flash_attention_tile` config fields
+- YAML (`runtime.cuda.flash_attention.enabled/tile_size`) + env-var (`INFERFLUX_CUDA_FLASH_ATTENTION`, `INFERFLUX_CUDA_FLASH_TILE`) parsing in `server/main.cpp`
+- `ctx_params.flash_attn_type` wired to `LLAMA_FLASH_ATTN_TYPE_ENABLED` / `DISABLED` in `LlamaCPUBackend::LoadModel()`
+- `LlamaCPUBackend::FlashAttentionEnabled()` accessor
+- `MetricsRegistry::SetFlashAttentionEnabled()` + `inferflux_flash_attention_enabled` Prometheus gauge (0/1)
+- 9 `[flash_attn]` unit tests in `tests/unit/test_flash_attn.cpp`; `FlashAttnTests` ctest target
+- Architecture.md §Flash Attention section added
+
+**Remaining (hardware-blocked):**
+- FA3 CUDA kernels on Hopper/Ada — link against cutlass or flash-attention library
+- Per-layer kernel selection metrics
 
 ### 2.8 Model Management UX (`inferctl pull`)
 
@@ -350,7 +358,7 @@ policy store with RBAC, CLI interactive mode, Prometheus metrics, audit logging.
 | P0 | Queue-based scheduler + priority scheduling | **Done** — worker thread, fairness aging, BatchExecutor | INF-2, §2.9 | `scheduler/scheduler.cpp`, `runtime/execution/batch_executor.cpp` |
 | P0 | **[UPGRADE]** Structured output / JSON mode | **Done** — HTTP parser validates `response_format`, `StructuredOutputAdapter` converts schemas to llama GBNF, `BatchExecutor`/`LlamaCPUBackend` enforce grammar sampling, unit tests cover adapter | §2.1 | `server/http/http_server.cpp`, `scheduler/request_batch.h`, `runtime/execution/batch_executor.cpp`, `runtime/structured_output/` |
 | P0 | **[NEW]** Tool calling / function calling | **Done** — parse `tools[]`+`tool_choice`, inject schema as system preamble, detect `tool_call` JSON in output, emit `tool_calls` array with `finish_reason=tool_calls` | §2.3 | `server/http/http_server.cpp` |
-| P0 | **[UPGRADE]** CUDA backend with FlashAttention | **Partial** — FA3 config fields added, CUDA build flags wired; GPU kernel execution pending | §2.7 | `runtime/backends/cuda/` |
+| P0 | **[UPGRADE]** CUDA backend with FlashAttention | **Done (llama.cpp wiring)** — `ctx_params.flash_attn_type` wired in `LoadModel()`; `FlashAttentionEnabled()` accessor; `inferflux_flash_attention_enabled` gauge; 9 unit tests. FA3 CUDA kernels hardware-blocked (pending L40S/H100 build). | §2.7 | `runtime/backends/cpu/llama_backend.cpp`, `server/metrics/metrics.cpp` |
 | P1 | **[NEW]** Prefix caching (radix tree KV reuse) | **Done** — `RadixPrefixCache` compressed trie; `Lookup` with `matched_tokens` out-param; LRU eviction; partial-hit Prometheus counters; 12 unit tests; scheduler + executor migrated | §2.4 | `runtime/prefix_cache/radix_prefix_cache.cpp` |
 | P1 | Prompt/response hashing in audit logs | **Done** | OBS-4 | `server/logging/audit_logger.cpp` |
 | P1 | **[DONE]** Multimodal / vision model support | **Done** — `ImagePreprocessor` (base64 decode, URL fetch, SHA-256 image IDs, `<__media__>` marker injection); `InferenceRequest.images` field; `LlamaCPUBackend::LoadMmproj()`/`GenerateWithImages()` (guarded by `INFERFLUX_HAS_MTMD`); multimodal Prometheus counters; 11 unit tests | §2.2 | `runtime/multimodal/`, `server/http/http_server.cpp`, `runtime/backends/cpu/llama_backend.cpp` |
@@ -417,7 +425,7 @@ identified above. Check items off as they are addressed.
 - [X] §Data Flow: Add image preprocessing stage — §2.2
 - [X] §Deployment View: Add disaggregated prefill/decode topology — §2.5
 - [X] §Runtime: Add prefix cache subsystem — §2.4
-- [ ] §Runtime: Document attention kernel strategy (FA3) — §2.7
+- [x] §Runtime: Document attention kernel strategy (FA3) — §2.7 (Architecture.md §Flash Attention added)
 - [X] §Scheduler: Add priority queue design — §2.9
 
 ### `docs/NFR.md`

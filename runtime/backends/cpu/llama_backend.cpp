@@ -102,9 +102,15 @@ bool LlamaCPUBackend::LoadModel(const std::filesystem::path& model_path, const L
   ctx_params.n_ctx = config.ctx_size;
   ctx_params.n_batch = config.batch_size;
 
+  // Wire Flash Attention (§2.7): set llama.cpp context parameter directly.
+  // LLAMA_FLASH_ATTN_TYPE_ENABLED lets llama.cpp choose FA on any supported backend
+  // (Metal, CUDA); the tile parameter is stored for future FA3 CUDA integration.
+  ctx_params.flash_attn_type = config.use_flash_attention
+                                   ? LLAMA_FLASH_ATTN_TYPE_ENABLED
+                                   : LLAMA_FLASH_ATTN_TYPE_DISABLED;
   if (config.use_flash_attention) {
-    std::cout << "[LlamaCPUBackend] FlashAttention requested (tile=" << config.flash_attention_tile
-              << "). Integrate FA3 kernels via llama.cpp CUDA build to enable GPU acceleration.\n";
+    std::cout << "[LlamaCPUBackend] FlashAttention enabled (tile=" << config.flash_attention_tile
+              << ")\n";
   }
 
   context_ = llama_init_from_model(model_, ctx_params);

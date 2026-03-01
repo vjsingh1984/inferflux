@@ -516,6 +516,10 @@ int main(int argc, char** argv) {
   }
 #endif
 
+  // Sync primary_cfg with effective post-guard FA state; record Prometheus gauge (§2.7).
+  primary_cfg.use_flash_attention = cuda_flash_attention_enabled;
+  inferflux::GlobalMetrics().SetFlashAttentionEnabled(primary_cfg.use_flash_attention);
+
   auto router = std::make_shared<inferflux::SingleModelRouter>();
   std::string resolved_default_model_id;
   std::string resolved_default_path = model_path;
