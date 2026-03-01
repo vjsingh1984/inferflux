@@ -47,7 +47,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 - Tool/function calling bumped to **C+**: `tools[]`/`tool_choice` are parsed, schema injected as system preamble, `tool_calls` array emitted with `finish_reason=tool_calls`. Streaming tool deltas and model-native chat templates (§2.3 follow-up) are the remaining gap to reach B.
 - Multimodal/vision bumped to **D**: `ImagePreprocessor` parses OpenAI `image_url` content arrays, decodes base64 data URIs, fetches HTTP URLs, and injects `<__media__>` markers (§2.2). `LlamaCPUBackend` supports `LoadMmproj()` / `GenerateWithImages()` via libmtmd when built with `-DENABLE_MTMD=ON`. Prometheus counters `inferflux_multimodal_images_total` and `inferflux_multimodal_requests_total` track usage. Actual vision inference requires a compatible mmproj GGUF and `ENABLE_MTMD=ON` at build time.
 - Quantization breadth and hardware breadth are **D** since only CPU/MPS paths run; CUDA/ROCm/Intel enablement in §2.7/§2.11 is unresolved.
-- Disaggregated prefill/decode and model parallelism are **F** because no distributed runtime exists yet (§2.5/§2.6).
+- §2.5 Option A (in-process phased prefill/decode) is done: `Prefill()`/`Decode()` on `LlamaCPUBackend`, sequence slot free-list, KVChannel gating; grade stays **F** until cross-node KV transfer and decode workers land. §2.6 (MoE expert parallelism) remains **F**.
 - OpenAI API compatibility holds at **C**—basic chat completion works; image_url content parts are now parsed (§2.2); tool/function calling gaps remain (§2.3).
 - Enterprise auth/RBAC at **B-** reflects working OIDC/API-key flows but lacks fine-grained RBAC UX improvements noted in Policy backlog.
 - Observability is **B** thanks to metrics/tracing/logging closures in OBS-1 through OBS-4.
@@ -143,24 +143,24 @@ and agent workloads.
 - **Tests:** 12 `[radix_cache]` unit tests in `tests/unit/test_radix_prefix_cache.cpp`.
 - **Still TODO:** Attach KV page IDs to trie nodes once llama.cpp multi-sequence support lands (true zero-copy prefix reuse). `docs/NFR.md` §Performance KPI table updated.
 
-### 2.5 Disaggregated Prefill/Decode
+### 2.5 Disaggregated Prefill/Decode — Option A Done
 
 **Why critical:** Now the default production architecture. vLLM deploys it at Meta, LinkedIn,
 Mistral. SGLang tested it on 96 H100s. NVIDIA Dynamo provides orchestration for it.
 
-- **Work Breakdown:**
-  1. **Scheduler split:** Teach `RequestBatch`/`Scheduler` to emit prefill vs decode work items, expose config knobs for pool sizes, and add queue depth metrics per phase.
-  2. **KV handoff plane:** Define a `runtime/disaggregated/kv_channel.*` that serializes KV pages + metadata, supports SHM + RDMA backends, and enforces <5 ms transfer SLA with tracing.
-  3. **Prefill workers:** New `PrefillWorker` loop that only tokenizes/prompts, persists KV segments, and emits completion tickets into the decode queue; integrate guardrails + cancellation.
-  4. **Decode workers:** Reuse/extend `BatchExecutor` to consume tickets, hydrate KV from the channel, and stream tokens; ensure fairness + speculative hooks operate in decode-only mode.
-  5. **Control plane + health:** `/readyz` must reflect both pools, expose Prometheus gauges for transfer latency and blocked tickets, and add chaos tests that restart either plane mid-run.
-  6. **Deployment topologies:** Document Helm/docker manifests that scale prefill/decode independently and add CI smoke tests for single-node SHM mode.
-- **Update:** `docs/Architecture.md` §Deployment View — add disaggregated topology.
-- **Update:** `docs/Architecture.md` §Runtime — add subsections for prefill pool, decode pool, and KV handoff responsibilities.
-- **Update:** `docs/PRD.md` §Functional Requirements — spell out the above work items with acceptance tests (prefill saturation, ticket retries, transfer latency SLA).
-- **Update:** `docs/Roadmap.md` Workstream D — enumerate milestones per bullet (scheduler split, KV channel, workers, control plane, deployment assets).
-- **Update:** `docs/NFR.md` §Scalability — add KV transfer latency targets and independent scaling KPIs.
-- **Implement in:** new `runtime/disaggregated/` module, `scheduler/scheduler.h/.cpp`, `runtime/kv_cache/` (serialization), deployment manifests, and tests under `tests/integration/disaggregated_*`.
+- **Implemented (Option A — in-process phased prefill/decode):**
+  - `LlamaCPUBackend::Prefill(prompt, seq_id)` evaluates prompt tokens into the KV cache for slot `seq_id` and returns `n_past`. `Decode(n_past, seq_id, …)` continues from that position. `FreeSequence(seq_id)` cleans up the KV slot via `llama_memory_seq_rm`. `BatchAddSeq()` sets per-token `seq_id` on `llama_batch`.
+  - `Scheduler` maintains a `seq_slots_free_` free-list (16 slots). `AllocSeqSlot()` / `FreeSeqSlot()` replace the unsafe `request_id % 16` modulo that caused KV corruption between concurrent requests.
+  - `ProcessBatch` kPrefill block calls `Prefill()` before handing the request to `BatchExecutor`; `ExecuteRequest` branches on `n_past >= 0` for `Decode()` vs legacy `Generate()`.
+  - `KVChannel` gate: only enqueued when `use_decode_workers_=true`; while workers are disabled the channel is bypassed entirely (prevents fill-and-deadlock at capacity 64).
+  - 11 `[phased]` unit tests in `tests/unit/test_phased_execution.cpp`.
+  - **Docs:** `docs/Architecture.md` updated with implementation details and remaining work checklist.
+- **Remaining (distributed / cross-process):**
+  1. **Decode workers:** Wire `DecodeWorkerLoop`, enable `use_decode_workers_=true`; `KVChannel` becomes the hand-off queue between prefill and decode thread groups.
+  2. **KV serialization:** `llama_state_seq_get_data` / `llama_state_seq_set_data` for cross-process KV transfer (requires llama.cpp upstream API).
+  3. **SHM/RDMA transport:** Replace in-process `KVChannel` queue with SHM ring buffer (same node) or RDMA (multi-node); enforce <5 ms transfer SLA.
+  4. **Control plane + health:** Dual-pool `/readyz`, transfer-latency Prometheus histograms, chaos tests.
+  5. **Deployment topologies:** Helm/Docker overlays for independent prefill/decode scaling; CI SHM smoke test.
 
 ### 2.6 Expert Parallelism for MoE Models
 
@@ -364,7 +364,7 @@ cache, speculative decoding, LoRA stacking, hot adapter reloads, autoscaler hint
 
 | Priority | Item | Status | Tracking IDs | Key Files |
 |----------|------|--------|-------------|-----------|
-| P0 | **[NEW]** Disaggregated prefill/decode | Not started | §2.5 | `runtime/disaggregated/` (new), `scheduler/` |
+| P0 | **[NEW]** Disaggregated prefill/decode | **Option A done** — in-process phased Prefill/Decode/FreeSequence, slot free-list, KVChannel gate; decode workers + cross-process transport pending | §2.5 | `runtime/disaggregated/`, `runtime/backends/cpu/llama_backend.cpp`, `scheduler/scheduler.cpp` |
 | P0 | **[NEW]** Expert parallelism for MoE models | Not started | §2.6 | `runtime/backends/`, `scheduler/` |
 | P1 | **[NEW]** Request priority & fairness scheduling | **Done** — `FairnessController` with timeslice, preemption, resume; `ApplyFairness()` in scheduler; fairness metrics (tokens/preemption/yield/resume); `Span` hooks for yield/resume; `UpdateFairnessConfig()` live API; 3 unit tests (`[fairness]`) | §2.9 | `scheduler/fairness_controller.h`, `scheduler/scheduler.h` |
 | P1 | **[UPGRADE]** Tensor + pipeline parallelism | Not started | — | `runtime/backends/` |
@@ -408,7 +408,7 @@ identified above. Check items off as they are addressed.
 - [X] §Modules: Add constrained decoding module — §2.1
 - [ ] §Modules: Add parallelism strategies section (TP/PP/EP) — §2.6, §2.7
 - [X] §Data Flow: Add image preprocessing stage — §2.2
-- [ ] §Deployment View: Add disaggregated prefill/decode topology — §2.5
+- [X] §Deployment View: Add disaggregated prefill/decode topology — §2.5
 - [X] §Runtime: Add prefix cache subsystem — §2.4
 - [ ] §Runtime: Document attention kernel strategy (FA3) — §2.7
 - [X] §Scheduler: Add priority queue design — §2.9
@@ -417,7 +417,7 @@ identified above. Check items off as they are addressed.
 
 - [X] §Performance: Add latency target for constrained vs unconstrained decoding — §2.1
 - [X] §Performance: Add prefix cache hit rate KPIs — §2.4
-- [ ] §Scalability: Add KV transfer latency targets for disaggregation — §2.5
+- [X] §Scalability: Add KV transfer latency targets for disaggregation — §2.5
 - [X] §Security: Require TLS support — SEC-5
 - [X] §Security: Require JWT signature verification — SEC-1
 - [X] §Operability: Add histogram and gauge metric requirements — OBS-1

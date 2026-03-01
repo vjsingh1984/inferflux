@@ -16,6 +16,17 @@
 
 ## Scalability
 - Horizontal scaling to 64 GPUs per cluster with shared KV cache metadata.
+
+### Disaggregated Prefill/Decode Targets (§2.5)
+Once decode workers and transport are enabled, the following SLOs apply:
+
+| KPI | Target | Notes |
+| --- | --- | --- |
+| KV transfer latency (same-node SHM) | <5 ms P99 | Measured from `Prefill()` return to first `Decode()` token |
+| KV transfer latency (multi-node RDMA) | <10 ms P99 | Single-hop InfiniBand / RoCEv2 |
+| Prefill queue depth | Exposed via Prometheus gauge | Enables autoscaler to scale prefill pool independently |
+| Decode queue depth | Exposed via Prometheus gauge | Enables autoscaler to scale decode pool independently |
+| Blocked ticket rate | <1% of requests | Tickets rejected by a full `KVChannel` force prefill retry |
 - Support for MIG partitioning and multi-node deployments using Redis/etcd for scheduler coordination.
 - Multi-region active/active design with weighted routing, autoscaler hints (queue depth, cache pressure), and BYO object-storage for weights/adapters.
 

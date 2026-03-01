@@ -44,12 +44,14 @@ layer above it.
 - **Batch Observability**: Prefill/decode timing and streamed token counters are exposed via `/metrics`; `inferflux_stream_tokens_total` vs `inferflux_stream_cache_hits_total` highlight live SSE health.
 - **Tool Calling Stubs**: When no backend is loaded the server synthesizes JSON tool-call envelopes so agent frameworks still receive valid scaffolding (logged via `INFERFLUX_LOG_TOOL_CALLS`).
 - **Fairness Scheduling (Done)**: `FairnessController` enforces per-priority timeslices and preemption; `scheduler.fairness.*` config knobs (`enable_preemption`, `high_priority_threshold`, `max_timeslice_tokens`) are live and updatable at runtime via `Scheduler::UpdateFairnessConfig()`. Fairness counters (`inferflux_fairness_preemptions_total`, `inferflux_fairness_yields_total`, `inferflux_fairness_resumes_total`, per-priority token gauges) are exported via `/metrics`.
-- **Next Focus**: GPU work once compatible hardware is available; disaggregated prefill/decode (§2.5) is blocked on KV export/hydration API availability in llama.cpp.
+- **Phased Prefill/Decode (Done — Option A)**: `LlamaCPUBackend::Prefill()`/`Decode()`/`FreeSequence()` run prompt evaluation and token generation as separate phases using llama.cpp sequence IDs. `Scheduler` manages a 16-slot free-list (`seq_slots_free_`) so concurrent requests never share a KV slot. `KVChannel` is gated on `use_decode_workers_` to prevent deadlock. 11 `[phased]` unit tests. Remaining: decode workers, cross-process KV serialization, SHM/RDMA transport.
+- **Next Focus**: GPU work once compatible hardware is available; §2.6 expert parallelism for MoE models remains.
 
 ### Strategic Modules In Flight
 - **Constrained Decoder**: Grammar/JSON-aware decoding path inserted between scheduler and runtime to deliver the 99.5% schema KPI.
 
 ### Completed Strategic Modules
+- **Phased Prefill/Decode** (§2.5): `LlamaCPUBackend` gains `Prefill(prompt, seq_id)`/`Decode(n_past, seq_id, …)`/`FreeSequence(seq_id)` backed by llama.cpp sequence-ID KV isolation. `Scheduler` allocates slots from a `seq_slots_free_` free-list (16 entries) and returns them after each request completes. `BatchExecutor` calls `Decode()` when `n_past >= 0`, advances `n_past` per fairness slice, and preserves the KV slot across yields. `KVChannel` is only populated when decode workers are enabled (currently disabled by default).
 - **Prefix Cache** (§2.4): `RadixPrefixCache` — compressed trie over token ID sequences. Exact-match completions skip generation; partial-match depth is tracked via Prometheus counters (`prefix_matched_tokens_total`, `prefix_partial_hits_total`) to quantify future KV page reuse opportunity once llama.cpp multi-sequence support lands.
 - **Multimodal Adapter** (§2.2): `ImagePreprocessor` parses OpenAI `image_url` content-array parts, decodes base64 data URIs or fetches HTTP URLs, assigns SHA-256 image IDs, and injects `<__media__>` markers into the flattened prompt. `LlamaCPUBackend` exposes `LoadMmproj()` / `GenerateWithImages()` via libmtmd (activated with `-DENABLE_MTMD=ON`). Prometheus counters report images preprocessed and multimodal request volume.
 

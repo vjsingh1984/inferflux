@@ -135,30 +135,54 @@ InferFlux now implements the PRD §Functional #8 requirements end-to-end:
 
 Contract tests (`tests/unit/test_structured_output.cpp`) cover schema validation/grammar emission, and the existing SSE/tooling tests ensure the HTTP surface emits structured responses. Future backends (CUDA/MPS) and CLI docs reuse the same adapter interface, so extending structured output beyond CPU is now an incremental task instead of a rewrite.
 
-## Disaggregated Prefill/Decode Blueprint (TechDebt §2.5)
-To graduate from single-node batching to best-in-class distributed throughput, InferFlux will implement a disaggregated runtime in six incremental slices. Each slice is independently testable so we can track progress across sessions:
+## Phased Prefill/Decode — Implemented (§2.5 Option A)
 
-1. **Scheduler Partitioning**
-   - Introduce `PrefillTicket` and `DecodeTicket` structures in `scheduler/request_batch.h`.
-   - Add config knobs (`scheduler.prefill_pool_size`, `scheduler.decode_pool_size`) plus metrics for per-phase queue depth and wait time.
-   - Update fairness controller to age tickets within their phase and emit distinct Prometheus counters.
-2. **KV Transfer Plane**
-   - New `runtime/disaggregated/kv_channel.{h,cpp}` with a pluggable transport interface (shared memory ring buffer first, RDMA later).
-   - Serialize KV pages, tokenizer state, and guardrail verdict metadata; enforce <5 ms copy using trace spans and Prometheus histograms.
-3. **Prefill Workers**
-   - A dedicated worker thread group that only runs prompt tokenization/prefill, writes KV payloads into the channel, and emits `DecodeTicket`s.
-   - Integrate guardrail checks, cancellation flags, and backpressure handling when decode is saturated.
-4. **Decode Workers**
-   - Extend `BatchExecutor` to hydrate KV blobs into the KV cache, resume decoding, and continue streaming tokens (still honoring fairness + speculative paths).
-   - Ensure decode-only workers can requeue tickets if a backend stalls or cancellation fires mid-stream.
-5. **Control Plane & Health**
-   - `/readyz` reflects both pools with granular failure reasons, `/metrics` exposes transfer latency histograms and blocked ticket gauges, and chaos tests restart either plane while ensuring in-flight tickets survive.
-   - Config schema + docs cover new knobs; CLI/admin commands surface pool health.
-6. **Deployment Assets**
-   - Add Helm/Docker Compose overlays that run prefill/decode pools as separate deployments with horizontal autoscaling hints.
-   - Provide a CI smoke test (stub mode) that exercises shared-memory transfer end-to-end.
+InferFlux now runs prefill and decode as distinct phases within the same process, using
+llama.cpp’s per-sequence KV cache to give each request an isolated state slot. This delivers
+phase visibility, per-request KV lifetime control, and the hook structure needed for future
+cross-process disaggregation — without requiring KV serialization or upstream llama.cpp changes.
 
-Each slice should land with design docs + tests (unit and integration) so that progress is auditable even before GPUs arrive.
+### New LlamaCPUBackend Methods
+| Method | Description |
+| --- | --- |
+| `Prefill(prompt, seq_id) → PrefillResult{n_past, ok}` | Clears slot `seq_id` via `llama_memory_seq_rm`, evaluates all prompt tokens, returns `n_past` (= prompt token count). Returns `{ok=false}` on error. |
+| `Decode(n_past, seq_id, max_tokens, …) → string` | Autoregressive generation from `n_past` for slot `seq_id`. Supports streaming callbacks and cancellation. |
+| `FreeSequence(seq_id)` | Releases KV slot `seq_id` via `llama_memory_seq_rm`. |
+| `BatchAddSeq(batch, token, pos, seq_id, logits)` | Sets per-token `seq_id` on a `llama_batch`, letting concurrent requests share one `llama_context` without KV collision. |
+
+### Sequence Slot Allocator
+`Scheduler` maintains `seq_slots_free_` — a `std::vector<bool>` of `kMaxSequenceSlots=16` entries (all `true` at init). `AllocSeqSlot()` does a first-fit scan and marks the slot busy; returns `-1` when all are taken (request falls back to the legacy `Generate()` path). `FreeSeqSlot(slot)` is called in the `ProcessBatch` post-execution loop after full completion. This replaces the earlier `request_id % kMaxSequenceSlots` assignment, which caused KV corruption when concurrent requests shared a modulo slot.
+
+### Per-Request Lifecycle
+1. `BuildBatchLocked` tags new requests `RequestPhase::kPrefill`.
+2. `ProcessBatch` kPrefill block: `AllocSeqSlot()` → `backend->Prefill(prompt, seq_id)` → store `n_past` + `sequence_id` on `InferenceRequest`.
+3. Request promoted to `kDecode`; `BatchExecutor::ExecuteRequest` branches on `n_past >= 0` and calls `Decode(n_past, seq_id, decode_limit, …)` instead of `Generate()`.
+4. After each slice, `n_past += completion_tokens` so the next fairness slice resumes from the correct KV position.
+5. **Full completion**: `BatchExecutor` calls `backend->FreeSequence(seq_id)` (KV memory); `Scheduler::ProcessBatch` calls `FreeSeqSlot(slot)` (slot integer).
+6. **Fairness yield**: KV slot preserved; `n_past` advanced; request requeues into `pending_decode_` for the next slice.
+
+### KVChannel (Stub — Future Distributed Transport)
+`runtime/disaggregated/kv_channel.*` provides `KVChannel` (thread-safe bounded queue) and `KVPacket` (carries `request_id`, `n_past`, `sequence_id`, `kv_blob`, metadata). The channel is only populated when `use_decode_workers_=true`; while decode workers are disabled (current default), the kPrefill block sets `enqueued=true` directly and skips the channel entirely, preventing fill-and-deadlock.
+
+### Configuration
+| Constant / Field | Value | Effect |
+| --- | --- | --- |
+| `kMaxSequenceSlots` | 16 | Free-list size; must exceed `kMaxBatchSize` (4) |
+| `use_decode_workers_` | `false` (hard-coded) | When `true`, prefill→decode hand-off goes via `KVChannel` + separate decode threads |
+
+### Implementation Checklist
+1. [x] `LlamaCPUBackend::Prefill()` / `Decode()` / `FreeSequence()` / `BatchAddSeq()`
+2. [x] `InferenceRequest.n_past{-1}` / `sequence_id{-1}` (phased state)
+3. [x] `KVPacket.n_past` / `sequence_id` (future transport)
+4. [x] Sequence slot free-list (`seq_slots_free_`, `AllocSeqSlot()`, `FreeSeqSlot()`)
+5. [x] `ProcessBatch`: allocate slot, call `Prefill()`, store n_past+sequence_id; return slot on full completion
+6. [x] `BatchExecutor::ExecuteRequest`: branch on `n_past>=0` for `Decode()`; advance n_past per slice; `FreeSequence()` on non-yield completion only
+7. [x] KVChannel gate: only enqueue when `use_decode_workers_=true`
+8. [x] 11 `[phased]` unit tests (`tests/unit/test_phased_execution.cpp`)
+9. [ ] Wire `DecodeWorkerLoop` + enable `use_decode_workers_=true`
+10. [ ] `llama_state_seq_get_data` / `llama_state_seq_set_data` for cross-process KV transfer (requires llama.cpp upstream)
+11. [ ] SHM/RDMA transport layer (<5 ms transfer SLA)
+12. [ ] Dual-pool `/readyz`, transfer-latency Prometheus histograms, Helm overlays for independent scaling
 
 ### Adapter Pattern & Backend Capabilities
 - **StructuredOutputAdapter** — Maintain OpenAI’s `response_format` as the public contract but introduce an internal adapter interface that validates payloads, enforces size limits, and emits backend-native constraints (e.g., llama.cpp GBNF via `json_schema_to_grammar`, regex/DSL for future engines).
