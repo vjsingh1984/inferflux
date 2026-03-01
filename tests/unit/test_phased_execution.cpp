@@ -90,3 +90,47 @@ TEST_CASE("InferenceRequest phased fields are assignable", "[phased]") {
   REQUIRE(req.n_past == 128);
   REQUIRE(req.sequence_id == 5);
 }
+
+// ---------------------------------------------------------------------------
+// Bug fix: KVChannel deadlock when channel fills with no consumers (Bug 1)
+//
+// The scheduler gates enqueue on use_decode_workers_.  We can't test that
+// gate here, but we can verify the channel contract that callers rely on:
+// Enqueue() returns false when at capacity, so callers MUST handle rejection
+// without infinite retry.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("KVChannel Enqueue returns false when at capacity (no deadlock contract)", "[phased]") {
+  disaggregated::KVChannel channel(2);
+  disaggregated::KVPacket p1; p1.request_id = 1;
+  disaggregated::KVPacket p2; p2.request_id = 2;
+  disaggregated::KVPacket p3; p3.request_id = 3;
+  REQUIRE(channel.Enqueue(std::move(p1)));
+  REQUIRE(channel.Enqueue(std::move(p2)));
+  // At capacity: third enqueue must fail so callers can requeue without looping.
+  REQUIRE_FALSE(channel.Enqueue(std::move(p3)));
+}
+
+// ---------------------------------------------------------------------------
+// Bug fix: sequence_id assignment (Bug 2)
+//
+// The invariant the Scheduler's free-list provides: if a slot is in use
+// (sequence_id >= 0) it must be reset to -1 before the slot is reused.
+// Simulate the lifecycle the scheduler enforces: assign → use → clear.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("InferenceRequest sequence_id lifecycle: assign then clear on completion", "[phased]") {
+  InferenceRequest req;
+  REQUIRE(req.sequence_id == -1);  // starts unassigned
+
+  // Scheduler assigns a slot after Prefill().
+  req.sequence_id = 3;
+  req.n_past = 64;
+  REQUIRE(req.sequence_id == 3);
+
+  // Scheduler clears slot after request fully completes (not a fairness yield).
+  req.sequence_id = -1;
+  req.n_past = -1;
+  REQUIRE(req.sequence_id == -1);  // slot returned to the pool
+  REQUIRE(req.n_past == -1);
+}

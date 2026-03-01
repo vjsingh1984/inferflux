@@ -45,7 +45,8 @@ Scheduler::Scheduler(SimpleTokenizer tokenizer,
       prefix_cache_(std::move(prefix_cache)),
       fairness_controller_(fairness_config),
       fairness_config_(fairness_config),
-      disagg_config_(disagg_config) {
+      disagg_config_(disagg_config),
+      seq_slots_free_(kMaxSequenceSlots, true) {
   executor_ = std::make_unique<BatchExecutor>(&tokenizer_, device_, cache_, router_, speculative_decoder_, prefix_cache_);
   worker_ = std::thread(&Scheduler::WorkerLoop, this);
   use_decode_workers_ = false;
@@ -233,15 +234,28 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       // the decode slice (ExecuteRequest) can call Decode() from n_past instead of Generate().
       auto& inf = pending->inference;
       if (pending->resolved_backend && pending->resolved_backend->IsReady()) {
-        int seq_id = static_cast<int>(inf.id % static_cast<uint64_t>(kMaxSequenceSlots));
-        auto pr = pending->resolved_backend->Prefill(inf.prompt, seq_id);
-        if (pr.ok) {
-          inf.n_past = pr.n_past;
-          inf.sequence_id = seq_id;
+        // Allocate a dedicated sequence slot from the free-list.  Using a free-list
+        // prevents two concurrent requests from sharing the same slot (which would
+        // cause Prefill() to wipe the other request's KV state).
+        int seq_id = AllocSeqSlot();
+        if (seq_id >= 0) {
+          auto pr = pending->resolved_backend->Prefill(inf.prompt, seq_id);
+          if (pr.ok) {
+            inf.n_past = pr.n_past;
+            inf.sequence_id = seq_id;
+          } else {
+            FreeSeqSlot(seq_id);  // Prefill failed — return the slot immediately.
+          }
         }
+        // If seq_id < 0 (all slots busy), inf.n_past stays -1 and ExecuteRequest
+        // falls back to the legacy Generate() path.
       }
       bool enqueued = false;
-      if (disagg_config_.kv_channel) {
+      if (use_decode_workers_ && disagg_config_.kv_channel) {
+        // Only enqueue when decode workers are live and draining the channel.
+        // Without active consumers the channel fills to capacity (default 64) and
+        // Enqueue() returns false, causing requests to bounce back into pending_prefill_
+        // indefinitely — a scheduler deadlock.
         disaggregated::KVPacket packet;
         packet.request_id = inf.id;
         packet.prompt_tokens = SerializeTokens(inf.prompt_tokens);
@@ -257,6 +271,13 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         staged_decode.push_back(pending);
         continue;
       } else {
+        // Channel rejected the packet (full).  Undo any phased state so the request
+        // retries cleanly and does not hold a stale slot or stale n_past.
+        if (inf.sequence_id >= 0) {
+          FreeSeqSlot(inf.sequence_id);
+          inf.sequence_id = -1;
+          inf.n_past = -1;
+        }
         inf.phase = RequestPhase::kPending;
         std::lock_guard<std::mutex> lock(queue_mutex_);
         pending_prefill_.push_back(pending);
@@ -411,6 +432,12 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     if (inference->reported_prompt_tokens >= 0) {
       result.prompt_tokens = inference->reported_prompt_tokens;
     }
+    // Return the sequence slot to the pool now that the request is fully done.
+    // (batch_executor already called backend->FreeSequence() to release KV memory.)
+    if (inference->sequence_id >= 0) {
+      FreeSeqSlot(inference->sequence_id);
+      inference->sequence_id = -1;
+    }
     inference->phase = RequestPhase::kFinished;
     pending->promise.set_value(std::move(result));
   }
@@ -517,6 +544,22 @@ void Scheduler::ApplyFairness(BatchSelection* selection) {
     UpdateQueueDepthLocked();
   }
   fairness_controller_.ApplyTimeslice(&batch_entries);
+}
+
+int Scheduler::AllocSeqSlot() {
+  for (int i = 0; i < static_cast<int>(seq_slots_free_.size()); ++i) {
+    if (seq_slots_free_[i]) {
+      seq_slots_free_[i] = false;
+      return i;
+    }
+  }
+  return -1;  // All slots in use; caller falls back to the legacy Generate() path.
+}
+
+void Scheduler::FreeSeqSlot(int slot) {
+  if (slot >= 0 && slot < static_cast<int>(seq_slots_free_.size())) {
+    seq_slots_free_[slot] = true;
+  }
 }
 
 void Scheduler::ResolveBackends(const std::vector<std::shared_ptr<PendingRequest>>& batch) {

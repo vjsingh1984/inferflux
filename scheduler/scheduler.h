@@ -94,6 +94,12 @@ class Scheduler {
   void UpdateQueueDepthLocked() const;
   void ResolveBackends(const std::vector<std::shared_ptr<PendingRequest>>& batch);
 
+  // Sequence slot allocator for §2.5 phased prefill/decode.
+  // Slots are borrowed during Prefill() and returned after full request completion.
+  // Only accessed from the single worker thread; no additional locking needed.
+  int AllocSeqSlot();
+  void FreeSeqSlot(int slot);
+
   SimpleTokenizer tokenizer_;
   std::shared_ptr<CPUDeviceContext> device_;
   std::shared_ptr<PagedKVCache> cache_;
@@ -114,6 +120,7 @@ class Scheduler {
   FairnessController fairness_controller_;
   FairnessConfig fairness_config_;
   DisaggregatedConfig disagg_config_;
+  std::vector<bool> seq_slots_free_;  // size = kMaxSequenceSlots; true = available
 };
 
 }  // namespace inferflux
