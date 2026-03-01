@@ -255,6 +255,22 @@ std::string LlamaCPUBackend::Generate(
     if (should_stop && should_stop()) {
       break;
     }
+    // Context-window management: sliding-window KV eviction when the next
+    // token would exceed n_ctx.  We discard the oldest half of the KV cache
+    // and shift the remaining positions so generation can continue.
+    {
+      llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx(context_));
+      if (position >= n_ctx - 1 && n_ctx > 1) {
+        llama_pos keep = n_ctx / 2;
+        llama_pos discard = position - keep + 1;
+        if (discard > 0) {
+          llama_memory_seq_rm(llama_get_memory(context_), 0, 0, discard);
+          llama_memory_seq_add(llama_get_memory(context_), 0, discard,
+                               static_cast<llama_pos>(-1), -discard);
+          position -= discard;
+        }
+      }
+    }
     BatchAdd(batch, token, position++, true);
     if (llama_decode(context_, batch) != 0) {
       std::cerr << "[LlamaCPUBackend] llama_decode failed while generating"
@@ -491,6 +507,24 @@ std::string LlamaCPUBackend::Decode(
       break;
     if (should_stop && should_stop())
       break;
+    // Context-window management: sliding-window KV eviction (same as
+    // Generate(), but scoped to the sequence slot for phased decode).
+    {
+      llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx(context_));
+      if (position >= n_ctx - 1 && n_ctx > 1) {
+        llama_pos keep = n_ctx / 2;
+        llama_pos discard = position - keep + 1;
+        if (discard > 0) {
+          llama_memory_seq_rm(llama_get_memory(context_),
+                              static_cast<llama_seq_id>(sequence_id), 0,
+                              discard);
+          llama_memory_seq_add(llama_get_memory(context_),
+                               static_cast<llama_seq_id>(sequence_id), discard,
+                               static_cast<llama_pos>(-1), -discard);
+          position -= discard;
+        }
+      }
+    }
     BatchAddSeq(batch, token, position++,
                 static_cast<llama_seq_id>(sequence_id), true);
     if (llama_decode(context_, batch) != 0) {
@@ -595,6 +629,9 @@ TokenLogprob LlamaCPUBackend::CollectLogprob(int token_id,
 
   if (!logits || n_vocab_ <= 0) {
     return tlp;
+  }
+  if (token_id < 0 || token_id >= n_vocab_) {
+    return tlp; // sampler returned out-of-range token; return zero logprob
   }
 
   // Numerically stable log-softmax: subtract max before exp.

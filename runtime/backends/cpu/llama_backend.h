@@ -113,6 +113,12 @@ public:
   void DisableGrammarConstraint();
   bool IsReady() const { return context_ != nullptr || test_ready_; }
 
+  // Returns the effective context size (in tokens) for the loaded model.
+  // Returns 0 when no model is loaded.
+  int ContextSize() const {
+    return context_ ? static_cast<int>(llama_n_ctx(context_)) : 0;
+  }
+
   // Flash Attention (§2.7): returns true when FA was requested in
   // LlamaBackendConfig and the context was successfully created with
   // LLAMA_FLASH_ATTN_TYPE_ENABLED.

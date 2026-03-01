@@ -59,7 +59,8 @@ TEST_CASE("KVPacket n_past and sequence_id default to -1", "[phased]") {
   REQUIRE(pkt.sequence_id == -1);
 }
 
-TEST_CASE("KVPacket n_past and sequence_id survive enqueue/dequeue round-trip", "[phased]") {
+TEST_CASE("KVPacket n_past and sequence_id survive enqueue/dequeue round-trip",
+          "[phased]") {
   disaggregated::KVChannel channel(4);
   disaggregated::KVPacket pkt;
   pkt.request_id = 7;
@@ -100,14 +101,20 @@ TEST_CASE("InferenceRequest phased fields are assignable", "[phased]") {
 // without infinite retry.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("KVChannel Enqueue returns false when at capacity (no deadlock contract)", "[phased]") {
+TEST_CASE(
+    "KVChannel Enqueue returns false when at capacity (no deadlock contract)",
+    "[phased]") {
   disaggregated::KVChannel channel(2);
-  disaggregated::KVPacket p1; p1.request_id = 1;
-  disaggregated::KVPacket p2; p2.request_id = 2;
-  disaggregated::KVPacket p3; p3.request_id = 3;
+  disaggregated::KVPacket p1;
+  p1.request_id = 1;
+  disaggregated::KVPacket p2;
+  p2.request_id = 2;
+  disaggregated::KVPacket p3;
+  p3.request_id = 3;
   REQUIRE(channel.Enqueue(std::move(p1)));
   REQUIRE(channel.Enqueue(std::move(p2)));
-  // At capacity: third enqueue must fail so callers can requeue without looping.
+  // At capacity: third enqueue must fail so callers can requeue without
+  // looping.
   REQUIRE_FALSE(channel.Enqueue(std::move(p3)));
 }
 
@@ -141,9 +148,11 @@ TEST_CASE("HydrateSequence returns false for empty blob", "[phased]") {
   REQUIRE_FALSE(backend.HydrateSequence(0, empty));
 }
 
-TEST_CASE("InferenceRequest sequence_id lifecycle: assign then clear on completion", "[phased]") {
+TEST_CASE(
+    "InferenceRequest sequence_id lifecycle: assign then clear on completion",
+    "[phased]") {
   InferenceRequest req;
-  REQUIRE(req.sequence_id == -1);  // starts unassigned
+  REQUIRE(req.sequence_id == -1); // starts unassigned
 
   // Scheduler assigns a slot after Prefill().
   req.sequence_id = 3;
@@ -153,6 +162,47 @@ TEST_CASE("InferenceRequest sequence_id lifecycle: assign then clear on completi
   // Scheduler clears slot after request fully completes (not a fairness yield).
   req.sequence_id = -1;
   req.n_past = -1;
-  REQUIRE(req.sequence_id == -1);  // slot returned to the pool
+  REQUIRE(req.sequence_id == -1); // slot returned to the pool
   REQUIRE(req.n_past == -1);
+}
+
+// ---------------------------------------------------------------------------
+// Context window management
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ContextSize returns 0 when no model loaded", "[phased]") {
+  LlamaCPUBackend backend;
+  REQUIRE(backend.ContextSize() == 0);
+}
+
+TEST_CASE("ContextSize returns 0 even after ForceReadyForTests", "[phased]") {
+  // ForceReadyForTests sets test_ready_=true but leaves context_=nullptr,
+  // so ContextSize() should still return 0 (no real context).
+  LlamaCPUBackend backend;
+  backend.ForceReadyForTests();
+  REQUIRE(backend.ContextSize() == 0);
+}
+
+TEST_CASE("InferenceRequest logprob fields default to disabled", "[phased]") {
+  InferenceRequest req;
+  REQUIRE_FALSE(req.collect_logprobs);
+  REQUIRE(req.logprob_top_n == 0);
+}
+
+TEST_CASE("InferenceRequest logprob fields: collect with no alternatives",
+          "[phased]") {
+  InferenceRequest req;
+  req.collect_logprobs = true;
+  req.logprob_top_n = 0; // collect selected token only — no O(V log V) sort
+  REQUIRE(req.collect_logprobs);
+  REQUIRE(req.logprob_top_n == 0);
+}
+
+TEST_CASE("InferenceRequest logprob fields: collect with top-5 alternatives",
+          "[phased]") {
+  InferenceRequest req;
+  req.collect_logprobs = true;
+  req.logprob_top_n = 5;
+  REQUIRE(req.collect_logprobs);
+  REQUIRE(req.logprob_top_n == 5);
 }
