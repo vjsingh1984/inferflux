@@ -38,7 +38,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | Model management UX           |  B   |   B    |   C     |    C      |   A+   |   **D**   | C+ (Q3) | CLI |
 | Test coverage & CI maturity   |  A   |   A    |   A     |    A      |   B    |   **B**   | B (Q3) | QA |
 
-**Overall grade: C (up from C-; KV warm prefix reuse + 4 correctness bug fixes in §2.5 prefix store)**
+**Overall grade: C (up from C-; KV warm prefix reuse + 5 correctness bug fixes in §2.5 prefix store; 3 additional debt items closed: misleading comment, seq_slots_free_ data race → atomic bitmask, INF-7 BPE prefix matching)**
 
 **Scorecard status notes (March 2026):**
 - **Production throughput: F** — CPU/MPS only via llama.cpp; no GPU kernel path, no true prefill/decode overlap. Unblocked only by CUDA hardware. Grade stays F.
@@ -49,7 +49,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 - **Structured output: B-** — HTTP parsing, schema→GBNF adapter (`StructuredOutputAdapter`), llama grammar sampling wired end-to-end (§2.1). Gap to B+: streaming grammar enforcement, nested `$defs` schemas.
 - **Tool/function calling: B** — `tools[]`/`tool_choice` parsed; schema injected as system preamble; `tool_calls` array with `finish_reason=tool_calls`; streaming four-chunk OpenAI delta sequence; model-native chat templates via `llama_chat_apply_template(nullptr,...)`; multi-format detection (InferFlux, bare generic, Hermes XML, Mistral `[TOOL_CALLS]`) with `[/TOOL_CALLS]` sentinel fix. Gap to A: parallel tool calls (`tool_choice: required`).
 - **Multimodal/vision: D** — `ImagePreprocessor` (base64 + URL fetch + SHA-256 IDs + `<__media__>` markers); `LlamaCPUBackend::GenerateWithImages()` via libmtmd (`-DENABLE_MTMD=ON`); Prometheus counters. Actual vision inference requires compatible mmproj GGUF. Gap to C+: streaming multimodal, batch image inputs.
-- **Disaggregated prefill/decode: D** — Option A complete: phased `Prefill()`/`Decode()`/`FreeSequence()`, seq_slot free-list, decode worker pool, ShmKVTransport (`INFERFLUX_KV_TRANSPORT=shm`), Helm overlays, SHM CI smoke test, KV warm prefix store (§2.5 Item 5 — `CopySequencePrefix`+`PrefillPartial`, 4-slot LRU, BPE-correct `n_kv_tokens`, `weak_ptr` backend, eviction-safety guard, expired-entry purge). F→D. Remaining: cross-node RDMA, chaos tests.
+- **Disaggregated prefill/decode: D** — Option A complete: phased `Prefill()`/`Decode()`/`FreeSequence()`, seq_slot free-list (now `atomic<uint64_t>` bitmask — lock-free, no WorkerLoop/DecodeWorkerLoop race), decode worker pool, ShmKVTransport (`INFERFLUX_KV_TRANSPORT=shm`), Helm overlays, SHM CI smoke test, KV warm prefix store (§2.5 Item 5 — `CopySequencePrefix`+`PrefillPartial`, 4-slot LRU, BPE-correct `n_kv_tokens`, BPE-token prefix matching via `TokenizeForCache` (INF-7), `weak_ptr` backend, eviction-safety guard, expired-entry purge). F→D. Remaining: cross-node RDMA, chaos tests.
 - **Model parallelism (TP/PP/EP): D** — EPDispatch/LocalEPDispatch stub, MoE detection (`IsMoE`/`ExpertCount`/`ActiveExperts`), `inferflux_moe_requests_total`. F→D. Remaining: multi-GPU expert sharding, TP.
   - **Design/docs**
     1. Draft `docs/design_ep_tp.md` (this doc) with target topologies (EP shards, TP stripes, PP stages), NCCL dependencies, and success metrics; cross-link here once merged.
@@ -184,14 +184,16 @@ Mistral. SGLang tested it on 96 H100s. NVIDIA Dynamo provides orchestration for 
 - **Item 5 — KV Warm Prefix Store (Done):**
   - `LlamaCPUBackend::CopySequencePrefix(src, dst, n_tokens)` — clears dst KV slot then copies positions `[0, n_tokens)` from src via `llama_memory_seq_cp`. O(1) metadata copy; no token re-evaluation.
   - `LlamaCPUBackend::PrefillPartial(prompt, seq_id, n_past_start)` — tokenizes the full prompt (BPE), evaluates only the suffix `[n_past_start..end]`, returns `PrefillResult{n_past, first_token, ok}`.
-  - `Scheduler::kv_prefix_store_` — `std::vector<KVPrefixEntry>` (capacity 4), LRU eviction. Each entry: `seq_id`, `n_kv_tokens` (BPE count from `Prefill::n_past`), `tokens` (SimpleTokenizer, for matching), `weak_ptr<LlamaCPUBackend>` (no backend pinning), `last_used` clock.
-  - `LookupKVPrefix` — returns longest strict-prefix entry matching the incoming `prompt_tokens` on the same backend; locks `weak_ptr`, skips expired.
-  - `DonateKVPrefix` — called post-execution for non-yielded, non-decode-worker, long-enough prompts that did not trigger KV eviction (`n_prompt_bpe + completion_tokens < ctx_size`). Eviction on overflow calls `FreeSequence` on the displaced entry's own backend.
+  - `Scheduler::kv_prefix_store_` — `std::vector<KVPrefixEntry>` (capacity 4), LRU eviction. Each entry: `seq_id`, `n_kv_tokens` (BPE position count from `Prefill::n_past`), `bpe_tokens` (BPE token IDs from `TokenizeForCache` — used for prefix matching in BPE-token space; replaces former SimpleTokenizer `tokens` field), `weak_ptr<LlamaCPUBackend>` (no backend pinning), `last_used` clock.
+  - `LookupKVPrefix(bpe_tokens, backend)` — returns longest strict-prefix entry matching the incoming BPE token IDs on the same backend; locks `weak_ptr`, skips expired. Matching in BPE-token space ensures the prefix boundary aligns with the KV cache (INF-7).
+  - `DonateKVPrefix(seq_id, bpe_tokens, n_kv_tokens, backend)` — called post-execution for non-yielded, non-decode-worker, long-enough prompts that did not trigger KV eviction (`prompt_bpe_tokens + completion_tokens < ctx_size`). Eviction on overflow calls `FreeSequence` on the displaced entry's own backend.
   - `PurgeExpiredKVPrefixEntries` — called at the start of each ProcessBatch prefill sweep; frees seq_slots for entries whose `weak_ptr` has expired so phantom entries don't starve `AllocSeqSlot()`.
-  - `InferenceRequest::prompt_bpe_tokens` — BPE count captured right after `Prefill()`, before `Decode()` increments `n_past`, and threaded through to `DonateKVPrefix` to avoid SimpleTokenizer/BPE mismatch.
+  - `LlamaCPUBackend::TokenizeForCache(prompt)` — new public method (wraps private `Tokenize(prompt, true)`); called once per request in the prefill block to populate `inf.bpe_prompt_tokens` (cached across retries).
+  - `InferenceRequest::bpe_prompt_tokens` — BPE token ID vector for `LookupKVPrefix`/`DonateKVPrefix`; `prompt_bpe_tokens` (int) — BPE count captured right after `Prefill()`, used for the eviction guard and as `n_kv_tokens` in the store entry.
+  - `Scheduler::seq_slots_free_` — `std::atomic<uint64_t>` bitmask; `AllocSeqSlot()` CAS loop, `FreeSeqSlot()` `fetch_or` — eliminates data race between WorkerLoop (no lock) and DecodeWorkerLoop (under `queue_mutex_`) on the old `std::vector<bool>`.
   - Metrics: `inferflux_kv_prefix_reuse_total` + `inferflux_kv_prefix_reuse_tokens_total`.
   - 6 `[kv_reuse]` unit tests (guard-path and contract tests in `test_phased_execution.cpp`).
-  - Post-review bugs fixed: (a) `shared_ptr` pinning → `weak_ptr`; (b) KV eviction guard; (c) SimpleTokenizer/BPE count mismatch in `n_kv_tokens`; (d) expired-entry seq_slot leak via `PurgeExpiredKVPrefixEntries`.
+  - Post-review bugs fixed: (a) `shared_ptr` pinning → `weak_ptr`; (b) initial KV eviction guard used SimpleTokenizer count on LHS; (c) `n_kv_tokens` stored SimpleTokenizer count instead of BPE `pr.n_past`; (d) expired-entry seq_slot leak → `PurgeExpiredKVPrefixEntries`; (e) eviction guard LHS still mixed vocabularies after (c) → replaced with `prompt_bpe_tokens` throughout; (f) misleading `DecodeWorkerLoop` comment corrected; (g) `seq_slots_free_` data race → atomic bitmask; (h) BPE prefix matching (INF-7) — `bpe_tokens`/`TokenizeForCache`/`bpe_prompt_tokens`.
 - **Remaining (multi-node):**
   - RDMA transport (multi-node, multi-pod): requires RDMA-capable NICs; replace SHM with ibverbs or UCX.
   - Chaos tests (inject SHM segment failures, validate graceful fallback).
@@ -308,7 +310,7 @@ grouped by the system area and ordered by severity within each group.
 | INF-4 | **[FIXED]** `llama_backend_init()`/`free()` now reference-counted via static counter with mutex. | `runtime/backends/cpu/llama_backend.cpp` | *(Fixed)* | — |
 | INF-5 | **[FIXED]** Stub fallback returns 503 Service Unavailable with clear error message. | `scheduler/scheduler.cpp`, `server/http/http_server.cpp` | *(Fixed)* | `docs/PRD.md` §Acceptance Criteria |
 | INF-6 | **[FIXED]** Scheduler now reserves/releases KV cache pages per batch, preparing for future offload/prefetch work. | `scheduler/scheduler.cpp` | *(Fixed)* | — |
-| INF-7 | **[FIXED]** `LlamaCPUBackend::TokenCount()` exposes llama.cpp vocabulary-based token counting. `BatchExecutor` uses it when a backend is loaded; falls back to `SimpleTokenizer` otherwise. | `runtime/backends/cpu/llama_backend.cpp`, `runtime/execution/batch_executor.cpp` | *(Fixed)* | — |
+| INF-7 | **[FIXED]** `LlamaCPUBackend::TokenCount()` exposes llama.cpp vocabulary-based token counting (`BatchExecutor` uses it when loaded, falls back to `SimpleTokenizer` otherwise). Extended: `TokenizeForCache(prompt)` added (public wrapper for private `Tokenize(prompt, true)`); KV prefix store (`KVPrefixEntry::bpe_tokens`, `InferenceRequest::bpe_prompt_tokens`) now matches in BPE-token space — eliminates boundary mismatch where SimpleTokenizer prefix split mid-BPE-token, causing wrong KV state to be copied into new slots. | `runtime/backends/cpu/llama_backend.h/.cpp`, `scheduler/scheduler.h/.cpp`, `scheduler/request_batch.h` | *(Fixed)* | `docs/Architecture.md` §KV Warm Prefix Store |
 
 ### 3.3 Data Handling — MEDIUM
 

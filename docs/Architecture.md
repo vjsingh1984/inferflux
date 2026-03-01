@@ -151,14 +151,14 @@ cross-process disaggregation — without requiring KV serialization or upstream 
 | `BatchAddSeq(batch, token, pos, seq_id, logits)` | Sets per-token `seq_id` on a `llama_batch`, letting concurrent requests share one `llama_context` without KV collision. |
 
 ### Sequence Slot Allocator
-`Scheduler` maintains `seq_slots_free_` — a `std::vector<bool>` of `kMaxSequenceSlots=16` entries (all `true` at init). `AllocSeqSlot()` does a first-fit scan and marks the slot busy; returns `-1` when all are taken (request falls back to the legacy `Generate()` path). `FreeSeqSlot(slot)` is called in the `ProcessBatch` post-execution loop after full completion. This replaces the earlier `request_id % kMaxSequenceSlots` assignment, which caused KV corruption when concurrent requests shared a modulo slot.
+`Scheduler` maintains `seq_slots_free_` — a `std::atomic<uint64_t>` bitmask where bit `i = 1` means slot `i` is free (initialised to `(1 << kMaxSequenceSlots) - 1`, all slots free). `AllocSeqSlot()` uses a CAS loop (`__builtin_ctzll` to find the lowest free bit) and is fully lock-free. `FreeSeqSlot(slot)` uses `fetch_or(1 << slot)`. A `static_assert` enforces `kMaxSequenceSlots ≤ 64`. This eliminates the data race that existed when `WorkerLoop` (no lock) and `DecodeWorkerLoop` (under `queue_mutex_`) both called `AllocSeqSlot`/`FreeSeqSlot` on the old `std::vector<bool>`. Replaced the earlier `request_id % kMaxSequenceSlots` assignment (KV corruption) and then the first-fit scan on `vector<bool>` (data race).
 
 ### Per-Request Lifecycle
 1. `BuildBatchLocked` tags new requests `RequestPhase::kPrefill`.
 2. `ProcessBatch` kPrefill block: `AllocSeqSlot()` → `backend->Prefill(prompt, seq_id)` → store `n_past` + `sequence_id` on `InferenceRequest`.
 3. Request promoted to `kDecode`; `BatchExecutor::ExecuteRequest` branches on `n_past >= 0` and calls `Decode(n_past, seq_id, decode_limit, …)` instead of `Generate()`.
 4. After each slice, `n_past += completion_tokens` so the next fairness slice resumes from the correct KV position.
-5. **Full completion**: `BatchExecutor` calls `backend->FreeSequence(seq_id)` (KV memory); `Scheduler::ProcessBatch` calls `FreeSeqSlot(slot)` (slot integer).
+5. **Full completion**: `BatchExecutor::ExecuteRequest` intentionally leaves `sequence_id` set (does NOT call `FreeSequence`); `Scheduler::ProcessBatch` / `DecodeWorkerLoop` call both `FreeSequence(seq_id)` (KV memory) and `FreeSeqSlot(slot)` (bitmask) together in one place.
 6. **Fairness yield**: KV slot preserved; `n_past` advanced; request requeues into `pending_decode_` for the next slice.
 
 ### KVChannel (Stub — Future Distributed Transport)
@@ -175,7 +175,7 @@ cross-process disaggregation — without requiring KV serialization or upstream 
 1. [x] `LlamaCPUBackend::Prefill()` / `Decode()` / `FreeSequence()` / `BatchAddSeq()`
 2. [x] `InferenceRequest.n_past{-1}` / `sequence_id{-1}` (phased state)
 3. [x] `KVPacket.n_past` / `sequence_id` (future transport)
-4. [x] Sequence slot free-list (`seq_slots_free_`, `AllocSeqSlot()`, `FreeSeqSlot()`)
+4. [x] Sequence slot free-list — `seq_slots_free_` (`std::atomic<uint64_t>` bitmask, CAS alloc, `fetch_or` free; replaces `vector<bool>` to eliminate WorkerLoop/DecodeWorkerLoop data race)
 5. [x] `ProcessBatch`: allocate slot, call `Prefill()`, store n_past+sequence_id; return slot on full completion
 6. [x] `BatchExecutor::ExecuteRequest`: branch on `n_past>=0` for `Decode()`; advance n_past per slice; `FreeSequence()` on non-yield completion only
 7. [x] KVChannel gate: only enqueue when `use_decode_workers_=true`
@@ -203,25 +203,31 @@ state from the first request's retained slot and evaluates only the suffix.
 ### Warm Store Structure
 `Scheduler::kv_prefix_store_` is a `std::vector<KVPrefixEntry>` (capacity 4, LRU eviction):
 - `seq_id` — the retained KV cache sequence slot
-- `n_kv_tokens` — BPE position count from `PrefillResult::n_past` (NOT SimpleTokenizer word count)
-- `tokens` — SimpleTokenizer token vector for prefix matching
+- `n_kv_tokens` — BPE position count from `PrefillResult::n_past` (used for `CopySequencePrefix`/`PrefillPartial` calls)
+- `bpe_tokens` — BPE token ID vector from `LlamaCPUBackend::TokenizeForCache()`, used for prefix matching (INF-7: replaces the earlier `tokens` field which held SimpleTokenizer words — matching in BPE-token space ensures the prefix boundary aligns with the KV cache)
 - `weak_ptr<LlamaCPUBackend> backend` — prevents pinning unloaded models in memory
 - `last_used` — LRU clock for eviction
 
+`InferenceRequest` carries two complementary fields:
+- `prompt_tokens` (SimpleTokenizer) — still used for batch budget estimation in `BuildBatchLocked`
+- `bpe_prompt_tokens` (BPE, from `TokenizeForCache`) — populated once in the prefill block; used by `LookupKVPrefix` / `DonateKVPrefix`; cached so channel-rejection retries do not re-tokenize
+
 ### Lifecycle
-1. After a phased-decode request fully completes (non-yield, non-decode-worker path), `ProcessBatch` calls `DonateKVPrefix(seq_id, prompt_tokens, prompt_bpe_tokens, backend)` if:
-   - `prompt_tokens.size() >= kMinPrefixTokens` (32)
+1. At the start of the ProcessBatch prefill sweep, `TokenizeForCache(inf.prompt)` is called once per request to populate `inf.bpe_prompt_tokens` (cached; skipped if already set from a prior retry).
+2. `PurgeExpiredKVPrefixEntries()` walks the store and frees seq_slots for entries whose `weak_ptr` has expired (model was unloaded).
+3. `LookupKVPrefix(inf.bpe_prompt_tokens, backend)` finds the longest `bpe_tokens` entry that is a strict prefix of the request's BPE tokens, on the same backend.
+4. If found: `CopySequencePrefix(warm->seq_id, new_seq_id, warm->n_kv_tokens)` + `PrefillPartial(prompt, new_seq_id, warm->n_kv_tokens)`. Metric: `inferflux_kv_prefix_reuse_tokens_total`.
+5. After full completion (non-yield, non-decode-worker), `ProcessBatch` calls `DonateKVPrefix(seq_id, bpe_prompt_tokens, prompt_bpe_tokens, backend)` if:
+   - `bpe_prompt_tokens.size() >= kMinPrefixTokens` (32)
    - `prompt_bpe_tokens + completion_tokens < ctx_size` (KV eviction guard — ensures prompt positions weren't shifted by sliding-window eviction)
    - `prompt_bpe_tokens > 0` (Prefill actually ran on the BPE path)
-2. On the next request, `LookupKVPrefix(inf.prompt_tokens, backend)` finds the longest stored prefix that is a strict prefix of the new request's `prompt_tokens`, on the same backend.
-3. If found: `CopySequencePrefix(warm->seq_id, new_seq_id, warm->n_kv_tokens)` + `PrefillPartial(prompt, new_seq_id, warm->n_kv_tokens)`. Metric: `inferflux_kv_prefix_reuse_tokens_total`.
-4. `PurgeExpiredKVPrefixEntries()` runs at the start of every ProcessBatch prefill sweep, freeing seq_slots for entries whose `weak_ptr` has expired (model was unloaded).
 
 ### Correctness Invariants
 - **Backend identity**: entries are only reused on the exact same `LlamaCPUBackend` instance (raw pointer comparison after `lock()`). Cross-model seq_id reuse would access a different `llama_context*`.
-- **BPE vs SimpleTokenizer**: `n_kv_tokens` stores the BPE count from `Prefill()`, not `tokens.size()` (SimpleTokenizer word count). These tokenizers have different vocabularies and lengths; using the wrong count would copy or evaluate wrong KV positions.
-- **KV eviction guard**: `Decode()`'s sliding-window eviction calls `llama_memory_seq_rm`+`llama_memory_seq_add`, shifting positions. If eviction fired during the donor's decode, the prompt prefix is no longer at `[0, n_kv_tokens)`. Guard: skip donation when `n_prompt_bpe + completion_tokens >= ctx_size`.
-- **Expired slot purge**: donated seq_slots remain busy in `seq_slots_free_` until `PurgeExpiredKVPrefixEntries()` reclaims them. Without this, up to `kPrefixStoreCap` phantom slots starve `AllocSeqSlot()` after a model unload.
+- **BPE prefix matching (INF-7)**: `bpe_tokens` in each entry holds BPE token IDs from `TokenizeForCache()`. `LookupKVPrefix` compares in BPE-token space so the prefix boundary always aligns with the KV cache. The earlier design stored SimpleTokenizer words, which can split at different word boundaries than BPE — a SimpleTokenizer prefix could end mid-BPE-token, causing `CopySequencePrefix` to restore wrong KV state for the new request's suffix.
+- **BPE position count**: `n_kv_tokens` stores the BPE position count from `Prefill()` (`pr.n_past`). This is the count used by `CopySequencePrefix`/`PrefillPartial`. It must NOT be confused with `bpe_tokens.size()` (which equals `n_kv_tokens` when no sliding-window eviction fired, but is conceptually distinct).
+- **KV eviction guard**: `Decode()`'s sliding-window eviction calls `llama_memory_seq_rm`+`llama_memory_seq_add`, shifting positions. If eviction fired during the donor's decode, the prompt prefix is no longer at `[0, n_kv_tokens)`. Guard: skip donation when `prompt_bpe_tokens + completion_tokens >= ctx_size` (all BPE counts).
+- **Expired slot purge**: donated seq_slots remain busy in the `seq_slots_free_` bitmask until `PurgeExpiredKVPrefixEntries()` reclaims them. Without this, up to `kPrefixStoreCap` phantom slots starve `AllocSeqSlot()` after a model unload.
 - **Eviction cross-model safety**: LRU eviction calls `FreeSequence` on the displaced entry's own backend (via `weak_ptr::lock()`), not the current donor's. If the backend is already gone, only `FreeSeqSlot` runs.
 
 ### Metrics
