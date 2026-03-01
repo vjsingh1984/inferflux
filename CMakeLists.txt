@@ -5,6 +5,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Load dependencies from cmake/Dependencies.cmake
+include(cmake/Dependencies.cmake)
+
 option(ENABLE_CUDA "Enable CUDA runtime" ON)
 option(ENABLE_ROCM "Enable ROCm runtime" ON)
 option(ENABLE_MPS "Enable Metal/MPS runtime" ON)
@@ -37,6 +40,7 @@ add_library(inferflux_core
   model/tokenizer/simple_tokenizer.cpp
   model/tokenizer/simple_tokenizer.h
   scheduler/scheduler.cpp
+  scheduler/fairness_controller.cpp
   scheduler/scheduler.h
   scheduler/single_model_router.cpp
   scheduler/single_model_router.h
@@ -117,7 +121,7 @@ target_include_directories(inferflux_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/include
   ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/common
 )
-target_link_libraries(inferflux_core PUBLIC OpenSSL::Crypto OpenSSL::SSL)
+target_link_libraries(inferflux_core PUBLIC OpenSSL::Crypto OpenSSL::SSL yaml-cpp)
 
 add_executable(inferfluxd server/main.cpp)
 target_link_libraries(inferfluxd PRIVATE inferflux_core)
@@ -136,14 +140,31 @@ add_executable(inferflux_tests
   tests/unit/test_scheduler.cpp
   tests/unit/test_policy_store.cpp
   tests/unit/test_oidc_validator.cpp
+  tests/unit/test_prefix_cache.cpp
+  tests/unit/test_span.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
 target_link_libraries(inferflux_tests PRIVATE inferflux_core)
 add_test(NAME UnitTests COMMAND inferflux_tests)
+add_test(NAME FairnessTests COMMAND inferflux_tests "[fairness]")
+set_tests_properties(FairnessTests PROPERTIES LABELS fairness)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+  # Stub-mode integration tests — run without a model; always enabled.
+  add_test(NAME StubIntegration
+           COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py)
+  set_tests_properties(StubIntegration PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60)
+
+  add_test(NAME SSECancel
+           COMMAND ${Python3_EXECUTABLE} tests/integration/sse_cancel_test.py)
+  set_tests_properties(SSECancel PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60)
+
   if(NOT "$ENV{INFERFLUX_MODEL_PATH}" STREQUAL "")
     add_test(NAME IntegrationSSE COMMAND ${Python3_EXECUTABLE} tests/integration/sse_metrics_test.py)
     set_tests_properties(IntegrationSSE PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
@@ -151,5 +172,5 @@ if(Python3_Interpreter_FOUND)
     message(STATUS "Skipping IntegrationSSE test (INFERFLUX_MODEL_PATH not set)")
   endif()
 else()
-  message(STATUS "Python3 interpreter not found; skipping IntegrationSSE test")
+  message(STATUS "Python3 interpreter not found; skipping integration tests")
 endif()
