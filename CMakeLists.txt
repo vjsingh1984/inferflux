@@ -13,6 +13,7 @@ option(ENABLE_ROCM "Enable ROCm runtime" ON)
 option(ENABLE_MPS "Enable Metal/MPS runtime" ON)
 option(ENABLE_BLAS "Enable BLAS acceleration" ON)
 option(ENABLE_VULKAN "Enable Vulkan GPU backend via llama.cpp" ON)
+option(ENABLE_WEBUI "Enable embedded WebUI (litehtml-based) support" OFF)
 option(ENABLE_CPU "Enable CPU runtime" ON)
 option(ENABLE_MTMD "Enable multimodal (vision) support via libmtmd" OFF)
 
@@ -139,6 +140,21 @@ if(ENABLE_VULKAN)
   endif()
 else()
   set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+endif()
+
+if(ENABLE_WEBUI)
+  message(STATUS "ENABLE_WEBUI=ON — embedding litehtml-based WebUI")
+  target_compile_definitions(inferflux_core PUBLIC INFERFLUX_ENABLE_WEBUI=1)
+  target_sources(inferflux_core PRIVATE
+    webui/ui_renderer.cpp
+    webui/ui_bundle.cpp
+  )
+  target_include_directories(inferflux_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/litehtml_stub
+    ${CMAKE_CURRENT_SOURCE_DIR}/webui
+  )
+else()
+  target_compile_definitions(inferflux_core PUBLIC INFERFLUX_ENABLE_WEBUI=0)
 endif()
 
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)

@@ -10,6 +10,10 @@
 #include "server/metrics/metrics.h"
 #include "server/policy/guardrail.h"
 
+#if INFERFLUX_ENABLE_WEBUI
+#include "webui/ui_renderer.h"
+#endif
+
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -26,7 +30,7 @@
 namespace inferflux {
 
 class HttpServer {
- public:
+public:
   struct TlsConfig {
     bool enabled{false};
     std::string cert_path;
@@ -39,68 +43,65 @@ class HttpServer {
   // kDecode:  this instance only runs decode; /readyz gates on decode pool.
   enum class PoolRole { kUnified, kPrefill, kDecode };
 
-  HttpServer(std::string host,
-             int port,
-             Scheduler* scheduler,
-             std::shared_ptr<ApiKeyAuth> auth,
-             MetricsRegistry* metrics,
-             OIDCValidator* oidc,
-             RateLimiter* rate_limiter,
-             Guardrail* guardrail,
-             AuditLogger* audit_logger,
-             PolicyBackend* policy_store,
+  HttpServer(std::string host, int port, Scheduler *scheduler,
+             std::shared_ptr<ApiKeyAuth> auth, MetricsRegistry *metrics,
+             OIDCValidator *oidc, RateLimiter *rate_limiter,
+             Guardrail *guardrail, AuditLogger *audit_logger,
+             PolicyBackend *policy_store,
              std::shared_ptr<SpeculativeDecoder> speculative_decoder,
-             TlsConfig tls_config,
-             int num_workers = 4);
+             TlsConfig tls_config, int num_workers = 4);
   ~HttpServer();
 
   void Start();
   void Stop();
   void SetModelReady(bool ready) { model_ready_.store(ready); }
   void SetRole(PoolRole role) { role_.store(role, std::memory_order_relaxed); }
-  void SetDecodePoolReady(bool ready) { decode_pool_ready_.store(ready, std::memory_order_relaxed); }
+  void SetDecodePoolReady(bool ready) {
+    decode_pool_ready_.store(ready, std::memory_order_relaxed);
+  }
 
- private:
+private:
   struct ClientSession {
     int fd{-1};
-    SSL* ssl{nullptr};
+    SSL *ssl{nullptr};
   };
 
   void Run();
-  void HandleClient(ClientSession& session);
+  void HandleClient(ClientSession &session);
 
   struct AuthContext {
     std::string subject{"anonymous"};
     std::unordered_set<std::string> scopes;
   };
 
-  bool ResolveSubject(const std::string& header_blob, AuthContext* ctx) const;
-  bool RequireScope(const AuthContext& ctx,
-                    const std::string& scope,
-                    ClientSession& session,
-                    const std::string& error_message);
+  bool ResolveSubject(const std::string &header_blob, AuthContext *ctx) const;
+  bool RequireScope(const AuthContext &ctx, const std::string &scope,
+                    ClientSession &session, const std::string &error_message);
 
-  bool SendAll(ClientSession& session, const std::string& payload);
-  ssize_t Receive(ClientSession& session, char* buffer, std::size_t length);
-  void CloseSession(ClientSession& session);
+  bool SendAll(ClientSession &session, const std::string &payload);
+  ssize_t Receive(ClientSession &session, char *buffer, std::size_t length);
+  void CloseSession(ClientSession &session);
 
   std::string host_;
   int port_;
-  Scheduler* scheduler_;
+  Scheduler *scheduler_;
   std::shared_ptr<ApiKeyAuth> auth_;
-  MetricsRegistry* metrics_;
-  OIDCValidator* oidc_;
-  RateLimiter* rate_limiter_;
-  Guardrail* guardrail_;
-  AuditLogger* audit_logger_;
-  PolicyBackend* policy_store_;
+  MetricsRegistry *metrics_;
+  OIDCValidator *oidc_;
+  RateLimiter *rate_limiter_;
+  Guardrail *guardrail_;
+  AuditLogger *audit_logger_;
+  PolicyBackend *policy_store_;
   std::shared_ptr<SpeculativeDecoder> speculative_decoder_;
   bool tls_enabled_{false};
-  SSL_CTX* ssl_ctx_{nullptr};
+  SSL_CTX *ssl_ctx_{nullptr};
   std::atomic<bool> running_{false};
   std::atomic<bool> model_ready_{false};
   std::atomic<PoolRole> role_{PoolRole::kUnified};
   std::atomic<bool> decode_pool_ready_{false};
+#if INFERFLUX_ENABLE_WEBUI
+  std::unique_ptr<WebUiRenderer> webui_renderer_;
+#endif
   std::atomic<int> server_fd_{-1};
   int num_workers_;
   std::thread accept_thread_;
@@ -112,4 +113,4 @@ class HttpServer {
   void WorkerLoop();
 };
 
-}  // namespace inferflux
+} // namespace inferflux

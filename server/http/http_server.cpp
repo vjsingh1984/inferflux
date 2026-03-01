@@ -687,6 +687,9 @@ HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
       audit_logger_(audit_logger), policy_store_(policy_store),
       speculative_decoder_(std::move(speculative_decoder)),
       num_workers_(num_workers > 0 ? num_workers : 4) {
+#if INFERFLUX_ENABLE_WEBUI
+  webui_renderer_ = std::make_unique<WebUiRenderer>();
+#endif
   if (tls_config.enabled) {
     if (tls_config.cert_path.empty() || tls_config.key_path.empty()) {
       std::cerr << "[http] TLS enabled without cert/key; falling back to HTTP"
@@ -1033,6 +1036,28 @@ void HttpServer::HandleClient(ClientSession &session) {
   std::string method = first_line.substr(0, method_end);
   std::string path =
       first_line.substr(method_end + 1, path_end - method_end - 1);
+
+#if INFERFLUX_ENABLE_WEBUI
+  if (method == "GET" && path == "/ui") {
+    std::string default_model = "unknown";
+    if (scheduler_ && scheduler_->Router()) {
+      auto id = scheduler_->Router()->DefaultModelId();
+      if (!id.empty()) {
+        default_model = id;
+      }
+    }
+    std::string body = webui_renderer_
+                           ? webui_renderer_->RenderIndex(default_model)
+                           : "<html><body><h1>InferFlux UI</h1></body></html>";
+    std::string response = "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: text/html; charset=utf-8\r\n"
+                           "Cache-Control: no-cache\r\n"
+                           "Content-Length: " +
+                           std::to_string(body.size()) + "\r\n\r\n" + body;
+    SendAll(session, response);
+    return;
+  }
+#endif
 
   // Unauthenticated health/readiness probes.
   if (method == "GET" && path == "/healthz") {
