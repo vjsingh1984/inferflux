@@ -65,6 +65,21 @@ class LlamaCPUBackend {
   // Release KV cache slots for the given sequence_id.
   void FreeSequence(int sequence_id);
 
+  // Serialize the KV cache state for sequence_id to a byte buffer.
+  // Returns an empty vector when the context is not loaded or serialization fails.
+  // Used for cross-process KV transfer (§2.5 disaggregated path).
+  std::vector<uint8_t> SerializeSequence(int sequence_id);
+
+  // Restore KV cache state for dest_sequence_id from a previously serialized buffer.
+  // Returns false when the context is not loaded, the buffer is empty, or restore fails.
+  bool HydrateSequence(int dest_sequence_id, const std::vector<uint8_t>& blob);
+
+  // MoE detection helpers (§2.6).  Return 0 / false when the model is not loaded
+  // or the GGUF metadata key is absent (i.e., the model is not a MoE model).
+  bool IsMoE() const;
+  int ExpertCount() const;
+  int ActiveExperts() const;
+
   std::string Generate(const std::string& prompt,
                        int max_tokens,
                        const std::function<bool(const std::string&)>& on_chunk = {},

@@ -119,6 +119,28 @@ TEST_CASE("KVChannel Enqueue returns false when at capacity (no deadlock contrac
 // Simulate the lifecycle the scheduler enforces: assign → use → clear.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// §2.5: KV serialization guard paths (context_ == nullptr)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("SerializeSequence returns empty when context is null", "[phased]") {
+  LlamaCPUBackend backend;
+  auto blob = backend.SerializeSequence(0);
+  REQUIRE(blob.empty());
+}
+
+TEST_CASE("HydrateSequence returns false when context is null", "[phased]") {
+  LlamaCPUBackend backend;
+  std::vector<uint8_t> dummy{1, 2, 3};
+  REQUIRE_FALSE(backend.HydrateSequence(0, dummy));
+}
+
+TEST_CASE("HydrateSequence returns false for empty blob", "[phased]") {
+  LlamaCPUBackend backend;
+  std::vector<uint8_t> empty;
+  REQUIRE_FALSE(backend.HydrateSequence(0, empty));
+}
+
 TEST_CASE("InferenceRequest sequence_id lifecycle: assign then clear on completion", "[phased]") {
   InferenceRequest req;
   REQUIRE(req.sequence_id == -1);  // starts unassigned

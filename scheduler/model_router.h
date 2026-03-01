@@ -15,6 +15,12 @@ struct ModelInfo {
   std::string backend;  // Backend type: "cpu", "cuda", "mps", "rocm".
   bool ready{false};    // True when the model is loaded and serving.
   bool supports_structured_output{false};
+
+  // MoE metadata (§2.6).  Populated from GGUF metadata after model load.
+  // is_moe is true when the GGUF "llm.expert_count" key is present and > 0.
+  bool is_moe{false};
+  int n_experts{0};         // Total expert count (llm.expert_count).
+  int n_active_experts{0};  // Active experts per token (llm.expert_used_count).
 };
 
 // ModelRouter is the plugin interface for multi-model serving.

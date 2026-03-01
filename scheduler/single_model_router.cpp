@@ -46,6 +46,9 @@ bool SingleModelRouter::RegisterModel(const ModelInfo& info,
   entry.info.path = info.path;
   entry.info.backend = info.backend.empty() ? "cpu" : info.backend;
   entry.info.supports_structured_output = true;
+  entry.info.is_moe = backend->IsMoE();
+  entry.info.n_experts = backend->ExpertCount();
+  entry.info.n_active_experts = backend->ActiveExperts();
   entry.info.id = info.id.empty()
                       ? GenerateModelIdLocked(info.path.empty() ? "model" : info.path)
                       : EnsureUniqueIdLocked(info.id);
@@ -91,6 +94,9 @@ std::string SingleModelRouter::LoadModel(const std::string& path,
   info.backend = BackendLabelOrDefault(backend_hint);
   info.ready = new_backend->IsReady();
   info.supports_structured_output = true;
+  info.is_moe = new_backend->IsMoE();
+  info.n_experts = new_backend->ExpertCount();
+  info.n_active_experts = new_backend->ActiveExperts();
 
   std::lock_guard<std::mutex> lock(mutex_);
   std::string preferred = !requested_id.empty()

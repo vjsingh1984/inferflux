@@ -59,6 +59,9 @@ class MetricsRegistry {
   // images: number of images decoded; decode_ms: preprocessing wall-clock time.
   void RecordImagePreprocess(int images, double decode_ms);
 
+  // MoE (§2.6): record a request dispatched to a MoE model.
+  void RecordMoERequest();
+
   // Latency recording — call with full request duration in milliseconds.
   void RecordLatency(double request_ms);
 
@@ -106,6 +109,7 @@ class MetricsRegistry {
   std::atomic<uint64_t> model_route_misses_{0};
   std::atomic<uint64_t> multimodal_images_{0};    // §2.2: total images preprocessed.
   std::atomic<uint64_t> multimodal_requests_{0};  // §2.2: total requests with images.
+  std::atomic<uint64_t> moe_requests_{0};         // §2.6: requests routed to MoE models.
 
   // Latency histograms.
   LatencyHistogram request_latency_;

@@ -96,7 +96,9 @@ class Scheduler {
 
   // Sequence slot allocator for §2.5 phased prefill/decode.
   // Slots are borrowed during Prefill() and returned after full request completion.
-  // Only accessed from the single worker thread; no additional locking needed.
+  // AllocSeqSlot() is called only from WorkerLoop (no lock needed).
+  // FreeSeqSlot() may also be called from DecodeWorkerLoop — callers must hold
+  // queue_mutex_ when calling from a non-worker-loop context.
   int AllocSeqSlot();
   void FreeSeqSlot(int slot);
 

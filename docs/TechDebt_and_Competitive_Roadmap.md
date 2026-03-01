@@ -47,7 +47,8 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 - Tool/function calling bumped to **C+**: `tools[]`/`tool_choice` are parsed, schema injected as system preamble, `tool_calls` array emitted with `finish_reason=tool_calls`. Streaming tool deltas and model-native chat templates (§2.3 follow-up) are the remaining gap to reach B.
 - Multimodal/vision bumped to **D**: `ImagePreprocessor` parses OpenAI `image_url` content arrays, decodes base64 data URIs, fetches HTTP URLs, and injects `<__media__>` markers (§2.2). `LlamaCPUBackend` supports `LoadMmproj()` / `GenerateWithImages()` via libmtmd when built with `-DENABLE_MTMD=ON`. Prometheus counters `inferflux_multimodal_images_total` and `inferflux_multimodal_requests_total` track usage. Actual vision inference requires a compatible mmproj GGUF and `ENABLE_MTMD=ON` at build time.
 - Quantization breadth and hardware breadth are **D** since only CPU/MPS paths run; CUDA/ROCm/Intel enablement in §2.7/§2.11 is unresolved.
-- §2.5 Option A (in-process phased prefill/decode) is done: `Prefill()`/`Decode()` on `LlamaCPUBackend`, sequence slot free-list, KVChannel gating; grade stays **F** until cross-node KV transfer and decode workers land. §2.6 (MoE expert parallelism) remains **F**.
+- §2.5 decode workers done: `DecodeWorkerLoop` (drains `pending_decode_`, runs `ExecuteBatch`, fulfills promises), `StartDecodeWorkers` (spawns `decode_pool_size` threads), `use_decode_workers_` derived from config, `SerializeSequence`/`HydrateSequence` wrappers for cross-process KV transfer. Grade stays **F** until cross-node KV transport and SHM/RDMA land.
+- §2.6 (MoE expert parallelism) is partially done: `IsMoE()`/`ExpertCount()`/`ActiveExperts()` on `LlamaCPUBackend`, `ModelInfo` MoE fields populated in `SingleModelRouter`, `RecordMoERequest()` Prometheus counter, `EPDispatch`/`LocalEPDispatch` stub interface. Grade moves from **F** to **D** — multi-GPU expert sharding remains.
 - OpenAI API compatibility holds at **C**—basic chat completion works; image_url content parts are now parsed (§2.2); tool/function calling gaps remain (§2.3).
 - Enterprise auth/RBAC at **B-** reflects working OIDC/API-key flows but lacks fine-grained RBAC UX improvements noted in Policy backlog.
 - Observability is **B** thanks to metrics/tracing/logging closures in OBS-1 through OBS-4.
@@ -167,11 +168,17 @@ Mistral. SGLang tested it on 96 H100s. NVIDIA Dynamo provides orchestration for 
 **Why critical:** DeepSeek-V3/R1 and Mixtral dominate open-source. SGLang achieves 5x
 throughput over vanilla TP for MoE models using expert parallelism.
 
-- **What to add:** Expert-parallel execution, MoE-aware batch scheduling, fused MoE kernels.
-- **Update:** `docs/PRD.md` §Goals — mention MoE model support explicitly.
-- **Update:** `docs/Architecture.md` §Runtime — add parallelism strategies section.
-- **Implement in:** `runtime/backends/` (EP dispatch), `scheduler/scheduler.h` (MoE-aware
-  batching).
+#### Implemented
+- `LlamaCPUBackend::IsMoE()` / `ExpertCount()` / `ActiveExperts()` — reads `llm.expert_count` / `llm.expert_used_count` from GGUF metadata.
+- `ModelInfo`: `is_moe`, `n_experts`, `n_active_experts` — populated in `SingleModelRouter::RegisterModel` and `LoadModel` after backend is ready.
+- `RecordMoERequest()` Prometheus counter (`inferflux_moe_requests_total`).
+- `EPDispatch` + `LocalEPDispatch` stub (`runtime/backends/ep_dispatch.h`) — single-process default, owns all experts, `world_size=1`.
+- 9 `[moe]` unit tests (`tests/unit/test_moe_routing.cpp`).
+
+#### Remaining
+- Multi-GPU expert sharding via NCCL or shared-memory ring.
+- EP-aware batch routing in `BatchExecutor` (partition expert layers by rank).
+- Fused MoE kernels (requires CUDA/ROCm backend).
 
 ### 2.7 Flash Attention Integration
 
@@ -365,7 +372,7 @@ cache, speculative decoding, LoRA stacking, hot adapter reloads, autoscaler hint
 | Priority | Item | Status | Tracking IDs | Key Files |
 |----------|------|--------|-------------|-----------|
 | P0 | **[NEW]** Disaggregated prefill/decode | **Option A done** — in-process phased Prefill/Decode/FreeSequence, slot free-list, KVChannel gate; decode workers + cross-process transport pending | §2.5 | `runtime/disaggregated/`, `runtime/backends/cpu/llama_backend.cpp`, `scheduler/scheduler.cpp` |
-| P0 | **[NEW]** Expert parallelism for MoE models | Not started | §2.6 | `runtime/backends/`, `scheduler/` |
+| P0 | Expert parallelism for MoE models | Detection + stub done (IsMoE, EPDispatch, metrics); multi-GPU sharding pending | §2.6 | `runtime/backends/`, `scheduler/` |
 | P1 | **[NEW]** Request priority & fairness scheduling | **Done** — `FairnessController` with timeslice, preemption, resume; `ApplyFairness()` in scheduler; fairness metrics (tokens/preemption/yield/resume); `Span` hooks for yield/resume; `UpdateFairnessConfig()` live API; 3 unit tests (`[fairness]`) | §2.9 | `scheduler/fairness_controller.h`, `scheduler/scheduler.h` |
 | P1 | **[UPGRADE]** Tensor + pipeline parallelism | Not started | — | `runtime/backends/` |
 | P2 | YAML parser replacement (yaml-cpp) | **Done** | DAT-2 | `server/main.cpp` |

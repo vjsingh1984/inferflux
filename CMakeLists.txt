@@ -199,6 +199,7 @@ add_executable(inferflux_tests
   tests/unit/test_kv_channel.cpp
   tests/unit/test_phased_execution.cpp
   tests/unit/test_multimodal.cpp
+  tests/unit/test_moe_routing.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -206,6 +207,8 @@ target_link_libraries(inferflux_tests PRIVATE inferflux_core)
 add_test(NAME UnitTests COMMAND inferflux_tests)
 add_test(NAME FairnessTests COMMAND inferflux_tests "[fairness]")
 set_tests_properties(FairnessTests PROPERTIES LABELS fairness)
+add_test(NAME MoETests COMMAND inferflux_tests "[moe]")
+set_tests_properties(MoETests PROPERTIES LABELS moe)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)

@@ -48,8 +48,11 @@ Scheduler::Scheduler(SimpleTokenizer tokenizer,
       disagg_config_(disagg_config),
       seq_slots_free_(kMaxSequenceSlots, true) {
   executor_ = std::make_unique<BatchExecutor>(&tokenizer_, device_, cache_, router_, speculative_decoder_, prefix_cache_);
+  // Enable decode worker pool when a positive pool size is configured.
+  // With use_decode_workers_=true, ProcessBatch only runs Prefill and
+  // hands off to pending_decode_; decode workers drain that queue.
+  use_decode_workers_ = disagg_config_.decode_pool_size > 0;
   worker_ = std::thread(&Scheduler::WorkerLoop, this);
-  use_decode_workers_ = false;
   if (use_decode_workers_) {
     StartDecodeWorkers();
   }
@@ -70,9 +73,12 @@ Scheduler::~Scheduler() {
 }
 
 void Scheduler::StartDecodeWorkers() {
-  // Decode worker pool is a forward-looking hook for disaggregated prefill/decode (§2.5).
-  // Currently a no-op; decode happens on the single WorkerLoop thread.
-  (void)disagg_config_.decode_pool_size;
+  int n = disagg_config_.decode_pool_size;
+  if (n <= 0) return;
+  decode_workers_.reserve(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    decode_workers_.emplace_back(&Scheduler::DecodeWorkerLoop, this);
+  }
 }
 
 void Scheduler::StopDecodeWorkers() {
@@ -85,7 +91,175 @@ void Scheduler::StopDecodeWorkers() {
 }
 
 void Scheduler::DecodeWorkerLoop() {
-  // Placeholder for future disaggregated decode worker (§2.5).
+  while (true) {
+    std::vector<std::shared_ptr<PendingRequest>> batch;
+    {
+      std::unique_lock<std::mutex> lock(queue_mutex_);
+      queue_cv_.wait(lock, [&] { return stop_ || !pending_decode_.empty(); });
+      if (stop_ && pending_decode_.empty()) break;
+
+      // Drain up to kMaxBatchSize requests from the decode queue.
+      std::size_t n = std::min(pending_decode_.size(), kMaxBatchSize);
+      batch.assign(pending_decode_.begin(), pending_decode_.begin() + static_cast<std::ptrdiff_t>(n));
+      pending_decode_.erase(pending_decode_.begin(), pending_decode_.begin() + static_cast<std::ptrdiff_t>(n));
+      UpdateQueueDepthLocked();
+    }
+
+    // If a KVChannel is configured, drain cross-process packets that may have
+    // arrived from remote prefill workers.  For the in-process case the KV
+    // state is already resident in the llama context and no hydration is needed.
+    if (disagg_config_.kv_channel) {
+      while (auto pkt = disagg_config_.kv_channel->TryDequeue()) {
+        // Match the packet to a pending decode request by request_id and
+        // hydrate its KV state.  If no matching request is found (e.g., it was
+        // already handled), discard the packet.
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        for (auto& pending : pending_decode_) {
+          if (pending->inference.id == pkt->request_id && pkt->n_past >= 0) {
+            // Packet carries a serialised KV blob; hydrate it now.
+            // (blob is currently empty for in-process path — no-op when empty.)
+            if (!pkt->kv_blob.empty() && pending->resolved_backend) {
+              int seq_id = AllocSeqSlot();
+              if (seq_id >= 0) {
+                // Reinterpret the raw byte payload from the channel packet.
+                std::vector<uint8_t> blob(
+                    reinterpret_cast<const uint8_t*>(pkt->kv_blob.data()),
+                    reinterpret_cast<const uint8_t*>(pkt->kv_blob.data()) +
+                        pkt->kv_blob.size() * sizeof(int));
+                if (pending->resolved_backend->HydrateSequence(seq_id, blob)) {
+                  pending->inference.sequence_id = seq_id;
+                  pending->inference.n_past = pkt->n_past;
+                } else {
+                  FreeSeqSlot(seq_id);
+                }
+              }
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    if (batch.empty()) continue;
+
+    ResolveBackends(batch);
+
+    RequestBatch exec_batch;
+    exec_batch.batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
+    std::vector<std::shared_ptr<LlamaCPUBackend>> overrides;
+    std::vector<std::shared_ptr<PendingRequest>> exec_pending;
+    overrides.reserve(batch.size());
+    exec_pending.reserve(batch.size());
+
+    for (auto& pending : batch) {
+      auto* inference = &pending->inference;
+      if (inference->has_response_format && !inference->response_format_supported) {
+        InferenceResult error;
+        error.no_backend = true;
+        error.completion = inference->response_format_error.empty()
+                               ? "Selected model does not support response_format"
+                               : inference->response_format_error;
+        pending->promise.set_value(std::move(error));
+        // Return the sequence slot so it is not leaked.
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (inference->sequence_id >= 0) {
+          FreeSeqSlot(inference->sequence_id);
+          inference->sequence_id = -1;
+        }
+        continue;
+      }
+      if (inference->has_response_format && !inference->response_format_ready) {
+        StructuredConstraint constraint;
+        std::string adapter_error;
+        if (!StructuredOutputAdapter::BuildConstraint(
+                inference->response_format_type,
+                inference->response_format_schema,
+                inference->response_format_grammar,
+                inference->response_format_root,
+                &constraint,
+                &adapter_error)) {
+          InferenceResult error;
+          error.no_backend = true;
+          error.completion = adapter_error.empty()
+                                 ? "response_format could not be converted"
+                                 : adapter_error;
+          pending->promise.set_value(std::move(error));
+          std::lock_guard<std::mutex> lock(queue_mutex_);
+          if (inference->sequence_id >= 0) {
+            FreeSeqSlot(inference->sequence_id);
+            inference->sequence_id = -1;
+          }
+          continue;
+        }
+        inference->response_constraint = constraint;
+        inference->response_format_ready = true;
+      }
+      exec_pending.push_back(pending);
+      overrides.push_back(pending->resolved_backend);
+      exec_batch.requests.push_back(inference);
+    }
+
+    if (exec_pending.empty()) continue;
+
+    auto responses = executor_->ExecuteBatch(exec_batch, overrides);
+    std::vector<std::shared_ptr<PendingRequest>> requeue;
+    requeue.reserve(exec_pending.size());
+
+    for (std::size_t i = 0; i < exec_pending.size(); ++i) {
+      auto& pending = exec_pending[i];
+      auto* inference = &pending->inference;
+      InferenceResult result;
+      if (i < responses.size()) {
+        result = std::move(responses[i]);
+      }
+
+      if (inference->fairness_yielded) {
+        auto now = std::chrono::steady_clock::now();
+        pending->enqueue_time = now;
+        inference->enqueue_time = now;
+        inference->phase = RequestPhase::kDecode;
+        if (!result.completion.empty()) {
+          inference->prompt.append(result.completion);
+          inference->prompt_tokens = tokenizer_.Encode(inference->prompt);
+        }
+        requeue.push_back(pending);
+        continue;
+      }
+
+      if (!inference->accumulated_output.empty()) {
+        result.completion = inference->accumulated_output;
+        if (inference->total_completion_tokens > 0) {
+          result.completion_tokens = inference->total_completion_tokens;
+        }
+      }
+      if (inference->reported_prompt_tokens >= 0) {
+        result.prompt_tokens = inference->reported_prompt_tokens;
+      }
+
+      // Return sequence slot and KV cache.
+      // Sequence slot management (seq_slots_free_) requires queue_mutex_.
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (inference->sequence_id >= 0) {
+          FreeSeqSlot(inference->sequence_id);
+          inference->sequence_id = -1;
+        }
+      }
+      inference->phase = RequestPhase::kFinished;
+      pending->promise.set_value(std::move(result));
+    }
+
+    if (!requeue.empty()) {
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        for (auto& pending : requeue) {
+          pending_decode_.push_back(pending);
+        }
+        UpdateQueueDepthLocked();
+      }
+      queue_cv_.notify_all();
+    }
+  }
 }
 
 InferenceResult Scheduler::Generate(InferenceRequest request) {
@@ -158,12 +332,19 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
     std::size_t index{0};
   };
   std::vector<QueueItem> queue_items;
-  queue_items.reserve(pending_prefill_.size() + pending_decode_.size());
+  // When decode workers are active they own pending_decode_; WorkerLoop must
+  // only build prefill batches to avoid both threads competing for the same
+  // requests and for the seq slot free-list (which is not separately locked).
+  const bool decode_workers_own_decode = use_decode_workers_;
+  queue_items.reserve(pending_prefill_.size() +
+                      (decode_workers_own_decode ? 0 : pending_decode_.size()));
   for (std::size_t i = 0; i < pending_prefill_.size(); ++i) {
     queue_items.push_back(QueueItem{pending_prefill_[i], false, i});
   }
-  for (std::size_t i = 0; i < pending_decode_.size(); ++i) {
-    queue_items.push_back(QueueItem{pending_decode_[i], true, i});
+  if (!decode_workers_own_decode) {
+    for (std::size_t i = 0; i < pending_decode_.size(); ++i) {
+      queue_items.push_back(QueueItem{pending_decode_[i], true, i});
+    }
   }
 
   auto now = std::chrono::steady_clock::now();

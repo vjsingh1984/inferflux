@@ -3,6 +3,7 @@
 #include <llama.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -460,6 +461,46 @@ std::string LlamaCPUBackend::Decode(int n_past,
 void LlamaCPUBackend::FreeSequence(int sequence_id) {
   if (!context_) return;
   llama_memory_seq_rm(llama_get_memory(context_), static_cast<llama_seq_id>(sequence_id), -1, -1);
+}
+
+std::vector<uint8_t> LlamaCPUBackend::SerializeSequence(int sequence_id) {
+  if (!context_) return {};
+  std::size_t size = llama_state_seq_get_size(context_, static_cast<llama_seq_id>(sequence_id));
+  if (size == 0) return {};
+  std::vector<uint8_t> buf(size);
+  std::size_t written = llama_state_seq_get_data(
+      context_, buf.data(), buf.size(), static_cast<llama_seq_id>(sequence_id));
+  if (written == 0) return {};
+  buf.resize(written);
+  return buf;
+}
+
+bool LlamaCPUBackend::HydrateSequence(int dest_sequence_id,
+                                      const std::vector<uint8_t>& blob) {
+  if (!context_ || blob.empty()) return false;
+  std::size_t read = llama_state_seq_set_data(
+      context_, blob.data(), blob.size(), static_cast<llama_seq_id>(dest_sequence_id));
+  return read > 0;
+}
+
+bool LlamaCPUBackend::IsMoE() const {
+  return ExpertCount() > 0;
+}
+
+int LlamaCPUBackend::ExpertCount() const {
+  if (!model_) return 0;
+  char buf[32] = {};
+  int32_t len = llama_model_meta_val_str(model_, "llm.expert_count", buf, sizeof(buf));
+  if (len <= 0) return 0;
+  return std::atoi(buf);
+}
+
+int LlamaCPUBackend::ActiveExperts() const {
+  if (!model_) return 0;
+  char buf[32] = {};
+  int32_t len = llama_model_meta_val_str(model_, "llm.expert_used_count", buf, sizeof(buf));
+  if (len <= 0) return 0;
+  return std::atoi(buf);
 }
 
 void LlamaCPUBackend::EnableGrammarConstraint(const std::string& grammar,

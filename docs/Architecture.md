@@ -179,10 +179,48 @@ cross-process disaggregation — without requiring KV serialization or upstream 
 6. [x] `BatchExecutor::ExecuteRequest`: branch on `n_past>=0` for `Decode()`; advance n_past per slice; `FreeSequence()` on non-yield completion only
 7. [x] KVChannel gate: only enqueue when `use_decode_workers_=true`
 8. [x] 11 `[phased]` unit tests (`tests/unit/test_phased_execution.cpp`)
-9. [ ] Wire `DecodeWorkerLoop` + enable `use_decode_workers_=true`
-10. [ ] `llama_state_seq_get_data` / `llama_state_seq_set_data` for cross-process KV transfer (requires llama.cpp upstream)
+9. [x] Wire `DecodeWorkerLoop` + enable `use_decode_workers_=true` when `decode_pool_size > 0`
+10. [x] `SerializeSequence` / `HydrateSequence` via `llama_state_seq_get_data` / `llama_state_seq_set_data`
 11. [ ] SHM/RDMA transport layer (<5 ms transfer SLA)
 12. [ ] Dual-pool `/readyz`, transfer-latency Prometheus histograms, Helm overlays for independent scaling
+
+## MoE Expert Parallelism (§2.6)
+
+### Current State
+MoE model detection is implemented in the CPU backend and router layer.  Full
+expert parallelism (sharding expert layers across GPU ranks) is a future work
+item once multi-GPU topology discovery lands.
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| `LlamaCPUBackend::IsMoE()` | Done | Reads `llm.expert_count` GGUF key |
+| `LlamaCPUBackend::ExpertCount()` | Done | Returns n_experts (0 for non-MoE) |
+| `LlamaCPUBackend::ActiveExperts()` | Done | Returns `llm.expert_used_count` |
+| `ModelInfo.is_moe / n_experts / n_active_experts` | Done | Populated in `SingleModelRouter` after load |
+| `RecordMoERequest()` Prometheus counter | Done | `inferflux_moe_requests_total` |
+| `EPDispatch` stub interface | Done | `runtime/backends/ep_dispatch.h`; `LocalEPDispatch` owns all experts |
+| Multi-GPU expert sharding | Pending | Requires NCCL/topology discovery |
+
+### EPDispatch Interface
+```cpp
+// runtime/backends/ep_dispatch.h
+class EPDispatch {
+  virtual EPRank LocalRank() const = 0;   // rank, world_size, [expert_start, expert_end)
+  virtual bool OwnsExpert(int expert_id) const = 0;
+  virtual std::string Name() const = 0;
+};
+class LocalEPDispatch : public EPDispatch { ... }; // single-process default
+```
+
+### Implementation Checklist
+1. [x] `IsMoE()`, `ExpertCount()`, `ActiveExperts()` on `LlamaCPUBackend`
+2. [x] `ModelInfo`: `is_moe`, `n_experts`, `n_active_experts` (GGUF metadata)
+3. [x] `SingleModelRouter::RegisterModel/LoadModel` populates MoE fields
+4. [x] `RecordMoERequest()` metric + Prometheus output
+5. [x] `EPDispatch` + `LocalEPDispatch` stub (`runtime/backends/ep_dispatch.h`)
+6. [x] 9 `[moe]` unit tests (`tests/unit/test_moe_routing.cpp`)
+7. [ ] Multi-GPU expert sharding via NCCL or shared-memory ring
+8. [ ] EP-aware batch routing in `BatchExecutor`
 
 ### Adapter Pattern & Backend Capabilities
 - **StructuredOutputAdapter** — Maintain OpenAI’s `response_format` as the public contract but introduce an internal adapter interface that validates payloads, enforces size limits, and emits backend-native constraints (e.g., llama.cpp GBNF via `json_schema_to_grammar`, regex/DSL for future engines).
