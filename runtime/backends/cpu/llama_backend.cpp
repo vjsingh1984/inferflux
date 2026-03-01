@@ -181,11 +181,20 @@ std::string LlamaCPUBackend::Generate(const std::string& prompt,
   llama_token eos = llama_vocab_eos(vocab_);
   int tokens_remaining = std::max(max_tokens, 1);
 
+  if (grammar_sampler_) {
+    llama_sampler_reset(grammar_sampler_);
+  }
+
   while (tokens_remaining-- > 0) {
     if (should_stop && should_stop()) {
       break;
     }
-    int token = SampleGreedy();
+    int token = 0;
+    if (grammar_sampler_) {
+      token = llama_sampler_sample(grammar_sampler_, context_, -1);
+    } else {
+      token = SampleGreedy();
+    }
     if (token == eos) {
       break;
     }
@@ -208,7 +217,30 @@ std::string LlamaCPUBackend::Generate(const std::string& prompt,
   }
 
   llama_batch_free(batch);
+  if (grammar_sampler_) {
+    llama_sampler_reset(grammar_sampler_);
+  }
   return output;
+}
+
+void LlamaCPUBackend::EnableGrammarConstraint(const std::string& grammar,
+                                              const std::string& root) {
+  if (grammar.empty() || !context_ || !vocab_) {
+    return;
+  }
+  DisableGrammarConstraint();
+  auto params = llama_sampler_chain_default_params();
+  auto* chain = llama_sampler_chain_init(params);
+  llama_sampler_chain_add(chain, llama_sampler_init_grammar(vocab_, grammar.c_str(), root.c_str()));
+  llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+  grammar_sampler_ = chain;
+}
+
+void LlamaCPUBackend::DisableGrammarConstraint() {
+  if (grammar_sampler_) {
+    llama_sampler_free(grammar_sampler_);
+    grammar_sampler_ = nullptr;
+  }
 }
 
 }  // namespace inferflux

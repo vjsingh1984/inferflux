@@ -22,23 +22,37 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | Production throughput         |  A   |   A+   |   A+    |     C     |   D    |   **F**   | B (Q4) | Runtime |
 | Continuous batching           |  A   |   A+   |   A     |    N/A    |  N/A   |   **F**   | B (Q3) | Scheduler |
 | KV cache efficiency           |  B+  |   A+   |   A     |    N/A    |  N/A   |   **F**   | B (Q3) | Runtime |
-| Prefix Caching                |  A   |   A+   |   A     |     B     |   B    |   **B**   | A (Q3)       | Runtime |
+| Prefix Caching                |  A   |   A+   |   A     |     B     |   B    |   **F**   | A (Q3)       | Runtime |
 | Speculative decoding          |  A   |   A    |   A     |    B+     |   B    |   **D**   | B (Q3) | Runtime |
-| Structured output / JSON mode |  A   |   A+   |   B+    |    B+     |   B    |   **C+**  | B+ (Q3) | Runtime |
+| Structured output / JSON mode |  A   |   A+   |   B+    |    B+     |   B    |   **B-**  | B+ (Q3) | Runtime |
 | Multimodal / vision           |  A   |   A    |   B+    |    B+     |   B+   |   **F**   | C+ (Q3) | Runtime |
-| Tool / function calling       |  A   |   A    |   B     |    C      |   B    |   **C**   | B (Q3) | Server |
+| Tool / function calling       |  A   |   A    |   B     |    C      |   B    |   **F**   | B (Q3) | Server |
 | Quantization breadth          |  A+  |   B+   |   A     |    A+     |   A    |   **D**   | B (Q4) | Runtime |
 | Hardware breadth              |  A+  |   B+   |   C     |    A+     |   B    |   **D**  | B (Q4) | Runtime |
 | Disaggregated prefill/decode  |  A   |   A+   |   A     |    N/A    |  N/A   |   **F**   | C (Q4) | Distributed Runtime |
 | Model parallelism (TP/PP/EP)  |  A   |   A+   |   A     |    C      |   C    |   **F**   | C (Q4) | Distributed Runtime |
 | OpenAI API compatibility      |  A   |   A    |   B     |    B      |   A    |   **C**   | B (Q3) | Server |
 | Enterprise auth & RBAC        |  B   |   C    |   B     |    F      |   F    |   **B-**  | B+ (Q3) | Policy |
-| Observability                 |  A   |   B    |   A     |    D      |   D    |   **C**   | B (Q3) | Observability |
+| Observability                 |  A   |   B    |   A     |    D      |   D    |   **B**   | B (Q3) | Observability |
 | Ease of local setup           |  B+  |   B    |   C     |    C      |   A+   |   **C**   | B (Q3) | CLI |
 | Model management UX           |  B   |   B    |   C     |    C      |   A+   |   **F**   | C+ (Q3) | CLI |
 | Test coverage & CI maturity   |  A   |   A    |   A     |    A      |   B    |   **D**   | B (Q3) | QA |
 
 **Overall grade: D (early prototype)**
+
+**Scorecard status notes (May 2025):**
+- Production throughput, continuous batching, and KV cache efficiency remain at **F** until GPU-aware execution, prefill/decode overlap, and FA3 kernels from §2.5/§2.7 land.
+- Prefix caching is **F** because the radix/prefix reuse work in §2.4 is still unstarted; only page reservation exists.
+- Structured output bumped to **B-** now that HTTP parsing, schema-to-grammar conversion, and llama grammar sampling are wired through scheduler/runtime (§2.1); tool/function calling remains **F** until streaming/tool deltas are emitted from the model output path (§2.3).
+- Multimodal/vision remains **F**; there is no image ingestion path today (§2.2).
+- Quantization breadth and hardware breadth are **D** since only CPU/MPS paths run; CUDA/ROCm/Intel enablement in §2.7/§2.11 is unresolved.
+- Disaggregated prefill/decode and model parallelism are **F** because no distributed runtime exists yet (§2.5/§2.6).
+- OpenAI API compatibility holds at **C**—basic chat completion works but tool/multimodal gaps block parity (§2.3).
+- Enterprise auth/RBAC at **B-** reflects working OIDC/API-key flows but lacks fine-grained RBAC UX improvements noted in Policy backlog.
+- Observability is **B** thanks to metrics/tracing/logging closures in OBS-1 through OBS-4.
+- Ease of local setup is **C** until `inferctl pull` and streamlined installers from §2.8 land.
+- Model management UX is **F** because no registry/pull flow exists beyond manual config (§2.8).
+- Test coverage/CI maturity stays **D**; only targeted unit suites exist, no CI matrix.
 
 InferFlux has strong *architectural vision* (enterprise auth, policy store, multi-backend) but
 the implementation is at stub/MVP stage. The competitive gap is largest in the core inference
@@ -312,7 +326,7 @@ policy store with RBAC, CLI interactive mode, Prometheus metrics, audit logging.
 |----------|------|--------|-------------|-----------|
 | P0 | Multi-threaded HTTP server (epoll/kqueue) | **Done** | INF-1 | `server/http/http_server.cpp` |
 | P0 | Queue-based scheduler + priority scheduling | **Done** — worker thread, fairness aging, BatchExecutor | INF-2, §2.9 | `scheduler/scheduler.cpp`, `runtime/execution/batch_executor.cpp` |
-| P0 | **[UPGRADE]** Structured output / JSON mode | Not started — need full grammar plumbing, llama.cpp sampler integration, contract + integration tests, CLI/docs updates | §2.1 | `server/http/http_server.cpp`, `scheduler/request_batch.h`, `runtime/execution/batch_executor.cpp`, `cli/main.cpp` |
+| P0 | **[UPGRADE]** Structured output / JSON mode | **Done** — HTTP parser validates `response_format`, `StructuredOutputAdapter` converts schemas to llama GBNF, `BatchExecutor`/`LlamaCPUBackend` enforce grammar sampling, unit tests cover adapter | §2.1 | `server/http/http_server.cpp`, `scheduler/request_batch.h`, `runtime/execution/batch_executor.cpp`, `runtime/structured_output/` |
 | P0 | **[NEW]** Tool calling / function calling | **Done** — parse `tools[]`+`tool_choice`, inject schema as system preamble, detect `tool_call` JSON in output, emit `tool_calls` array with `finish_reason=tool_calls` | §2.3 | `server/http/http_server.cpp` |
 | P0 | **[UPGRADE]** CUDA backend with FlashAttention | **Partial** — FA3 config fields added, CUDA build flags wired; GPU kernel execution pending | §2.7 | `runtime/backends/cuda/` |
 | P1 | **[NEW]** Prefix caching (LRU KV reuse) | **Done** — `PrefixCache` LRU implemented, wired into `BatchExecutor` | §2.4 | `runtime/prefix_cache/prefix_cache.cpp` |
@@ -376,7 +390,7 @@ identified above. Check items off as they are addressed.
 - [X] §Security: Document API key hashing — SEC-2
 - [X] §Security: Document readiness vs liveness health checks — OBS-3
 - [X] §Observability: Document audit log redaction (hash by default) — OBS-4
-- [ ] §Modules: Add constrained decoding module — §2.1
+- [X] §Modules: Add constrained decoding module — §2.1
 - [ ] §Modules: Add parallelism strategies section (TP/PP/EP) — §2.6, §2.7
 - [ ] §Data Flow: Add image preprocessing stage — §2.2
 - [ ] §Deployment View: Add disaggregated prefill/decode topology — §2.5

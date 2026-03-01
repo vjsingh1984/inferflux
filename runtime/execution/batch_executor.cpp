@@ -7,10 +7,42 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <stdexcept>
 
 using json = nlohmann::json;
 
 namespace inferflux {
+
+namespace {
+
+class GrammarScope {
+ public:
+  GrammarScope(const StructuredConstraint& constraint,
+               const std::shared_ptr<LlamaCPUBackend>& backend)
+      : backend_(backend.get() ? backend.get() : nullptr) {
+    if (!backend_ || !constraint.has_grammar) {
+      backend_ = nullptr;
+      return;
+    }
+    backend_->EnableGrammarConstraint(constraint.grammar, constraint.root);
+    active_ = true;
+  }
+
+  GrammarScope(const GrammarScope&) = delete;
+  GrammarScope& operator=(const GrammarScope&) = delete;
+
+  ~GrammarScope() {
+    if (active_ && backend_) {
+      backend_->DisableGrammarConstraint();
+    }
+  }
+
+ private:
+  LlamaCPUBackend* backend_{nullptr};
+  bool active_{false};
+};
+
+}  // namespace
 
 BatchExecutor::BatchExecutor(SimpleTokenizer* tokenizer,
                              std::shared_ptr<CPUDeviceContext> device,
@@ -142,7 +174,10 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   inference.phase = RequestPhase::kDecode;
   auto decode_start = std::chrono::steady_clock::now();
 
+  GrammarScope grammar_scope(inference.response_constraint, backend);
+
   if (speculative_decoder_ && speculative_decoder_->Enabled() &&
+      !inference.has_response_format &&
       (!inference.cancellation_flag || !inference.cancellation_flag->load())) {
     auto draft = speculative_decoder_->Draft(inference.prompt_tokens, decode_limit);
     auto validated = speculative_decoder_->Validate(
@@ -224,11 +259,29 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
     inference.phase = RequestPhase::kFinished;
   }
 
-  if (inference.json_mode) {
+  bool needs_json_validation = inference.json_mode || inference.response_constraint.require_json_object;
+  if (needs_json_validation) {
     try {
       auto parsed = json::parse(response.completion);
+      if (inference.response_constraint.require_json_object && !parsed.is_object()) {
+        throw std::runtime_error("model output was not a JSON object");
+      }
       response.completion = parsed.dump();
     } catch (const std::exception&) {
+      if (inference.response_constraint.require_json_object && !response.no_backend) {
+        response.no_backend = true;
+        response.completion = "Model output violated response_format constraints";
+        response.completion_tokens = 0;
+        inference.output_tokens.clear();
+        inference.phase = RequestPhase::kFinished;
+        inference.fairness_yielded = false;
+        if (cache_ && kv_page >= 0) {
+          cache_->ReleasePage(kv_page);
+          kv_page = -1;
+        }
+        inference.first_token_time = std::chrono::steady_clock::now();
+        return outcome;
+      }
       response.completion = json({{"output", response.completion}}).dump();
     }
     auto retokens = tokenizer_->Encode(response.completion);

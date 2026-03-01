@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "runtime/structured_output/structured_constraint.h"
+
 namespace inferflux {
 
 // Phase of an inference request in the continuous batching pipeline.
@@ -47,6 +49,9 @@ struct InferenceRequest {
   std::string response_format_grammar;  // Resolved GBNF string.
   std::string response_format_root{"root"};
   bool response_format_ready{false};    // True once grammar string compiled/resolved.
+  bool response_format_supported{true};
+  std::string response_format_error;
+  StructuredConstraint response_constraint;
 
   // Token state (populated during scheduling).
   std::vector<int> prompt_tokens;

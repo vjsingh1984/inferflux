@@ -62,6 +62,11 @@ add_library(inferflux_core
   policy/policy_store.h
   policy/opa_client.cpp
   policy/opa_client.h
+  runtime/structured_output/structured_constraint.h
+  runtime/structured_output/structured_output_adapter.cpp
+  runtime/structured_output/structured_output_adapter.h
+  runtime/structured_output/json_schema_shim.cpp
+  external/llama.cpp/common/json-schema-to-grammar.cpp
   io/async_file_writer.cpp
   io/async_file_writer.h
   net/http_client.cpp
@@ -120,6 +125,7 @@ target_link_libraries(inferflux_core PUBLIC llama)
 target_include_directories(inferflux_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/include
   ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/common
+  ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/vendor
 )
 target_link_libraries(inferflux_core PUBLIC OpenSSL::Crypto OpenSSL::SSL yaml-cpp)
 

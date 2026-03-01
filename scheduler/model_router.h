@@ -14,6 +14,7 @@ struct ModelInfo {
   std::string path;     // Filesystem path to weights.
   std::string backend;  // Backend type: "cpu", "cuda", "mps", "rocm".
   bool ready{false};    // True when the model is loaded and serving.
+  bool supports_structured_output{false};
 };
 
 // ModelRouter is the plugin interface for multi-model serving.

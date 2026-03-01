@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# pre-commit: linting, compilation, and test checks for InferFlux
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# ── 1. clang-format on staged C++ files ──────────────────────────────────────
+STAGED_CPP=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(cpp|h|cc|cxx)$' || true)
+
+if [ -n "$STAGED_CPP" ]; then
+  if command -v clang-format &>/dev/null; then
+    FORMAT_ISSUES=""
+    while IFS= read -r file; do
+      [ -f "$file" ] || continue
+      DIFF=$(clang-format --style=file "$file" | diff "$file" - || true)
+      if [ -n "$DIFF" ]; then
+        FORMAT_ISSUES="$FORMAT_ISSUES\n  $file"
+      fi
+    done <<< "$STAGED_CPP"
+
+    if [ -n "$FORMAT_ISSUES" ]; then
+      echo "[pre-commit] clang-format violations detected in:"
+      echo -e "$FORMAT_ISSUES"
+      echo "[pre-commit] Run: clang-format -i <files> to fix, then re-stage."
+      exit 1
+    fi
+    echo "[pre-commit] clang-format: OK"
+  else
+    echo "[pre-commit] WARNING: clang-format not found — skipping format check."
+    echo "             Install with: brew install clang-format"
+  fi
+fi
+
+# ── 2. Incremental compilation ────────────────────────────────────────────────
+if [ ! -d "$REPO_ROOT/build" ]; then
+  echo "[pre-commit] No build directory found — running cmake configure first."
+  cmake -S "$REPO_ROOT" -B "$REPO_ROOT/build" -DCMAKE_BUILD_TYPE=Release -DINFERFLUX_BUILD_TESTS=ON -Wno-dev &>/dev/null
+fi
+
+echo "[pre-commit] Building (incremental)..."
+if ! cmake --build "$REPO_ROOT/build" -j"$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)" 2>&1; then
+  echo "[pre-commit] BUILD FAILED — fix compilation errors before committing."
+  exit 1
+fi
+echo "[pre-commit] Build: OK"
+
+# ── 3. Unit tests ─────────────────────────────────────────────────────────────
+echo "[pre-commit] Running unit tests..."
+if ! ctest --test-dir "$REPO_ROOT/build" -R "UnitTests|FairnessTests" --output-on-failure -Q 2>&1; then
+  echo "[pre-commit] UNIT TESTS FAILED — fix failing tests before committing."
+  exit 1
+fi
+echo "[pre-commit] Unit tests: OK"
+
+# ── 4. Stub integration tests (no model required) ─────────────────────────────
+echo "[pre-commit] Running stub integration tests..."
+if ! ctest --test-dir "$REPO_ROOT/build" -R "StubIntegration" --output-on-failure -Q 2>&1; then
+  echo "[pre-commit] STUB INTEGRATION TESTS FAILED — fix before committing."
+  exit 1
+fi
+echo "[pre-commit] Stub integration tests: OK"
+
+# ── 5. Chain global Databricks hook if present ───────────────────────────────
+GLOBAL_HOOKS_DIR="$(git config --global core.hooksPath 2>/dev/null || true)"
+if [ -n "$GLOBAL_HOOKS_DIR" ] && [ -x "$GLOBAL_HOOKS_DIR/pre-commit" ]; then
+  echo "[pre-commit] Chaining global pre-commit hook at $GLOBAL_HOOKS_DIR/pre-commit"
+  "$GLOBAL_HOOKS_DIR/pre-commit" "$@"
+fi
+
+echo "[pre-commit] All checks passed."

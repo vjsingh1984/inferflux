@@ -3,6 +3,7 @@
 #include "scheduler/single_model_router.h"
 #include "server/metrics/metrics.h"
 #include "server/tracing/span.h"
+#include "runtime/structured_output/structured_output_adapter.h"
 #include "runtime/execution/batch_executor.h"
 
 #include <algorithm>
@@ -174,16 +175,61 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   }
   GlobalMetrics().RecordBatch(selection.batch.requests.size(), selection.total_tokens);
 
+  RequestBatch exec_batch;
+  exec_batch.batch_id = selection.batch.batch_id;
   std::vector<std::shared_ptr<LlamaCPUBackend>> overrides;
+  std::vector<std::shared_ptr<PendingRequest>> exec_pending;
   overrides.reserve(selection.pending.size());
+  exec_pending.reserve(selection.pending.size());
   for (auto& pending : selection.pending) {
+    auto* inference = &pending->inference;
+    if (inference->has_response_format && !inference->response_format_supported) {
+      InferenceResult error;
+      error.no_backend = true;
+      error.completion = inference->response_format_error.empty()
+                             ? "Selected model does not support response_format"
+                             : inference->response_format_error;
+      pending->promise.set_value(std::move(error));
+      continue;
+    }
+    if (inference->has_response_format) {
+      StructuredConstraint constraint;
+      std::string adapter_error;
+      if (!StructuredOutputAdapter::BuildConstraint(
+              inference->response_format_type,
+              inference->response_format_schema,
+              inference->response_format_grammar,
+              inference->response_format_root,
+              &constraint,
+              &adapter_error)) {
+        InferenceResult error;
+        error.no_backend = true;
+        error.completion = adapter_error.empty()
+                               ? "response_format could not be converted"
+                               : adapter_error;
+        pending->promise.set_value(std::move(error));
+        continue;
+      }
+      inference->response_constraint = constraint;
+      inference->response_format_ready = true;
+    } else {
+      inference->response_constraint = StructuredConstraint{};
+      inference->response_format_ready = false;
+    }
+    exec_pending.push_back(pending);
     overrides.push_back(pending->resolved_backend);
+    exec_batch.requests.push_back(&pending->inference);
   }
-  auto responses = executor_->ExecuteBatch(selection.batch, overrides);
+
+  if (exec_pending.empty()) {
+    return;
+  }
+
+  auto responses = executor_->ExecuteBatch(exec_batch, overrides);
   std::vector<std::shared_ptr<PendingRequest>> requeue;
-  requeue.reserve(selection.pending.size());
-  for (std::size_t i = 0; i < selection.pending.size(); ++i) {
-    auto& pending = selection.pending[i];
+  requeue.reserve(exec_pending.size());
+  for (std::size_t i = 0; i < exec_pending.size(); ++i) {
+    auto& pending = exec_pending[i];
     auto* inference = &pending->inference;
     InferenceResult result;
     if (i < responses.size()) {
@@ -313,15 +359,26 @@ void Scheduler::ResolveBackends(const std::vector<std::shared_ptr<PendingRequest
     for (auto& pending : batch) {
       pending->resolved_backend.reset();
       pending->inference.resolved_model.clear();
+      pending->inference.response_format_supported = true;
+      pending->inference.response_format_error.clear();
     }
     return;
   }
   for (auto& pending : batch) {
     pending->resolved_backend.reset();
     pending->inference.resolved_model.clear();
+    pending->inference.response_format_supported = true;
+    pending->inference.response_format_error.clear();
     auto* info = router_->Resolve(pending->inference.model);
     if (!info) {
       GlobalMetrics().RecordModelRoute(pending->inference.model, "", false);
+      continue;
+    }
+    if (pending->inference.has_response_format && !info->supports_structured_output) {
+      pending->inference.response_format_supported = false;
+      pending->inference.response_format_error =
+          "Selected model does not support response_format constraints";
+      GlobalMetrics().RecordModelRoute(info->id, info->backend, false);
       continue;
     }
     auto backend = router_->GetBackend(info->id);

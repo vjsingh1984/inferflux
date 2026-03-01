@@ -108,19 +108,16 @@ This plan completes ARCH-5, unlocks PRD Continuous Batching and Roadmap Workstre
 - Per-priority token consumption is exposed via `inferflux_fairness_tokens_total{priority="<level>"}` alongside the existing queue-depth gauge (`inferflux_scheduler_queue_depth`), making it easy to verify SLO budgets across classes.
 - Spans `scheduler.fairness.yield` and `scheduler.fairness.resume` wrap surrender/resume cycles with trace IDs, mirroring the new Prometheus counters for log-based investigations.
 
-## Structured Output & Grammar Plan
-### Current Gaps
-- `response_format` only flips a `json_mode` flag; schemas/grammars are not propagated through `InferenceRequest` or the runtime, so completions are unconstrained.
-- There is no llama.cpp grammar integration in `BatchExecutor`/`LlamaCPUBackend`, nor CLI/docs that explain schema usage or limits.
+## Structured Output & Grammar
+InferFlux now implements the PRD §Functional #8 requirements end-to-end:
 
-### Target Design
-1. **Request Parsing** — Extend HTTP parsers to accept OpenAI-style `json_schema` payloads or raw GBNF strings. Validate payload size/complexity and store normalized metadata on `InferenceRequest`.
-2. **Scheduler Plumbing** — Add grammar fields to `InferenceRequest`/`RequestBatch`, ensuring slices preserve grammar state. Update tracing/logging so fairness yields include schema context when relevant.
-3. **Runtime Execution** — Teach `BatchExecutor` and each backend (`LlamaCPUBackend`, CUDA stub) to initialize llama.cpp grammar samplers (`llama_sampler_init_grammar` or JSON-schema conversion) and feed them through the sampling loop.
-4. **CLI & Documentation** — Document `response_format` usage, schema limits, and examples in CLI help + docs; add troubleshooting guidance when schemas are invalid.
-5. **Testing** — Add Catch2 contract tests with nested JSON schemas plus an integration test hitting the HTTP path to verify ≥99.5% schema compliance.
+1. **Request Parsing** — `server/http/http_server.cpp` accepts OpenAI-style `response_format` payloads (`json_object`, `json_schema`, or `grammar`) with a 16 KB size cap, normalizes schemas into strings, and persists capability flags on `InferenceRequest`.
+2. **Schema Adaptation** — `runtime/structured_output/structured_output_adapter.*` feeds nlohmann JSON schemas through llama.cpp’s `json_schema_to_grammar` helper, producing backend-ready GBNF along with an optional “require JSON object” bit for downstream validation.
+3. **Scheduler Plumbing** — `InferenceRequest` tracks `StructuredConstraint` data, and `Scheduler::ProcessBatch` rejects requests that target models without structured-output support before they enter the execution pipeline.
+4. **Runtime Execution** — `BatchExecutor` uses the constraint to disable speculative decoding, attach llama grammar samplers via `LlamaCPUBackend::EnableGrammarConstraint`, and verify that any JSON-mode response is a valid object before returning it to HTTP clients.
+5. **Sampling** — `LlamaCPUBackend` now wraps llama.cpp’s sampler chain (grammar + greedy) so decoding is constrained on-token rather than relying on best-effort post-processing. Grammar scopes are released after each request to keep shared backends safe.
 
-This sequence keeps structured output aligned with PRD §Functional #8 and Roadmap Workstream C, ensuring agent builders can depend on InferFlux for schema-constrained responses.
+Contract tests (`tests/unit/test_structured_output.cpp`) cover schema validation/grammar emission, and the existing SSE/tooling tests ensure the HTTP surface emits structured responses. Future backends (CUDA/MPS) and CLI docs reuse the same adapter interface, so extending structured output beyond CPU is now an incremental task instead of a rewrite.
 
 ### Adapter Pattern & Backend Capabilities
 - **StructuredOutputAdapter** — Maintain OpenAI’s `response_format` as the public contract but introduce an internal adapter interface that validates payloads, enforces size limits, and emits backend-native constraints (e.g., llama.cpp GBNF via `json_schema_to_grammar`, regex/DSL for future engines).

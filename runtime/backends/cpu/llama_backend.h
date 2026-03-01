@@ -28,14 +28,11 @@ class LlamaCPUBackend {
                        int max_tokens,
                        const std::function<bool(const std::string&)>& on_chunk = {},
                        const std::function<bool()>& should_stop = {});
+  void EnableGrammarConstraint(const std::string& grammar, const std::string& root);
+  void DisableGrammarConstraint();
   bool IsReady() const { return context_ != nullptr || test_ready_; }
 
-  // Returns the number of tokens in `text` using the loaded model's vocabulary.
-  // Falls back to 0 if no model is loaded. Does not include the BOS token.
   int TokenCount(const std::string& text) const;
-
-  // Testing hook: marks the backend as ready without loading a model.
-  // Only used in unit tests to exercise router logic without GGUF weights.
   void ForceReadyForTests() { test_ready_ = true; }
 
  private:
@@ -49,6 +46,7 @@ class LlamaCPUBackend {
   int32_t n_vocab_{0};
   LlamaBackendConfig config_;
   bool test_ready_{false};
+  struct llama_sampler* grammar_sampler_{nullptr};
 };
 
 }  // namespace inferflux
