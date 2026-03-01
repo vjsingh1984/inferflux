@@ -127,24 +127,32 @@ private:
   // Warm KV prefix store (§ Item 5 — KV prefix reuse).
   // After a phased-decode request completes, its KV sequence slot is optionally
   // donated here instead of freed.  Future requests whose prompt starts with
-  // the same token sequence can call CopySequencePrefix + PrefillPartial to
-  // skip re-evaluating those prefix tokens, saving prefill compute.
+  // the same token sequence *on the same backend* can call CopySequencePrefix +
+  // PrefillPartial to skip re-evaluating those prefix tokens.
   // Only accessed from the WorkerLoop thread — no mutex required.
   struct KVPrefixEntry {
     int seq_id{-1};
     int n_tokens{0};         // number of prefix tokens in the KV slot
     std::vector<int> tokens; // full prompt token vector (used for matching)
     uint64_t last_used{0};   // LRU clock value
+    // The backend that owns the KV slot.  Reuse is only valid when the
+    // incoming request resolves to the same backend instance; eviction must
+    // call FreeSequence on this backend, not the caller's.
+    std::shared_ptr<LlamaCPUBackend> backend;
   };
-  // Find the longest entry whose tokens are a strict prefix of `tokens`.
-  // Updates last_used on the matching entry and returns a pointer, or nullptr.
-  KVPrefixEntry *LookupKVPrefix(const std::vector<int> &tokens);
-  // Donate seq_id to the warm prefix store.
-  // Returns: -2 = declined (too short / duplicate),
-  //          -1 = accepted (no eviction needed),
-  //          >= 0 = accepted and this old seq_id was evicted (caller must
-  //          free).
-  int DonateKVPrefix(int seq_id, const std::vector<int> &tokens);
+  // Find the longest entry whose tokens are a strict prefix of `tokens` AND
+  // whose backend pointer matches `backend`.  Returns nullptr on no match.
+  // Updates last_used on the returned entry.
+  KVPrefixEntry *LookupKVPrefix(const std::vector<int> &tokens,
+                                LlamaCPUBackend *backend);
+  // Donate seq_id to the warm prefix store for `backend`.
+  // Handles LRU eviction internally: the displaced entry's FreeSequence() is
+  // called on its own backend (not the caller's), preventing cross-model
+  // memory corruption.
+  // Returns true if the slot was accepted (caller must NOT free seq_id).
+  // Returns false if declined (too short / duplicate); caller frees normally.
+  bool DonateKVPrefix(int seq_id, const std::vector<int> &tokens,
+                      std::shared_ptr<LlamaCPUBackend> backend);
 
   std::vector<KVPrefixEntry> kv_prefix_store_;
   uint64_t kv_prefix_clock_{0};

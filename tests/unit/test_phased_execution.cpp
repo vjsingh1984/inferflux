@@ -288,3 +288,10 @@ TEST_CASE("PrefillResult kv_reuse defaults: first_token=-1, ok=false",
   REQUIRE_FALSE(r.ok);
   REQUIRE(r.n_past == 0);
 }
+
+TEST_CASE("CopySequencePrefix zero n_tokens is a no-op when context null",
+          "[kv_reuse]") {
+  // Guard: n_tokens=0 with null context must not crash (degenerate copy).
+  LlamaCPUBackend backend;
+  REQUIRE_NOTHROW(backend.CopySequencePrefix(0, 1, 0));
+}

@@ -471,7 +471,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // KV prefix reuse (§ Item 5): if we have a warm sequence whose tokens
         // are a strict prefix of this request's prompt, copy that KV state and
         // only evaluate the suffix — skipping repeated prompt computation.
-        KVPrefixEntry *warm = LookupKVPrefix(inf.prompt_tokens);
+        KVPrefixEntry *warm =
+            LookupKVPrefix(inf.prompt_tokens, pending->resolved_backend.get());
         // Allocate a dedicated sequence slot from the free-list.  Using a
         // free-list prevents two concurrent requests from sharing the same slot
         // (which would cause Prefill() to wipe the other request's KV state).
@@ -702,17 +703,12 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           static_cast<int>(inference->prompt_tokens.size()) >=
               kMinPrefixTokens &&
           pending->resolved_backend) {
-        int evicted =
-            DonateKVPrefix(inference->sequence_id, inference->prompt_tokens);
-        if (evicted != -2) {
-          // Donation accepted: the slot is now owned by kv_prefix_store_.
-          if (evicted >= 0) {
-            // An older entry was displaced; free its KV state and slot.
-            pending->resolved_backend->FreeSequence(evicted);
-            FreeSeqSlot(evicted);
-          }
-          donated = true;
-        }
+        // DonateKVPrefix owns any eviction: it calls FreeSequence on the
+        // displaced entry's own backend so cross-model corruption is
+        // impossible.
+        donated =
+            DonateKVPrefix(inference->sequence_id, inference->prompt_tokens,
+                           pending->resolved_backend);
       }
       if (!donated) {
         if (pending->resolved_backend) {
@@ -847,11 +843,16 @@ void Scheduler::FreeSeqSlot(int slot) {
 }
 
 Scheduler::KVPrefixEntry *
-Scheduler::LookupKVPrefix(const std::vector<int> &tokens) {
+Scheduler::LookupKVPrefix(const std::vector<int> &tokens,
+                          LlamaCPUBackend *backend) {
   KVPrefixEntry *best = nullptr;
   for (auto &entry : kv_prefix_store_) {
     // Only useful as a prefix when the cached entry is shorter than the query.
     if (entry.tokens.empty() || entry.tokens.size() >= tokens.size())
+      continue;
+    // Only reuse within the same backend instance: a seq_id has no meaning
+    // across different KV caches.
+    if (entry.backend.get() != backend)
       continue;
     if (std::equal(entry.tokens.begin(), entry.tokens.end(), tokens.begin())) {
       // Prefer the longest matching prefix.
@@ -866,29 +867,34 @@ Scheduler::LookupKVPrefix(const std::vector<int> &tokens) {
   return best;
 }
 
-int Scheduler::DonateKVPrefix(int seq_id, const std::vector<int> &tokens) {
+bool Scheduler::DonateKVPrefix(int seq_id, const std::vector<int> &tokens,
+                               std::shared_ptr<LlamaCPUBackend> backend) {
   if (static_cast<int>(tokens.size()) < kMinPrefixTokens)
-    return -2;
-  // Decline if an identical entry is already cached.
+    return false;
+  // Decline if an identical (backend, tokens) entry is already cached.
   for (const auto &entry : kv_prefix_store_) {
-    if (entry.tokens == tokens)
-      return -2;
+    if (entry.backend.get() == backend.get() && entry.tokens == tokens)
+      return false;
   }
   if (static_cast<int>(kv_prefix_store_.size()) < kPrefixStoreCap) {
-    kv_prefix_store_.push_back(
-        {seq_id, static_cast<int>(tokens.size()), tokens, ++kv_prefix_clock_});
-    return -1; // accepted, no eviction
+    kv_prefix_store_.push_back({seq_id, static_cast<int>(tokens.size()), tokens,
+                                ++kv_prefix_clock_, backend});
+    return true;
   }
-  // Evict the least-recently-used entry to make room.
+  // Evict the least-recently-used entry.  Free its KV slot on its own backend
+  // — not the caller's — to avoid cross-model memory corruption.
   auto min_it =
       std::min_element(kv_prefix_store_.begin(), kv_prefix_store_.end(),
                        [](const KVPrefixEntry &a, const KVPrefixEntry &b) {
                          return a.last_used < b.last_used;
                        });
-  int evicted = min_it->seq_id;
+  if (min_it->backend) {
+    min_it->backend->FreeSequence(min_it->seq_id);
+  }
+  FreeSeqSlot(min_it->seq_id);
   *min_it = {seq_id, static_cast<int>(tokens.size()), tokens,
-             ++kv_prefix_clock_};
-  return evicted;
+             ++kv_prefix_clock_, backend};
+  return true;
 }
 
 void Scheduler::ResolveBackends(
