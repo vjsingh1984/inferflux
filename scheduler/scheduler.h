@@ -37,7 +37,9 @@ struct SpeculativeStats {
 
 struct DisaggregatedConfig {
   int prefill_pool_size{1};
-  int decode_pool_size{1};
+  // decode_pool_size > 0 enables the decode worker pool and sets use_decode_workers_=true.
+  // Default is 0 (decode runs on the WorkerLoop thread, matching pre-§2.5 behaviour).
+  int decode_pool_size{0};
   std::shared_ptr<disaggregated::KVChannel> kv_channel;
 };
 

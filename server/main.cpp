@@ -148,7 +148,7 @@ int main(int argc, char** argv) {
   std::size_t nvme_writer_queue_depth = 256;
   std::size_t prefix_cache_capacity = 256;
   int prefill_pool_size = 1;
-  int decode_pool_size = 1;
+  int decode_pool_size = 0;  // 0 = decode on WorkerLoop thread (no separate pool)
   std::size_t kv_channel_capacity = 64;
   std::vector<ModelConfig> configured_models;
   std::string default_model_override;
@@ -651,7 +651,7 @@ int main(int argc, char** argv) {
   auto kv_channel = std::make_shared<inferflux::disaggregated::KVChannel>(kv_channel_capacity);
   inferflux::DisaggregatedConfig disagg_config;
   disagg_config.prefill_pool_size = std::max(1, prefill_pool_size);
-  disagg_config.decode_pool_size = std::max(1, decode_pool_size);
+  disagg_config.decode_pool_size = std::max(0, decode_pool_size);
   disagg_config.kv_channel = kv_channel;
   inferflux::Scheduler scheduler(tokenizer,
                                  device,

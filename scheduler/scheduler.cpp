@@ -118,15 +118,12 @@ void Scheduler::DecodeWorkerLoop() {
           if (pending->inference.id == pkt->request_id && pkt->n_past >= 0) {
             // Packet carries a serialised KV blob; hydrate it now.
             // (blob is currently empty for in-process path — no-op when empty.)
+            // kv_blob holds raw bytes from LlamaCPUBackend::SerializeSequence.
+            // Pass it directly to HydrateSequence — no cast or size adjustment.
             if (!pkt->kv_blob.empty() && pending->resolved_backend) {
               int seq_id = AllocSeqSlot();
               if (seq_id >= 0) {
-                // Reinterpret the raw byte payload from the channel packet.
-                std::vector<uint8_t> blob(
-                    reinterpret_cast<const uint8_t*>(pkt->kv_blob.data()),
-                    reinterpret_cast<const uint8_t*>(pkt->kv_blob.data()) +
-                        pkt->kv_blob.size() * sizeof(int));
-                if (pending->resolved_backend->HydrateSequence(seq_id, blob)) {
+                if (pending->resolved_backend->HydrateSequence(seq_id, pkt->kv_blob)) {
                   pending->inference.sequence_id = seq_id;
                   pending->inference.n_past = pkt->n_past;
                 } else {
@@ -308,7 +305,14 @@ void Scheduler::WorkerLoop() {
     BatchSelection selection;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
-      queue_cv_.wait(lock, [&] { return stop_ || !pending_prefill_.empty() || !pending_decode_.empty(); });
+      // When decode workers are active they own pending_decode_; WorkerLoop
+      // should only wake for prefill items (or stop).  Waking on pending_decode_
+      // would cause a spin: BuildBatchLocked skips that queue but the predicate
+      // would remain true as long as workers haven't drained it.
+      queue_cv_.wait(lock, [&] {
+        return stop_ || !pending_prefill_.empty() ||
+               (!use_decode_workers_ && !pending_decode_.empty());
+      });
       if (stop_ && pending_prefill_.empty() && pending_decode_.empty()) {
         break;
       }
@@ -440,7 +444,11 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         disaggregated::KVPacket packet;
         packet.request_id = inf.id;
         packet.prompt_tokens = SerializeTokens(inf.prompt_tokens);
-        packet.kv_blob = SerializeTokens(inf.prompt_tokens);
+        // Serialize the actual KV cache state for this sequence so a remote
+        // decode worker can hydrate it.  Empty when Prefill failed (seq_id<0).
+        if (inf.sequence_id >= 0 && pending->resolved_backend) {
+          packet.kv_blob = pending->resolved_backend->SerializeSequence(inf.sequence_id);
+        }
         packet.n_past = inf.n_past;
         packet.sequence_id = inf.sequence_id;
         packet.metadata = inf.model;
@@ -775,6 +783,9 @@ void Scheduler::ResolveBackends(const std::vector<std::shared_ptr<PendingRequest
       pending->resolved_backend = backend;
       pending->inference.resolved_model = info->id;
       GlobalMetrics().RecordModelRoute(info->id, info->backend, true);
+      if (info->is_moe) {
+        GlobalMetrics().RecordMoERequest();
+      }
     } else {
       pending->inference.resolved_model = info->id;
       GlobalMetrics().RecordModelRoute(info->id, info->backend, false);
