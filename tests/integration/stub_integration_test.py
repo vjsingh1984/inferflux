@@ -401,6 +401,102 @@ class StubIntegrationTests(unittest.TestCase):
             f"Expected 'get_weather' in tool_calls delta; got: {names_found}",
         )
 
+    # ── SSE streaming framing (covers IntegrationSSE gap) ────────────────────
+
+    def _parse_sse_chunks(self, body):
+        """Return parsed JSON objects from SSE body (skips [DONE] sentinel)."""
+        chunks = []
+        for line in body.splitlines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                chunks.append(json.loads(line[6:]))
+        return chunks
+
+    def test_sse_streaming_response_is_properly_framed(self):
+        """stream=true without tools must return text/event-stream with valid delta chunks.
+
+        This test covers the SSE framing gap that IntegrationSSE validates with a real
+        model.  In stub mode the scheduler returns a completion without a backend; the
+        no_backend streaming path (fixed alongside §2.3) now correctly emits:
+          1.  Content delta chunk
+          2.  Stop chunk (finish_reason="stop")
+          3.  data: [DONE] sentinel
+        rather than a second HTTP response that would corrupt the framing.
+        """
+        resp, body = self._post(
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "Hello, world"}],
+                "max_tokens": 8,
+                "stream": True,
+            },
+        )
+        self.assertEqual(resp.status, 200)
+        content_type = resp.getheader("Content-Type", "")
+        self.assertIn("text/event-stream", content_type,
+                      f"Expected text/event-stream; got: {content_type}")
+        self.assertIn("data: [DONE]", body, "SSE sentinel missing from streaming response")
+
+        chunks = self._parse_sse_chunks(body)
+        self.assertGreater(len(chunks), 0, "Expected at least one SSE data chunk")
+
+        finish_reasons = [c.get("choices", [{}])[0].get("finish_reason") for c in chunks]
+        self.assertIn("stop", finish_reasons, "Expected finish_reason=stop in stream")
+
+        # Every chunk must carry a 'choices' array with a 'delta'.
+        for i, chunk in enumerate(chunks):
+            self.assertIn("choices", chunk, f"chunk[{i}] missing 'choices'")
+            self.assertIn("delta", chunk["choices"][0], f"chunk[{i}]['choices'][0] missing 'delta'")
+
+    def test_sse_streaming_content_delta_carries_text(self):
+        """Content delta chunks must contain non-empty text (stub completion text)."""
+        resp, body = self._post(
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "Ping"}],
+                "max_tokens": 4,
+                "stream": True,
+            },
+        )
+        self.assertEqual(resp.status, 200)
+        chunks = self._parse_sse_chunks(body)
+        content_chunks = [
+            c for c in chunks
+            if c.get("choices", [{}])[0].get("delta", {}).get("content")
+        ]
+        self.assertGreater(len(content_chunks), 0,
+                           "Expected at least one chunk with non-empty delta.content")
+
+    def test_sse_streaming_server_remains_healthy_after_stream(self):
+        """Server must continue serving /livez after a streaming response completes."""
+        self._post(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "test"}], "max_tokens": 4, "stream": True},
+        )
+        # /livez is always 200 regardless of model state (unlike /healthz which
+        # returns 503 when no model is loaded).
+        resp, _ = self._get("/livez")
+        self.assertEqual(resp.status, 200)
+
+    def test_sse_streaming_metrics_endpoint_still_reachable(self):
+        """Metrics endpoint must remain responsive after a streaming request.
+
+        In stub mode, no_backend streaming calls RecordError() (not RecordSuccess),
+        so inferflux_errors_total is the counter that increments.  The test verifies
+        the metrics endpoint stays reachable and that at least one known counter line
+        appears in the output — without asserting exact delta counts that depend on
+        test execution order.
+        """
+        # Fire a streaming request.
+        self._post(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "metrics check"}], "max_tokens": 4, "stream": True},
+        )
+        resp, body = self._get("/metrics")
+        self.assertEqual(resp.status, 200)
+        # inferflux_errors_total is the counter incremented by the no_backend path.
+        self.assertIn("inferflux_errors_total", body,
+                      "inferflux_errors_total counter missing from /metrics after streaming request")
+
 
 if __name__ == "__main__":
     unittest.main()

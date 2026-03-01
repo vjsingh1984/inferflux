@@ -107,6 +107,89 @@ jobs:
           retention-days: 90
 
   # ---------------------------------------------------------------------------
+  # macOS / Metal (MPS) build + unit test
+  # Validates the Metal/MPS compilation path and unit test suite on Apple
+  # Silicon.  GitHub Actions macos-latest is arm64; ENABLE_MPS=ON enables
+  # llama.cpp Metal kernels and the INFERFLUX_HAS_METAL guard blocks.
+  # ---------------------------------------------------------------------------
+  build-check-mps:
+    name: Build & Test (macos-latest, MPS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew update --quiet
+          brew install cmake yaml-cpp openssl python3
+
+      - name: Configure (MPS enabled)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_CUDA=OFF \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=ON \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_MTMD=OFF \
+            -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
+
+      - name: Build
+        run: cmake --build build -j$(sysctl -n hw.logicalcpu)
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure --timeout 90
+
+  # ---------------------------------------------------------------------------
+  # CUDA compile-check (no GPU runner required)
+  # Installs the CUDA toolkit so CUDAToolkit_FOUND=true in CMake, then builds
+  # the full server binary with ENABLE_CUDA=ON.  This validates that CUDA-
+  # guarded headers, device-context code, and llama.cpp CUDA paths compile
+  # without errors — GPU test execution is deferred to self-hosted runners.
+  # Non-blocking (continue-on-error) since free-tier runners have no GPU.
+  # ---------------------------------------------------------------------------
+  build-check-cuda:
+    name: CUDA compile check (ubuntu-latest)
+    runs-on: ubuntu-latest
+    continue-on-error: true   # advisory only; no GPU available for execution
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libssl-dev libyaml-cpp-dev
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '12.3.0'
+          method: 'network'
+
+      - name: Configure (CUDA=ON)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_CUDA=ON \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_MTMD=OFF
+
+      # Build only the server binary; unit tests can't run without a GPU.
+      - name: Build (compile-only)
+        run: cmake --build build --target inferfluxd -j$(nproc)
+
+  # ---------------------------------------------------------------------------
   # clang-format style gate
   # Reports violations as annotations but does not block merge by default.
   # Change `continue-on-error: true` → `false` to enforce formatting in CI.
