@@ -87,6 +87,11 @@ class Scheduler {
     return live_decode_workers_.load(std::memory_order_relaxed);
   }
 
+  // Configured pool size from DisaggregatedConfig::decode_pool_size.
+  // HttpServer compares LiveDecodeWorkers() == ConfiguredDecodeWorkers() so
+  // that even a single worker crash flips /readyz to not_ready.
+  int ConfiguredDecodeWorkers() const { return disagg_config_.decode_pool_size; }
+
  private:
   struct BatchSelection {
     RequestBatch batch;

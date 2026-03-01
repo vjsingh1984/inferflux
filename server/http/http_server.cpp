@@ -798,10 +798,14 @@ void HttpServer::HandleClient(ClientSession& session) {
       } else {
         model_loaded = model_ready_.load(std::memory_order_relaxed);
       }
-      // Use the live worker count from Scheduler rather than the one-time
-      // startup flag (decode_pool_ready_), so that worker thread exits are
-      // reflected in readiness without a server restart.
-      bool pool_warm = scheduler_ && scheduler_->LiveDecodeWorkers() > 0;
+      // Require ALL configured decode workers to be alive, not just at least
+      // one.  With > 0 a 4-worker pool remains "ready" if 3 crash.
+      // live == configured means every thread is in its run-loop; the RAII
+      // guard in DecodeWorkerLoop decrements on any exit path so a single
+      // crash immediately makes this false.
+      bool pool_warm = scheduler_ &&
+                       scheduler_->ConfiguredDecodeWorkers() > 0 &&
+                       scheduler_->LiveDecodeWorkers() == scheduler_->ConfiguredDecodeWorkers();
       ready = model_loaded && pool_warm;
       if (!ready) reason = !model_loaded ? "no model backend loaded" : "decode pool not ready";
     } else {

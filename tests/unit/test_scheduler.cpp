@@ -309,7 +309,7 @@ TEST_CASE("FairnessController applies timeslice to low-priority entries", "[fair
 
 TEST_CASE("Scheduler::LiveDecodeWorkers returns 0 when decode_pool_size=0", "[scheduler]") {
   // Verify that a scheduler without decode workers reports no live workers.
-  // This is what HttpServer uses for the decode-role /readyz gate.
+  // HttpServer uses live == configured for the decode-role /readyz gate.
   inferflux::SimpleTokenizer tokenizer;
   auto device = std::make_shared<inferflux::CPUDeviceContext>();
   auto cache = std::make_shared<inferflux::PagedKVCache>(
@@ -318,6 +318,11 @@ TEST_CASE("Scheduler::LiveDecodeWorkers returns 0 when decode_pool_size=0", "[sc
   disagg.decode_pool_size = 0;  // no decode workers
   inferflux::Scheduler scheduler(tokenizer, device, cache, nullptr, nullptr, nullptr, {}, disagg);
   REQUIRE(scheduler.LiveDecodeWorkers() == 0);
+  REQUIRE(scheduler.ConfiguredDecodeWorkers() == 0);
+  // Pool is not warm when configured size is zero (avoids 0==0 false-positive).
+  bool pool_warm = scheduler.ConfiguredDecodeWorkers() > 0 &&
+                   scheduler.LiveDecodeWorkers() == scheduler.ConfiguredDecodeWorkers();
+  REQUIRE_FALSE(pool_warm);
 }
 
 TEST_CASE("FairnessController skips timeslice for high-priority entries", "[fairness]") {
