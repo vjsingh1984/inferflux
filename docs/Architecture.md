@@ -162,13 +162,14 @@ cross-process disaggregation — without requiring KV serialization or upstream 
 6. **Fairness yield**: KV slot preserved; `n_past` advanced; request requeues into `pending_decode_` for the next slice.
 
 ### KVChannel (Stub — Future Distributed Transport)
-`runtime/disaggregated/kv_channel.*` provides `KVChannel` (thread-safe bounded queue) and `KVPacket` (carries `request_id`, `n_past`, `sequence_id`, `kv_blob`, metadata). The channel is only populated when `use_decode_workers_=true`; while decode workers are disabled (current default), the kPrefill block sets `enqueued=true` directly and skips the channel entirely, preventing fill-and-deadlock.
+`runtime/disaggregated/kv_channel.*` provides `KVChannel` (thread-safe bounded queue) and `KVPacket` (carries `request_id`, `n_past`, `sequence_id`, `kv_blob`, metadata). `kv_blob` is populated by `LlamaCPUBackend::SerializeSequence(seq_id)` (wraps `llama_state_seq_get_data`) so a remote decode worker can call `HydrateSequence(dest_seq_id, blob)` to restore KV state without re-running prefill. The channel is only populated when `use_decode_workers_=true`; while decode workers are disabled (current default, `decode_pool_size=0`), the kPrefill block sets `enqueued=true` directly and skips the channel, preventing fill-and-deadlock.
 
 ### Configuration
 | Constant / Field | Value | Effect |
 | --- | --- | --- |
 | `kMaxSequenceSlots` | 16 | Free-list size; must exceed `kMaxBatchSize` (4) |
-| `use_decode_workers_` | `false` (hard-coded) | When `true`, prefill→decode hand-off goes via `KVChannel` + separate decode threads |
+| `use_decode_workers_` | `decode_pool_size > 0` (default `false`) | When `true`, WorkerLoop only handles prefill; decode workers drain `pending_decode_` |
+| `decode_pool_size` | `0` (default, off) | Set to N > 0 to spawn N `DecodeWorkerLoop` threads |
 
 ### Implementation Checklist
 1. [x] `LlamaCPUBackend::Prefill()` / `Decode()` / `FreeSequence()` / `BatchAddSeq()`
@@ -178,9 +179,9 @@ cross-process disaggregation — without requiring KV serialization or upstream 
 5. [x] `ProcessBatch`: allocate slot, call `Prefill()`, store n_past+sequence_id; return slot on full completion
 6. [x] `BatchExecutor::ExecuteRequest`: branch on `n_past>=0` for `Decode()`; advance n_past per slice; `FreeSequence()` on non-yield completion only
 7. [x] KVChannel gate: only enqueue when `use_decode_workers_=true`
-8. [x] 11 `[phased]` unit tests (`tests/unit/test_phased_execution.cpp`)
-9. [x] Wire `DecodeWorkerLoop` + enable `use_decode_workers_=true` when `decode_pool_size > 0`
-10. [x] `SerializeSequence` / `HydrateSequence` via `llama_state_seq_get_data` / `llama_state_seq_set_data`
+8. [x] 14 `[phased]` unit tests (`tests/unit/test_phased_execution.cpp`)
+9. [x] Wire `DecodeWorkerLoop` + enable `use_decode_workers_=true` when `decode_pool_size > 0`; `WorkerLoop` wait predicate excludes `pending_decode_` when workers are active (prevents spin-wakeup)
+10. [x] `SerializeSequence` / `HydrateSequence` via `llama_state_seq_get_data` / `llama_state_seq_set_data`; `kv_blob` in `KVPacket` carries real KV bytes (not token IDs); hydration passes blob directly without `sizeof(int)` multiplication
 11. [ ] SHM/RDMA transport layer (<5 ms transfer SLA)
 12. [ ] Dual-pool `/readyz`, transfer-latency Prometheus histograms, Helm overlays for independent scaling
 
@@ -197,7 +198,7 @@ item once multi-GPU topology discovery lands.
 | `LlamaCPUBackend::ExpertCount()` | Done | Returns n_experts (0 for non-MoE) |
 | `LlamaCPUBackend::ActiveExperts()` | Done | Returns `llm.expert_used_count` |
 | `ModelInfo.is_moe / n_experts / n_active_experts` | Done | Populated in `SingleModelRouter` after load |
-| `RecordMoERequest()` Prometheus counter | Done | `inferflux_moe_requests_total` |
+| `RecordMoERequest()` Prometheus counter | Done | `inferflux_moe_requests_total`; emitted in `ResolveBackends()` when `info->is_moe=true` |
 | `EPDispatch` stub interface | Done | `runtime/backends/ep_dispatch.h`; `LocalEPDispatch` owns all experts |
 | Multi-GPU expert sharding | Pending | Requires NCCL/topology discovery |
 
