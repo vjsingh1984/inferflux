@@ -35,6 +35,8 @@ add_library(inferflux_core
   runtime/execution/batch_executor.h
   runtime/prefix_cache/prefix_cache.cpp
   runtime/prefix_cache/prefix_cache.h
+  runtime/prefix_cache/radix_prefix_cache.cpp
+  runtime/prefix_cache/radix_prefix_cache.h
   model/gguf/gguf_loader.cpp
   model/gguf/gguf_loader.h
   model/tokenizer/simple_tokenizer.cpp
@@ -66,6 +68,8 @@ add_library(inferflux_core
   runtime/structured_output/structured_output_adapter.cpp
   runtime/structured_output/structured_output_adapter.h
   runtime/structured_output/json_schema_shim.cpp
+  runtime/disaggregated/kv_channel.cpp
+  runtime/disaggregated/kv_channel.h
   external/llama.cpp/common/json-schema-to-grammar.cpp
   io/async_file_writer.cpp
   io/async_file_writer.h
@@ -147,7 +151,9 @@ add_executable(inferflux_tests
   tests/unit/test_policy_store.cpp
   tests/unit/test_oidc_validator.cpp
   tests/unit/test_prefix_cache.cpp
+  tests/unit/test_radix_prefix_cache.cpp
   tests/unit/test_span.cpp
+  tests/unit/test_kv_channel.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)

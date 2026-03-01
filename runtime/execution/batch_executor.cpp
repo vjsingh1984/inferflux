@@ -49,7 +49,7 @@ BatchExecutor::BatchExecutor(SimpleTokenizer* tokenizer,
                              std::shared_ptr<PagedKVCache> cache,
                              std::shared_ptr<ModelRouter> router,
                              std::shared_ptr<SpeculativeDecoder> speculative_decoder,
-                             std::shared_ptr<PrefixCache> prefix_cache)
+                             std::shared_ptr<RadixPrefixCache> prefix_cache)
     : tokenizer_(tokenizer),
       device_(std::move(device)),
       cache_(std::move(cache)),
@@ -103,7 +103,9 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   if (prefix_cache_) {
     std::string cached_completion;
     int cached_tokens = 0;
-    if (prefix_cache_->Lookup(inference.prompt_tokens, &cached_completion, &cached_tokens)) {
+    int matched_tokens = 0;
+    if (prefix_cache_->Lookup(inference.prompt_tokens, &cached_completion, &cached_tokens,
+                              &matched_tokens)) {
       GlobalMetrics().RecordPrefixLookup(true);
       response.completion = cached_completion;
       response.completion_tokens = cached_tokens;
@@ -118,6 +120,10 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
       return outcome;
     }
     GlobalMetrics().RecordPrefixLookup(false);
+    if (matched_tokens > 0) {
+      GlobalMetrics().RecordPartialPrefixHit();
+      GlobalMetrics().RecordPrefixMatchedTokens(matched_tokens);
+    }
   }
 
   std::string resolved_model = inference.resolved_model;

@@ -1,7 +1,7 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #include "runtime/backends/cpu/llama_backend.h"
-#include "runtime/prefix_cache/prefix_cache.h"
+#include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/single_model_router.h"
 #include "scheduler/fairness_controller.h"
@@ -217,7 +217,7 @@ TEST_CASE("on_token callback fires on prefix cache hit", "[scheduler]") {
   auto device = std::make_shared<inferflux::CPUDeviceContext>();
   auto cache = std::make_shared<inferflux::PagedKVCache>(
       4, sizeof(float) * 4, inferflux::PagedKVCache::EvictionPolicy::kLRU);
-  auto prefix_cache = std::make_shared<inferflux::PrefixCache>(64);
+  auto prefix_cache = std::make_shared<inferflux::RadixPrefixCache>(64);
 
   // Pre-populate the cache with a known completion for the prompt we'll submit.
   // Use the tokenizer to derive the key as the scheduler will.

@@ -35,6 +35,8 @@ class MetricsRegistry {
                          std::size_t reused_tokens);
   void RecordBatch(std::size_t request_count, std::size_t token_count);
   void RecordPrefixLookup(bool hit);
+  void RecordPrefixMatchedTokens(int tokens);
+  void RecordPartialPrefixHit();
   void RecordStreamTokens(std::size_t tokens);
   void RecordStreamCacheHit();
   void RecordFairnessTokens(int priority_level, std::size_t tokens);
@@ -66,6 +68,8 @@ class MetricsRegistry {
   void IncrementConnections();
   void DecrementConnections();
   void SetQueueDepth(int depth);
+  void SetPrefillQueueDepth(int depth);
+  void SetDecodeQueueDepth(int depth);
 
   std::string RenderPrometheus() const;
 
@@ -86,6 +90,8 @@ class MetricsRegistry {
   std::atomic<uint64_t> max_batch_size_{0};
   std::atomic<uint64_t> prefix_hits_{0};
   std::atomic<uint64_t> prefix_misses_{0};
+  std::atomic<uint64_t> prefix_matched_tokens_{0};
+  std::atomic<uint64_t> prefix_partial_hits_{0};
   std::atomic<uint64_t> stream_tokens_{0};
   std::atomic<uint64_t> stream_cache_hits_{0};
   std::atomic<uint64_t> fairness_preemptions_{0};
@@ -105,6 +111,8 @@ class MetricsRegistry {
   // Gauges.
   std::atomic<int> active_connections_{0};
   std::atomic<int> queue_depth_{0};
+  std::atomic<int> prefill_queue_depth_{0};
+  std::atomic<int> decode_queue_depth_{0};
 
   struct ModelStats {
     std::string backend;

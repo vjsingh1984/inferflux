@@ -69,6 +69,15 @@ void MetricsRegistry::RecordPrefixLookup(bool hit) {
   }
 }
 
+void MetricsRegistry::RecordPrefixMatchedTokens(int tokens) {
+  if (tokens <= 0) return;
+  prefix_matched_tokens_.fetch_add(static_cast<uint64_t>(tokens), std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordPartialPrefixHit() {
+  prefix_partial_hits_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void MetricsRegistry::RecordStreamTokens(std::size_t tokens) {
   if (tokens == 0) {
     return;
@@ -181,6 +190,14 @@ void MetricsRegistry::DecrementConnections() {
 
 void MetricsRegistry::SetQueueDepth(int depth) {
   queue_depth_.store(depth, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::SetPrefillQueueDepth(int depth) {
+  prefill_queue_depth_.store(depth, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::SetDecodeQueueDepth(int depth) {
+  decode_queue_depth_.store(depth, std::memory_order_relaxed);
 }
 
 std::string MetricsRegistry::RenderPrometheus() const {
@@ -305,6 +322,16 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_prefix_misses_total counter\n";
   out << "inferflux_prefix_misses_total{backend=\"" << backend << "\"} "
       << prefix_misses_.load() << "\n";
+
+  out << "# HELP inferflux_prefix_matched_tokens_total Tokens matched in prefix (partial or exact)\n";
+  out << "# TYPE inferflux_prefix_matched_tokens_total counter\n";
+  out << "inferflux_prefix_matched_tokens_total{backend=\"" << backend << "\"} "
+      << prefix_matched_tokens_.load() << "\n";
+
+  out << "# HELP inferflux_prefix_partial_hits_total Lookups with a partial prefix match but no exact hit\n";
+  out << "# TYPE inferflux_prefix_partial_hits_total counter\n";
+  out << "inferflux_prefix_partial_hits_total{backend=\"" << backend << "\"} "
+      << prefix_partial_hits_.load() << "\n";
 
   out << "# HELP inferflux_stream_tokens_total Tokens streamed via SSE\n";
   out << "# TYPE inferflux_stream_tokens_total counter\n";
@@ -436,6 +463,14 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# HELP inferflux_scheduler_queue_depth Current number of requests in the scheduler queue\n";
   out << "# TYPE inferflux_scheduler_queue_depth gauge\n";
   out << "inferflux_scheduler_queue_depth " << queue_depth_.load() << "\n";
+
+  out << "# HELP inferflux_prefill_queue_depth Current number of tickets waiting in the prefill pool\n";
+  out << "# TYPE inferflux_prefill_queue_depth gauge\n";
+  out << "inferflux_prefill_queue_depth " << prefill_queue_depth_.load() << "\n";
+
+  out << "# HELP inferflux_decode_queue_depth Current number of tickets waiting in the decode pool\n";
+  out << "# TYPE inferflux_decode_queue_depth gauge\n";
+  out << "inferflux_decode_queue_depth " << decode_queue_depth_.load() << "\n";
 
   return out.str();
 }

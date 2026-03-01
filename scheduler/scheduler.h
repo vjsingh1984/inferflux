@@ -4,10 +4,12 @@
 #include "runtime/backends/cpu/cpu_backend.h"
 #include "runtime/speculative/speculative_decoder.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
+#include "runtime/disaggregated/kv_channel.h"
 #include "scheduler/model_router.h"
 #include "scheduler/fairness_controller.h"
 #include "scheduler/request_batch.h"
 #include "runtime/prefix_cache/prefix_cache.h"
+#include "runtime/prefix_cache/radix_prefix_cache.h"
 
 #include <atomic>
 #include <chrono>
@@ -23,10 +25,20 @@
 namespace inferflux {
 
 class BatchExecutor;
+namespace disaggregated {
+class KVChannel;
+}
+
 struct SpeculativeStats {
   int total_chunks{0};
   int accepted_chunks{0};
   int reused_tokens{0};
+};
+
+struct DisaggregatedConfig {
+  int prefill_pool_size{1};
+  int decode_pool_size{1};
+  std::shared_ptr<disaggregated::KVChannel> kv_channel;
 };
 
 struct InferenceResult {
@@ -54,8 +66,9 @@ class Scheduler {
             std::shared_ptr<PagedKVCache> cache,
             std::shared_ptr<ModelRouter> router = nullptr,
             std::shared_ptr<SpeculativeDecoder> speculative_decoder = nullptr,
-            std::shared_ptr<PrefixCache> prefix_cache = nullptr,
-            FairnessConfig fairness_config = {});
+            std::shared_ptr<RadixPrefixCache> prefix_cache = nullptr,
+            FairnessConfig fairness_config = {},
+            DisaggregatedConfig disagg_config = {});
   ~Scheduler();
 
   InferenceResult Generate(InferenceRequest request);
@@ -83,8 +96,9 @@ class Scheduler {
   std::shared_ptr<PagedKVCache> cache_;
   std::shared_ptr<ModelRouter> router_;
   std::shared_ptr<SpeculativeDecoder> speculative_decoder_;
-  std::shared_ptr<PrefixCache> prefix_cache_;
-  std::vector<std::shared_ptr<PendingRequest>> pending_;
+  std::shared_ptr<RadixPrefixCache> prefix_cache_;
+  std::vector<std::shared_ptr<PendingRequest>> pending_prefill_;
+  std::vector<std::shared_ptr<PendingRequest>> pending_decode_;
   mutable std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::thread worker_;
@@ -94,6 +108,7 @@ class Scheduler {
   std::unique_ptr<BatchExecutor> executor_;
   FairnessController fairness_controller_;
   FairnessConfig fairness_config_;
+  DisaggregatedConfig disagg_config_;
 };
 
 }  // namespace inferflux

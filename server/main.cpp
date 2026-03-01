@@ -4,8 +4,10 @@
 #include "runtime/backends/cpu/cpu_backend.h"
 #include "runtime/backends/cpu/llama_backend.h"
 #include "runtime/prefix_cache/prefix_cache.h"
+#include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/speculative/speculative_decoder.h"
+#include "runtime/disaggregated/kv_channel.h"
 #include "scheduler/model_router.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/single_model_router.h"
@@ -145,6 +147,9 @@ int main(int argc, char** argv) {
   std::size_t nvme_writer_workers = 1;
   std::size_t nvme_writer_queue_depth = 256;
   std::size_t prefix_cache_capacity = 256;
+  int prefill_pool_size = 1;
+  int decode_pool_size = 1;
+  std::size_t kv_channel_capacity = 64;
   std::vector<ModelConfig> configured_models;
   std::string default_model_override;
 
@@ -210,6 +215,12 @@ int main(int argc, char** argv) {
             if (config["runtime"]["paged_kv"]) {
                 if(config["runtime"]["paged_kv"]["cpu_pages"]) paged_kv_pages = config["runtime"]["paged_kv"]["cpu_pages"].as<std::size_t>();
                 if(config["runtime"]["paged_kv"]["eviction"]) paged_kv_policy = config["runtime"]["paged_kv"]["eviction"].as<std::string>();
+            }
+            if (config["runtime"]["disaggregated"]) {
+                const auto& disagg = config["runtime"]["disaggregated"];
+                if (disagg["prefill_pool_size"]) prefill_pool_size = std::max(1, disagg["prefill_pool_size"].as<int>());
+                if (disagg["decode_pool_size"]) decode_pool_size = std::max(1, disagg["decode_pool_size"].as<int>());
+                if (disagg["kv_channel_capacity"]) kv_channel_capacity = disagg["kv_channel_capacity"].as<std::size_t>();
             }
         }
 
@@ -407,6 +418,24 @@ int main(int argc, char** argv) {
   if (const char* env_timeslice = std::getenv("INFERFLUX_FAIRNESS_MAX_TIMESLICE")) {
     fairness_config.max_timeslice_tokens = std::stoi(env_timeslice);
   }
+  if (const char* env_prefill_pool = std::getenv("INFERFLUX_PREFILL_POOL_SIZE")) {
+    auto pool = ParsePositiveSize(env_prefill_pool);
+    if (pool > 0) {
+      prefill_pool_size = static_cast<int>(pool);
+    }
+  }
+  if (const char* env_decode_pool = std::getenv("INFERFLUX_DECODE_POOL_SIZE")) {
+    auto pool = ParsePositiveSize(env_decode_pool);
+    if (pool > 0) {
+      decode_pool_size = static_cast<int>(pool);
+    }
+  }
+  if (const char* env_kv_channel_cap = std::getenv("INFERFLUX_KV_CHANNEL_CAPACITY")) {
+    auto cap = ParsePositiveSize(env_kv_channel_cap);
+    if (cap > 0) {
+      kv_channel_capacity = cap;
+    }
+  }
   if (const char* env_models = std::getenv("INFERFLUX_MODELS")) {
     auto parsed = ParseModelsEnv(env_models);
     if (!parsed.empty()) {
@@ -598,14 +627,20 @@ int main(int argc, char** argv) {
 
   // Build ModelRouter (SingleModelRouter is the default; future multi-model
   // routers can be substituted here without touching Scheduler or HttpServer).
-  auto prefix_cache = std::make_shared<inferflux::PrefixCache>(prefix_cache_capacity);
+  auto prefix_cache = std::make_shared<inferflux::RadixPrefixCache>(prefix_cache_capacity);
+  auto kv_channel = std::make_shared<inferflux::disaggregated::KVChannel>(kv_channel_capacity);
+  inferflux::DisaggregatedConfig disagg_config;
+  disagg_config.prefill_pool_size = std::max(1, prefill_pool_size);
+  disagg_config.decode_pool_size = std::max(1, decode_pool_size);
+  disagg_config.kv_channel = kv_channel;
   inferflux::Scheduler scheduler(tokenizer,
                                  device,
                                  cache,
                                  router,
                                  speculative_decoder,
                                  prefix_cache,
-                                 fairness_config);
+                                 fairness_config,
+                                 disagg_config);
   auto& metrics = inferflux::GlobalMetrics();
   metrics.SetBackend(backend_label);
   inferflux::OIDCValidator oidc_validator(oidc_issuer, oidc_audience);
@@ -626,6 +661,9 @@ int main(int argc, char** argv) {
     std::cout << "NVMe KV offload path: " << nvme_offload_path << " (workers=" << nvme_writer_workers
               << ", queue_depth=" << nvme_writer_queue_depth << ")" << std::endl;
   }
+  std::cout << "Scheduler pools (prefill/decode): " << disagg_config.prefill_pool_size
+            << "/" << disagg_config.decode_pool_size
+            << " kv_channel_capacity=" << kv_channel_capacity << std::endl;
   if (!opa_endpoint.empty()) {
     std::cout << "OPA guardrail endpoint: " << opa_endpoint << std::endl;
   }

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <cstring>
 
 namespace inferflux {
 
@@ -15,6 +16,14 @@ namespace {
 constexpr std::size_t kMaxBatchSize = 4;
 constexpr std::size_t kMaxBatchTokens = 8192;
 constexpr double kFairnessAgingDivisorMs = 2000.0;  // every 2s of wait adds +1 to effective priority
+
+std::vector<uint8_t> SerializeTokens(const std::vector<int>& tokens) {
+  std::vector<uint8_t> payload(tokens.size() * sizeof(int));
+  if (!tokens.empty()) {
+    std::memcpy(payload.data(), tokens.data(), payload.size());
+  }
+  return payload;
+}
 }
 
 Scheduler::Scheduler(SimpleTokenizer tokenizer,
@@ -22,8 +31,9 @@ Scheduler::Scheduler(SimpleTokenizer tokenizer,
                      std::shared_ptr<PagedKVCache> cache,
                      std::shared_ptr<ModelRouter> router,
                      std::shared_ptr<SpeculativeDecoder> speculative_decoder,
-                     std::shared_ptr<PrefixCache> prefix_cache,
-                     FairnessConfig fairness_config)
+                     std::shared_ptr<RadixPrefixCache> prefix_cache,
+                     FairnessConfig fairness_config,
+                     DisaggregatedConfig disagg_config)
     : tokenizer_(std::move(tokenizer)),
       device_(std::move(device)),
       cache_(std::move(cache)),
@@ -31,7 +41,8 @@ Scheduler::Scheduler(SimpleTokenizer tokenizer,
       speculative_decoder_(std::move(speculative_decoder)),
       prefix_cache_(std::move(prefix_cache)),
       fairness_controller_(fairness_config),
-      fairness_config_(fairness_config) {
+      fairness_config_(fairness_config),
+      disagg_config_(disagg_config) {
   executor_ = std::make_unique<BatchExecutor>(&tokenizer_, device_, cache_, router_, speculative_decoder_, prefix_cache_);
   worker_ = std::thread(&Scheduler::WorkerLoop, this);
 }
@@ -73,7 +84,7 @@ InferenceResult Scheduler::Generate(InferenceRequest request) {
   auto future = pending->promise.get_future();
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
-    pending_.push_back(pending);
+    pending_prefill_.push_back(pending);
     UpdateQueueDepthLocked();
   }
   queue_cv_.notify_one();
@@ -93,8 +104,8 @@ void Scheduler::WorkerLoop() {
     BatchSelection selection;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
-      queue_cv_.wait(lock, [&] { return stop_ || !pending_.empty(); });
-      if (stop_ && pending_.empty()) {
+      queue_cv_.wait(lock, [&] { return stop_ || !pending_prefill_.empty() || !pending_decode_.empty(); });
+      if (stop_ && pending_prefill_.empty() && pending_decode_.empty()) {
         break;
       }
       selection = BuildBatchLocked();
@@ -107,44 +118,67 @@ void Scheduler::WorkerLoop() {
 
 Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
   BatchSelection selection;
-  if (pending_.empty()) {
+  if (pending_prefill_.empty() && pending_decode_.empty()) {
     return selection;
   }
 
+  struct QueueItem {
+    std::shared_ptr<PendingRequest> pending;
+    bool from_decode{false};
+    std::size_t index{0};
+  };
+  std::vector<QueueItem> queue_items;
+  queue_items.reserve(pending_prefill_.size() + pending_decode_.size());
+  for (std::size_t i = 0; i < pending_prefill_.size(); ++i) {
+    queue_items.push_back(QueueItem{pending_prefill_[i], false, i});
+  }
+  for (std::size_t i = 0; i < pending_decode_.size(); ++i) {
+    queue_items.push_back(QueueItem{pending_decode_[i], true, i});
+  }
+
   auto now = std::chrono::steady_clock::now();
-  std::stable_sort(pending_.begin(),
-                   pending_.end(),
-                   [&](const auto& a, const auto& b) {
-                     double age_a = std::chrono::duration<double, std::milli>(now - a->enqueue_time).count();
-                     double age_b = std::chrono::duration<double, std::milli>(now - b->enqueue_time).count();
-                     double eff_a = static_cast<double>(a->priority) + age_a / kFairnessAgingDivisorMs;
-                     double eff_b = static_cast<double>(b->priority) + age_b / kFairnessAgingDivisorMs;
+  std::stable_sort(queue_items.begin(),
+                   queue_items.end(),
+                   [&](const QueueItem& a, const QueueItem& b) {
+                     double age_a = std::chrono::duration<double, std::milli>(now - a.pending->enqueue_time).count();
+                     double age_b = std::chrono::duration<double, std::milli>(now - b.pending->enqueue_time).count();
+                     double eff_a = static_cast<double>(a.pending->priority) + age_a / kFairnessAgingDivisorMs;
+                     double eff_b = static_cast<double>(b.pending->priority) + age_b / kFairnessAgingDivisorMs;
                      if (eff_a != eff_b) {
                        return eff_a > eff_b;
                      }
-                     return a->sequence < b->sequence;
+                     return a.pending->sequence < b.pending->sequence;
                    });
 
-  std::vector<std::size_t> to_remove;
+  std::vector<std::size_t> to_remove_prefill;
+  std::vector<std::size_t> to_remove_decode;
   std::size_t token_budget = 0;
-  for (std::size_t i = 0; i < pending_.size(); ++i) {
-    auto& item = pending_[i];
+  for (std::size_t i = 0; i < queue_items.size(); ++i) {
+    auto& item = queue_items[i].pending;
     std::size_t tokens = item->inference.prompt_tokens.size();
     if (!selection.pending.empty() && token_budget + tokens > kMaxBatchTokens) {
       continue;
     }
     selection.pending.push_back(item);
     selection.batch.requests.push_back(&item->inference);
+    item->inference.phase = queue_items[i].from_decode ? RequestPhase::kDecode : RequestPhase::kPrefill;
     token_budget += tokens;
     selection.total_tokens += tokens;
-    to_remove.push_back(i);
+    if (queue_items[i].from_decode) {
+      to_remove_decode.push_back(queue_items[i].index);
+    } else {
+      to_remove_prefill.push_back(queue_items[i].index);
+    }
     if (selection.pending.size() >= kMaxBatchSize) {
       break;
     }
   }
 
-  for (std::size_t idx = to_remove.size(); idx-- > 0;) {
-    pending_.erase(pending_.begin() + static_cast<std::ptrdiff_t>(to_remove[idx]));
+  for (std::size_t idx = to_remove_prefill.size(); idx-- > 0;) {
+    pending_prefill_.erase(pending_prefill_.begin() + static_cast<std::ptrdiff_t>(to_remove_prefill[idx]));
+  }
+  for (std::size_t idx = to_remove_decode.size(); idx-- > 0;) {
+    pending_decode_.erase(pending_decode_.begin() + static_cast<std::ptrdiff_t>(to_remove_decode[idx]));
   }
   UpdateQueueDepthLocked();
   return selection;
@@ -155,13 +189,56 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     return;
   }
 
+  GlobalMetrics().SetDecodeQueueDepth(static_cast<int>(selection.pending.size()));
   ApplyFairness(&selection);
   ResolveBackends(selection.pending);
   auto batch_start = std::chrono::steady_clock::now();
   selection.batch.batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
-  for (auto& req : selection.pending) {
-    req->inference.phase = RequestPhase::kPrefill;
+  std::vector<std::shared_ptr<PendingRequest>> staged_decode;
+  staged_decode.reserve(selection.pending.size());
+  std::vector<std::shared_ptr<PendingRequest>> decode_ready;
+  decode_ready.reserve(selection.pending.size());
+  for (auto& pending : selection.pending) {
+    if (pending->inference.phase == RequestPhase::kPrefill) {
+      bool enqueued = false;
+      if (disagg_config_.kv_channel) {
+        disaggregated::KVPacket packet;
+        packet.request_id = pending->inference.id;
+        packet.payload = SerializeTokens(pending->inference.prompt_tokens);
+        packet.metadata = pending->inference.model;
+        enqueued = disagg_config_.kv_channel->Enqueue(std::move(packet));
+      } else {
+        enqueued = true;
+      }
+      if (enqueued) {
+        staged_decode.push_back(pending);
+        continue;
+      } else {
+        pending->inference.phase = RequestPhase::kPending;
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        pending_prefill_.push_back(pending);
+      }
+    } else {
+      decode_ready.push_back(pending);
+    }
   }
+
+  if (!staged_decode.empty()) {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    for (auto& pending : staged_decode) {
+      pending->inference.phase = RequestPhase::kDecode;
+      pending_decode_.push_back(pending);
+    }
+    UpdateQueueDepthLocked();
+    queue_cv_.notify_all();
+  }
+
+  if (decode_ready.empty()) {
+    GlobalMetrics().SetDecodeQueueDepth(0);
+    return;
+  }
+
+  selection.pending = decode_ready;
   for (auto& req : selection.pending) {
     double wait_ms = std::chrono::duration<double, std::milli>(batch_start - req->enqueue_time).count();
     GlobalMetrics().RecordQueueLatency(wait_ms);
@@ -222,6 +299,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   }
 
   if (exec_pending.empty()) {
+    GlobalMetrics().SetDecodeQueueDepth(0);
     return;
   }
 
@@ -241,6 +319,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       auto now = std::chrono::steady_clock::now();
       pending->enqueue_time = now;
       inference->enqueue_time = now;
+      inference->phase = RequestPhase::kDecode;
       if (!slice_text.empty()) {
         inference->prompt.append(slice_text);
         inference->prompt_tokens = tokenizer_.Encode(inference->prompt);
@@ -277,13 +356,14 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     if (inference->reported_prompt_tokens >= 0) {
       result.prompt_tokens = inference->reported_prompt_tokens;
     }
+    inference->phase = RequestPhase::kFinished;
     pending->promise.set_value(std::move(result));
   }
   if (!requeue.empty()) {
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
       for (auto& pending : requeue) {
-        pending_.push_back(pending);
+        pending_decode_.push_back(pending);
       }
       UpdateQueueDepthLocked();
     }
@@ -292,10 +372,15 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   auto batch_exec_end = std::chrono::steady_clock::now();
   double exec_ms = std::chrono::duration<double, std::milli>(batch_exec_end - batch_start).count();
   GlobalMetrics().RecordBatchExecution(exec_ms);
+  GlobalMetrics().SetDecodeQueueDepth(0);
 }
 
 void Scheduler::UpdateQueueDepthLocked() const {
-  GlobalMetrics().SetQueueDepth(static_cast<int>(pending_.size()));
+  int prefill_depth = static_cast<int>(pending_prefill_.size());
+  int decode_depth = static_cast<int>(pending_decode_.size());
+  GlobalMetrics().SetQueueDepth(prefill_depth + decode_depth);
+  GlobalMetrics().SetPrefillQueueDepth(prefill_depth);
+  GlobalMetrics().SetDecodeQueueDepth(decode_depth);
 }
  
 void Scheduler::ApplyFairness(BatchSelection* selection) {
@@ -330,26 +415,50 @@ void Scheduler::ApplyFairness(BatchSelection* selection) {
     batch_entries.push_back(
         FairnessEntry{&pending->inference, pending->inference.priority_level, i});
   }
-  std::vector<FairnessEntry> queue_entries;
-  queue_entries.reserve(pending_.size());
-  for (std::size_t i = 0; i < pending_.size(); ++i) {
-    auto& pending = pending_[i];
+  struct QueueItem {
+    std::shared_ptr<PendingRequest> pending;
+    bool from_decode{false};
+    std::size_t index{0};
+  };
+  std::vector<QueueItem> queue_refs;
+  queue_refs.reserve(pending_prefill_.size() + pending_decode_.size());
+  for (std::size_t i = 0; i < pending_prefill_.size(); ++i) {
+    auto& pending = pending_prefill_[i];
     pending->inference.priority_level = pending->inference.priority;
+    queue_refs.push_back(QueueItem{pending, false, i});
+  }
+  for (std::size_t i = 0; i < pending_decode_.size(); ++i) {
+    auto& pending = pending_decode_[i];
+    pending->inference.priority_level = pending->inference.priority;
+    queue_refs.push_back(QueueItem{pending, true, i});
+  }
+  std::vector<FairnessEntry> queue_entries;
+  queue_entries.reserve(queue_refs.size());
+  for (std::size_t i = 0; i < queue_refs.size(); ++i) {
     queue_entries.push_back(
-        FairnessEntry{&pending->inference, pending->inference.priority_level, i});
+        FairnessEntry{&queue_refs[i].pending->inference,
+                      queue_refs[i].pending->inference.priority_level,
+                      i});
   }
 
   auto decision = fairness_controller_.Evaluate(batch_entries, queue_entries);
   if (decision.swap &&
       decision.batch_index < selection->pending.size() &&
-      decision.queue_index < pending_.size()) {
-    auto queued = pending_[decision.queue_index];
+      decision.queue_index < queue_refs.size()) {
+    auto queued_ref = queue_refs[decision.queue_index];
+    auto queued = queued_ref.pending;
     auto displaced = selection->pending[decision.batch_index];
     selection->pending[decision.batch_index] = queued;
-    pending_.erase(pending_.begin() + static_cast<std::ptrdiff_t>(decision.queue_index));
-    pending_.push_back(displaced);
+    if (queued_ref.from_decode) {
+      pending_decode_.erase(pending_decode_.begin() + static_cast<std::ptrdiff_t>(queued_ref.index));
+    } else {
+      pending_prefill_.erase(pending_prefill_.begin() + static_cast<std::ptrdiff_t>(queued_ref.index));
+    }
+    displaced->inference.phase = RequestPhase::kPrefill;
+    pending_prefill_.push_back(displaced);
     batch_entries[decision.batch_index].request = &queued->inference;
     GlobalMetrics().RecordFairnessPreemption(queued->inference.priority_level);
+    UpdateQueueDepthLocked();
   }
   fairness_controller_.ApplyTimeslice(&batch_entries);
 }
