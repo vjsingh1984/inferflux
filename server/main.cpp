@@ -8,6 +8,7 @@
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/speculative/speculative_decoder.h"
 #include "runtime/disaggregated/kv_channel.h"
+#include "runtime/disaggregated/shm_kv_transport.h"
 #include "scheduler/model_router.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/single_model_router.h"
@@ -150,6 +151,7 @@ int main(int argc, char** argv) {
   int prefill_pool_size = 1;
   int decode_pool_size = 0;  // 0 = decode on WorkerLoop thread (no separate pool)
   std::size_t kv_channel_capacity = 64;
+  std::string kv_transport_type = "channel";  // "channel" | "shm"
   std::vector<ModelConfig> configured_models;
   std::string default_model_override;
   std::string mmproj_path;  // §2.2: path to multimodal projector (empty = disabled).
@@ -222,8 +224,8 @@ int main(int argc, char** argv) {
             }
             if (config["runtime"]["disaggregated"]) {
                 const auto& disagg = config["runtime"]["disaggregated"];
-                if (disagg["prefill_pool_size"]) prefill_pool_size = std::max(1, disagg["prefill_pool_size"].as<int>());
-                if (disagg["decode_pool_size"]) decode_pool_size = std::max(1, disagg["decode_pool_size"].as<int>());
+                if (disagg["prefill_pool_size"]) prefill_pool_size = std::max(0, disagg["prefill_pool_size"].as<int>());
+                if (disagg["decode_pool_size"]) decode_pool_size = std::max(0, disagg["decode_pool_size"].as<int>());
                 if (disagg["kv_channel_capacity"]) kv_channel_capacity = disagg["kv_channel_capacity"].as<std::size_t>();
             }
         }
@@ -426,10 +428,11 @@ int main(int argc, char** argv) {
     fairness_config.max_timeslice_tokens = std::stoi(env_timeslice);
   }
   if (const char* env_prefill_pool = std::getenv("INFERFLUX_PREFILL_POOL_SIZE")) {
-    auto pool = ParsePositiveSize(env_prefill_pool);
-    if (pool > 0) {
-      prefill_pool_size = static_cast<int>(pool);
-    }
+    // Allow "0" explicitly so a decode-only node can disable all prefill workers.
+    try {
+      int v = std::stoi(env_prefill_pool);
+      if (v >= 0) prefill_pool_size = v;
+    } catch (...) {}
   }
   if (const char* env_decode_pool = std::getenv("INFERFLUX_DECODE_POOL_SIZE")) {
     auto pool = ParsePositiveSize(env_decode_pool);
@@ -442,6 +445,9 @@ int main(int argc, char** argv) {
     if (cap > 0) {
       kv_channel_capacity = cap;
     }
+  }
+  if (const char* env_kv_transport = std::getenv("INFERFLUX_KV_TRANSPORT")) {
+    kv_transport_type = env_kv_transport;  // "channel" or "shm"
   }
   if (const char* env_models = std::getenv("INFERFLUX_MODELS")) {
     auto parsed = ParseModelsEnv(env_models);
@@ -652,11 +658,18 @@ int main(int argc, char** argv) {
   // Build ModelRouter (SingleModelRouter is the default; future multi-model
   // routers can be substituted here without touching Scheduler or HttpServer).
   auto prefix_cache = std::make_shared<inferflux::RadixPrefixCache>(prefix_cache_capacity);
-  auto kv_channel = std::make_shared<inferflux::disaggregated::KVChannel>(kv_channel_capacity);
+  std::shared_ptr<inferflux::disaggregated::IKVTransport> kv_transport;
+  if (kv_transport_type == "shm") {
+    kv_transport = std::make_shared<inferflux::disaggregated::ShmKVTransport>(kv_channel_capacity);
+    std::cout << "[server] KV transport: POSIX SHM (capacity=" << kv_channel_capacity << ")\n";
+  } else {
+    kv_transport = std::make_shared<inferflux::disaggregated::KVChannel>(kv_channel_capacity);
+    std::cout << "[server] KV transport: in-process channel (capacity=" << kv_channel_capacity << ")\n";
+  }
   inferflux::DisaggregatedConfig disagg_config;
-  disagg_config.prefill_pool_size = std::max(1, prefill_pool_size);
+  disagg_config.prefill_pool_size = std::max(0, prefill_pool_size);
   disagg_config.decode_pool_size = std::max(0, decode_pool_size);
-  disagg_config.kv_channel = kv_channel;
+  disagg_config.kv_transport = kv_transport;
   inferflux::Scheduler scheduler(tokenizer,
                                  device,
                                  cache,
@@ -687,7 +700,8 @@ int main(int argc, char** argv) {
   }
   std::cout << "Scheduler pools (prefill/decode): " << disagg_config.prefill_pool_size
             << "/" << disagg_config.decode_pool_size
-            << " kv_channel_capacity=" << kv_channel_capacity << std::endl;
+            << " kv_transport=" << kv_transport_type
+            << " capacity=" << kv_channel_capacity << std::endl;
   if (!opa_endpoint.empty()) {
     std::cout << "OPA guardrail endpoint: " << opa_endpoint << std::endl;
   }

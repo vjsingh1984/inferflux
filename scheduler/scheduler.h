@@ -25,9 +25,6 @@
 namespace inferflux {
 
 class BatchExecutor;
-namespace disaggregated {
-class KVChannel;
-}
 
 struct SpeculativeStats {
   int total_chunks{0};
@@ -40,7 +37,10 @@ struct DisaggregatedConfig {
   // decode_pool_size > 0 enables the decode worker pool and sets use_decode_workers_=true.
   // Default is 0 (decode runs on the WorkerLoop thread, matching pre-§2.5 behaviour).
   int decode_pool_size{0};
-  std::shared_ptr<disaggregated::KVChannel> kv_channel;
+  // kv_transport is the channel over which prefill workers hand KV state to
+  // decode workers.  KVChannel (in-process) is the default; ShmKVTransport
+  // (POSIX SHM) is selected when INFERFLUX_KV_TRANSPORT=shm.
+  std::shared_ptr<disaggregated::IKVTransport> kv_transport;
 };
 
 struct InferenceResult {

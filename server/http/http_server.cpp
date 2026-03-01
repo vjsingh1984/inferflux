@@ -788,9 +788,19 @@ void HttpServer::HandleClient(ClientSession& session) {
     bool ready = false;
     std::string reason;
     if (role == PoolRole::kDecode) {
-      // Decode-only node: ready when the decode worker pool is warm.
-      ready = decode_pool_ready_.load(std::memory_order_relaxed);
-      if (!ready) reason = "decode pool not ready";
+      // Decode-only node: ready when a model backend is loaded AND the decode
+      // worker pool is warm.  Checking only decode_pool_ready_ was wrong:
+      // that flag is set at startup from pool size, so a pod would report 200
+      // before weights are resident and before it can actually serve tokens.
+      bool model_loaded = false;
+      if (scheduler_ && scheduler_->Router()) {
+        model_loaded = !scheduler_->Router()->DefaultModelId().empty();
+      } else {
+        model_loaded = model_ready_.load(std::memory_order_relaxed);
+      }
+      bool pool_warm = decode_pool_ready_.load(std::memory_order_relaxed);
+      ready = model_loaded && pool_warm;
+      if (!ready) reason = !model_loaded ? "no model backend loaded" : "decode pool not ready";
     } else {
       // Unified or prefill node: ready when at least one model backend is loaded.
       if (scheduler_ && scheduler_->Router()) {

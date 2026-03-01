@@ -105,11 +105,11 @@ void Scheduler::DecodeWorkerLoop() {
       UpdateQueueDepthLocked();
     }
 
-    // If a KVChannel is configured, drain cross-process packets that may have
+    // If a KV transport is configured, drain cross-process packets that may have
     // arrived from remote prefill workers.  For the in-process case the KV
     // state is already resident in the llama context and no hydration is needed.
-    if (disagg_config_.kv_channel) {
-      while (auto pkt = disagg_config_.kv_channel->TryDequeue()) {
+    if (disagg_config_.kv_transport) {
+      while (auto pkt = disagg_config_.kv_transport->TryDequeue()) {
         // Record KV transfer latency (§2.5 item 12): time from Enqueue to dequeue.
         auto dequeue_time = std::chrono::steady_clock::now();
         double transfer_ms =
@@ -442,7 +442,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // falls back to the legacy Generate() path.
       }
       bool enqueued = false;
-      if (use_decode_workers_ && disagg_config_.kv_channel) {
+      if (use_decode_workers_ && disagg_config_.kv_transport) {
         // Only enqueue when decode workers are live and draining the channel.
         // Without active consumers the channel fills to capacity (default 64) and
         // Enqueue() returns false, causing requests to bounce back into pending_prefill_
@@ -458,7 +458,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         packet.n_past = inf.n_past;
         packet.sequence_id = inf.sequence_id;
         packet.metadata = inf.model;
-        enqueued = disagg_config_.kv_channel->Enqueue(std::move(packet));
+        enqueued = disagg_config_.kv_transport->Enqueue(std::move(packet));
       } else {
         enqueued = true;
       }

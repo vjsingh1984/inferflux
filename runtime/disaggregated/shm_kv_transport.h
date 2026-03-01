@@ -11,9 +11,9 @@ namespace disaggregated {
 
 // POSIX shared-memory backed KV transport (§2.5 item 11).
 //
-// Each Write() stores packet.kv_blob in a uniquely-named SHM segment
+// Each Enqueue() stores packet.kv_blob in a uniquely-named SHM segment
 // (shm_open + mmap + memcpy) and enqueues a lightweight control packet
-// that carries only the segment name and blob size.  Read() dequeues the
+// that carries only the segment name and blob size.  TryDequeue() reads the
 // control packet, maps the SHM segment, copies the blob back into the
 // packet, then unlinks the segment.
 //
@@ -24,22 +24,22 @@ namespace disaggregated {
 // Cross-process use: both writer and reader must use the same capacity value
 // and call shm_open with the segment name embedded in packet.metadata.
 // Leaked segments (e.g. after a crash) can be cleaned with shm_unlink(3).
-class ShmKVTransport {
+class ShmKVTransport : public IKVTransport {
  public:
   explicit ShmKVTransport(std::size_t capacity = 64);
-  ~ShmKVTransport();
+  ~ShmKVTransport() override;
 
-  // Write packet.kv_blob into a named SHM segment, enqueue control metadata.
+  // Store packet.kv_blob in a named SHM segment, enqueue control metadata.
   // For empty kv_blob, enqueues a control-only packet with no SHM segment.
   // Returns false if the control queue is full or SHM creation fails.
-  bool Write(KVPacket packet);
+  bool Enqueue(KVPacket packet) override;
 
   // Dequeue control metadata, map and read the SHM blob, unlink the segment,
   // return the reassembled packet.  Returns nullopt when the queue is empty.
-  std::optional<KVPacket> Read();
+  std::optional<KVPacket> TryDequeue() override;
 
-  std::size_t Capacity() const;
-  std::size_t Size() const;
+  std::size_t Capacity() const override;
+  std::size_t Size() const override;
 
  private:
   // Generate a unique SHM segment name embedding request_id and a process-

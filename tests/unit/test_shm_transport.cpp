@@ -13,7 +13,7 @@ using namespace inferflux::disaggregated;
 
 TEST_CASE("ShmKVTransport: empty queue returns nullopt", "[shm_transport]") {
   ShmKVTransport transport(4);
-  REQUIRE_FALSE(transport.Read().has_value());
+  REQUIRE_FALSE(transport.TryDequeue().has_value());
 }
 
 TEST_CASE("ShmKVTransport: control-only packet (no kv_blob) roundtrips correctly", "[shm_transport]") {
@@ -22,8 +22,8 @@ TEST_CASE("ShmKVTransport: control-only packet (no kv_blob) roundtrips correctly
   pkt.request_id = 42;
   pkt.n_past = 7;
   pkt.sequence_id = 2;
-  REQUIRE(transport.Write(std::move(pkt)));
-  auto result = transport.Read();
+  REQUIRE(transport.Enqueue(std::move(pkt)));
+  auto result = transport.TryDequeue();
   REQUIRE(result.has_value());
   REQUIRE(result->request_id == 42);
   REQUIRE(result->n_past == 7);
@@ -37,29 +37,29 @@ TEST_CASE("ShmKVTransport: kv_blob roundtrips through POSIX SHM", "[shm_transpor
   pkt.request_id = 99;
   pkt.kv_blob = {0x01, 0x02, 0x03, 0xAB, 0xCD, 0xEF};
   std::vector<uint8_t> expected = pkt.kv_blob;
-  REQUIRE(transport.Write(std::move(pkt)));
-  auto result = transport.Read();
+  REQUIRE(transport.Enqueue(std::move(pkt)));
+  auto result = transport.TryDequeue();
   REQUIRE(result.has_value());
   REQUIRE(result->request_id == 99);
   REQUIRE(result->kv_blob == expected);
 }
 
-TEST_CASE("ShmKVTransport: FIFO ordering preserved across multiple writes", "[shm_transport]") {
+TEST_CASE("ShmKVTransport: FIFO ordering preserved across multiple enqueues", "[shm_transport]") {
   ShmKVTransport transport(8);
   for (uint64_t i = 1; i <= 4; ++i) {
     KVPacket pkt;
     pkt.request_id = i;
-    REQUIRE(transport.Write(std::move(pkt)));
+    REQUIRE(transport.Enqueue(std::move(pkt)));
   }
   for (uint64_t i = 1; i <= 4; ++i) {
-    auto result = transport.Read();
+    auto result = transport.TryDequeue();
     REQUIRE(result.has_value());
     REQUIRE(result->request_id == i);
   }
-  REQUIRE_FALSE(transport.Read().has_value());
+  REQUIRE_FALSE(transport.TryDequeue().has_value());
 }
 
-TEST_CASE("ShmKVTransport: Write returns false when capacity is full", "[shm_transport]") {
+TEST_CASE("ShmKVTransport: Enqueue returns false when capacity is full", "[shm_transport]") {
   ShmKVTransport transport(2);
   KVPacket p1;
   p1.request_id = 1;
@@ -67,9 +67,9 @@ TEST_CASE("ShmKVTransport: Write returns false when capacity is full", "[shm_tra
   p2.request_id = 2;
   KVPacket p3;
   p3.request_id = 3;
-  REQUIRE(transport.Write(std::move(p1)));
-  REQUIRE(transport.Write(std::move(p2)));
-  REQUIRE_FALSE(transport.Write(std::move(p3)));
+  REQUIRE(transport.Enqueue(std::move(p1)));
+  REQUIRE(transport.Enqueue(std::move(p2)));
+  REQUIRE_FALSE(transport.Enqueue(std::move(p3)));
 }
 
 TEST_CASE("ShmKVTransport: Size() and Capacity() reflect state", "[shm_transport]") {
@@ -78,9 +78,9 @@ TEST_CASE("ShmKVTransport: Size() and Capacity() reflect state", "[shm_transport
   REQUIRE(transport.Size() == 0);
   KVPacket pkt;
   pkt.request_id = 1;
-  transport.Write(std::move(pkt));
+  transport.Enqueue(std::move(pkt));
   REQUIRE(transport.Size() == 1);
-  transport.Read();
+  transport.TryDequeue();
   REQUIRE(transport.Size() == 0);
 }
 
@@ -94,8 +94,8 @@ TEST_CASE("ShmKVTransport: large kv_blob roundtrips correctly", "[shm_transport]
   KVPacket pkt;
   pkt.request_id = 7;
   pkt.kv_blob = big_blob;
-  REQUIRE(transport.Write(std::move(pkt)));
-  auto result = transport.Read();
+  REQUIRE(transport.Enqueue(std::move(pkt)));
+  auto result = transport.TryDequeue();
   REQUIRE(result.has_value());
   REQUIRE(result->kv_blob == big_blob);
 }

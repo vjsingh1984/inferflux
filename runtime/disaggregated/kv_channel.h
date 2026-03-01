@@ -22,17 +22,30 @@ struct KVPacket {
   std::chrono::steady_clock::time_point enqueue_time{std::chrono::steady_clock::now()};
 };
 
-// Thread-safe queue that will evolve into the shared-memory/RDMA transport.
-class KVChannel {
+// Common interface for KV-state transports (in-process queue and POSIX SHM).
+// Both KVChannel and ShmKVTransport implement this so they are substitutable
+// in DisaggregatedConfig without touching Scheduler or BatchExecutor.
+class IKVTransport {
+ public:
+  virtual ~IKVTransport() = default;
+  virtual bool Enqueue(KVPacket packet) = 0;
+  virtual std::optional<KVPacket> TryDequeue() = 0;
+  virtual std::size_t Size() const = 0;
+  virtual std::size_t Capacity() const = 0;
+};
+
+// Thread-safe in-process queue.  Default transport when INFERFLUX_KV_TRANSPORT
+// is unset or set to "channel".
+class KVChannel : public IKVTransport {
  public:
   explicit KVChannel(std::size_t capacity = 64);
 
   void SetCapacity(std::size_t capacity);
-  std::size_t Capacity() const;
+  std::size_t Capacity() const override;
 
-  bool Enqueue(KVPacket packet);
-  std::optional<KVPacket> TryDequeue();
-  std::size_t Size() const;
+  bool Enqueue(KVPacket packet) override;
+  std::optional<KVPacket> TryDequeue() override;
+  std::size_t Size() const override;
   void Clear();
 
  private:

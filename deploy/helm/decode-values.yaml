@@ -27,9 +27,15 @@ env:
   - name: INFERFLUX_DECODE_POOL_SIZE
     value: "4"
 
-  # Prefill pool disabled on decode nodes.
+  # Decode-only node: disable all prefill worker threads so this pod never
+  # runs the prefill phase.  Prefill is handled by the prefill pool.
   - name: INFERFLUX_PREFILL_POOL_SIZE
-    value: "1"
+    value: "0"
+
+  # Use POSIX SHM transport so KV state written by the prefill pool is picked
+  # up by the decode pool on the same host (sub-ms transfer cost).
+  - name: INFERFLUX_KV_TRANSPORT
+    value: "shm"
 
   # KV channel capacity — must match the prefill overlay.
   - name: INFERFLUX_KV_CHANNEL_CAPACITY

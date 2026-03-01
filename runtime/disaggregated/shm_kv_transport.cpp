@@ -57,7 +57,7 @@ std::size_t ShmKVTransport::ExtractShmSize(const std::string& metadata) {
   }
 }
 
-bool ShmKVTransport::Write(KVPacket packet) {
+bool ShmKVTransport::Enqueue(KVPacket packet) {
   if (packet.kv_blob.empty()) {
     // No KV state: pass through as a control-only packet.
     return control_queue_.Enqueue(std::move(packet));
@@ -110,7 +110,7 @@ bool ShmKVTransport::Write(KVPacket packet) {
 #endif
 }
 
-std::optional<KVPacket> ShmKVTransport::Read() {
+std::optional<KVPacket> ShmKVTransport::TryDequeue() {
   auto maybe = control_queue_.TryDequeue();
   if (!maybe) return std::nullopt;
 
