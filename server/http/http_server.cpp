@@ -411,6 +411,83 @@ std::string BuildStreamChunk(const std::string& id,
   return "data: " + j.dump() + "\n\n";
 }
 
+// §2.3: emit SSE delta sequence for a streaming tool call response.
+// Sequence per OpenAI spec:
+//   1. role=assistant, content=null
+//   2. tool_calls[0] with id + type + function.name + empty arguments
+//   3. tool_calls[0] function.arguments (full JSON string)
+//   4. finish_reason=tool_calls, empty delta
+std::string BuildToolCallStreamChunks(const std::string& id,
+                                       const std::string& model,
+                                       std::time_t ts,
+                                       const ToolCallResult& tc) {
+  std::string out;
+  auto base = [&]() -> json {
+    json j;
+    j["id"] = id;
+    j["object"] = "chat.completion.chunk";
+    j["created"] = ts;
+    j["model"] = model;
+    return j;
+  };
+
+  // Chunk 1: role=assistant, content=null
+  {
+    json j = base();
+    j["choices"] = json::array({{
+      {"index", 0},
+      {"delta", {{"role", "assistant"}, {"content", nullptr}}},
+      {"finish_reason", nullptr}
+    }});
+    out += "data: " + j.dump() + "\n\n";
+  }
+
+  // Chunk 2: tool_calls[0] — id, type, function name, empty arguments
+  {
+    json j = base();
+    json tc_delta = json::array({{
+      {"index", 0},
+      {"id", tc.call_id},
+      {"type", "function"},
+      {"function", {{"name", tc.function_name}, {"arguments", ""}}}
+    }});
+    j["choices"] = json::array({{
+      {"index", 0},
+      {"delta", {{"tool_calls", tc_delta}}},
+      {"finish_reason", nullptr}
+    }});
+    out += "data: " + j.dump() + "\n\n";
+  }
+
+  // Chunk 3: function arguments
+  if (!tc.arguments_json.empty()) {
+    json j = base();
+    json arg_delta = json::array({{
+      {"index", 0},
+      {"function", {{"arguments", tc.arguments_json}}}
+    }});
+    j["choices"] = json::array({{
+      {"index", 0},
+      {"delta", {{"tool_calls", arg_delta}}},
+      {"finish_reason", nullptr}
+    }});
+    out += "data: " + j.dump() + "\n\n";
+  }
+
+  // Chunk 4: finish_reason=tool_calls
+  {
+    json j = base();
+    j["choices"] = json::array({{
+      {"index", 0},
+      {"delta", json::object()},
+      {"finish_reason", "tool_calls"}
+    }});
+    out += "data: " + j.dump() + "\n\n";
+  }
+
+  return out;
+}
+
 std::string BuildApiKeysPayload(const std::vector<PolicyKeyEntry>& keys) {
   json arr = json::array();
   for (const auto& k : keys) {
@@ -1297,6 +1374,10 @@ void HttpServer::HandleClient(ClientSession& session) {
       req.cancellation_flag = stream_cancel_flag;
       ClientSession* stream_session = &session;
       std::string stream_model = parsed.model;
+      // §2.3: when tools are active, suppress raw token streaming — the model
+      // emits tool_call JSON which must be buffered and re-emitted as structured
+      // tool_calls deltas after the full completion is assembled.
+      bool suppress_stream_content = use_tools;
       req.on_token = [this,
                       stream_session,
                       stream_mutex,
@@ -1305,8 +1386,9 @@ void HttpServer::HandleClient(ClientSession& session) {
                       stream_cancel_flag,
                       stream_id,
                       stream_model,
-                      stream_ts](const std::string& chunk) {
-        if (chunk.empty() || !stream_active->load()) {
+                      stream_ts,
+                      suppress_stream_content](const std::string& chunk) {
+        if (suppress_stream_content || chunk.empty() || !stream_active->load()) {
           return;
         }
         auto pieces = SplitForStreaming(chunk);
@@ -1333,11 +1415,35 @@ void HttpServer::HandleClient(ClientSession& session) {
           metrics_->RecordError();
         }
         if (parsed.stream) {
+          // SSE headers were already sent. Complete the stream body rather than
+          // sending a second HTTP response (which would corrupt the framing).
+          ToolCallResult nb_tc;
+          if (use_tools && (!parsed.tools.empty() || !parsed.first_tool_name.empty())) {
+            std::string fname = !parsed.tools.empty() ? parsed.tools.front().function.name
+                                                      : parsed.first_tool_name;
+            if (fname.empty()) fname = "stub_tool";
+            nb_tc.detected = true;
+            nb_tc.function_name = fname;
+            nb_tc.call_id = "call_stub_" + fname;
+            nb_tc.arguments_json = json{{"reason", "no_model_available"}}.dump();
+          }
+          {
+            std::lock_guard<std::mutex> lock(*stream_mutex);
+            if (nb_tc.detected) {
+              SendAll(session, BuildToolCallStreamChunks(stream_id, parsed.model, stream_ts, nb_tc));
+            } else {
+              SendAll(session, BuildStreamChunk(stream_id, parsed.model, stream_ts,
+                                                result.completion, false));
+              SendAll(session, BuildStreamChunk(stream_id, parsed.model, stream_ts, "", true));
+            }
+            SendAll(session, "data: [DONE]\n\n");
+          }
           stream_active->store(false);
+        } else {
+          auto payload = BuildResponse(BuildCompletionBody(result, parsed, chat_mode),
+                                       200, "OK", trace_response_header);
+          SendAll(session, payload);
         }
-        auto payload = BuildResponse(BuildCompletionBody(result, parsed, chat_mode),
-                                     200, "OK", trace_response_header);
-        SendAll(session, payload);
         if (audit_logger_) {
           audit_logger_->Log(auth_ctx.subject, parsed.model, "no_backend", result.completion);
         }
@@ -1395,7 +1501,12 @@ void HttpServer::HandleClient(ClientSession& session) {
         {
           std::lock_guard<std::mutex> lock(*stream_mutex);
           if (stream_active->load()) {
-            SendAll(session, BuildStreamChunk(stream_id, parsed.model, stream_ts, "", true));
+            if (tool_call.detected) {
+              // §2.3: emit structured tool_calls delta sequence (role → name → args → finish).
+              SendAll(session, BuildToolCallStreamChunks(stream_id, parsed.model, stream_ts, tool_call));
+            } else {
+              SendAll(session, BuildStreamChunk(stream_id, parsed.model, stream_ts, "", true));
+            }
             SendAll(session, "data: [DONE]\n\n");
           }
         }

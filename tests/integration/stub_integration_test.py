@@ -332,6 +332,75 @@ class StubIntegrationTests(unittest.TestCase):
         msg = data["choices"][0].get("message", {})
         self.assertNotIn("tool_calls", msg)
 
+    def test_streaming_tool_call_emits_tool_calls_deltas(self):
+        """stream=true + tools must emit structured tool_calls deltas, not raw JSON tokens.
+
+        Verifies the §2.3 streaming delta sequence:
+          1. A chunk with delta.role="assistant" and content=null
+          2. A chunk with delta.tool_calls[0].function.name set
+          3. A chunk with finish_reason="tool_calls" (not "stop")
+        """
+        resp, body = self._post(
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "What is the weather?"}],
+                "max_tokens": 8,
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Get current weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"location": {"type": "string"}},
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": "auto",
+            },
+        )
+        self.assertEqual(resp.status, 200)
+        # Parse SSE chunks: lines starting with "data: " contain JSON payloads.
+        chunks = []
+        for line in body.splitlines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                chunks.append(json.loads(line[6:]))
+        self.assertGreater(len(chunks), 0, "Expected at least one SSE chunk")
+
+        # Collect delta fields across all chunks.
+        found_role_chunk = any(
+            chunk.get("choices", [{}])[0].get("delta", {}).get("role") == "assistant"
+            for chunk in chunks
+        )
+        found_tool_calls_delta = any(
+            "tool_calls" in chunk.get("choices", [{}])[0].get("delta", {})
+            for chunk in chunks
+        )
+        finish_reasons = [
+            chunk.get("choices", [{}])[0].get("finish_reason")
+            for chunk in chunks
+        ]
+        self.assertTrue(found_role_chunk, "Expected a delta with role=assistant")
+        self.assertTrue(found_tool_calls_delta, "Expected a delta with tool_calls")
+        self.assertIn("tool_calls", finish_reasons, "Expected finish_reason=tool_calls")
+        self.assertNotIn("stop", finish_reasons, "finish_reason must not be 'stop' for tool calls")
+
+        # Verify the function name appears in one of the tool_calls delta chunks.
+        names_found = []
+        for chunk in chunks:
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            for tc in delta.get("tool_calls", []):
+                fn = tc.get("function", {}).get("name", "")
+                if fn:
+                    names_found.append(fn)
+        self.assertTrue(
+            any("get_weather" in n for n in names_found),
+            f"Expected 'get_weather' in tool_calls delta; got: {names_found}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
