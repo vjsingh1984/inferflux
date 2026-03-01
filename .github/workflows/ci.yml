@@ -190,6 +190,81 @@ jobs:
         run: cmake --build build --target inferfluxd -j$(nproc)
 
   # ---------------------------------------------------------------------------
+  # Coverage — gcov/lcov instrumented Debug build, Codecov upload.
+  # Runs unit + stub-integration test suite; uploads lcov.info to Codecov.
+  # A 50 % line-coverage floor is enforced via .codecov.yml; missing tokens
+  # in the Codecov secret make the upload a no-op (advisory only).
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: Coverage (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            libssl-dev \
+            libyaml-cpp-dev \
+            python3 \
+            lcov
+
+      # ------------------------------------------------------------------
+      # Configure with coverage instrumentation
+      # ENABLE_SBOM=OFF keeps the build focused on tests.
+      # ------------------------------------------------------------------
+      - name: Configure (coverage)
+        run: |
+          cmake -S . -B build-cov \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_COVERAGE=ON \
+            -DENABLE_CUDA=OFF \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_MTMD=OFF \
+            -DENABLE_SBOM=OFF
+
+      - name: Build
+        run: cmake --build build-cov -j$(nproc)
+
+      # ------------------------------------------------------------------
+      # Run tests + collect coverage in one CMake target
+      # ------------------------------------------------------------------
+      - name: Generate coverage report
+        run: cmake --build build-cov --target coverage
+
+      # ------------------------------------------------------------------
+      # Upload to Codecov — requires CODECOV_TOKEN repository secret.
+      # The action is a no-op if the token is absent (advisory mode).
+      # ------------------------------------------------------------------
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: build-cov/coverage/lcov.info
+          flags: unittests
+          name: inferflux-coverage
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload HTML report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html-${{ github.sha }}
+          path: build-cov/coverage/html/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
   # clang-format style gate
   # Reports violations as annotations but does not block merge by default.
   # Change `continue-on-error: true` → `false` to enforce formatting in CI.

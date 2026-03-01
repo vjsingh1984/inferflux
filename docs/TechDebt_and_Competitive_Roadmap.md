@@ -36,7 +36,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | Observability                 |  A   |   B    |   A     |    D      |   D    |   **B**   | B (Q3) | Observability |
 | Ease of local setup           |  B+  |   B    |   C     |    C      |   A+   |   **C**   | B (Q3) | CLI |
 | Model management UX           |  B   |   B    |   C     |    C      |   A+   |   **F**   | C+ (Q3) | CLI |
-| Test coverage & CI maturity   |  A   |   A    |   A     |    A      |   B    |   **C**   | B (Q3) | QA |
+| Test coverage & CI maturity   |  A   |   A    |   A     |    A      |   B    |   **B**   | B (Q3) | QA |
 
 **Overall grade: D (early prototype)**
 
@@ -54,7 +54,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 - Observability is **B** thanks to metrics/tracing/logging closures in OBS-1 through OBS-4.
 - Ease of local setup is **C**; `inferctl pull` (§2.8) now downloads GGUF models from HuggingFace Hub — streamlined installers remain for a future pass.
 - Model management UX bumped from **F** to **D**; `inferctl pull` with progress reporting and quantization selection (Q4_K_M preferred) is live (§2.8); full registry UI and listing commands remain.
-- Test coverage/CI maturity bumped to **C**; `.github/workflows/ci.yml` now runs on push/PR to main and weekly: CPU-only build on `ubuntu-latest`, full `ctest` suite (unit + fairness + MoE + flash-attn + SHM transport + StubIntegration + SSECancel), SBOM generation, and clang-format annotation job. IntegrationSSE (model-required) gated by `INFERFLUX_MODEL_PATH`. Remaining gap to B: coverage reporting (lcov/codecov), macOS runner, and a coverage-threshold gate.
+- Test coverage/CI maturity bumped to **B**; CI now has five jobs: CPU `build-and-test` (ubuntu-latest, full ctest + SBOM), `build-check-mps` (macos-latest, MPS, full unit tests), `build-check-cuda` (CUDA 12.3 compile-check, advisory), `coverage` (gcov/lcov Debug build + Codecov upload), and `clang-format`. Coverage pipeline: `ENABLE_COVERAGE=ON` adds `--coverage -O0 -fno-inline` flags + links `--coverage`; `cmake --build --target coverage` zeroes counters, runs ctest, merges lcov traces, strips external/tests/usr, generates HTML report and lcov.info; `.codecov.yml` enforces 60% target / 5pp threshold; HTML report uploaded as `coverage-html-<sha>` artifact (14-day retention). Remaining gap to A: live GPU test execution (self-hosted runner), CI SHM smoke test.
 
 InferFlux has strong *architectural vision* (enterprise auth, policy store, multi-backend) but
 the implementation is at stub/MVP stage. The competitive gap is largest in the core inference

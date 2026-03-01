@@ -234,6 +234,79 @@ set_tests_properties(ShmTransportTests PROPERTIES LABELS shm_transport)
 # The target is always defined but only runs when Python3 is available.
 # Run manually: cmake --build build --target sbom
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Coverage — gcov/lcov instrumentation.
+# Enable with -DENABLE_COVERAGE=ON (automatically uses Debug build).
+# Requires GCC or Clang + lcov installed.  Run:
+#   cmake --build build-cov --target coverage
+# to produce HTML report at build-cov/coverage/html/index.html and an
+# lcov.info trace file for upload to Codecov.
+# ---------------------------------------------------------------------------
+option(ENABLE_COVERAGE "Instrument build for gcov/lcov coverage" OFF)
+
+if(ENABLE_COVERAGE)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    message(FATAL_ERROR "ENABLE_COVERAGE requires GCC or Clang")
+  endif()
+  # Force Debug so optimiser doesn't collapse away instrumented lines.
+  if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(STATUS "ENABLE_COVERAGE: overriding build type to Debug")
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
+  endif()
+  set(COVERAGE_FLAGS --coverage -O0 -fno-inline)
+  target_compile_options(inferflux_core PUBLIC ${COVERAGE_FLAGS})
+  target_compile_options(inferflux_tests PRIVATE ${COVERAGE_FLAGS})
+  target_link_libraries(inferflux_core PUBLIC --coverage)
+  target_link_libraries(inferflux_tests PRIVATE --coverage)
+
+  find_program(LCOV_BIN lcov REQUIRED)
+  find_program(GENHTML_BIN genhtml REQUIRED)
+
+  set(COVERAGE_OUT_DIR "${CMAKE_BINARY_DIR}/coverage")
+  set(LCOV_INFO "${COVERAGE_OUT_DIR}/lcov.info")
+
+  add_custom_target(coverage
+    DEPENDS inferflux_tests inferfluxd
+    COMMENT "Collecting gcov data and generating coverage report"
+    # 0. Ensure output directory exists
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${COVERAGE_OUT_DIR}"
+    # 1. Zero any stale counters
+    COMMAND ${LCOV_BIN} --zerocounters --directory "${CMAKE_BINARY_DIR}" --quiet
+    # 2. Capture initial baseline (zero coverage)
+    COMMAND ${LCOV_BIN} --capture --initial --directory "${CMAKE_BINARY_DIR}"
+            --output-file "${COVERAGE_OUT_DIR}/baseline.info" --quiet
+    # 3. Run the test suite
+    COMMAND ${CMAKE_CTEST_COMMAND} --test-dir "${CMAKE_BINARY_DIR}"
+            --output-on-failure --timeout 90
+    # 4. Capture post-test counters
+    COMMAND ${LCOV_BIN} --capture --directory "${CMAKE_BINARY_DIR}"
+            --output-file "${COVERAGE_OUT_DIR}/tests.info" --quiet
+    # 5. Merge baseline + test data
+    COMMAND ${LCOV_BIN} --add-tracefile "${COVERAGE_OUT_DIR}/baseline.info"
+            --add-tracefile "${COVERAGE_OUT_DIR}/tests.info"
+            --output-file "${LCOV_INFO}" --quiet
+    # 6. Strip external/vendored and system headers
+    COMMAND ${LCOV_BIN} --remove "${LCOV_INFO}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/external/*"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/*"
+            "/usr/*"
+            --output-file "${LCOV_INFO}" --quiet
+    # 7. HTML report
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${COVERAGE_OUT_DIR}/html"
+    COMMAND ${GENHTML_BIN} "${LCOV_INFO}"
+            --output-directory "${COVERAGE_OUT_DIR}/html"
+            --title "InferFlux coverage"
+            --legend --demangle-cpp --quiet
+    COMMAND ${CMAKE_COMMAND} -E echo
+            "Coverage report: ${COVERAGE_OUT_DIR}/html/index.html"
+    COMMAND ${CMAKE_COMMAND} -E echo
+            "lcov.info for Codecov: ${LCOV_INFO}"
+    VERBATIM
+    USES_TERMINAL
+  )
+  message(STATUS "ENABLE_COVERAGE=ON — run: cmake --build <build-dir> --target coverage")
+endif()
+
 option(ENABLE_SBOM "Generate SBOM after build" ON)
 
 find_package(Python3 COMPONENTS Interpreter)

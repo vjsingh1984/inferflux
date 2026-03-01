@@ -1,0 +1,23 @@
+coverage:
+  # Aim for 60 % overall; warn (but don't fail) below 50 %.
+  status:
+    project:
+      default:
+        target: 60%
+        threshold: 5%   # allow up to 5 pp drop before failing
+    patch:
+      default:
+        target: 50%     # every PR diff should hit 50 % line coverage
+
+ignore:
+  # Vendored and generated code — not our responsibility
+  - "external/**"
+  - "tests/**"
+  - "build/**"
+  - "build-cov/**"
+  - "scripts/**"
+
+comment:
+  layout: "diff, files"
+  behavior: default
+  require_changes: true   # only comment when coverage actually changes

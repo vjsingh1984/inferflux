@@ -1,67 +1,118 @@
 #!/usr/bin/env bash
-# pre-commit: linting, compilation, and test checks for InferFlux
+# pre-commit: linting, compilation, and test checks for InferFlux.
+# Mirrors CI gates from .github/workflows/ci.yml so failures are caught locally.
+#
+# Gates run here (fast, no hardware deps):
+#   1. clang-format on staged C++ files
+#   2. Incremental cmake build (Release, CPU-only)
+#   3. Full unit + tagged subtests (UnitTests, FairnessTests, MoETests,
+#      FlashAttnTests, ShmTransportTests)
+#   4. Stub integration + SSE-cancel integration tests (no model required)
+#
+# Gates deferred to CI (too slow or hardware-specific):
+#   - coverage  : full gcov/lcov instrumented Debug build (slow)
+#   - MPS build : macOS-only, validates Metal paths on GitHub macos runner
+#   - CUDA check: Linux CUDA toolkit install + compile-check (network-heavy)
+#
+# Skip variables:
+#   SKIP_BUILD=1   — skip cmake build step (not recommended)
+#   SKIP_TESTS=1   — skip all ctest steps (for doc-only commits)
+#   SKIP_FORMAT=1  — skip clang-format check
+
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
 # ── 1. clang-format on staged C++ files ──────────────────────────────────────
-STAGED_CPP=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(cpp|h|cc|cxx)$' || true)
+if [ "${SKIP_FORMAT:-0}" != "1" ]; then
+  STAGED_CPP=$(git diff --cached --name-only --diff-filter=ACM | \
+               grep -E '\.(cpp|h|cc|cxx)$' || true)
 
-if [ -n "$STAGED_CPP" ]; then
-  if command -v clang-format &>/dev/null; then
-    FORMAT_ISSUES=""
-    while IFS= read -r file; do
-      [ -f "$file" ] || continue
-      DIFF=$(clang-format --style=file "$file" | diff "$file" - || true)
-      if [ -n "$DIFF" ]; then
-        FORMAT_ISSUES="$FORMAT_ISSUES\n  $file"
+  if [ -n "$STAGED_CPP" ]; then
+    if command -v clang-format &>/dev/null; then
+      FORMAT_ISSUES=""
+      while IFS= read -r file; do
+        [ -f "$file" ] || continue
+        DIFF=$(clang-format --style=file "$file" | diff "$file" - || true)
+        if [ -n "$DIFF" ]; then
+          FORMAT_ISSUES="$FORMAT_ISSUES\n  $file"
+        fi
+      done <<< "$STAGED_CPP"
+
+      if [ -n "$FORMAT_ISSUES" ]; then
+        echo "[pre-commit] clang-format violations detected in:"
+        echo -e "$FORMAT_ISSUES"
+        echo "[pre-commit] Run: clang-format -i <files> to fix, then re-stage."
+        exit 1
       fi
-    done <<< "$STAGED_CPP"
-
-    if [ -n "$FORMAT_ISSUES" ]; then
-      echo "[pre-commit] clang-format violations detected in:"
-      echo -e "$FORMAT_ISSUES"
-      echo "[pre-commit] Run: clang-format -i <files> to fix, then re-stage."
-      exit 1
+      echo "[pre-commit] clang-format: OK"
+    else
+      echo "[pre-commit] WARNING: clang-format not found — skipping format check."
+      echo "             Install with: brew install clang-format  (macOS)"
+      echo "                      or: sudo apt install clang-format  (Linux)"
     fi
-    echo "[pre-commit] clang-format: OK"
-  else
-    echo "[pre-commit] WARNING: clang-format not found — skipping format check."
-    echo "             Install with: brew install clang-format"
   fi
 fi
 
 # ── 2. Incremental compilation ────────────────────────────────────────────────
-if [ ! -d "$REPO_ROOT/build" ]; then
-  echo "[pre-commit] No build directory found — running cmake configure first."
-  cmake -S "$REPO_ROOT" -B "$REPO_ROOT/build" -DCMAKE_BUILD_TYPE=Release -DINFERFLUX_BUILD_TESTS=ON -Wno-dev &>/dev/null
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+  if [ ! -d "$REPO_ROOT/build" ]; then
+    echo "[pre-commit] No build directory found — running cmake configure first."
+    # Match CI: CPU-only Release build, no CUDA/ROCm/MPS/BLAS/MTMD
+    cmake -S "$REPO_ROOT" -B "$REPO_ROOT/build" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DENABLE_CUDA=OFF \
+      -DENABLE_ROCM=OFF \
+      -DENABLE_MPS=OFF \
+      -DENABLE_BLAS=OFF \
+      -DENABLE_MTMD=OFF \
+      -Wno-dev &>/dev/null
+  fi
+
+  NPROC=$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+  echo "[pre-commit] Building (incremental, ${NPROC} jobs)..."
+  if ! cmake --build "$REPO_ROOT/build" -j"$NPROC" 2>&1; then
+    echo "[pre-commit] BUILD FAILED — fix compilation errors before committing."
+    exit 1
+  fi
+  echo "[pre-commit] Build: OK"
 fi
 
-echo "[pre-commit] Building (incremental)..."
-if ! cmake --build "$REPO_ROOT/build" -j"$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)" 2>&1; then
-  echo "[pre-commit] BUILD FAILED — fix compilation errors before committing."
-  exit 1
-fi
-echo "[pre-commit] Build: OK"
+# ── 3. Unit + tagged subtests (mirrors CI ctest run) ─────────────────────────
+if [ "${SKIP_TESTS:-0}" != "1" ]; then
+  # Run each registered test target individually so per-tag failures are visible.
+  # The set matches the add_test() calls in CMakeLists.txt.
+  UNIT_TARGETS="UnitTests FairnessTests MoETests FlashAttnTests ShmTransportTests"
 
-# ── 3. Unit tests ─────────────────────────────────────────────────────────────
-echo "[pre-commit] Running unit tests..."
-if ! ctest --test-dir "$REPO_ROOT/build" -R "UnitTests|FairnessTests" --output-on-failure -Q 2>&1; then
-  echo "[pre-commit] UNIT TESTS FAILED — fix failing tests before committing."
-  exit 1
-fi
-echo "[pre-commit] Unit tests: OK"
+  echo "[pre-commit] Running unit tests..."
+  PATTERN=$(echo $UNIT_TARGETS | tr ' ' '|')
+  if ! ctest --test-dir "$REPO_ROOT/build" -R "$PATTERN" \
+             --output-on-failure -Q 2>&1; then
+    echo "[pre-commit] UNIT TESTS FAILED — fix failing tests before committing."
+    exit 1
+  fi
+  echo "[pre-commit] Unit tests: OK"
 
-# ── 4. Stub integration tests (no model required) ─────────────────────────────
-echo "[pre-commit] Running stub integration tests..."
-if ! ctest --test-dir "$REPO_ROOT/build" -R "StubIntegration" --output-on-failure -Q 2>&1; then
-  echo "[pre-commit] STUB INTEGRATION TESTS FAILED — fix before committing."
-  exit 1
-fi
-echo "[pre-commit] Stub integration tests: OK"
+  # ── 4. Stub + SSE-cancel integration tests (no model required) ──────────────
+  echo "[pre-commit] Running stub integration tests..."
+  if ! ctest --test-dir "$REPO_ROOT/build" -R "StubIntegration" \
+             --output-on-failure -Q 2>&1; then
+    echo "[pre-commit] STUB INTEGRATION TESTS FAILED — fix before committing."
+    exit 1
+  fi
+  echo "[pre-commit] Stub integration: OK"
 
-# ── 5. Chain global Databricks hook if present ───────────────────────────────
+  echo "[pre-commit] Running SSE-cancel integration test..."
+  if ! ctest --test-dir "$REPO_ROOT/build" -R "SSECancel" \
+             --output-on-failure -Q 2>&1; then
+    echo "[pre-commit] SSE-CANCEL TEST FAILED — fix before committing."
+    exit 1
+  fi
+  echo "[pre-commit] SSE-cancel: OK"
+fi
+
+# ── 5. Chain global hook if present ──────────────────────────────────────────
 GLOBAL_HOOKS_DIR="$(git config --global core.hooksPath 2>/dev/null || true)"
 if [ -n "$GLOBAL_HOOKS_DIR" ] && [ -x "$GLOBAL_HOOKS_DIR/pre-commit" ]; then
   echo "[pre-commit] Chaining global pre-commit hook at $GLOBAL_HOOKS_DIR/pre-commit"
