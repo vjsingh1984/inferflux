@@ -71,7 +71,7 @@ class InferFluxIntegrationTests(unittest.TestCase):
 
     def http_get(self, path):
         conn = http.client.HTTPConnection("127.0.0.1", SERVER_PORT, timeout=5)
-        conn.request("GET", path)
+        conn.request("GET", path, headers={"Authorization": "Bearer dev-key-123"})
         resp = conn.getresponse()
         body = resp.read().decode()
         conn.close()
