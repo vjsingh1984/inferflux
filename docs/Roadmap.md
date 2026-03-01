@@ -61,13 +61,14 @@ Goal: ship the customer-facing differentiators promised in the PRD.
 Goal: unlock large-cluster deployments and SLO-aware scheduling.
 
 - **DoD**
-  - [ ] Disaggregated prefill/decode path with KV transfer latency <5 ms (TechDebt §2.5):
-    - [ ] Split scheduler queues + metrics for prefill vs decode.
-    - [ ] Implement `runtime/disaggregated/kv_channel` (SHM + RDMA adapters) with trace hooks.
-    - [ ] Stand up dedicated prefill workers that emit KV tickets into the decode queue.
-    - [ ] Extend decode workers/BatchExecutor to hydrate KV from the channel and stream tokens.
-    - [ ] Wire `/readyz`, Prometheus gauges, and chaos tests for independent pool failures.
-    - [ ] Publish Helm/docker overlays that scale pools independently; add CI smoke test.
+  - [x] Disaggregated prefill/decode path with KV transfer latency <5 ms (TechDebt §2.5):
+    - [x] Split scheduler queues + metrics for prefill vs decode.
+    - [x] Implement `runtime/disaggregated/kv_channel` (SHM + RDMA adapters) with trace hooks.
+    - [x] Stand up dedicated prefill workers that emit KV tickets into the decode queue.
+    - [x] Extend decode workers/BatchExecutor to hydrate KV from the channel and stream tokens.
+    - [x] Wire `/readyz`, Prometheus gauges, and chaos tests for independent pool failures.
+    - [x] Publish Helm/docker overlays that scale pools independently; add CI smoke test.
+    - [x] KV warm prefix store: `CopySequencePrefix`+`PrefillPartial` bypass re-evaluation of shared prompt prefixes; 4-slot LRU store with `weak_ptr` backends, BPE-correct position counts, KV eviction guard, expired-entry purge. (§2.5 Item 5)
   - [ ] Expert parallelism + tensor/pipeline parallel knobs exposed (TechDebt §2.6).
   - [ ] Request priority/fairness scheduling with starvation prevention (TechDebt §2.9).
   - [ ] Model registry with signed manifests + attestation (Roadmap Q4).

@@ -184,6 +184,49 @@ cross-process disaggregation — without requiring KV serialization or upstream 
 10. [x] `SerializeSequence` / `HydrateSequence` via `llama_state_seq_get_data` / `llama_state_seq_set_data`; `kv_blob` in `KVPacket` carries real KV bytes (not token IDs); hydration passes blob directly without `sizeof(int)` multiplication
 11. [x] `ShmKVTransport` — POSIX `shm_open`/`mmap` transport (`runtime/disaggregated/shm_kv_transport.{h,cpp}`); `Enqueue()` stores `kv_blob` in a named SHM segment, `TryDequeue()` maps + copies + unlinks; falls back to control-only packet when blob is empty; `-lrt` linked on Linux; `IKVTransport` interface in `kv_channel.h` is shared by `KVChannel` and `ShmKVTransport`; `DisaggregatedConfig.kv_transport` (`shared_ptr<IKVTransport>`); `INFERFLUX_KV_TRANSPORT=shm` selects SHM at runtime; `prefill_pool_size=0` supported on decode nodes; 10 `[shm_transport]` unit tests
 12. [x] Dual-pool `/readyz` with `INFERFLUX_ROLE` (`prefill`/`decode`/`unified`); decode role now requires model_loaded AND pool_warm; `inferflux_kv_transfer_duration_ms` Prometheus histogram; `ShmTransportTests` ctest target; Helm decode overlay sets `INFERFLUX_PREFILL_POOL_SIZE=0` + `INFERFLUX_KV_TRANSPORT=shm`
+13. [x] KV Warm Prefix Store (§2.5 Item 5) — see section below
+
+## KV Warm Prefix Store (§2.5 Item 5)
+
+### Motivation
+When two requests share a prompt prefix (e.g. same system prompt + different questions), the
+second request normally re-evaluates the shared prefix via a full `Prefill()`, wasting O(n_prefix)
+forward passes. The warm prefix store lets the second request skip those tokens: it copies the KV
+state from the first request's retained slot and evaluates only the suffix.
+
+### New Backend Methods
+| Method | Description |
+| --- | --- |
+| `CopySequencePrefix(src, dst, n_kv_tokens)` | Clears dst KV slot, then copies positions `[0, n_kv_tokens)` from src via `llama_memory_seq_cp`. O(1) metadata copy. |
+| `PrefillPartial(prompt, seq_id, n_past_start)` | Tokenizes the full prompt (BPE), evaluates only suffix tokens `[n_past_start..end]` in `seq_id`, returns `PrefillResult`. |
+
+### Warm Store Structure
+`Scheduler::kv_prefix_store_` is a `std::vector<KVPrefixEntry>` (capacity 4, LRU eviction):
+- `seq_id` — the retained KV cache sequence slot
+- `n_kv_tokens` — BPE position count from `PrefillResult::n_past` (NOT SimpleTokenizer word count)
+- `tokens` — SimpleTokenizer token vector for prefix matching
+- `weak_ptr<LlamaCPUBackend> backend` — prevents pinning unloaded models in memory
+- `last_used` — LRU clock for eviction
+
+### Lifecycle
+1. After a phased-decode request fully completes (non-yield, non-decode-worker path), `ProcessBatch` calls `DonateKVPrefix(seq_id, prompt_tokens, prompt_bpe_tokens, backend)` if:
+   - `prompt_tokens.size() >= kMinPrefixTokens` (32)
+   - `prompt_bpe_tokens + completion_tokens < ctx_size` (KV eviction guard — ensures prompt positions weren't shifted by sliding-window eviction)
+   - `prompt_bpe_tokens > 0` (Prefill actually ran on the BPE path)
+2. On the next request, `LookupKVPrefix(inf.prompt_tokens, backend)` finds the longest stored prefix that is a strict prefix of the new request's `prompt_tokens`, on the same backend.
+3. If found: `CopySequencePrefix(warm->seq_id, new_seq_id, warm->n_kv_tokens)` + `PrefillPartial(prompt, new_seq_id, warm->n_kv_tokens)`. Metric: `inferflux_kv_prefix_reuse_tokens_total`.
+4. `PurgeExpiredKVPrefixEntries()` runs at the start of every ProcessBatch prefill sweep, freeing seq_slots for entries whose `weak_ptr` has expired (model was unloaded).
+
+### Correctness Invariants
+- **Backend identity**: entries are only reused on the exact same `LlamaCPUBackend` instance (raw pointer comparison after `lock()`). Cross-model seq_id reuse would access a different `llama_context*`.
+- **BPE vs SimpleTokenizer**: `n_kv_tokens` stores the BPE count from `Prefill()`, not `tokens.size()` (SimpleTokenizer word count). These tokenizers have different vocabularies and lengths; using the wrong count would copy or evaluate wrong KV positions.
+- **KV eviction guard**: `Decode()`'s sliding-window eviction calls `llama_memory_seq_rm`+`llama_memory_seq_add`, shifting positions. If eviction fired during the donor's decode, the prompt prefix is no longer at `[0, n_kv_tokens)`. Guard: skip donation when `n_prompt_bpe + completion_tokens >= ctx_size`.
+- **Expired slot purge**: donated seq_slots remain busy in `seq_slots_free_` until `PurgeExpiredKVPrefixEntries()` reclaims them. Without this, up to `kPrefixStoreCap` phantom slots starve `AllocSeqSlot()` after a model unload.
+- **Eviction cross-model safety**: LRU eviction calls `FreeSequence` on the displaced entry's own backend (via `weak_ptr::lock()`), not the current donor's. If the backend is already gone, only `FreeSeqSlot` runs.
+
+### Metrics
+- `inferflux_kv_prefix_reuse_total` — number of requests that reused a warm prefix
+- `inferflux_kv_prefix_reuse_tokens_total` — cumulative BPE tokens saved
 
 ## SHM Transport & Disaggregated Operations (§2.5 items 11-12)
 
