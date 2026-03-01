@@ -34,7 +34,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | OpenAI API compatibility      |  A   |   A    |   B     |    B      |   A    |   **B**   | B (Q3) | Server |
 | Enterprise auth & RBAC        |  B   |   C    |   B     |    F      |   F    |   **B-**  | B+ (Q3) | Policy |
 | Observability                 |  A   |   B    |   A     |    D      |   D    |   **B**   | B (Q3) | Observability |
-| Ease of local setup           |  B+  |   B    |   C     |    C      |   A+   |   **C**   | B (Q3) | CLI |
+| Ease of local setup           |  B+  |   B    |   C     |    C      |   A+   |   **B-**  | B (Q3) | CLI |
 | Model management UX           |  B   |   B    |   C     |    C      |   A+   |   **D**   | C+ (Q3) | CLI |
 | Test coverage & CI maturity   |  A   |   A    |   A     |    A      |   B    |   **B**   | B (Q3) | QA |
 
@@ -42,6 +42,18 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 
 **Scorecard status notes (March 2026):**
 - **Production throughput: F** — CPU/MPS only via llama.cpp; no GPU kernel path, no true prefill/decode overlap. Unblocked only by CUDA hardware. Grade stays F.
+  - **Design/docs**
+    1. Author `docs/design/cuda_tp_pipeline.md` describing the target CUDA execution stack: required llama.cpp patches, NCCL topology, overlapping prefill/decode, memory budgets per GPU.
+    2. Enumerate acceptance criteria (tokens/sec target per GPU, tail latency, failure behavior) and link them to OBS/Runtime NFRs.
+  - **CUDA enablement**
+    1. Finish CUDA build path wiring (ENABLE_CUDA defaults, llama.cpp build flags, sanity tests) so the server can actually load GPU models.
+    2. Add CI compile-check with CUDA toolkit + self-hosted smoke test (load small GPTQ model, run queries).
+  - **Kernel / scheduler overlap**
+    1. Implement overlapped prefill/decode for CUDA: dedicate streams, rework scheduler to hand off work without CPU blocking.
+    2. Integrate Flash Attention / FA3 kernels and verify we hit target batch sizes.
+  - **Throughput metrics / watchdog**
+    1. Expose tokens/sec, GPU utilization, and queue depth per GPU shard in Prometheus.
+    2. Add regression tests/benchmarks that fail CI if tokens/sec drops below baseline.
 - **Continuous batching: D** — `WorkerLoop` batches up to 4 concurrent requests per cycle (batch-level concurrency, fairness-aware); individual requests decode sequentially on-CPU. No GPU-level in-flight token overlap (requires vLLM-style paged KV scheduler).
 - **KV cache efficiency: D** — `RadixPrefixCache` provides completion-level caching (trie over token IDs, LRU eviction, partial-match metrics). KV warm prefix store (`kv_prefix_store_`, capacity 4, LRU) allows `CopySequencePrefix`+`PrefillPartial` to skip re-evaluating shared prompt prefixes on the CPU path. No GPU KV page reuse (requires vLLM-style paged KV). D stays — warm store is CPU-only and covers O(1) copy within one llama_context.
 - **Prefix caching: B** — `RadixPrefixCache` (compressed trie, LRU eviction, partial-match Prometheus counters) for completion-level caching. KV warm prefix store (`kv_prefix_store_`, 4-slot LRU): `CopySequencePrefix`+`PrefillPartial` lets requests sharing a prompt prefix skip re-evaluating those tokens entirely. B-→B. Gap to A: GPU KV page reuse (vLLM-style paged attention + zero-copy across requests).
@@ -66,11 +78,15 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
   - **Documentation & rollout**
     1. Update `docs/Architecture.md` with a “Model Parallelism” section once EP/TP MVP lands.
     2. Add operator guide (`docs/operators/tp_ep_setup.md`) plus Helm values for configuring TP/EP (per-stage GPU counts, process layout).
-- **OpenAI API compat: B** — Chat completions, completions, SSE streaming, structured output, image_url, tool calls, model-native chat templates all done. Missing: `/v1/models` standard endpoint (currently admin-only at `/v1/admin/models`), logprobs, `n>1`, best_of.
+- **OpenAI API compat: B** — Chat completions, completions, SSE streaming, structured output, image_url, tool calls, model-native chat templates, `/v1/models` + `/v1/models/{id}` (OpenAI list format, `read` scope, 4 integration tests) all done. Missing: logprobs on streaming, `n>1`, best_of.
 - **Enterprise auth/RBAC: B-** — OIDC RS256 (JWKS TTL cache), API-key SHA-256, rate-limiter, OPA client, encrypted policy store (AES-GCM), audit log (hash-by-default). Gap to B+: fine-grained per-model RBAC, key rotation UI.
 - **Observability: B** — 5 latency histograms, Prometheus `/metrics`, W3C traceparent, `Span` RAII, audit log, fairness/preemption metrics, KV-transfer histogram, MoE counter, flash-attention gauge. Gap to A: structured JSON logs, Grafana dashboard template, self-hosted GPU runner for live metric CI.
-- **Ease of local setup: C** — `inferctl pull` downloads best GGUF from HuggingFace Hub (Q4_K_M preferred). Gap to B: one-command installer, shell completions, Docker image push to registry.
-- **Model management UX: D** — `inferctl pull` live, `inferctl admin models --list/--load` via `/v1/admin/models`. Missing: OpenAI-standard `/v1/models` endpoint (every SDK calls this), `inferctl models list`, hot reload.
+- **Ease of local setup: B-** — Embedded litehtml WebUI and CLI quickstart are live. Remaining polish to hit B: packaged installers + Docker flow.
+  - **Next steps**
+    1. Ship Homebrew/winget installers & publish official Docker image.
+    2. Expand `/ui` into a full SPA (chat history, model selection) with assets under `webui/static/`.
+    3. Extend docs (Quickstart) with UI screenshots + troubleshooting; include CLI `serve` workflow.
+- **Model management UX: D** — `inferctl pull` live, `inferctl admin models --list/--load` via `/v1/admin/models`, `/v1/models` + `/v1/models/{id}` OpenAI-standard endpoints live. Missing: `inferctl models list` CLI wrapper, hot reload.
 - **Test/CI: B** — 9 ctest targets (5 unit + 4 integration incl. SHM smoke), 5-job CI (build-test/MPS/CUDA-check/coverage/clang-format), SBOM artifact, Codecov (60% target). Gap to A: live GPU test runner, property-based tests.
 
 InferFlux has strong *architectural vision* (enterprise auth, policy store, multi-backend) but

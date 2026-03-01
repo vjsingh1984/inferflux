@@ -24,11 +24,11 @@ Goal: reach competitive continuous batching throughput on CPU/MPS today while pa
   - [x] Continuous batching replaces global mutex; `RequestBatch` wired end-to-end (INF-2).
   - [x] Prefix cache online with metrics + eviction policies (INF-6/§2.4) — `RadixPrefixCache` (compressed trie, partial-match tracking, LRU eviction, 12 unit tests).
   - [ ] CUDA backend with FlashAttention-3 kernels validated on L40S (INF-2, §2.7 KPIs). Subtasks: enable llama.cpp CUDA build, add FlashAttention config knobs, implement BatchExecutor with prefill/decode overlap, wire GPU KV cache. **Hardware constraint:** hold execution until compatible CUDA hardware is available; keep design work ready.
-- [ ] Priority-aware fairness scheduler on CPU/MPS (preemption + cancellation) so agents get SLO-backed latency even without CUDA. Leverages `RequestBatch` plan §7.2.
-  - [ ] ModelRouter routes multi-model requests with hot load/unload (ARCH-4/5/6, see Architecture “ModelRouter Activation Plan”).
-  - [ ] Priority fairness queue + preemption hooks (ARCH-5 follow-up); expose `runtime.fairness.*` knobs (enable_preemption, high_priority_threshold, max_timeslice_tokens) in config/env.
-  - [ ] SSE cancellation regression tests (ctest target) kept green.
-  - [ ] SimpleTokenizer metrics replaced with llama.cpp tokenizer to align TPS telemetry (INF-7).
+- [x] Priority-aware fairness scheduler on CPU/MPS (preemption + cancellation) — `FairnessController`, timeslice, preemption, per-priority metrics (§2.9).
+  - [x] ModelRouter routes multi-model requests with hot load/unload (ARCH-4/5/6) — `SingleModelRouter`, `/v1/admin/models` CRUD, `/v1/models` OpenAI-standard list (4 integration tests).
+  - [x] Priority fairness queue + preemption hooks (ARCH-5 follow-up); `runtime.fairness.*` knobs (`enable_preemption`, `high_priority_threshold`, `max_timeslice_tokens`) live in config/env.
+  - [x] SSE cancellation regression tests (`SSECancel` ctest target) kept green.
+  - [x] SimpleTokenizer metrics replaced with llama.cpp tokenizer (INF-7) — `TokenizeForCache` + BPE prefix matching in KV prefix store.
   - [x] Latency histograms + queue-depth gauges emitted (OBS-1) to prove KPI gains; add fairness counters (preemptions, per-priority tokens).
   - [ ] Design scaffolding for Intel GPU + AMD ROCm backends (build flags, DeviceContext hooks) so hardware bring-up is unblocked once samples arrive.
   - **Exit KPIs**: ≥400 tok/s aggregate on L40S (future), prefix cache hit rate >60%, TTFT <250 ms with guardrails enabled, fairness tests demonstrate <5% variance across priorities on CPU/MPS.
@@ -39,9 +39,9 @@ Goal: close SEC/OBS debts required for enterprise pilots and comply with PRD sec
 - **DoD**
 - [x] Native TLS for HttpServer + HttpClient (SEC-5) with e2e tests.
   - [x] JWKS fetch + signature verification for OIDCValidator (SEC-1).
-  - [ ] PolicyStore hashes API keys on write/read (SEC-2) with migration tooling.
-  - [ ] Audit logger defaults to prompt hashing + configurable redaction (OBS-4).
-  - [ ] OpenTelemetry traces cover tokenize→schedule→backend pipeline (OBS-2).
+  - [x] PolicyStore hashes API keys on write/read (SEC-2) — SHA-256 hashing on write/read; `AddKeyHashed` for load-from-disk path; migration via CLI.
+  - [x] Audit logger defaults to prompt hashing + configurable redaction (OBS-4) — SHA-256 by default; `debug_mode=true`/`INFERFLUX_AUDIT_DEBUG` for raw logging.
+  - [x] OpenTelemetry traces cover tokenize→schedule→backend pipeline (OBS-2) — W3C traceparent propagation, `Span` RAII abstraction (`server/tracing/span.h`), prefill/decode duration histograms, 11 tracing unit tests.
   - [ ] Guardrail verdict latency profiled and <500 ms P95 (NFR / KPI table).
   - **Exit KPIs**: Policy replication lag <30 s, zero plaintext secrets on disk, tracing coverage ≥90% of request path.
 
@@ -49,11 +49,12 @@ Goal: close SEC/OBS debts required for enterprise pilots and comply with PRD sec
 Goal: ship the customer-facing differentiators promised in the PRD.
 
 - **DoD**
-  - [ ] Structured output / JSON mode via llama.cpp grammar sampling with schema contract tests (PRD §Functional, TechDebt §2.1). Includes HTTP parser updates for `response_format`, adapter interface + backend capability flags, InferenceRequest plumbing, backend grammar hooks, and contract/integration tests.
-  - [ ] Tool/function calling parity with OpenAI semantics (TechDebt §2.3).
+  - [x] Structured output / JSON mode via llama.cpp grammar sampling (§2.1) — `StructuredOutputAdapter`, schema→GBNF, `response_format` HTTP parsing, `InferenceRequest.response_constraint`, grammar hooks end-to-end.
+  - [x] Tool/function calling parity with OpenAI semantics (§2.3) — `tools[]`/`tool_choice` parsing, schema-as-preamble, streaming 4-chunk delta sequence, model-native chat templates, multi-format detection (InferFlux/generic/Hermes/Mistral).
   - [x] Multimodal (vision) ingestion path via `libmtmd` including preprocessing metrics (TechDebt §2.2) — `ImagePreprocessor` (base64/URL decode, SHA-256 image IDs, `<__media__>` marker injection), `LlamaCPUBackend::LoadMmproj()`/`GenerateWithImages()`, Prometheus counters, 11 unit tests. Full vision inference requires `-DENABLE_MTMD=ON` with a compatible mmproj GGUF.
   - [ ] Prefix cache APIs exposed to `inferctl` for agent workflows, plus CLI/docs showing cache warmers and status.
-  - [ ] `inferctl pull` + model registry CLI with progress reporting (TechDebt §2.8).
+- [x] `inferctl pull` + model registry CLI with progress reporting (§2.8) — `SelectBestGguf`, `DownloadToFile`, HuggingFace Hub, Q4_K_M preference, redirect following, `~/.cache/inferflux/models/`.
+- [x] CLI quickstart/serve workflow + embedded WebUI docs — `inferctl quickstart`, `inferctl serve`, `docs/Quickstart.md`, `/ui` litehtml shell.
   - [ ] Developer docs + examples updated for new params and guardrails.
   - **Exit KPIs**: 99.5% JSON schema conformance, multimodal preprocessing <80 ms/image on CUDA, CLI SUS ≥80.
 
@@ -70,9 +71,9 @@ Goal: unlock large-cluster deployments and SLO-aware scheduling.
     - [x] Publish Helm/docker overlays that scale pools independently; add CI smoke test.
     - [x] KV warm prefix store: `CopySequencePrefix`+`PrefillPartial` bypass re-evaluation of shared prompt prefixes; 4-slot LRU store with `weak_ptr` backends, BPE-correct position counts, KV eviction guard, expired-entry purge. (§2.5 Item 5)
   - [ ] Expert parallelism + tensor/pipeline parallel knobs exposed (TechDebt §2.6).
-  - [ ] Request priority/fairness scheduling with starvation prevention (TechDebt §2.9).
+  - [x] Request priority/fairness scheduling with starvation prevention (TechDebt §2.9) — `FairnessController` (timeslice, preemption, resume), per-priority metrics, `UpdateFairnessConfig()` live API, 3 `[fairness]` unit tests.
   - [ ] Model registry with signed manifests + attestation (Roadmap Q4).
-  - [ ] YAML parser replaced with supported config stack (DAT-2).
+  - [x] YAML parser replaced with supported config stack (DAT-2) — `server/main.cpp` rewritten with yaml-cpp; `INFERCTL_API_KEY`/`INFERFLUX_API_KEYS` env var registration.
   - [ ] Web admin console surfaces queue depth, guardrail decisions, and live traces.
   - **Exit KPIs**: Guardrail verdict latency <500 ms, policy replication consistency 99.95%, admin UX SUS ≥80.
 
