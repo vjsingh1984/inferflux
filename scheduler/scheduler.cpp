@@ -713,15 +713,19 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               kMinPrefixTokens &&
           pending->resolved_backend) {
         // Guard: if sliding-window KV eviction fired during decode, prompt
-        // positions in this slot are no longer at [0, n_prompt_tokens).
+        // positions in this slot are no longer at [0, n_prompt_bpe_tokens).
         // Reusing such a slot via CopySequencePrefix would restore wrong KV
-        // state for the next request.  Skip donation when the total token
-        // budget (prompt + completion) reached the context size.
+        // state for the next request.  Must reason in BPE positions throughout:
+        // prompt_bpe_tokens (from PrefillResult::n_past) and completion_tokens
+        // are both llama.cpp counts.  Do NOT use prompt_tokens.size() here —
+        // that is the SimpleTokenizer word count which can be fewer than the
+        // BPE count, causing the guard to wrongly conclude the slot is safe.
         int ctx_size = pending->resolved_backend->ContextSize();
-        int n_prompt = static_cast<int>(inference->prompt_tokens.size());
         bool eviction_safe =
-            ctx_size > 0 && (n_prompt + result.completion_tokens < ctx_size);
-        if (eviction_safe && inference->prompt_bpe_tokens > 0) {
+            ctx_size > 0 && inference->prompt_bpe_tokens > 0 &&
+            (inference->prompt_bpe_tokens + result.completion_tokens <
+             ctx_size);
+        if (eviction_safe) {
           // DonateKVPrefix owns any eviction: it calls FreeSequence on the
           // displaced entry's own backend so cross-model corruption is
           // impossible.  Pass prompt_bpe_tokens (llama.cpp BPE count from
