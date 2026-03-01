@@ -222,6 +222,20 @@ set_tests_properties(FlashAttnTests PROPERTIES LABELS flash_attn)
 add_test(NAME ShmTransportTests COMMAND inferflux_tests "[shm_transport]")
 set_tests_properties(ShmTransportTests PROPERTIES LABELS shm_transport)
 
+# ---------------------------------------------------------------------------
+# SBOM — generate CycloneDX / SPDX bill-of-materials after every build.
+#
+# The SBOM script (scripts/generate_sbom.py) walks the source tree for
+# vendored dependencies, reads their declared versions, and writes two
+# output files to ${CMAKE_BINARY_DIR}/sbom/:
+#   inferflux-sbom.cdx.json   — CycloneDX 1.5 JSON (for supply-chain tooling)
+#   inferflux-sbom.spdx        — SPDX 2.3 tag-value (for license compliance)
+#
+# The target is always defined but only runs when Python3 is available.
+# Run manually: cmake --build build --target sbom
+# ---------------------------------------------------------------------------
+option(ENABLE_SBOM "Generate SBOM after build" ON)
+
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
   # Stub-mode integration tests — run without a model; always enabled.
@@ -243,6 +257,22 @@ if(Python3_Interpreter_FOUND)
   else()
     message(STATUS "Skipping IntegrationSSE test (INFERFLUX_MODEL_PATH not set)")
   endif()
+
+  if(ENABLE_SBOM)
+    set(SBOM_OUT_DIR "${CMAKE_BINARY_DIR}/sbom")
+    add_custom_target(sbom
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${SBOM_OUT_DIR}
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_sbom.py
+              --source-dir  ${CMAKE_CURRENT_SOURCE_DIR}
+              --version     ${PROJECT_VERSION}
+              --out-dir     ${SBOM_OUT_DIR}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      COMMENT "Generating SBOM (CycloneDX + SPDX) → ${SBOM_OUT_DIR}"
+      VERBATIM
+    )
+    message(STATUS "SBOM target registered — run: cmake --build build --target sbom")
+  endif()
 else()
-  message(STATUS "Python3 interpreter not found; skipping integration tests")
+  message(STATUS "Python3 interpreter not found; skipping integration tests and SBOM")
 endif()

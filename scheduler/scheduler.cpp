@@ -91,6 +91,15 @@ void Scheduler::StopDecodeWorkers() {
 }
 
 void Scheduler::DecodeWorkerLoop() {
+  // Register as a live worker; deregister on any exit path (stop signal or
+  // uncaught exception), so HttpServer::LiveDecodeWorkers() accurately reflects
+  // pool health rather than the static startup flag.
+  live_decode_workers_.fetch_add(1, std::memory_order_relaxed);
+  struct LiveGuard {
+    std::atomic<int>& counter;
+    ~LiveGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+  } live_guard{live_decode_workers_};
+
   while (true) {
     std::vector<std::shared_ptr<PendingRequest>> batch;
     {

@@ -798,7 +798,10 @@ void HttpServer::HandleClient(ClientSession& session) {
       } else {
         model_loaded = model_ready_.load(std::memory_order_relaxed);
       }
-      bool pool_warm = decode_pool_ready_.load(std::memory_order_relaxed);
+      // Use the live worker count from Scheduler rather than the one-time
+      // startup flag (decode_pool_ready_), so that worker thread exits are
+      // reflected in readiness without a server restart.
+      bool pool_warm = scheduler_ && scheduler_->LiveDecodeWorkers() > 0;
       ready = model_loaded && pool_warm;
       if (!ready) reason = !model_loaded ? "no model backend loaded" : "decode pool not ready";
     } else {

@@ -729,9 +729,8 @@ int main(int argc, char** argv) {
     }
   }
   server.SetRole(server_role);
-  if (server_role == inferflux::HttpServer::PoolRole::kDecode) {
-    server.SetDecodePoolReady(disagg_config.decode_pool_size > 0);
-  }
+  // decode_pool_ready_ is no longer the primary gate; /readyz uses
+  // Scheduler::LiveDecodeWorkers() so worker thread exits are reflected live.
 
   if (!router->DefaultModelId().empty()) {
     server.SetModelReady(true);

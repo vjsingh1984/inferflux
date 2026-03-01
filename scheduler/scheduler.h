@@ -79,6 +79,14 @@ class Scheduler {
   // Expose the router for use by the HTTP admin endpoint (/v1/models).
   ModelRouter* Router() const { return router_.get(); }
 
+  // Number of DecodeWorkerLoop threads currently running.  Zero means either
+  // decode_pool_size=0 or all workers have exited (degraded/stopped state).
+  // HttpServer uses this for the decode-role /readyz gate so that readiness
+  // reflects live thread health rather than a static startup flag.
+  int LiveDecodeWorkers() const {
+    return live_decode_workers_.load(std::memory_order_relaxed);
+  }
+
  private:
   struct BatchSelection {
     RequestBatch batch;
@@ -125,6 +133,7 @@ class Scheduler {
   FairnessConfig fairness_config_;
   DisaggregatedConfig disagg_config_;
   std::vector<bool> seq_slots_free_;  // size = kMaxSequenceSlots; true = available
+  std::atomic<int> live_decode_workers_{0};  // live thread count; 0 = no pool or all exited
 };
 
 }  // namespace inferflux
