@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly Monday 02:00 UTC — catches upstream dependency drift
+    - cron: '0 2 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Primary build + test job
+  # Builds a CPU-only release binary, runs the full unit + stub-integration
+  # suite, generates SBOM, and uploads it as a workflow artifact.
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: Build & Test (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # ------------------------------------------------------------------
+      # System dependencies
+      # ------------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            libssl-dev \
+            libyaml-cpp-dev \
+            python3 \
+            ccache
+
+      # ------------------------------------------------------------------
+      # ccache — reuse object files across runs; keyed on CMake + llama.cpp
+      # ------------------------------------------------------------------
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-ubuntu-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'external/llama.cpp/CMakeLists.txt') }}
+          restore-keys: |
+            ccache-ubuntu-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=500M
+          ccache --zero-stats
+
+      # ------------------------------------------------------------------
+      # CMake configure — CPU-only, no CUDA/ROCm/MPS/MTMD
+      # ------------------------------------------------------------------
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DENABLE_CUDA=OFF \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_MTMD=OFF \
+            -DENABLE_SBOM=ON
+
+      # ------------------------------------------------------------------
+      # Build all targets (inferflux_core, inferfluxd, inferctl, tests)
+      # ------------------------------------------------------------------
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: ccache stats
+        run: ccache --show-stats
+
+      # ------------------------------------------------------------------
+      # Unit + stub-integration tests
+      # IntegrationSSE is gated by INFERFLUX_MODEL_PATH — since that env var
+      # is not set here, CMake never registers that ctest entry, so a plain
+      # "ctest --test-dir build" skips it automatically.
+      # ------------------------------------------------------------------
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure --timeout 90
+
+      # ------------------------------------------------------------------
+      # SBOM — CycloneDX 1.5 JSON + SPDX 2.3 tag-value
+      # ------------------------------------------------------------------
+      - name: Generate SBOM
+        run: cmake --build build --target sbom
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: build/sbom/
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # clang-format style gate
+  # Reports violations as annotations but does not block merge by default.
+  # Change `continue-on-error: true` → `false` to enforce formatting in CI.
+  # ---------------------------------------------------------------------------
+  clang-format:
+    name: clang-format check
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-format
+
+      - name: Check formatting
+        run: |
+          find server runtime scheduler model cli net io policy \
+            \( -name '*.cpp' -o -name '*.h' \) \
+            ! -path '*/external/*' \
+            | sort \
+            | xargs clang-format --dry-run --Werror
