@@ -48,8 +48,10 @@ layer above it.
 
 ### Strategic Modules In Flight
 - **Constrained Decoder**: Grammar/JSON-aware decoding path inserted between scheduler and runtime to deliver the 99.5% schema KPI.
-- **Prefix Cache**: Radix-tree cache of validated KV prefixes feeding both single-tenant (agent) and multi-tenant workloads.
 - **Multimodal Adapter**: Image/audio preprocessing pipeline leveraging llama.cpp `libmtmd` so chat completions accept base64/URL media blobs.
+
+### Completed Strategic Modules
+- **Prefix Cache** (§2.4): `RadixPrefixCache` — compressed trie over token ID sequences. Exact-match completions skip generation; partial-match depth is tracked via Prometheus counters (`prefix_matched_tokens_total`, `prefix_partial_hits_total`) to quantify future KV page reuse opportunity once llama.cpp multi-sequence support lands.
 
 ## Unique Selling Propositions
 1. **Integrated Policy Engine**: Built-in OIDC/API-key auth, per-tenant rate limiting, RBAC scopes, audit logging, encrypted policy store (AES-GCM), and pluggable guardrails. No competitor has this built-in.
@@ -78,6 +80,15 @@ layer above it.
 10. Support per-request priority hints so fairness scheduling can honor latency SLOs.
 11. Support CUDA/FlashAttention execution path with disaggregated prefill/decode to hit GPU throughput targets.
 12. Support model pull from HuggingFace Hub (`inferctl pull`).
+
+### Disaggregated Prefill/Decode Deliverables (Q4 Enterprise Scope)
+To satisfy Requirement #11 and raise the distributed-runtime grade, the following sub-items must be delivered:
+1. **Scheduler split & config:** `scheduler.prefill_pool_size`/`scheduler.decode_pool_size` knobs, per-phase queue metrics, and CI coverage for phase-aware fairness decisions.
+2. **KV transfer channel:** `runtime/disaggregated/kv_channel` abstraction with SHM transport (RDMA follow-up), <5 ms P95 transfer latency, and trace spans covering enqueue→hydrate.
+3. **Prefill worker service:** Dedicated worker threads (and Kubernetes Deployment) that execute prompt ingestion, write KV payloads, and expose `/metrics` for saturation/backpressure.
+4. **Decode worker service:** Extended BatchExecutor that consumes KV tickets, streams tokens, and is resilient to cancellation + fairness requeues while running independently of prefill.
+5. **Health + deployment:** `/readyz` reflects both pools, Helm/Docker artifacts support independent scaling, and chaos/integration tests prove that restarts in either tier do not drop tickets.
+6. **Acceptance tests:** Integration tests simulate load with separate pools, ensuring throughput scaling >1.7× on two decode replicas, transfer histograms stay under the SLA, and admin CLI reports pool health.
 
 ## Security Caveats & Dependencies
 - Built-in TLS termination can be enabled via `server.tls.*` (or `INFERFLUX_TLS_ENABLED` + cert/key env vars); clusters that terminate at an external ingress can keep it disabled.

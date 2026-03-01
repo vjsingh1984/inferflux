@@ -119,6 +119,31 @@ InferFlux now implements the PRD §Functional #8 requirements end-to-end:
 
 Contract tests (`tests/unit/test_structured_output.cpp`) cover schema validation/grammar emission, and the existing SSE/tooling tests ensure the HTTP surface emits structured responses. Future backends (CUDA/MPS) and CLI docs reuse the same adapter interface, so extending structured output beyond CPU is now an incremental task instead of a rewrite.
 
+## Disaggregated Prefill/Decode Blueprint (TechDebt §2.5)
+To graduate from single-node batching to best-in-class distributed throughput, InferFlux will implement a disaggregated runtime in six incremental slices. Each slice is independently testable so we can track progress across sessions:
+
+1. **Scheduler Partitioning**
+   - Introduce `PrefillTicket` and `DecodeTicket` structures in `scheduler/request_batch.h`.
+   - Add config knobs (`scheduler.prefill_pool_size`, `scheduler.decode_pool_size`) plus metrics for per-phase queue depth and wait time.
+   - Update fairness controller to age tickets within their phase and emit distinct Prometheus counters.
+2. **KV Transfer Plane**
+   - New `runtime/disaggregated/kv_channel.{h,cpp}` with a pluggable transport interface (shared memory ring buffer first, RDMA later).
+   - Serialize KV pages, tokenizer state, and guardrail verdict metadata; enforce <5 ms copy using trace spans and Prometheus histograms.
+3. **Prefill Workers**
+   - A dedicated worker thread group that only runs prompt tokenization/prefill, writes KV payloads into the channel, and emits `DecodeTicket`s.
+   - Integrate guardrail checks, cancellation flags, and backpressure handling when decode is saturated.
+4. **Decode Workers**
+   - Extend `BatchExecutor` to hydrate KV blobs into the KV cache, resume decoding, and continue streaming tokens (still honoring fairness + speculative paths).
+   - Ensure decode-only workers can requeue tickets if a backend stalls or cancellation fires mid-stream.
+5. **Control Plane & Health**
+   - `/readyz` reflects both pools with granular failure reasons, `/metrics` exposes transfer latency histograms and blocked ticket gauges, and chaos tests restart either plane while ensuring in-flight tickets survive.
+   - Config schema + docs cover new knobs; CLI/admin commands surface pool health.
+6. **Deployment Assets**
+   - Add Helm/Docker Compose overlays that run prefill/decode pools as separate deployments with horizontal autoscaling hints.
+   - Provide a CI smoke test (stub mode) that exercises shared-memory transfer end-to-end.
+
+Each slice should land with design docs + tests (unit and integration) so that progress is auditable even before GPUs arrive.
+
 ### Adapter Pattern & Backend Capabilities
 - **StructuredOutputAdapter** — Maintain OpenAI’s `response_format` as the public contract but introduce an internal adapter interface that validates payloads, enforces size limits, and emits backend-native constraints (e.g., llama.cpp GBNF via `json_schema_to_grammar`, regex/DSL for future engines).
 - **Backend capability flags** — Extend `ModelRouter`/`BackendManager` to advertise whether a backend supports structured output and which adapter type it requires. Scheduler consults these flags so unsupported combinations fail fast.
@@ -126,9 +151,8 @@ Contract tests (`tests/unit/test_structured_output.cpp`) cover schema validation
 
 ## Modules
 - **Runtime** (`runtime/`): `DeviceContext` abstraction, `CPUDeviceContext` implementation, `CudaDeviceContext` placeholder (FlashAttention-ready), Metal/MPS + BLAS autodetection (via `LLAMA_METAL`/`LLAMA_BLAS`) so hardware accelerators are toggled automatically, `PagedKVCache` with LRU/Clock eviction and async NVMe offload, speculative decoding (draft + validator), `BackendManager` for named model loading.
-- **Prefix Cache** (`runtime/prefix_cache/`): LRU cache of prompt token prefixes so repeated prompts can skip generation; metrics track hit/miss rates to feed fairness work.
+- **Prefix Cache** (`runtime/prefix_cache/`): `RadixPrefixCache` — a compressed trie (radix tree) over token ID sequences. `Lookup` returns the longest matching prefix plus a `matched_tokens` out-parameter for partial-hit metrics; `Insert` splits trie edges on mismatch. LRU eviction prunes the least-recently-used completion leaf when the tree exceeds capacity. Exact-match completions skip generation entirely; partial matches are tracked via `inferflux_prefix_matched_tokens_total` and `inferflux_prefix_partial_hits_total` Prometheus counters for future KV page reuse analysis. The original `PrefixCache` (flat hash-map) is retained for reference but is no longer used at runtime.
 - **Constrained Decoder** (`scheduler/constrained_decoder.*`, planned): Grammar/JSON aware decoding path that consumes scheduler outputs before runtime execution to ensure schema compliance.
-- **Prefix Cache** (`runtime/prefix_cache.*`, planned): Radix-tree cache of validated KV prefixes shared across tenants for agent workflows and speculative reuse.
 - **Multimodal Adapter** (`runtime/multimodal/` planned): Pre/post-processing stage that converts base64 or URL-sourced images/audio into llama.cpp `libmtmd` tensors before scheduling.
 - **Model** (`model/`): `SimpleTokenizer` (whitespace/punctuation splitter — stub for real tokenizer), GGUF loader (delegates to llama.cpp submodule).
 - **Scheduler** (`scheduler/`): `Scheduler` with global mutex (continuous batching rewrite in progress via `RequestBatch`). `ModelRouter` interface for multi-model routing. Requests flow through `InferenceRequest`/`RequestBatch`, and results are returned as `InferenceResult` for HTTP compatibility.
@@ -152,7 +176,7 @@ Contract tests (`tests/unit/test_structured_output.cpp`) cover schema validation
 4. Auth middleware validates API key (SHA-256 hash match) or OIDC JWT (RS256 signature + exp/nbf/iss/aud).
 5. Rate limiter checks per-key token budget. Guardrail checks blocklist + optional OPA endpoint.
 6. Multimodal Adapter (planned) resolves media payloads to tensors; Scheduler tokenizes text components.
-7. Prefix Cache (planned) checks for matching KV prefixes; hits skip prefill and emit cache handles to runtime.
+7. `RadixPrefixCache` checks for exact-match completions (skip generation) and records partial prefix depth for future KV reuse metrics.
 8. Constrained Decoder enforces grammar/JSON schemas before tokens are committed to the runtime backend.
 9. Response sent as JSON (non-streaming) or SSE chunks (streaming).
 10. Metrics counters updated. Audit logger writes JSON line if enabled.

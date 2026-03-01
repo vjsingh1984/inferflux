@@ -22,7 +22,7 @@ Goal: reach competitive continuous batching throughput on CPU/MPS today while pa
 
 - **DoD**
   - [x] Continuous batching replaces global mutex; `RequestBatch` wired end-to-end (INF-2).
-  - [x] Prefix cache online with metrics + eviction policies (INF-6/§2.4).
+  - [x] Prefix cache online with metrics + eviction policies (INF-6/§2.4) — `RadixPrefixCache` (compressed trie, partial-match tracking, LRU eviction, 12 unit tests).
   - [ ] CUDA backend with FlashAttention-3 kernels validated on L40S (INF-2, §2.7 KPIs). Subtasks: enable llama.cpp CUDA build, add FlashAttention config knobs, implement BatchExecutor with prefill/decode overlap, wire GPU KV cache. **Hardware constraint:** hold execution until compatible CUDA hardware is available; keep design work ready.
 - [ ] Priority-aware fairness scheduler on CPU/MPS (preemption + cancellation) so agents get SLO-backed latency even without CUDA. Leverages `RequestBatch` plan §7.2.
   - [ ] ModelRouter routes multi-model requests with hot load/unload (ARCH-4/5/6, see Architecture “ModelRouter Activation Plan”).
@@ -61,7 +61,13 @@ Goal: ship the customer-facing differentiators promised in the PRD.
 Goal: unlock large-cluster deployments and SLO-aware scheduling.
 
 - **DoD**
-  - [ ] Disaggregated prefill/decode path with KV transfer latency <5 ms (TechDebt §2.5).
+  - [ ] Disaggregated prefill/decode path with KV transfer latency <5 ms (TechDebt §2.5):
+    - [ ] Split scheduler queues + metrics for prefill vs decode.
+    - [ ] Implement `runtime/disaggregated/kv_channel` (SHM + RDMA adapters) with trace hooks.
+    - [ ] Stand up dedicated prefill workers that emit KV tickets into the decode queue.
+    - [ ] Extend decode workers/BatchExecutor to hydrate KV from the channel and stream tokens.
+    - [ ] Wire `/readyz`, Prometheus gauges, and chaos tests for independent pool failures.
+    - [ ] Publish Helm/docker overlays that scale pools independently; add CI smoke test.
   - [ ] Expert parallelism + tensor/pipeline parallel knobs exposed (TechDebt §2.6).
   - [ ] Request priority/fairness scheduling with starvation prevention (TechDebt §2.9).
   - [ ] Model registry with signed manifests + attestation (Roadmap Q4).

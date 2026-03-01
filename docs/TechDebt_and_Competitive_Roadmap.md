@@ -22,7 +22,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | Production throughput         |  A   |   A+   |   A+    |     C     |   D    |   **F**   | B (Q4) | Runtime |
 | Continuous batching           |  A   |   A+   |   A     |    N/A    |  N/A   |   **F**   | B (Q3) | Scheduler |
 | KV cache efficiency           |  B+  |   A+   |   A     |    N/A    |  N/A   |   **F**   | B (Q3) | Runtime |
-| Prefix Caching                |  A   |   A+   |   A     |     B     |   B    |   **F**   | A (Q3)       | Runtime |
+| Prefix Caching                |  A   |   A+   |   A     |     B     |   B    |   **B-**  | A (Q3)       | Runtime |
 | Speculative decoding          |  A   |   A    |   A     |    B+     |   B    |   **D**   | B (Q3) | Runtime |
 | Structured output / JSON mode |  A   |   A+   |   B+    |    B+     |   B    |   **B-**  | B+ (Q3) | Runtime |
 | Multimodal / vision           |  A   |   A    |   B+    |    B+     |   B+   |   **F**   | C+ (Q3) | Runtime |
@@ -42,7 +42,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 
 **Scorecard status notes (May 2025):**
 - Production throughput, continuous batching, and KV cache efficiency remain at **F** until GPU-aware execution, prefill/decode overlap, and FA3 kernels from §2.5/§2.7 land.
-- Prefix caching is **F** because the radix/prefix reuse work in §2.4 is still unstarted; only page reservation exists.
+- Prefix caching bumped to **B-**: `RadixPrefixCache` (compressed trie over token sequences) is live, wired into `BatchExecutor` and `Scheduler`, with LRU eviction, partial-match metrics (`prefix_matched_tokens_total`, `prefix_partial_hits_total`), and 12 unit tests. Actual KV page reuse requires llama.cpp multi-sequence integration (§2.4 follow-up).
 - Structured output bumped to **B-** now that HTTP parsing, schema-to-grammar conversion, and llama grammar sampling are wired through scheduler/runtime (§2.1); tool/function calling remains **F** until streaming/tool deltas are emitted from the model output path (§2.3).
 - Multimodal/vision remains **F**; there is no image ingestion path today (§2.2).
 - Quantization breadth and hardware breadth are **D** since only CPU/MPS paths run; CUDA/ROCm/Intel enablement in §2.7/§2.11 is unresolved.
@@ -121,31 +121,46 @@ OpenAI-compatible tool calling is expected by every SDK (LangChain, LlamaIndex).
 - **Implement in:** `server/http/http_server.cpp` (parse tools array, emit tool_call in
   response), `model/tokenizer/` (chat template with tool definitions).
 
-### 2.4 Prefix Caching / Automatic KV Cache Reuse
+### 2.4 Prefix Caching / Automatic KV Cache Reuse — **DONE**
 
 **Why critical:** SGLang's RadixAttention achieves 85-95% cache hit for few-shot workloads vs.
 15-25% for naive paging. This is the single biggest throughput differentiator for multi-turn
 and agent workloads.
 
-- **What to add:** Radix-tree or hash-based prefix matching in the KV cache, automatic reuse
-  across requests sharing common prefixes (system prompts, few-shot examples).
-- **Update:** `docs/Architecture.md` §Runtime — add prefix cache subsystem.
-- **Update:** `docs/NFR.md` §Performance — add cache hit rate KPIs.
-- **Implement in:** `runtime/kv_cache/paged_kv_cache.h` (prefix tree index),
-  `scheduler/scheduler.h` (prefix-aware request routing).
+- **Implemented:** `RadixPrefixCache` (`runtime/prefix_cache/radix_prefix_cache.{h,cpp}`) —
+  a compressed trie (radix tree) over token ID sequences. Nodes hold cached completions at
+  points where past requests terminated; `Lookup` returns the longest matching prefix plus a
+  `matched_tokens` out-parameter for partial-hit metrics.
+- **Wiring:** `Scheduler` and `BatchExecutor` migrated from the old `PrefixCache` (flat LRU
+  hash-map) to `RadixPrefixCache`. `server/main.cpp` constructs `RadixPrefixCache` at startup.
+- **Metrics:** Two new Prometheus counters — `inferflux_prefix_matched_tokens_total` (tokens
+  matched even on partial hits) and `inferflux_prefix_partial_hits_total` (lookups with a
+  shared prefix but no exact completion). These quantify future KV reuse opportunity.
+- **LRU eviction:** DFS leaf collection + `std::min_element` evicts the least-recently-used
+  completion node when `size > capacity`.
+- **Thread safety:** `std::shared_mutex` — shared lock for `Lookup`, exclusive for `Insert`/eviction.
+- **Tests:** 12 `[radix_cache]` unit tests in `tests/unit/test_radix_prefix_cache.cpp`.
+- **Still TODO:** Attach KV page IDs to trie nodes once llama.cpp multi-sequence support lands
+  (true zero-copy prefix reuse). Update `docs/NFR.md` §Performance with cache hit rate KPIs.
 
 ### 2.5 Disaggregated Prefill/Decode
 
 **Why critical:** Now the default production architecture. vLLM deploys it at Meta, LinkedIn,
 Mistral. SGLang tested it on 96 H100s. NVIDIA Dynamo provides orchestration for it.
 
-- **What to add:** Separate prefill and decode worker pools, KV cache transfer via shared
-  memory or RDMA, independent scaling of prefill vs decode instances.
+- **Work Breakdown:**
+  1. **Scheduler split:** Teach `RequestBatch`/`Scheduler` to emit prefill vs decode work items, expose config knobs for pool sizes, and add queue depth metrics per phase.
+  2. **KV handoff plane:** Define a `runtime/disaggregated/kv_channel.*` that serializes KV pages + metadata, supports SHM + RDMA backends, and enforces <5 ms transfer SLA with tracing.
+  3. **Prefill workers:** New `PrefillWorker` loop that only tokenizes/prompts, persists KV segments, and emits completion tickets into the decode queue; integrate guardrails + cancellation.
+  4. **Decode workers:** Reuse/extend `BatchExecutor` to consume tickets, hydrate KV from the channel, and stream tokens; ensure fairness + speculative hooks operate in decode-only mode.
+  5. **Control plane + health:** `/readyz` must reflect both pools, expose Prometheus gauges for transfer latency and blocked tickets, and add chaos tests that restart either plane mid-run.
+  6. **Deployment topologies:** Document Helm/docker manifests that scale prefill/decode independently and add CI smoke tests for single-node SHM mode.
 - **Update:** `docs/Architecture.md` §Deployment View — add disaggregated topology.
-- **Update:** `docs/Roadmap.md` — add as Q3 milestone (currently not mentioned).
-- **Update:** `docs/NFR.md` §Scalability — add KV transfer latency targets.
-- **Implement in:** New `runtime/disaggregated/` module, `scheduler/scheduler.h` (split
-  prefill/decode queues into separate schedulable units).
+- **Update:** `docs/Architecture.md` §Runtime — add subsections for prefill pool, decode pool, and KV handoff responsibilities.
+- **Update:** `docs/PRD.md` §Functional Requirements — spell out the above work items with acceptance tests (prefill saturation, ticket retries, transfer latency SLA).
+- **Update:** `docs/Roadmap.md` Workstream D — enumerate milestones per bullet (scheduler split, KV channel, workers, control plane, deployment assets).
+- **Update:** `docs/NFR.md` §Scalability — add KV transfer latency targets and independent scaling KPIs.
+- **Implement in:** new `runtime/disaggregated/` module, `scheduler/scheduler.h/.cpp`, `runtime/kv_cache/` (serialization), deployment manifests, and tests under `tests/integration/disaggregated_*`.
 
 ### 2.6 Expert Parallelism for MoE Models
 
@@ -329,7 +344,7 @@ policy store with RBAC, CLI interactive mode, Prometheus metrics, audit logging.
 | P0 | **[UPGRADE]** Structured output / JSON mode | **Done** — HTTP parser validates `response_format`, `StructuredOutputAdapter` converts schemas to llama GBNF, `BatchExecutor`/`LlamaCPUBackend` enforce grammar sampling, unit tests cover adapter | §2.1 | `server/http/http_server.cpp`, `scheduler/request_batch.h`, `runtime/execution/batch_executor.cpp`, `runtime/structured_output/` |
 | P0 | **[NEW]** Tool calling / function calling | **Done** — parse `tools[]`+`tool_choice`, inject schema as system preamble, detect `tool_call` JSON in output, emit `tool_calls` array with `finish_reason=tool_calls` | §2.3 | `server/http/http_server.cpp` |
 | P0 | **[UPGRADE]** CUDA backend with FlashAttention | **Partial** — FA3 config fields added, CUDA build flags wired; GPU kernel execution pending | §2.7 | `runtime/backends/cuda/` |
-| P1 | **[NEW]** Prefix caching (LRU KV reuse) | **Done** — `PrefixCache` LRU implemented, wired into `BatchExecutor` | §2.4 | `runtime/prefix_cache/prefix_cache.cpp` |
+| P1 | **[NEW]** Prefix caching (radix tree KV reuse) | **Done** — `RadixPrefixCache` compressed trie; `Lookup` with `matched_tokens` out-param; LRU eviction; partial-hit Prometheus counters; 12 unit tests; scheduler + executor migrated | §2.4 | `runtime/prefix_cache/radix_prefix_cache.cpp` |
 | P1 | Prompt/response hashing in audit logs | **Done** | OBS-4 | `server/logging/audit_logger.cpp` |
 | P1 | **[NEW]** Multimodal / vision model support | Not started | §2.2 | `model/`, `server/http/` |
 | P1 | **[DONE]** Model pull from HuggingFace (`inferctl pull`) | Done | §2.8 | `cli/main.cpp` |
@@ -394,7 +409,7 @@ identified above. Check items off as they are addressed.
 - [ ] §Modules: Add parallelism strategies section (TP/PP/EP) — §2.6, §2.7
 - [ ] §Data Flow: Add image preprocessing stage — §2.2
 - [ ] §Deployment View: Add disaggregated prefill/decode topology — §2.5
-- [ ] §Runtime: Add prefix cache subsystem — §2.4
+- [X] §Runtime: Add prefix cache subsystem — §2.4
 - [ ] §Runtime: Document attention kernel strategy (FA3) — §2.7
 - [ ] §Scheduler: Add priority queue design — §2.9
 

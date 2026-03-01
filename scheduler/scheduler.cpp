@@ -45,6 +45,10 @@ Scheduler::Scheduler(SimpleTokenizer tokenizer,
       disagg_config_(disagg_config) {
   executor_ = std::make_unique<BatchExecutor>(&tokenizer_, device_, cache_, router_, speculative_decoder_, prefix_cache_);
   worker_ = std::thread(&Scheduler::WorkerLoop, this);
+  use_decode_workers_ = false;
+  if (use_decode_workers_) {
+    StartDecodeWorkers();
+  }
 }
 
 Scheduler::~Scheduler() {
@@ -56,6 +60,28 @@ Scheduler::~Scheduler() {
   if (worker_.joinable()) {
     worker_.join();
   }
+  if (use_decode_workers_) {
+    StopDecodeWorkers();
+  }
+}
+
+void Scheduler::StartDecodeWorkers() {
+  // Decode worker pool is a forward-looking hook for disaggregated prefill/decode (§2.5).
+  // Currently a no-op; decode happens on the single WorkerLoop thread.
+  (void)disagg_config_.decode_pool_size;
+}
+
+void Scheduler::StopDecodeWorkers() {
+  for (auto& t : decode_workers_) {
+    if (t.joinable()) {
+      t.join();
+    }
+  }
+  decode_workers_.clear();
+}
+
+void Scheduler::DecodeWorkerLoop() {
+  // Placeholder for future disaggregated decode worker (§2.5).
 }
 
 InferenceResult Scheduler::Generate(InferenceRequest request) {
@@ -224,13 +250,25 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   }
 
   if (!staged_decode.empty()) {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    for (auto& pending : staged_decode) {
-      pending->inference.phase = RequestPhase::kDecode;
-      pending_decode_.push_back(pending);
+    if (use_decode_workers_) {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      for (auto& pending : staged_decode) {
+        pending->inference.phase = RequestPhase::kDecode;
+        pending_decode_.push_back(pending);
+      }
+      UpdateQueueDepthLocked();
+      queue_cv_.notify_all();
+    } else {
+      for (auto& pending : staged_decode) {
+        pending->inference.phase = RequestPhase::kDecode;
+        decode_ready.push_back(pending);
+      }
     }
-    UpdateQueueDepthLocked();
-    queue_cv_.notify_all();
+  }
+
+  if (use_decode_workers_) {
+    GlobalMetrics().SetDecodeQueueDepth(static_cast<int>(pending_decode_.size()));
+    return;
   }
 
   if (decode_ready.empty()) {
@@ -359,6 +397,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     inference->phase = RequestPhase::kFinished;
     pending->promise.set_value(std::move(result));
   }
+
   if (!requeue.empty()) {
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
