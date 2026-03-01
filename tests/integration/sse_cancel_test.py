@@ -15,7 +15,7 @@ import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-BINARY = ROOT / "build" / "inferfluxd"
+BINARY = pathlib.Path(os.environ.get("INFERFLUX_SERVER_BIN", str(ROOT / "build" / "inferfluxd")))
 CONFIG = ROOT / "config" / "server.yaml"
 HOST = "127.0.0.1"
 PORT = 18100

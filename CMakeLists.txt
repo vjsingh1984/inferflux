@@ -311,22 +311,32 @@ option(ENABLE_SBOM "Generate SBOM after build" ON)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+  # INFERFLUX_SERVER_BIN tells integration tests which binary to launch.
+  # CMake always knows the correct path (CMAKE_BINARY_DIR/inferfluxd), so we
+  # inject it as a ctest environment variable — this makes the tests work
+  # regardless of whether the build directory is "build", "build-cov", etc.
+  set(_INFERFLUX_SERVER_BIN "${CMAKE_BINARY_DIR}/inferfluxd")
+
   # Stub-mode integration tests — run without a model; always enabled.
   add_test(NAME StubIntegration
            COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py)
   set_tests_properties(StubIntegration PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    TIMEOUT 60)
+    TIMEOUT 60
+    ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
 
   add_test(NAME SSECancel
            COMMAND ${Python3_EXECUTABLE} tests/integration/sse_cancel_test.py)
   set_tests_properties(SSECancel PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    TIMEOUT 60)
+    TIMEOUT 60
+    ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
 
   if(NOT "$ENV{INFERFLUX_MODEL_PATH}" STREQUAL "")
     add_test(NAME IntegrationSSE COMMAND ${Python3_EXECUTABLE} tests/integration/sse_metrics_test.py)
-    set_tests_properties(IntegrationSSE PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(IntegrationSSE PROPERTIES
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
   else()
     message(STATUS "Skipping IntegrationSSE test (INFERFLUX_MODEL_PATH not set)")
   endif()

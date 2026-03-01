@@ -14,14 +14,18 @@ SERVER_PORT = 18080
 BASE_URL = f"127.0.0.1:{SERVER_PORT}"
 
 
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
+_SERVER_BIN = os.environ.get("INFERFLUX_SERVER_BIN", os.path.join(_ROOT, "build", "inferfluxd"))
+
+
 def start_server(env):
     proc = subprocess.Popen(
         [
-            "./build/inferfluxd",
+            _SERVER_BIN,
             "--config",
             "config/server.yaml",
         ],
-        cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")),
+        cwd=_ROOT,
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

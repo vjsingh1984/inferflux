@@ -22,10 +22,14 @@ API_KEY = "stub-test-key-456"
 RATE_LIMIT_KEY = "rate-limit-exhaustion-key-789"
 
 
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
+_SERVER_BIN = os.environ.get("INFERFLUX_SERVER_BIN", os.path.join(_ROOT, "build", "inferfluxd"))
+
+
 def start_server(env):
     proc = subprocess.Popen(
-        ["./build/inferfluxd", "--config", "config/server.yaml"],
-        cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")),
+        [_SERVER_BIN, "--config", "config/server.yaml"],
+        cwd=_ROOT,
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
