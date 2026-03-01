@@ -13,6 +13,7 @@ option(ENABLE_ROCM "Enable ROCm runtime" ON)
 option(ENABLE_MPS "Enable Metal/MPS runtime" ON)
 option(ENABLE_BLAS "Enable BLAS acceleration" ON)
 option(ENABLE_CPU "Enable CPU runtime" ON)
+option(ENABLE_MTMD "Enable multimodal (vision) support via libmtmd" OFF)
 
 add_library(inferflux_core
   runtime/device_context.h
@@ -70,6 +71,8 @@ add_library(inferflux_core
   runtime/structured_output/json_schema_shim.cpp
   runtime/disaggregated/kv_channel.cpp
   runtime/disaggregated/kv_channel.h
+  runtime/multimodal/image_preprocessor.cpp
+  runtime/multimodal/image_preprocessor.h
   external/llama.cpp/common/json-schema-to-grammar.cpp
   io/async_file_writer.cpp
   io/async_file_writer.h
@@ -133,6 +136,46 @@ target_include_directories(inferflux_core PUBLIC
 )
 target_link_libraries(inferflux_core PUBLIC OpenSSL::Crypto OpenSSL::SSL yaml-cpp)
 
+# §2.2 Multimodal support via libmtmd (ENABLE_MTMD=OFF by default)
+if(ENABLE_MTMD)
+  set(MTMD_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/tools/mtmd)
+  target_sources(inferflux_core PRIVATE
+    ${MTMD_SRC_DIR}/mtmd.cpp
+    ${MTMD_SRC_DIR}/mtmd-audio.cpp
+    ${MTMD_SRC_DIR}/mtmd-helper.cpp
+    ${MTMD_SRC_DIR}/clip.cpp
+    ${MTMD_SRC_DIR}/models/cogvlm.cpp
+    ${MTMD_SRC_DIR}/models/conformer.cpp
+    ${MTMD_SRC_DIR}/models/glm4v.cpp
+    ${MTMD_SRC_DIR}/models/internvl.cpp
+    ${MTMD_SRC_DIR}/models/kimivl.cpp
+    ${MTMD_SRC_DIR}/models/kimik25.cpp
+    ${MTMD_SRC_DIR}/models/nemotron-v2-vl.cpp
+    ${MTMD_SRC_DIR}/models/llama4.cpp
+    ${MTMD_SRC_DIR}/models/llava.cpp
+    ${MTMD_SRC_DIR}/models/minicpmv.cpp
+    ${MTMD_SRC_DIR}/models/paddleocr.cpp
+    ${MTMD_SRC_DIR}/models/pixtral.cpp
+    ${MTMD_SRC_DIR}/models/qwen2vl.cpp
+    ${MTMD_SRC_DIR}/models/qwen3vl.cpp
+    ${MTMD_SRC_DIR}/models/siglip.cpp
+    ${MTMD_SRC_DIR}/models/whisper-enc.cpp
+    ${MTMD_SRC_DIR}/models/mobilenetv5.cpp
+    ${MTMD_SRC_DIR}/models/youtuvl.cpp
+  )
+  target_include_directories(inferflux_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/tools/mtmd
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/tools
+  )
+  target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_MTMD=1)
+  if(NOT MSVC)
+    target_compile_options(inferflux_core PRIVATE -Wno-cast-qual)
+  endif()
+  message(STATUS "ENABLE_MTMD=ON — libmtmd vision support enabled")
+else()
+  message(STATUS "ENABLE_MTMD=OFF — multimodal support disabled (pass -DENABLE_MTMD=ON to enable)")
+endif()
+
 add_executable(inferfluxd server/main.cpp)
 target_link_libraries(inferfluxd PRIVATE inferflux_core)
 
@@ -154,6 +197,7 @@ add_executable(inferflux_tests
   tests/unit/test_radix_prefix_cache.cpp
   tests/unit/test_span.cpp
   tests/unit/test_kv_channel.cpp
+  tests/unit/test_multimodal.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)

@@ -50,6 +50,12 @@ void LlamaBackendRelease() {
 LlamaCPUBackend::LlamaCPUBackend() { LlamaBackendAcquire(); }
 
 LlamaCPUBackend::~LlamaCPUBackend() {
+#ifdef INFERFLUX_HAS_MTMD
+  if (mtmd_ctx_) {
+    mtmd_free(mtmd_ctx_);
+    mtmd_ctx_ = nullptr;
+  }
+#endif
   if (context_ != nullptr) {
     llama_free(context_);
     context_ = nullptr;
@@ -221,6 +227,141 @@ std::string LlamaCPUBackend::Generate(const std::string& prompt,
     llama_sampler_reset(grammar_sampler_);
   }
   return output;
+}
+
+bool LlamaCPUBackend::LoadMmproj(const std::filesystem::path& mmproj_path) {
+#ifdef INFERFLUX_HAS_MTMD
+  if (!model_) {
+    std::cerr << "[LlamaCPUBackend] LoadMmproj: text model must be loaded first\n";
+    return false;
+  }
+  if (mtmd_ctx_) {
+    mtmd_free(mtmd_ctx_);
+    mtmd_ctx_ = nullptr;
+    vision_ready_ = false;
+  }
+  auto params = mtmd_context_params_default();
+  params.use_gpu = (config_.gpu_layers > 0);
+  params.n_threads = 4;
+  params.print_timings = false;
+  params.warmup = false;
+  mtmd_ctx_ = mtmd_init_from_file(mmproj_path.string().c_str(), model_, params);
+  if (!mtmd_ctx_) {
+    std::cerr << "[LlamaCPUBackend] failed to load mmproj from " << mmproj_path << "\n";
+    return false;
+  }
+  vision_ready_ = mtmd_support_vision(mtmd_ctx_);
+  std::cout << "[LlamaCPUBackend] mmproj loaded from " << mmproj_path
+            << " (vision=" << vision_ready_ << ")\n";
+  return vision_ready_;
+#else
+  (void)mmproj_path;
+  std::cerr << "[LlamaCPUBackend] ENABLE_MTMD=OFF; vision support unavailable\n";
+  return false;
+#endif
+}
+
+std::string LlamaCPUBackend::GenerateWithImages(
+    const std::string& prompt,
+    const std::vector<DecodedImage>& images,
+    int max_tokens,
+    const std::function<bool(const std::string&)>& on_chunk,
+    const std::function<bool()>& should_stop) {
+#ifdef INFERFLUX_HAS_MTMD
+  if (!IsReady() || !vision_ready_ || !mtmd_ctx_ || images.empty()) {
+    return Generate(prompt, max_tokens, on_chunk, should_stop);
+  }
+
+  // Build bitmap list from raw image bytes.
+  std::vector<mtmd_bitmap*> bitmaps;
+  bitmaps.reserve(images.size());
+  for (const auto& img : images) {
+    if (img.raw_bytes.empty()) continue;
+    auto* bmp = mtmd_helper_bitmap_init_from_buf(
+        mtmd_ctx_, img.raw_bytes.data(), img.raw_bytes.size());
+    if (!bmp) {
+      std::cerr << "[LlamaCPUBackend] failed to decode image bitmap; falling back to text-only\n";
+      for (auto* b : bitmaps) mtmd_bitmap_free(b);
+      return Generate(prompt, max_tokens, on_chunk, should_stop);
+    }
+    if (!img.image_id.empty()) {
+      mtmd_bitmap_set_id(bmp, img.image_id.c_str());
+    }
+    bitmaps.push_back(bmp);
+  }
+
+  if (bitmaps.empty()) {
+    return Generate(prompt, max_tokens, on_chunk, should_stop);
+  }
+
+  // Tokenize prompt + image bitmaps into interleaved chunks.
+  auto* chunks = mtmd_input_chunks_init();
+  mtmd_input_text input_text;
+  input_text.text = prompt.c_str();
+  input_text.add_special = true;
+  input_text.parse_special = true;
+  const mtmd_bitmap** bitmap_ptr = const_cast<const mtmd_bitmap**>(bitmaps.data());
+  int32_t rc = mtmd_tokenize(mtmd_ctx_, chunks, &input_text, bitmap_ptr, bitmaps.size());
+  for (auto* b : bitmaps) mtmd_bitmap_free(b);
+  if (rc != 0) {
+    std::cerr << "[LlamaCPUBackend] mtmd_tokenize failed (rc=" << rc << "); falling back\n";
+    mtmd_input_chunks_free(chunks);
+    return Generate(prompt, max_tokens, on_chunk, should_stop);
+  }
+
+  // Evaluate all chunks (text decode + image encode) through the model.
+  llama_pos n_past = 0;
+  int32_t n_batch = config_.batch_size;
+  rc = mtmd_helper_eval_chunks(mtmd_ctx_, context_, chunks, n_past, 0, n_batch,
+                               /*logits_last=*/true, &n_past);
+  mtmd_input_chunks_free(chunks);
+  if (rc != 0) {
+    std::cerr << "[LlamaCPUBackend] mtmd_helper_eval_chunks failed (rc=" << rc << ")\n";
+    return {};
+  }
+
+  // Decode loop: generate tokens starting from the updated n_past position.
+  int32_t batch_cap = std::max<int32_t>(config_.batch_size, max_tokens + 1);
+  llama_batch batch = llama_batch_init(batch_cap, 0, 1);
+
+  std::string output;
+  llama_token eos = llama_vocab_eos(vocab_);
+  int tokens_remaining = std::max(max_tokens, 1);
+
+  if (grammar_sampler_) {
+    llama_sampler_reset(grammar_sampler_);
+  }
+
+  while (tokens_remaining-- > 0) {
+    if (should_stop && should_stop()) break;
+    int token = 0;
+    if (grammar_sampler_) {
+      token = llama_sampler_sample(grammar_sampler_, context_, -1);
+    } else {
+      token = SampleGreedy();
+    }
+    if (token == eos) break;
+    std::string piece = TokenToString(token);
+    output += piece;
+    if (on_chunk && !on_chunk(piece)) break;
+    if (should_stop && should_stop()) break;
+    BatchAdd(batch, token, n_past++, true);
+    if (llama_decode(context_, batch) != 0) {
+      std::cerr << "[LlamaCPUBackend] llama_decode failed (vision decode loop)\n";
+      break;
+    }
+    BatchClear(batch);
+  }
+
+  llama_batch_free(batch);
+  if (grammar_sampler_) {
+    llama_sampler_reset(grammar_sampler_);
+  }
+  return output;
+#else
+  (void)images;
+  return Generate(prompt, max_tokens, on_chunk, should_stop);
+#endif
 }
 
 void LlamaCPUBackend::EnableGrammarConstraint(const std::string& grammar,

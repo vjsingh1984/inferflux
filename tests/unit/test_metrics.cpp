@@ -89,3 +89,13 @@ TEST_CASE("MetricsRegistry queue depth gauge", "[metrics]") {
   auto output = registry.RenderPrometheus();
   REQUIRE(output.find("inferflux_scheduler_queue_depth 7") != std::string::npos);
 }
+
+TEST_CASE("MetricsRegistry prefill/decode queue gauges", "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.SetPrefillQueueDepth(3);
+  registry.SetDecodeQueueDepth(2);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_prefill_queue_depth 3") != std::string::npos);
+  REQUIRE(output.find("inferflux_decode_queue_depth 2") != std::string::npos);
+}

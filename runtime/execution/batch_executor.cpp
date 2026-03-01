@@ -171,6 +171,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   if (cache_) {
     try {
       kv_page = cache_->ReservePage();
+      inference.kv_page = kv_page;
     } catch (const std::exception& ex) {
       std::cerr << "[BatchExecutor] KV cache reserve failed: " << ex.what() << std::endl;
     }
@@ -216,10 +217,13 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
         auto flag = inference.cancellation_flag;
         should_stop = [flag]() { return flag->load(); };
       }
-      auto text = backend->Generate(inference.prompt,
-                                    decode_limit,
-                                    chunk_cb,
-                                    should_stop);
+      std::string text;
+      if (inference.has_images && backend->SupportsVision()) {
+        text = backend->GenerateWithImages(inference.prompt, inference.images,
+                                           decode_limit, chunk_cb, should_stop);
+      } else {
+        text = backend->Generate(inference.prompt, decode_limit, chunk_cb, should_stop);
+      }
       response.completion = text.empty() ? "[backend returned empty response]" : text;
     } else {
       response.no_backend = true;
@@ -284,6 +288,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
         if (cache_ && kv_page >= 0) {
           cache_->ReleasePage(kv_page);
           kv_page = -1;
+          inference.kv_page = -1;
         }
         inference.first_token_time = std::chrono::steady_clock::now();
         return outcome;
@@ -309,6 +314,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   }
   if (cache_ && kv_page >= 0) {
     cache_->ReleasePage(kv_page);
+    inference.kv_page = -1;
   }
 
   if (!inference.fairness_yielded &&

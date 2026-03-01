@@ -152,6 +152,7 @@ int main(int argc, char** argv) {
   std::size_t kv_channel_capacity = 64;
   std::vector<ModelConfig> configured_models;
   std::string default_model_override;
+  std::string mmproj_path;  // §2.2: path to multimodal projector (empty = disabled).
 
   struct ApiKeyEntry {
     std::string key;
@@ -172,6 +173,9 @@ int main(int argc, char** argv) {
         // Legacy model config
         if (config["model"] && config["model"]["path"]) {
             model_path = config["model"]["path"].as<std::string>();
+        }
+        if (config["model"] && config["model"]["mmproj_path"]) {
+            mmproj_path = config["model"]["mmproj_path"].as<std::string>();
         }
         
         // Models config
@@ -300,6 +304,9 @@ int main(int argc, char** argv) {
 
   if (const char* env_model = std::getenv("INFERFLUX_MODEL_PATH")) {
     model_path = env_model;
+  }
+  if (const char* env_mmproj = std::getenv("INFERFLUX_MMPROJ_PATH")) {
+    mmproj_path = env_mmproj;
   }
   if (const char* env_mps = std::getenv("INFERFLUX_MPS_LAYERS")) {
     mps_layers = std::stoi(env_mps);
@@ -561,6 +568,19 @@ int main(int argc, char** argv) {
   }
   if (llama_backend && backend_label == "stub") {
     backend_label = cuda_enabled ? "cuda" : (mps_layers > 0 ? "mps" : "cpu");
+  }
+
+  // §2.2: Load multimodal projector if specified.
+  if (llama_backend && !mmproj_path.empty()) {
+    if (llama_backend->LoadMmproj(mmproj_path)) {
+      std::cout << "[server] Multimodal projector loaded: " << mmproj_path << "\n";
+    } else {
+      std::cerr << "[server] Warning: failed to load mmproj from " << mmproj_path
+                << "; vision features disabled\n";
+    }
+  } else if (!mmproj_path.empty()) {
+    std::cerr << "[server] Warning: INFERFLUX_MMPROJ_PATH set but no model loaded; "
+              << "mmproj will not be applied\n";
   }
   std::string policy_store_path = "config/policy_store.conf";
   if (const char* env_policy = std::getenv("INFERFLUX_POLICY_STORE")) {

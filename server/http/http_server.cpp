@@ -1,5 +1,6 @@
 #include "server/http/http_server.h"
 
+#include "runtime/multimodal/image_preprocessor.h"
 #include "server/metrics/metrics.h"
 #include "server/tracing/span.h"
 
@@ -101,6 +102,8 @@ struct CompletionRequestPayload {
   std::string first_tool_name;
   bool has_tool_schema{false};
   std::string tool_choice{"auto"}; // "auto" | "none" | "required"
+  bool has_images{false};          // §2.2: true when any message contained image_url parts.
+  std::vector<DecodedImage> images;  // §2.2: decoded images in prompt order.
   bool has_response_format{false};
   std::string response_format_type;
   std::string response_format_schema;
@@ -185,8 +188,20 @@ CompletionRequestPayload ParseJsonPayload(const std::string& body) {
         if (msg.contains("role") && msg["role"].is_string()) {
           m.role = msg["role"].get<std::string>();
         }
-        if (msg.contains("content") && msg["content"].is_string()) {
-          m.content = msg["content"].get<std::string>();
+        if (msg.contains("content")) {
+          if (msg["content"].is_string()) {
+            m.content = msg["content"].get<std::string>();
+          } else if (msg["content"].is_array()) {
+            // §2.2: OpenAI multipart content — extract text and image_url parts.
+            auto mm = ImagePreprocessor::ProcessContentArray(msg["content"].dump());
+            m.content = mm.text;
+            if (!mm.images.empty()) {
+              payload.has_images = true;
+              for (auto& img : mm.images) {
+                payload.images.push_back(std::move(img));
+              }
+            }
+          }
         }
         if (!m.role.empty() || !m.content.empty()) {
           payload.messages.push_back(std::move(m));
@@ -1175,6 +1190,13 @@ void HttpServer::HandleClient(ClientSession& session) {
       req.response_format_root = parsed.response_format_root;
     }
     req.stream = parsed.stream;
+
+    // §2.2: attach decoded images (populated when messages contain image_url parts).
+    if (parsed.has_images) {
+      req.has_images = true;
+      req.images = std::move(parsed.images);
+      GlobalMetrics().RecordImagePreprocess(static_cast<int>(req.images.size()), 0.0);
+    }
 
     // W3C Trace Context (OBS-2): propagate trace-id from incoming traceparent header.
     {

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "runtime/multimodal/image_preprocessor.h"
 #include "runtime/structured_output/structured_constraint.h"
 
 namespace inferflux {
@@ -40,6 +41,7 @@ struct InferenceRequest {
   int last_timeslice_tokens{0};     // Last applied fairness slice limit (observability).
   bool fairness_yielded{false};     // True when the last slice yielded for fairness.
   bool json_mode{false};
+  bool has_images{false};   // §2.2: true when request contains image_url parts.
   bool stream{false};
   bool cancelled{false};
   RequestPhase phase{RequestPhase::kPending};
@@ -52,6 +54,8 @@ struct InferenceRequest {
   bool response_format_supported{true};
   std::string response_format_error;
   StructuredConstraint response_constraint;
+
+  std::vector<DecodedImage> images;  // §2.2: decoded images (parallel to <__media__> markers).
 
   // Token state (populated during scheduling).
   std::vector<int> prompt_tokens;
@@ -72,6 +76,7 @@ struct InferenceRequest {
 
   // Shared cancellation flag toggled when the HTTP connection closes.
   std::shared_ptr<std::atomic<bool>> cancellation_flag;
+  int kv_page{-1};
 };
 
 // RequestBatch groups requests that will execute together in a single

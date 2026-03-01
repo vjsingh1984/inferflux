@@ -168,6 +168,13 @@ void MetricsRegistry::RecordModelRoute(const std::string& model_id,
   stats.routes += 1;
 }
 
+void MetricsRegistry::RecordImagePreprocess(int images, double /*decode_ms*/) {
+  if (images > 0) {
+    multimodal_images_.fetch_add(static_cast<uint64_t>(images), std::memory_order_relaxed);
+    multimodal_requests_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 void MetricsRegistry::RecordLatency(double request_ms) {
   request_latency_.Record(request_ms);
 }
@@ -454,6 +461,15 @@ std::string MetricsRegistry::RenderPrometheus() const {
       << decode_latency_.sum_ms.load() << "\n";
   out << "inferflux_decode_duration_ms_count{backend=\"" << backend << "\"} "
       << decode_latency_.total.load() << "\n";
+
+  // --- Multimodal (§2.2) ---
+  out << "# HELP inferflux_multimodal_images_total Total images preprocessed from image_url parts\n";
+  out << "# TYPE inferflux_multimodal_images_total counter\n";
+  out << "inferflux_multimodal_images_total " << multimodal_images_.load() << "\n";
+
+  out << "# HELP inferflux_multimodal_requests_total Total requests containing image_url parts\n";
+  out << "# TYPE inferflux_multimodal_requests_total counter\n";
+  out << "inferflux_multimodal_requests_total " << multimodal_requests_.load() << "\n";
 
   // --- Gauges ---
   out << "# HELP inferflux_active_connections Current number of active HTTP connections\n";

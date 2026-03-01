@@ -87,6 +87,9 @@ class Scheduler {
   BatchSelection BuildBatchLocked();
   void WorkerLoop();
   void ProcessBatch(BatchSelection selection);
+  void DecodeWorkerLoop();
+  void StartDecodeWorkers();
+  void StopDecodeWorkers();
   void ApplyFairness(BatchSelection* selection);
   void UpdateQueueDepthLocked() const;
   void ResolveBackends(const std::vector<std::shared_ptr<PendingRequest>>& batch);
@@ -102,6 +105,8 @@ class Scheduler {
   mutable std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::thread worker_;
+  std::vector<std::thread> decode_workers_;
+  bool use_decode_workers_{false};
   std::atomic<bool> stop_{false};
   std::atomic<uint64_t> next_sequence_{0};
   std::atomic<uint64_t> next_batch_id_{0};

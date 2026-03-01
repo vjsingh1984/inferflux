@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/multimodal/image_preprocessor.h"
+
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -7,6 +9,11 @@
 #include <vector>
 
 #include <llama.h>
+
+#ifdef INFERFLUX_HAS_MTMD
+#include "tools/mtmd/mtmd.h"
+#include "tools/mtmd/mtmd-helper.h"
+#endif
 
 namespace inferflux {
 
@@ -16,6 +23,7 @@ struct LlamaBackendConfig {
   int gpu_layers = 0;
   bool use_flash_attention = false;
   int flash_attention_tile = 128;
+  std::string mmproj_path;  // Path to multimodal projector; empty = vision disabled.
 };
 
 class LlamaCPUBackend {
@@ -24,10 +32,27 @@ class LlamaCPUBackend {
   ~LlamaCPUBackend();
 
   bool LoadModel(const std::filesystem::path& model_path, const LlamaBackendConfig& config = {});
+
+  // Load a multimodal projector (mmproj) GGUF alongside the text model.
+  // Must be called after LoadModel(). Returns false if ENABLE_MTMD is off.
+  bool LoadMmproj(const std::filesystem::path& mmproj_path);
+
+  // True when a mmproj has been loaded and supports vision input.
+  bool SupportsVision() const { return vision_ready_; }
+
   std::string Generate(const std::string& prompt,
                        int max_tokens,
                        const std::function<bool(const std::string&)>& on_chunk = {},
                        const std::function<bool()>& should_stop = {});
+
+  // Vision-aware generation. Prompt must contain <__media__> markers matching images.
+  // Falls back to Generate() when vision is not ready or images is empty.
+  std::string GenerateWithImages(const std::string& prompt,
+                                 const std::vector<DecodedImage>& images,
+                                 int max_tokens,
+                                 const std::function<bool(const std::string&)>& on_chunk = {},
+                                 const std::function<bool()>& should_stop = {});
+
   void EnableGrammarConstraint(const std::string& grammar, const std::string& root);
   void DisableGrammarConstraint();
   bool IsReady() const { return context_ != nullptr || test_ready_; }
@@ -47,6 +72,11 @@ class LlamaCPUBackend {
   LlamaBackendConfig config_;
   bool test_ready_{false};
   struct llama_sampler* grammar_sampler_{nullptr};
+
+#ifdef INFERFLUX_HAS_MTMD
+  mtmd_context* mtmd_ctx_{nullptr};
+#endif
+  bool vision_ready_{false};
 };
 
 }  // namespace inferflux

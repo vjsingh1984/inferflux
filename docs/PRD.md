@@ -48,10 +48,10 @@ layer above it.
 
 ### Strategic Modules In Flight
 - **Constrained Decoder**: Grammar/JSON-aware decoding path inserted between scheduler and runtime to deliver the 99.5% schema KPI.
-- **Multimodal Adapter**: Image/audio preprocessing pipeline leveraging llama.cpp `libmtmd` so chat completions accept base64/URL media blobs.
 
 ### Completed Strategic Modules
 - **Prefix Cache** (§2.4): `RadixPrefixCache` — compressed trie over token ID sequences. Exact-match completions skip generation; partial-match depth is tracked via Prometheus counters (`prefix_matched_tokens_total`, `prefix_partial_hits_total`) to quantify future KV page reuse opportunity once llama.cpp multi-sequence support lands.
+- **Multimodal Adapter** (§2.2): `ImagePreprocessor` parses OpenAI `image_url` content-array parts, decodes base64 data URIs or fetches HTTP URLs, assigns SHA-256 image IDs, and injects `<__media__>` markers into the flattened prompt. `LlamaCPUBackend` exposes `LoadMmproj()` / `GenerateWithImages()` via libmtmd (activated with `-DENABLE_MTMD=ON`). Prometheus counters report images preprocessed and multimodal request volume.
 
 ## Unique Selling Propositions
 1. **Integrated Policy Engine**: Built-in OIDC/API-key auth, per-tenant rate limiting, RBAC scopes, audit logging, encrypted policy store (AES-GCM), and pluggable guardrails. No competitor has this built-in.

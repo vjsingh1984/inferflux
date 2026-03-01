@@ -25,7 +25,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | Prefix Caching                |  A   |   A+   |   A     |     B     |   B    |   **B-**  | A (Q3)       | Runtime |
 | Speculative decoding          |  A   |   A    |   A     |    B+     |   B    |   **D**   | B (Q3) | Runtime |
 | Structured output / JSON mode |  A   |   A+   |   B+    |    B+     |   B    |   **B-**  | B+ (Q3) | Runtime |
-| Multimodal / vision           |  A   |   A    |   B+    |    B+     |   B+   |   **F**   | C+ (Q3) | Runtime |
+| Multimodal / vision           |  A   |   A    |   B+    |    B+     |   B+   |   **D**   | C+ (Q3) | Runtime |
 | Tool / function calling       |  A   |   A    |   B     |    C      |   B    |   **F**   | B (Q3) | Server |
 | Quantization breadth          |  A+  |   B+   |   A     |    A+     |   A    |   **D**   | B (Q4) | Runtime |
 | Hardware breadth              |  A+  |   B+   |   C     |    A+     |   B    |   **D**  | B (Q4) | Runtime |
@@ -44,10 +44,10 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 - Production throughput, continuous batching, and KV cache efficiency remain at **F** until GPU-aware execution, prefill/decode overlap, and FA3 kernels from §2.5/§2.7 land.
 - Prefix caching bumped to **B-**: `RadixPrefixCache` (compressed trie over token sequences) is live, wired into `BatchExecutor` and `Scheduler`, with LRU eviction, partial-match metrics (`prefix_matched_tokens_total`, `prefix_partial_hits_total`), and 12 unit tests. Actual KV page reuse requires llama.cpp multi-sequence integration (§2.4 follow-up).
 - Structured output bumped to **B-** now that HTTP parsing, schema-to-grammar conversion, and llama grammar sampling are wired through scheduler/runtime (§2.1); tool/function calling remains **F** until streaming/tool deltas are emitted from the model output path (§2.3).
-- Multimodal/vision remains **F**; there is no image ingestion path today (§2.2).
+- Multimodal/vision bumped to **D**: `ImagePreprocessor` parses OpenAI `image_url` content arrays, decodes base64 data URIs, fetches HTTP URLs, and injects `<__media__>` markers (§2.2). `LlamaCPUBackend` supports `LoadMmproj()` / `GenerateWithImages()` via libmtmd when built with `-DENABLE_MTMD=ON`. Prometheus counters `inferflux_multimodal_images_total` and `inferflux_multimodal_requests_total` track usage. Actual vision inference requires a compatible mmproj GGUF and `ENABLE_MTMD=ON` at build time.
 - Quantization breadth and hardware breadth are **D** since only CPU/MPS paths run; CUDA/ROCm/Intel enablement in §2.7/§2.11 is unresolved.
 - Disaggregated prefill/decode and model parallelism are **F** because no distributed runtime exists yet (§2.5/§2.6).
-- OpenAI API compatibility holds at **C**—basic chat completion works but tool/multimodal gaps block parity (§2.3).
+- OpenAI API compatibility holds at **C**—basic chat completion works; image_url content parts are now parsed (§2.2); tool/function calling gaps remain (§2.3).
 - Enterprise auth/RBAC at **B-** reflects working OIDC/API-key flows but lacks fine-grained RBAC UX improvements noted in Policy backlog.
 - Observability is **B** thanks to metrics/tracing/logging closures in OBS-1 through OBS-4.
 - Ease of local setup is **C** until `inferctl pull` and streamlined installers from §2.8 land.
@@ -346,7 +346,7 @@ policy store with RBAC, CLI interactive mode, Prometheus metrics, audit logging.
 | P0 | **[UPGRADE]** CUDA backend with FlashAttention | **Partial** — FA3 config fields added, CUDA build flags wired; GPU kernel execution pending | §2.7 | `runtime/backends/cuda/` |
 | P1 | **[NEW]** Prefix caching (radix tree KV reuse) | **Done** — `RadixPrefixCache` compressed trie; `Lookup` with `matched_tokens` out-param; LRU eviction; partial-hit Prometheus counters; 12 unit tests; scheduler + executor migrated | §2.4 | `runtime/prefix_cache/radix_prefix_cache.cpp` |
 | P1 | Prompt/response hashing in audit logs | **Done** | OBS-4 | `server/logging/audit_logger.cpp` |
-| P1 | **[NEW]** Multimodal / vision model support | Not started | §2.2 | `model/`, `server/http/` |
+| P1 | **[DONE]** Multimodal / vision model support | **Done** — `ImagePreprocessor` (base64 decode, URL fetch, SHA-256 image IDs, `<__media__>` marker injection); `InferenceRequest.images` field; `LlamaCPUBackend::LoadMmproj()`/`GenerateWithImages()` (guarded by `INFERFLUX_HAS_MTMD`); multimodal Prometheus counters; 11 unit tests | §2.2 | `runtime/multimodal/`, `server/http/http_server.cpp`, `runtime/backends/cpu/llama_backend.cpp` |
 | P1 | **[DONE]** Model pull from HuggingFace (`inferctl pull`) | Done | §2.8 | `cli/main.cpp` |
 | P1 | TLS support (server + HttpClient) | **Done** — HttpServer TLS + HttpClient HTTPS both fully implemented with TLS handshake and cert verification | SEC-5 | `net/http_client.cpp` |
 | P1 | Latency histograms and queue depth gauges in metrics | **Done** — 3 histograms (request/queue/batch), batch + prefix counters | OBS-1 | `server/metrics/` |
@@ -385,12 +385,12 @@ identified above. Check items off as they are addressed.
 
 - [X] §Functional Requirements: Add structured output (`response_format` param) — §2.1
 - [X] §Functional Requirements: Add tool calling (`tools`, `tool_choice` params) — §2.3
-- [ ] §Functional Requirements: Add multimodal input (image content parts) — §2.2
+- [X] §Functional Requirements: Add multimodal input (image content parts) — §2.2
 - [X] §Functional Requirements: Add `inferctl pull` workflow — §2.8
 - [ ] §Functional Requirements: Add request priority parameter — §2.9
 - [ ] §Goals: Mention MoE model support explicitly — §2.6
 - [X] §User Stories: Add agent workflow story (tool calling) — §2.3
-- [ ] §User Stories: Add vision model story — §2.2
+- [X] §User Stories: Add vision model story — §2.2
 - [X] §Acceptance Criteria: Return 503 (not 200) when no model loaded — INF-5
 - [X] §Milestones: Add structured output, tool calling to Q3 scope
 - [X] §Vision: Updated vision statement per design review recommendations
@@ -407,7 +407,7 @@ identified above. Check items off as they are addressed.
 - [X] §Observability: Document audit log redaction (hash by default) — OBS-4
 - [X] §Modules: Add constrained decoding module — §2.1
 - [ ] §Modules: Add parallelism strategies section (TP/PP/EP) — §2.6, §2.7
-- [ ] §Data Flow: Add image preprocessing stage — §2.2
+- [X] §Data Flow: Add image preprocessing stage — §2.2
 - [ ] §Deployment View: Add disaggregated prefill/decode topology — §2.5
 - [X] §Runtime: Add prefix cache subsystem — §2.4
 - [ ] §Runtime: Document attention kernel strategy (FA3) — §2.7

@@ -51,7 +51,7 @@ Goal: ship the customer-facing differentiators promised in the PRD.
 - **DoD**
   - [ ] Structured output / JSON mode via llama.cpp grammar sampling with schema contract tests (PRD §Functional, TechDebt §2.1). Includes HTTP parser updates for `response_format`, adapter interface + backend capability flags, InferenceRequest plumbing, backend grammar hooks, and contract/integration tests.
   - [ ] Tool/function calling parity with OpenAI semantics (TechDebt §2.3).
-  - [ ] Multimodal (vision) ingestion path via `libmtmd` including preprocessing metrics (TechDebt §2.2). Requires request parsing, tensor staging, and observability hooks.
+  - [x] Multimodal (vision) ingestion path via `libmtmd` including preprocessing metrics (TechDebt §2.2) — `ImagePreprocessor` (base64/URL decode, SHA-256 image IDs, `<__media__>` marker injection), `LlamaCPUBackend::LoadMmproj()`/`GenerateWithImages()`, Prometheus counters, 11 unit tests. Full vision inference requires `-DENABLE_MTMD=ON` with a compatible mmproj GGUF.
   - [ ] Prefix cache APIs exposed to `inferctl` for agent workflows, plus CLI/docs showing cache warmers and status.
   - [ ] `inferctl pull` + model registry CLI with progress reporting (TechDebt §2.8).
   - [ ] Developer docs + examples updated for new params and guardrails.

@@ -153,7 +153,7 @@ Each slice should land with design docs + tests (unit and integration) so that p
 - **Runtime** (`runtime/`): `DeviceContext` abstraction, `CPUDeviceContext` implementation, `CudaDeviceContext` placeholder (FlashAttention-ready), Metal/MPS + BLAS autodetection (via `LLAMA_METAL`/`LLAMA_BLAS`) so hardware accelerators are toggled automatically, `PagedKVCache` with LRU/Clock eviction and async NVMe offload, speculative decoding (draft + validator), `BackendManager` for named model loading.
 - **Prefix Cache** (`runtime/prefix_cache/`): `RadixPrefixCache` — a compressed trie (radix tree) over token ID sequences. `Lookup` returns the longest matching prefix plus a `matched_tokens` out-parameter for partial-hit metrics; `Insert` splits trie edges on mismatch. LRU eviction prunes the least-recently-used completion leaf when the tree exceeds capacity. Exact-match completions skip generation entirely; partial matches are tracked via `inferflux_prefix_matched_tokens_total` and `inferflux_prefix_partial_hits_total` Prometheus counters for future KV page reuse analysis. The original `PrefixCache` (flat hash-map) is retained for reference but is no longer used at runtime.
 - **Constrained Decoder** (`scheduler/constrained_decoder.*`, planned): Grammar/JSON aware decoding path that consumes scheduler outputs before runtime execution to ensure schema compliance.
-- **Multimodal Adapter** (`runtime/multimodal/` planned): Pre/post-processing stage that converts base64 or URL-sourced images/audio into llama.cpp `libmtmd` tensors before scheduling.
+- **Multimodal Adapter** (`runtime/multimodal/`): `ImagePreprocessor` parses OpenAI `image_url` content arrays, decodes base64 data URIs / fetches HTTP URLs, generates SHA-256 image IDs, and injects `<__media__>` markers into the flattened prompt. `LlamaCPUBackend::LoadMmproj()` / `GenerateWithImages()` integrate libmtmd for actual vision inference (requires `-DENABLE_MTMD=ON`).
 - **Model** (`model/`): `SimpleTokenizer` (whitespace/punctuation splitter — stub for real tokenizer), GGUF loader (delegates to llama.cpp submodule).
 - **Scheduler** (`scheduler/`): `Scheduler` with global mutex (continuous batching rewrite in progress via `RequestBatch`). `ModelRouter` interface for multi-model routing. Requests flow through `InferenceRequest`/`RequestBatch`, and results are returned as `InferenceResult` for HTTP compatibility.
 - **Scheduler** (`scheduler/`): Request queue is priority-aware with aging (older requests automatically boost priority) to prevent starvation; batches capture queue wait time + execution time metrics.
@@ -175,7 +175,7 @@ Each slice should land with design docs + tests (unit and integration) so that p
 3. CORS preflight (OPTIONS) handled immediately. Other requests proceed to auth.
 4. Auth middleware validates API key (SHA-256 hash match) or OIDC JWT (RS256 signature + exp/nbf/iss/aud).
 5. Rate limiter checks per-key token budget. Guardrail checks blocklist + optional OPA endpoint.
-6. Multimodal Adapter (planned) resolves media payloads to tensors; Scheduler tokenizes text components.
+6. `ImagePreprocessor` extracts image_url parts from content arrays, decodes/fetches images, and injects `<__media__>` markers; Scheduler tokenizes the flattened text prompt.
 7. `RadixPrefixCache` checks for exact-match completions (skip generation) and records partial prefix depth for future KV reuse metrics.
 8. Constrained Decoder enforces grammar/JSON schemas before tokens are committed to the runtime backend.
 9. Response sent as JSON (non-streaming) or SSE chunks (streaming).

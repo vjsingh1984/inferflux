@@ -230,7 +230,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       if (disagg_config_.kv_channel) {
         disaggregated::KVPacket packet;
         packet.request_id = pending->inference.id;
-        packet.payload = SerializeTokens(pending->inference.prompt_tokens);
+        packet.prompt_tokens = SerializeTokens(pending->inference.prompt_tokens);
+        packet.kv_blob = SerializeTokens(pending->inference.prompt_tokens);
         packet.metadata = pending->inference.model;
         enqueued = disagg_config_.kv_channel->Enqueue(std::move(packet));
       } else {

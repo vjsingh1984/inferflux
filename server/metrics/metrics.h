@@ -55,6 +55,10 @@ class MetricsRegistry {
                         const std::string& backend,
                         bool hit);
 
+  // Multimodal (§2.2): record image preprocessing events.
+  // images: number of images decoded; decode_ms: preprocessing wall-clock time.
+  void RecordImagePreprocess(int images, double decode_ms);
+
   // Latency recording — call with full request duration in milliseconds.
   void RecordLatency(double request_ms);
 
@@ -100,6 +104,8 @@ class MetricsRegistry {
   mutable std::mutex fairness_metrics_mutex_;
   std::unordered_map<int, uint64_t> fairness_tokens_;
   std::atomic<uint64_t> model_route_misses_{0};
+  std::atomic<uint64_t> multimodal_images_{0};    // §2.2: total images preprocessed.
+  std::atomic<uint64_t> multimodal_requests_{0};  // §2.2: total requests with images.
 
   // Latency histograms.
   LatencyHistogram request_latency_;
