@@ -1586,9 +1586,22 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
     req.stream = parsed.stream;
     if (parsed.logprobs) {
-      // top_logprobs==0 → collect selected-token logprob only (top_n=1
-      // internally).
-      req.logprob_top_n = std::max(parsed.top_logprobs, 1);
+      if (parsed.stream) {
+        // Logprobs in the SSE streaming path are not yet implemented: the
+        // on_token callback only passes text chunks and has no way to carry
+        // per-token logprob payloads.  Reject clearly rather than silently
+        // discarding the logprob data while still paying the compute cost.
+        SendAll(session,
+                BuildResponse(
+                    BuildErrorBody("logprobs_not_supported_with_streaming"),
+                    400, "Bad Request"));
+        return;
+      }
+      req.collect_logprobs = true;
+      // top_logprobs=0 means selected-token logprob only (no alternatives).
+      // Keep logprob_top_n at 0 — CollectLogprob skips the O(V log V)
+      // partial-sort when top_n==0, so we only pay the O(V) log-softmax.
+      req.logprob_top_n = parsed.top_logprobs; // 0-20, already clamped above
     }
 
     // §2.2: attach decoded images (populated when messages contain image_url

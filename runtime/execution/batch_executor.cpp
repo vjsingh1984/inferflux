@@ -222,8 +222,11 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
       }
       std::string text;
       const int logprob_top_n = inference.logprob_top_n;
+      // Use collect_logprobs (not logprob_top_n > 0) so that logprobs=true
+      // with top_logprobs=0 still records the selected token's log-probability
+      // without the O(V log V) partial-sort for alternatives.
       std::vector<TokenLogprob> *lp_out =
-          (logprob_top_n > 0) ? &response.logprobs : nullptr;
+          inference.collect_logprobs ? &response.logprobs : nullptr;
       if (inference.n_past >= 0 && inference.sequence_id >= 0) {
         // Phased path: prompt was already prefilled by the scheduler; run
         // decode only.

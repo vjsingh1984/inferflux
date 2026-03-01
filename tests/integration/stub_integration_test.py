@@ -590,6 +590,24 @@ class StubIntegrationTests(unittest.TestCase):
             self.assertEqual(resp.status, 200, msg=body)
             self.assertIsNone(json.loads(body)["choices"][0]["logprobs"])
 
+    def test_stream_and_logprobs_rejected(self):
+        """stream=true combined with logprobs=true must return 400."""
+        for path, payload in [
+            ("/v1/completions",
+             {"prompt": "hi", "max_tokens": 5, "stream": True, "logprobs": True}),
+            ("/v1/chat/completions", {
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 5,
+                "stream": True,
+                "logprobs": True,
+            }),
+        ]:
+            resp, body = self._post(path, payload)
+            self.assertEqual(resp.status, 400, msg=f"{path}: {body}")
+            data = json.loads(body)
+            self.assertIn("error", data)
+            self.assertIn("logprobs_not_supported_with_streaming", data["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

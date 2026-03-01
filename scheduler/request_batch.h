@@ -93,8 +93,12 @@ struct InferenceRequest {
   int kv_page{-1};
 
   // Logprob collection (OpenAI logprobs API).
-  // logprob_top_n == 0 means disabled; > 0 means collect selected-token logprob
-  // and the top-N alternatives at each decode step.
+  // collect_logprobs enables per-token logprob recording.
+  // logprob_top_n controls how many top alternatives to include (0 = none,
+  // just the selected token's logprob; max 20).
+  // The two are kept separate so logprobs=true,top_logprobs=0 doesn't trigger
+  // the O(V log V) partial-sort for alternatives.
+  bool collect_logprobs{false};
   int logprob_top_n{0};
 };
 
