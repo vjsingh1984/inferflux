@@ -183,6 +183,10 @@ void MetricsRegistry::SetFlashAttentionEnabled(bool enabled) {
   flash_attention_enabled_.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
+void MetricsRegistry::RecordKVTransfer(double transfer_ms) {
+  kv_transfer_latency_.Record(transfer_ms);
+}
+
 void MetricsRegistry::RecordLatency(double request_ms) {
   request_latency_.Record(request_ms);
 }
@@ -469,6 +473,22 @@ std::string MetricsRegistry::RenderPrometheus() const {
       << decode_latency_.sum_ms.load() << "\n";
   out << "inferflux_decode_duration_ms_count{backend=\"" << backend << "\"} "
       << decode_latency_.total.load() << "\n";
+
+  // --- KV transfer latency (§2.5 item 12) ---
+  out << "# HELP inferflux_kv_transfer_duration_ms Prefill-to-decode KV hand-off latency via KVChannel/ShmKVTransport\n";
+  out << "# TYPE inferflux_kv_transfer_duration_ms histogram\n";
+  for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
+    out << "inferflux_kv_transfer_duration_ms_bucket{backend=\"" << backend
+        << "\",le=\"" << std::fixed << std::setprecision(0)
+        << LatencyHistogram::kBuckets[i] << "\"} "
+        << kv_transfer_latency_.counts[i].load() << "\n";
+  }
+  out << "inferflux_kv_transfer_duration_ms_bucket{backend=\"" << backend
+      << "\",le=\"+Inf\"} " << kv_transfer_latency_.counts[LatencyHistogram::kBuckets.size()].load() << "\n";
+  out << "inferflux_kv_transfer_duration_ms_sum{backend=\"" << backend << "\"} "
+      << kv_transfer_latency_.sum_ms.load() << "\n";
+  out << "inferflux_kv_transfer_duration_ms_count{backend=\"" << backend << "\"} "
+      << kv_transfer_latency_.total.load() << "\n";
 
   // --- Multimodal (§2.2) ---
   out << "# HELP inferflux_multimodal_images_total Total images preprocessed from image_url parts\n";

@@ -71,6 +71,8 @@ add_library(inferflux_core
   runtime/structured_output/json_schema_shim.cpp
   runtime/disaggregated/kv_channel.cpp
   runtime/disaggregated/kv_channel.h
+  runtime/disaggregated/shm_kv_transport.cpp
+  runtime/disaggregated/shm_kv_transport.h
   runtime/multimodal/image_preprocessor.cpp
   runtime/multimodal/image_preprocessor.h
   external/llama.cpp/common/json-schema-to-grammar.cpp
@@ -135,6 +137,10 @@ target_include_directories(inferflux_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/vendor
 )
 target_link_libraries(inferflux_core PUBLIC OpenSSL::Crypto OpenSSL::SSL yaml-cpp)
+# POSIX SHM (shm_open/mmap) requires -lrt on Linux; macOS links it automatically.
+if(UNIX AND NOT APPLE)
+  target_link_libraries(inferflux_core PUBLIC rt)
+endif()
 
 # §2.2 Multimodal support via libmtmd (ENABLE_MTMD=OFF by default)
 if(ENABLE_MTMD)
@@ -201,6 +207,7 @@ add_executable(inferflux_tests
   tests/unit/test_multimodal.cpp
   tests/unit/test_moe_routing.cpp
   tests/unit/test_flash_attn.cpp
+  tests/unit/test_shm_transport.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -212,6 +219,8 @@ add_test(NAME MoETests COMMAND inferflux_tests "[moe]")
 set_tests_properties(MoETests PROPERTIES LABELS moe)
 add_test(NAME FlashAttnTests COMMAND inferflux_tests "[flash_attn]")
 set_tests_properties(FlashAttnTests PROPERTIES LABELS flash_attn)
+add_test(NAME ShmTransportTests COMMAND inferflux_tests "[shm_transport]")
+set_tests_properties(ShmTransportTests PROPERTIES LABELS shm_transport)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)

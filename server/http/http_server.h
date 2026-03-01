@@ -33,6 +33,12 @@ class HttpServer {
     std::string key_path;
   };
 
+  // Disaggregated deployment role (§2.5 item 12).
+  // kUnified: combined prefill+decode (default; existing behaviour).
+  // kPrefill: this instance only runs prefill; /readyz gates on model load.
+  // kDecode:  this instance only runs decode; /readyz gates on decode pool.
+  enum class PoolRole { kUnified, kPrefill, kDecode };
+
   HttpServer(std::string host,
              int port,
              Scheduler* scheduler,
@@ -51,6 +57,8 @@ class HttpServer {
   void Start();
   void Stop();
   void SetModelReady(bool ready) { model_ready_.store(ready); }
+  void SetRole(PoolRole role) { role_.store(role, std::memory_order_relaxed); }
+  void SetDecodePoolReady(bool ready) { decode_pool_ready_.store(ready, std::memory_order_relaxed); }
 
  private:
   struct ClientSession {
@@ -91,6 +99,8 @@ class HttpServer {
   SSL_CTX* ssl_ctx_{nullptr};
   std::atomic<bool> running_{false};
   std::atomic<bool> model_ready_{false};
+  std::atomic<PoolRole> role_{PoolRole::kUnified};
+  std::atomic<bool> decode_pool_ready_{false};
   std::atomic<int> server_fd_{-1};
   int num_workers_;
   std::thread accept_thread_;

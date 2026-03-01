@@ -1,0 +1,66 @@
+# InferFlux — Prefill-pool Helm overlay (§2.5 item 12)
+#
+# Deploy this as the prefill side of a disaggregated prefill/decode cluster.
+# A prefill node loads the model, runs Prefill(), serialises the KV state via
+# ShmKVTransport, and hands off the packet to a decode node over KVChannel.
+#
+# Usage:
+#   helm upgrade --install inferflux-prefill ./charts/inferflux \
+#     -f deploy/helm/prefill-values.yaml
+#
+# Paired with: deploy/helm/decode-values.yaml
+
+replicaCount: 2
+
+image:
+  repository: inferencial/inferfluxd
+  tag: latest
+  pullPolicy: IfNotPresent
+
+env:
+  # This instance only runs prefill; /readyz gates on model load.
+  - name: INFERFLUX_ROLE
+    value: "prefill"
+
+  # Decode workers disabled: prefill nodes do not run the decode loop.
+  - name: INFERFLUX_DECODE_POOL_SIZE
+    value: "0"
+
+  # Prefill pool: one thread per replica (scale replicas for throughput).
+  - name: INFERFLUX_PREFILL_POOL_SIZE
+    value: "1"
+
+  # KV channel capacity — must match the decode overlay.
+  - name: INFERFLUX_KV_CHANNEL_CAPACITY
+    value: "64"
+
+  # Optional: point to a shared SHM or RDMA endpoint for cross-pod KV transfer.
+  # Leave blank on single-node deployments (in-process SHM is used instead).
+  # - name: INFERFLUX_KV_ENDPOINT
+  #   value: ""
+
+service:
+  port: 8080
+  type: ClusterIP
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+resources:
+  requests:
+    memory: "8Gi"
+    cpu: "4"
+  limits:
+    memory: "16Gi"
+    cpu: "8"

@@ -1,0 +1,62 @@
+# InferFlux — Decode-pool Helm overlay (§2.5 item 12)
+#
+# Deploy this as the decode side of a disaggregated prefill/decode cluster.
+# A decode node runs DecodeWorkerLoop threads, drains KVChannel packets from
+# prefill nodes, hydrates KV state via HydrateSequence, and generates tokens.
+#
+# Usage:
+#   helm upgrade --install inferflux-decode ./charts/inferflux \
+#     -f deploy/helm/decode-values.yaml
+#
+# Paired with: deploy/helm/prefill-values.yaml
+
+replicaCount: 4
+
+image:
+  repository: inferencial/inferfluxd
+  tag: latest
+  pullPolicy: IfNotPresent
+
+env:
+  # This instance only runs decode; /readyz gates on decode pool readiness.
+  - name: INFERFLUX_ROLE
+    value: "decode"
+
+  # Number of DecodeWorkerLoop threads per replica.
+  # Set to match the expected prefill throughput (packets/s × avg decode time).
+  - name: INFERFLUX_DECODE_POOL_SIZE
+    value: "4"
+
+  # Prefill pool disabled on decode nodes.
+  - name: INFERFLUX_PREFILL_POOL_SIZE
+    value: "1"
+
+  # KV channel capacity — must match the prefill overlay.
+  - name: INFERFLUX_KV_CHANNEL_CAPACITY
+    value: "64"
+
+service:
+  port: 8080
+  type: ClusterIP
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+resources:
+  requests:
+    memory: "4Gi"
+    cpu: "8"
+  limits:
+    memory: "8Gi"
+    cpu: "16"

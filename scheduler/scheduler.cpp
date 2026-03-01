@@ -110,6 +110,12 @@ void Scheduler::DecodeWorkerLoop() {
     // state is already resident in the llama context and no hydration is needed.
     if (disagg_config_.kv_channel) {
       while (auto pkt = disagg_config_.kv_channel->TryDequeue()) {
+        // Record KV transfer latency (§2.5 item 12): time from Enqueue to dequeue.
+        auto dequeue_time = std::chrono::steady_clock::now();
+        double transfer_ms =
+            std::chrono::duration<double, std::milli>(dequeue_time - pkt->enqueue_time).count();
+        GlobalMetrics().RecordKVTransfer(transfer_ms);
+
         // Match the packet to a pending decode request by request_id and
         // hydrate its KV state.  If no matching request is found (e.g., it was
         // already handled), discard the packet.

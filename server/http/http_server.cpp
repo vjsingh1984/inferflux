@@ -784,20 +784,30 @@ void HttpServer::HandleClient(ClientSession& session) {
     return;
   }
   if (method == "GET" && path == "/readyz") {
+    PoolRole role = role_.load(std::memory_order_relaxed);
     bool ready = false;
-    if (scheduler_ && scheduler_->Router()) {
-      ready = !scheduler_->Router()->DefaultModelId().empty();
+    std::string reason;
+    if (role == PoolRole::kDecode) {
+      // Decode-only node: ready when the decode worker pool is warm.
+      ready = decode_pool_ready_.load(std::memory_order_relaxed);
+      if (!ready) reason = "decode pool not ready";
     } else {
-      ready = model_ready_.load();
+      // Unified or prefill node: ready when at least one model backend is loaded.
+      if (scheduler_ && scheduler_->Router()) {
+        ready = !scheduler_->Router()->DefaultModelId().empty();
+      } else {
+        ready = model_ready_.load();
+      }
+      if (!ready) reason = "no model backend loaded";
     }
-    if (ready) {
-      SendAll(session, BuildResponse(json({{"status", "ready"}}).dump()));
-    } else {
-      SendAll(session,
-              BuildResponse(json({{"status", "not_ready"}, {"reason", "no model backend loaded"}}).dump(),
-                            503,
-                            "Service Unavailable"));
-    }
+    std::string role_str = (role == PoolRole::kPrefill) ? "prefill"
+                         : (role == PoolRole::kDecode)  ? "decode"
+                                                        : "unified";
+    json body = {{"status", ready ? "ready" : "not_ready"}, {"role", role_str}};
+    if (!ready) body["reason"] = reason;
+    int status_code = ready ? 200 : 503;
+    std::string status_text = ready ? "OK" : "Service Unavailable";
+    SendAll(session, BuildResponse(body.dump(), status_code, status_text));
     return;
   }
 

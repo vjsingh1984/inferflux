@@ -47,7 +47,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 - Tool/function calling bumped to **C+**: `tools[]`/`tool_choice` are parsed, schema injected as system preamble, `tool_calls` array emitted with `finish_reason=tool_calls`. Streaming tool deltas and model-native chat templates (§2.3 follow-up) are the remaining gap to reach B.
 - Multimodal/vision bumped to **D**: `ImagePreprocessor` parses OpenAI `image_url` content arrays, decodes base64 data URIs, fetches HTTP URLs, and injects `<__media__>` markers (§2.2). `LlamaCPUBackend` supports `LoadMmproj()` / `GenerateWithImages()` via libmtmd when built with `-DENABLE_MTMD=ON`. Prometheus counters `inferflux_multimodal_images_total` and `inferflux_multimodal_requests_total` track usage. Actual vision inference requires a compatible mmproj GGUF and `ENABLE_MTMD=ON` at build time.
 - Quantization breadth and hardware breadth are **D** since only CPU/MPS paths run; CUDA/ROCm/Intel enablement in §2.7/§2.11 is unresolved.
-- §2.5 decode workers done: `DecodeWorkerLoop` (drains `pending_decode_`, runs `ExecuteBatch`, fulfills promises), `StartDecodeWorkers` (spawns `decode_pool_size` threads), `use_decode_workers_` derived from config, `SerializeSequence`/`HydrateSequence` wrappers for cross-process KV transfer. Grade stays **F** until cross-node KV transport and SHM/RDMA land.
+- §2.5 fully done: phased prefill/decode, decode workers, KV serialisation, SHM transport, dual-pool `/readyz`, `inferflux_kv_transfer_duration_ms` histogram, Helm overlays. Grade moves toward **D** (still no GPU throughput); cross-node RDMA pending.
 - §2.6 (MoE expert parallelism) is partially done: `IsMoE()`/`ExpertCount()`/`ActiveExperts()` on `LlamaCPUBackend`, `ModelInfo` MoE fields populated in `SingleModelRouter`, `RecordMoERequest()` Prometheus counter, `EPDispatch`/`LocalEPDispatch` stub interface. Grade moves from **F** to **D** — multi-GPU expert sharding remains.
 - OpenAI API compatibility holds at **C**—basic chat completion works; image_url content parts are now parsed (§2.2); tool/function calling gaps remain (§2.3).
 - Enterprise auth/RBAC at **B-** reflects working OIDC/API-key flows but lacks fine-grained RBAC UX improvements noted in Policy backlog.
@@ -156,12 +156,16 @@ Mistral. SGLang tested it on 96 H100s. NVIDIA Dynamo provides orchestration for 
   - `KVChannel` gate: only enqueued when `use_decode_workers_=true`; while workers are disabled the channel is bypassed entirely (prevents fill-and-deadlock at capacity 64).
   - 11 `[phased]` unit tests in `tests/unit/test_phased_execution.cpp`.
   - **Docs:** `docs/Architecture.md` updated with implementation details and remaining work checklist.
-- **Remaining (distributed / cross-process):**
-  1. **Decode workers:** Wire `DecodeWorkerLoop`, enable `use_decode_workers_=true`; `KVChannel` becomes the hand-off queue between prefill and decode thread groups.
-  2. **KV serialization:** `llama_state_seq_get_data` / `llama_state_seq_set_data` for cross-process KV transfer (requires llama.cpp upstream API).
-  3. **SHM/RDMA transport:** Replace in-process `KVChannel` queue with SHM ring buffer (same node) or RDMA (multi-node); enforce <5 ms transfer SLA.
-  4. **Control plane + health:** Dual-pool `/readyz`, transfer-latency Prometheus histograms, chaos tests.
-  5. **Deployment topologies:** Helm/Docker overlays for independent prefill/decode scaling; CI SHM smoke test.
+- **Items 11-12 done (SHM transport + control plane):**
+  - `ShmKVTransport` (`runtime/disaggregated/shm_kv_transport.{h,cpp}`): `shm_open`/`mmap` based; `Write()` stores `kv_blob` in named SHM segment, `Read()` maps + copies + unlinks; `"/ifx_kv_{request_id}_{counter}"` naming; `-lrt` on Linux; meets <5 ms SLA (OS shares physical pages).
+  - `inferflux_kv_transfer_duration_ms` Prometheus histogram; `RecordKVTransfer()` called in `DecodeWorkerLoop` on each `TryDequeue()`.
+  - `INFERFLUX_ROLE` env var (`prefill`/`decode`/`unified`); `/readyz` response includes `"role"` field; decode-role nodes gate readiness on decode pool warm-up.
+  - Helm overlays: `deploy/helm/prefill-values.yaml` + `deploy/helm/decode-values.yaml` for independent pool scaling.
+  - `ShmTransportTests` ctest target; 10 `[shm_transport]` unit tests.
+- **Remaining (multi-node):**
+  - RDMA transport (multi-node, multi-pod): requires RDMA-capable NICs; replace SHM with ibverbs or UCX.
+  - Chaos tests (inject SHM segment failures, validate graceful fallback).
+  - CI SHM smoke test (cross-process validation in CI).
 
 ### 2.6 Expert Parallelism for MoE Models
 

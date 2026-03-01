@@ -66,6 +66,10 @@ class MetricsRegistry {
   // Called once at server startup after LlamaBackendConfig is applied.
   void SetFlashAttentionEnabled(bool enabled);
 
+  // KV transfer latency (§2.5 item 12): elapsed time from KVPacket::enqueue_time
+  // to when a decode worker dequeues it from KVChannel / ShmKVTransport.
+  void RecordKVTransfer(double transfer_ms);
+
   // Latency recording — call with full request duration in milliseconds.
   void RecordLatency(double request_ms);
 
@@ -120,8 +124,9 @@ class MetricsRegistry {
   LatencyHistogram request_latency_;
   LatencyHistogram queue_latency_;
   LatencyHistogram batch_exec_latency_;
-  LatencyHistogram prefill_latency_;   // OBS-2: prefill phase
+  LatencyHistogram prefill_latency_;    // OBS-2: prefill phase
   LatencyHistogram decode_latency_;    // OBS-2: decode phase
+  LatencyHistogram kv_transfer_latency_;  // §2.5 item 12: prefill→decode KV hand-off
 
   // Gauges.
   std::atomic<int> active_connections_{0};

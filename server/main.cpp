@@ -704,6 +704,21 @@ int main(int argc, char** argv) {
                                tls_config,
                                http_workers);
 
+  // §2.5 item 12: disaggregated deployment role.
+  inferflux::HttpServer::PoolRole server_role = inferflux::HttpServer::PoolRole::kUnified;
+  if (const char* env_role = std::getenv("INFERFLUX_ROLE")) {
+    std::string role_str = env_role;
+    if (role_str == "prefill") {
+      server_role = inferflux::HttpServer::PoolRole::kPrefill;
+    } else if (role_str == "decode") {
+      server_role = inferflux::HttpServer::PoolRole::kDecode;
+    }
+  }
+  server.SetRole(server_role);
+  if (server_role == inferflux::HttpServer::PoolRole::kDecode) {
+    server.SetDecodePoolReady(disagg_config.decode_pool_size > 0);
+  }
+
   if (!router->DefaultModelId().empty()) {
     server.SetModelReady(true);
   }
