@@ -36,7 +36,7 @@ layer above it.
 | Compliance Lead | Policy/audit replication lag | <30 s propagation across replicas | Observability dashboard, daily |
 
 ## Goals & Non-Goals
-- **Goals**: OpenAI-compatible API serving via llama.cpp, drop-in compatibility with existing SDKs, enterprise-grade auth/policy/audit, multi-backend runtime (CPU/CUDA/ROCm/MPS), observability (Prometheus metrics), and safe hot-reloads.
+- **Goals**: OpenAI-compatible API serving via llama.cpp, drop-in compatibility with existing SDKs, enterprise-grade auth/policy/audit, multi-backend runtime (CPU/CUDA/ROCm/MPS), observability (Prometheus metrics), safe hot-reloads, and first-class MoE model support (expert detection, `EPDispatch` routing, future multi-GPU expert sharding).
 - **Non-Goals**: Training, fine-tuning pipelines, bespoke frontend UX, or reimplementing inference kernels that llama.cpp already provides.
 
 ### Current Status (early 2026)

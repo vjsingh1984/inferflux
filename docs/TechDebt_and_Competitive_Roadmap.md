@@ -156,11 +156,13 @@ Mistral. SGLang tested it on 96 H100s. NVIDIA Dynamo provides orchestration for 
   - `KVChannel` gate: only enqueued when `use_decode_workers_=true`; while workers are disabled the channel is bypassed entirely (prevents fill-and-deadlock at capacity 64).
   - 11 `[phased]` unit tests in `tests/unit/test_phased_execution.cpp`.
   - **Docs:** `docs/Architecture.md` updated with implementation details and remaining work checklist.
-- **Items 11-12 done (SHM transport + control plane):**
-  - `ShmKVTransport` (`runtime/disaggregated/shm_kv_transport.{h,cpp}`): `shm_open`/`mmap` based; `Write()` stores `kv_blob` in named SHM segment, `Read()` maps + copies + unlinks; `"/ifx_kv_{request_id}_{counter}"` naming; `-lrt` on Linux; meets <5 ms SLA (OS shares physical pages).
+- **Items 11-12 done (SHM transport + control plane) — post-review bugs fixed:**
+  - `IKVTransport` pure-virtual interface (`kv_channel.h`): `Enqueue`/`TryDequeue`/`Size`/`Capacity`. Both `KVChannel` and `ShmKVTransport` implement it. `DisaggregatedConfig.kv_transport` is `shared_ptr<IKVTransport>` (renamed from `kv_channel`). Scheduler's four `kv_channel` references updated. `INFERFLUX_KV_TRANSPORT=shm` env var in `main.cpp` selects `ShmKVTransport` at runtime; default is `KVChannel`.
+  - `ShmKVTransport` (`runtime/disaggregated/shm_kv_transport.{h,cpp}`): `Enqueue()` stores `kv_blob` in named SHM segment, `TryDequeue()` maps + copies + unlinks; `"/ifx_kv_{request_id}_{counter}"` naming; `-lrt` on Linux; meets <5 ms SLA (OS shares physical pages).
   - `inferflux_kv_transfer_duration_ms` Prometheus histogram; `RecordKVTransfer()` called in `DecodeWorkerLoop` on each `TryDequeue()`.
-  - `INFERFLUX_ROLE` env var (`prefill`/`decode`/`unified`); `/readyz` response includes `"role"` field; decode-role nodes gate readiness on decode pool warm-up.
-  - Helm overlays: `deploy/helm/prefill-values.yaml` + `deploy/helm/decode-values.yaml` for independent pool scaling.
+  - `INFERFLUX_ROLE` env var (`prefill`/`decode`/`unified`); `/readyz` decode role now gates on model_loaded AND pool_warm (not just pool_warm — avoids Kubernetes routing to unweighted decode pods).
+  - `prefill_pool_size=0` supported: `std::max(0, ...)` in YAML parse, env parse (`stoi` instead of `ParsePositiveSize`), and config assignment.
+  - Helm overlays: `deploy/helm/prefill-values.yaml` + `deploy/helm/decode-values.yaml`; decode overlay sets `INFERFLUX_PREFILL_POOL_SIZE=0` + `INFERFLUX_KV_TRANSPORT=shm`.
   - `ShmTransportTests` ctest target; 10 `[shm_transport]` unit tests.
 - **Remaining (multi-node):**
   - RDMA transport (multi-node, multi-pod): requires RDMA-capable NICs; replace SHM with ibverbs or UCX.
@@ -325,7 +327,7 @@ grouped by the system area and ordered by severity within each group.
 | CQ-3 | **[VERIFIED INCORRECT]** `Guardrail::Enabled()` returns false when only OPA endpoint is configured (empty blocklist). The implementation correctly checks both `blocklist_.empty()` and `opa_endpoint_.empty()`. | `server/policy/guardrail.cpp:74` | *(Not a bug)* | — |
 | CQ-4 | **[FIXED]** `HttpClient::send()` now loops on partial sends and throws on failure. Also added 30s socket timeouts. | `net/http_client.cpp` | *(Fixed)* | — |
 | CQ-5 | **[FIXED]** `Stop()` shuts down listening socket via `shutdown(SHUT_RDWR)` to unblock `accept()`. | `server/http/http_server.cpp` | *(Fixed)* | — |
-| CQ-6 | Config path defaults to relative `"config/server.yaml"` — depends on CWD | `server/main.cpp:65` | Resolve relative to executable path or require absolute path | — |
+| CQ-6 | **[FIXED]** Config path now resolves relative to the executable directory when the CWD-relative path does not exist, so `inferfluxd` can be invoked from any working directory. | `server/main.cpp` | *(Fixed)* | — |
 | CQ-7 | **[FIXED]** Default `max_tokens` raised from 64/32 to 256 in both scheduler and CLI. | `scheduler/scheduler.h`, `cli/main.cpp` | *(Fixed)* | — |
 
 ---
@@ -407,7 +409,7 @@ identified above. Check items off as they are addressed.
 - [X] §Functional Requirements: Add multimodal input (image content parts) — §2.2
 - [X] §Functional Requirements: Add `inferctl pull` workflow — §2.8
 - [X] §Functional Requirements: Add request priority parameter — §2.9
-- [ ] §Goals: Mention MoE model support explicitly — §2.6
+- [X] §Goals: Mention MoE model support explicitly — §2.6
 - [X] §User Stories: Add agent workflow story (tool calling) — §2.3
 - [X] §User Stories: Add vision model story — §2.2
 - [X] §Acceptance Criteria: Return 503 (not 200) when no model loaded — INF-5
@@ -425,7 +427,7 @@ identified above. Check items off as they are addressed.
 - [X] §Security: Document readiness vs liveness health checks — OBS-3
 - [X] §Observability: Document audit log redaction (hash by default) — OBS-4
 - [X] §Modules: Add constrained decoding module — §2.1
-- [ ] §Modules: Add parallelism strategies section (TP/PP/EP) — §2.6, §2.7
+- [X] §Modules: Add parallelism strategies section (TP/PP/EP) — §2.6, §2.7
 - [X] §Data Flow: Add image preprocessing stage — §2.2
 - [X] §Deployment View: Add disaggregated prefill/decode topology — §2.5
 - [X] §Runtime: Add prefix cache subsystem — §2.4

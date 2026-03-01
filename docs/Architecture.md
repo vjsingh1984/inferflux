@@ -182,8 +182,8 @@ cross-process disaggregation — without requiring KV serialization or upstream 
 8. [x] 14 `[phased]` unit tests (`tests/unit/test_phased_execution.cpp`)
 9. [x] Wire `DecodeWorkerLoop` + enable `use_decode_workers_=true` when `decode_pool_size > 0`; `WorkerLoop` wait predicate excludes `pending_decode_` when workers are active (prevents spin-wakeup)
 10. [x] `SerializeSequence` / `HydrateSequence` via `llama_state_seq_get_data` / `llama_state_seq_set_data`; `kv_blob` in `KVPacket` carries real KV bytes (not token IDs); hydration passes blob directly without `sizeof(int)` multiplication
-11. [x] `ShmKVTransport` — POSIX `shm_open`/`mmap` transport (`runtime/disaggregated/shm_kv_transport.{h,cpp}`); `Write()` stores `kv_blob` in a named SHM segment, `Read()` maps + copies + unlinks; falls back to control-only packet when blob is empty; `-lrt` linked on Linux; 10 `[shm_transport]` unit tests
-12. [x] Dual-pool `/readyz` with `INFERFLUX_ROLE` (`prefill`/`decode`/`unified`); `inferflux_kv_transfer_duration_ms` Prometheus histogram; `ShmTransportTests` ctest target; Helm overlays `deploy/helm/prefill-values.yaml` + `deploy/helm/decode-values.yaml`
+11. [x] `ShmKVTransport` — POSIX `shm_open`/`mmap` transport (`runtime/disaggregated/shm_kv_transport.{h,cpp}`); `Enqueue()` stores `kv_blob` in a named SHM segment, `TryDequeue()` maps + copies + unlinks; falls back to control-only packet when blob is empty; `-lrt` linked on Linux; `IKVTransport` interface in `kv_channel.h` is shared by `KVChannel` and `ShmKVTransport`; `DisaggregatedConfig.kv_transport` (`shared_ptr<IKVTransport>`); `INFERFLUX_KV_TRANSPORT=shm` selects SHM at runtime; `prefill_pool_size=0` supported on decode nodes; 10 `[shm_transport]` unit tests
+12. [x] Dual-pool `/readyz` with `INFERFLUX_ROLE` (`prefill`/`decode`/`unified`); decode role now requires model_loaded AND pool_warm; `inferflux_kv_transfer_duration_ms` Prometheus histogram; `ShmTransportTests` ctest target; Helm decode overlay sets `INFERFLUX_PREFILL_POOL_SIZE=0` + `INFERFLUX_KV_TRANSPORT=shm`
 
 ## SHM Transport & Disaggregated Operations (§2.5 items 11-12)
 
@@ -193,16 +193,20 @@ cross-process disaggregation — without requiring KV serialization or upstream 
 shared-memory transport suitable for single-host cross-process disaggregation:
 
 ```
-Writer (prefill node)                Reader (decode node)
-─────────────────────               ─────────────────────
-ShmKVTransport::Write(pkt)          ShmKVTransport::Read()
-  1. shm_open("/ifx_kv_N_M", ...)      1. control_queue_.TryDequeue()
-  2. ftruncate(fd, blob_size)          2. shm_open(name, O_RDWR)
-  3. mmap + memcpy(blob)               3. mmap + memcpy(kv_blob out)
-  4. munmap; close(fd)                 4. munmap; shm_unlink(name)
-  5. Enqueue control pkt               5. return reassembled packet
+Writer (prefill node)                   Reader (decode node)
+──────────────────────────              ─────────────────────────────
+ShmKVTransport::Enqueue(pkt)            ShmKVTransport::TryDequeue()
+  1. shm_open("/ifx_kv_N_M", ...)         1. control_queue_.TryDequeue()
+  2. ftruncate(fd, blob_size)             2. shm_open(name, O_RDWR)
+  3. mmap + memcpy(blob)                  3. mmap + memcpy(kv_blob out)
+  4. munmap; close(fd)                    4. munmap; shm_unlink(name)
+  5. control_queue_.Enqueue(ctrl_pkt)     5. return reassembled packet
      (metadata: |shm=name|size=N)
 ```
+
+`ShmKVTransport` and `KVChannel` both implement the `IKVTransport` interface
+(`kv_channel.h`), so `DisaggregatedConfig.kv_transport` (`shared_ptr<IKVTransport>`)
+can hold either. Select via `INFERFLUX_KV_TRANSPORT=shm` (default: `channel`).
 
 Transfer latency is sub-millisecond for in-process use (shared physical pages);
 cross-process on the same host is bounded by memory bandwidth, not network, meeting the
@@ -231,13 +235,18 @@ inferflux_kv_transfer_duration_ms_count{backend="..."} ...
 |------|---------------------|----------|
 | `unified` (default) | Model loaded (`SingleModelRouter::DefaultModelId` non-empty) | Single-node |
 | `prefill` | Same as unified | Prefill-only pod |
-| `decode` | `decode_pool_size > 0` (decode workers warm) | Decode-only pod |
+| `decode` | Model loaded **AND** decode workers warm | Decode-only pod |
 
 Response always includes a `"role"` field:
 ```json
 {"status": "ready", "role": "decode"}
+{"status": "not_ready", "role": "decode", "reason": "no model backend loaded"}
 {"status": "not_ready", "role": "decode", "reason": "decode pool not ready"}
 ```
+
+The decode role gates on **both** conditions so a pod that has decode workers
+configured but hasn't finished loading weights is never marked ready by
+Kubernetes before it can serve tokens.
 
 ### Helm Overlays
 
@@ -245,6 +254,7 @@ Response always includes a `"role"` field:
 `INFERFLUX_DECODE_POOL_SIZE=0`, 2 replicas, 8 Gi memory.
 
 `deploy/helm/decode-values.yaml` — decode pool: `INFERFLUX_ROLE=decode`,
+`INFERFLUX_PREFILL_POOL_SIZE=0`, `INFERFLUX_KV_TRANSPORT=shm`,
 `INFERFLUX_DECODE_POOL_SIZE=4`, 4 replicas, tuned for token-generation throughput.
 
 Both set `readinessProbe.httpGet.path=/readyz` so Kubernetes routes traffic only to
@@ -345,6 +355,52 @@ Environment overrides:
 - **StructuredOutputAdapter** — Maintain OpenAI’s `response_format` as the public contract but introduce an internal adapter interface that validates payloads, enforces size limits, and emits backend-native constraints (e.g., llama.cpp GBNF via `json_schema_to_grammar`, regex/DSL for future engines).
 - **Backend capability flags** — Extend `ModelRouter`/`BackendManager` to advertise whether a backend supports structured output and which adapter type it requires. Scheduler consults these flags so unsupported combinations fail fast.
 - **Pluggable sampler hooks** — Wrap llama.cpp grammar sampler creation in a small `StructuredConstraint::Attach(BackendContext&)` helper so CUDA/ROCm/MPS backends (or entirely new runtimes) can implement constraint enforcement without touching HTTP or scheduler code.
+
+## Parallelism Strategies (§2.6 / §2.7)
+
+InferFlux models three complementary parallelism modes, all sharing the `EPDispatch`
+interface and the same per-sequence KV API used by phased prefill/decode.
+
+### Tensor Parallelism (TP)
+Attention heads and MLP weight columns are split across `world_size` ranks. Each rank
+holds a shard of the weight matrix; an all-reduce primitive (NCCL on CUDA, UCX on CPU
+clusters) merges partial activations before sampling. llama.cpp handles intra-node TP
+transparently when multiple GPUs are visible and `n_gpu_layers` covers enough layers.
+Cross-node TP requires explicit NCCL group initialization; deferred until multi-GPU
+hardware is available for validation.
+
+### Pipeline Parallelism (PP)
+Model layers are assigned to ranks in contiguous bands (e.g., layers 0–15 on rank 0,
+16–31 on rank 1). Each rank forward-passes its shard and forwards activations to the
+next rank via inter-node transport. A `PPStage` descriptor (layer range per rank) is
+reserved in the design but activation forwarding and rank-aware scheduling are not yet
+implemented. PP scheduling also requires the scheduler to track which stage is active
+per request to avoid head-of-line blocking.
+
+### Expert Parallelism (EP) — Partially Implemented
+EP assigns MoE expert layers to ranks so each rank only computes the experts it owns,
+avoiding redundant expert computation. `EPDispatch` / `LocalEPDispatch` (single-process,
+owns all experts, `world_size=1`) are live; expert routing metrics are active. Multi-GPU
+sharding via NCCL or shared-memory ring, and EP-aware batch routing in `BatchExecutor`,
+are the remaining steps.
+
+### Status
+
+| Strategy | Interface | Current State | Remaining |
+|----------|-----------|---------------|-----------|
+| Tensor (TP) | llama.cpp multi-GPU | Implicit via `n_gpu_layers` (single-host only) | NCCL cross-node group init |
+| Pipeline (PP) | `PPStage` descriptor (planned) | Not started | Activation forwarding, rank-aware scheduling |
+| Expert (EP) | `EPDispatch` / `LocalEPDispatch` | Detection + stub + metrics | Multi-GPU sharding, EP-aware batch routing |
+
+### Implementation Checklist
+1. [x] `EPDispatch` pure-virtual interface + `LocalEPDispatch` stub (`runtime/backends/ep_dispatch.h`)
+2. [x] `LlamaCPUBackend::IsMoE()` / `ExpertCount()` / `ActiveExperts()` via GGUF metadata
+3. [x] `ModelInfo.is_moe` / `n_experts` / `n_active_experts` populated in `SingleModelRouter`
+4. [x] `inferflux_moe_requests_total` Prometheus counter
+5. [ ] Multi-GPU EP sharding via NCCL (hardware-blocked)
+6. [ ] EP-aware batch routing in `BatchExecutor` (partition expert layers by rank)
+7. [ ] PP activation forwarding + rank-aware scheduling
+8. [ ] TP cross-node all-reduce via NCCL group init
 
 ## Modules
 - **Runtime** (`runtime/`): `DeviceContext` abstraction, `CPUDeviceContext` implementation, `CudaDeviceContext` placeholder (FlashAttention-ready), Metal/MPS + BLAS autodetection (via `LLAMA_METAL`/`LLAMA_BLAS`) so hardware accelerators are toggled automatically, `PagedKVCache` with LRU/Clock eviction and async NVMe offload, speculative decoding (draft + validator), `BackendManager` for named model loading.
