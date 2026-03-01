@@ -5,6 +5,15 @@
 - Streaming throughput >= 30 tok/s per request; aggregate >= 400 tok/s per GPU.
 - CPU fallback must sustain 8 tok/s for demo workloads.
 
+### Pipeline KPIs
+| KPI | Target | Owner | Notes |
+| --- | --- | --- | --- |
+| Constrained decoding overhead | <5% delta vs. unconstrained for JSON schema workloads | Runtime | Requires Constrained Decoder module |
+| Prefix cache hit rate (agent traces) | >60% for cached prefixes in benchmark corpus | Scheduler | Dependence on radix-tree cache rollout |
+| Multimodal preprocessing latency | <80 ms per 1 MP image on CUDA, <150 ms on CPU | Runtime | Uses llama.cpp `libmtmd` |
+| Guardrail verdict latency | <500 ms P95 including OPA calls | Policy | Blocks GA sign-off |
+| Policy replication lag | <30 s across replicas | Policy | Mirrors PRD persona KPI |
+
 ## Scalability
 - Horizontal scaling to 64 GPUs per cluster with shared KV cache metadata.
 - Support for MIG partitioning and multi-node deployments using Redis/etcd for scheduler coordination.
@@ -22,12 +31,18 @@
 - RBAC scopes (admin, read, generate, adapter-manager) enforced at gateway and CLI.
 - Audit logging (structured JSON) shipped to SIEM/KMS-encrypted storage; adapter secrets encrypted with KMS key.
 - Guardrail API to plug in policy engines (PII scrubbing, jailbreak detection, classifier enforcement).
+- **Current caveats**: None — built-in TLS can be enabled via `server.tls.enabled` when termination at the binary is required; otherwise fronting proxies may continue to terminate TLS.
 
 ## Operability
 - Prometheus metrics for latency, queue depth, KV cache usage, GPU memory fragmentation, adapter hits, backend mode.
 - OpenTelemetry traces for tokenizer→scheduler→backend pipeline.
 - Configurable structured logging (JSON) with log rotation and log-sampling per tenant, plus `/metrics` and `/debug` endpoints (token traces, adapter status).
 - CLI + admin UI for live streaming, SSE playback, interactive transcripts, and health dashboards.
+
+### Planned Module Deliverables
+- **Constrained Decoder**: Adds histogram visibility for grammar token latency and schema success rate.
+- **Prefix Cache**: Emits gauges for hit/miss/eviction, plus per-tenant cache quotas.
+- **Multimodal Adapter**: Surfaces preprocessing queue depth and GPU tensor conversion time.
 
 ## Compliance & Testing
 - Deterministic CPU integration tests for reproducibility.

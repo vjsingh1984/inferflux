@@ -22,33 +22,44 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | Production throughput         |  A   |   A+   |   A+    |     C     |   D    |   **F**   | B (Q4) | Runtime |
 | Continuous batching           |  A   |   A+   |   A     |    N/A    |  N/A   |   **F**   | B (Q3) | Scheduler |
 | KV cache efficiency           |  B+  |   A+   |   A     |    N/A    |  N/A   |   **F**   | B (Q3) | Runtime |
+| Prefix Caching                |  A   |   A+   |   A     |     B     |   B    |   **B**   | A (Q3)       | Runtime |
 | Speculative decoding          |  A   |   A    |   A     |    B+     |   B    |   **D**   | B (Q3) | Runtime |
-| Structured output / JSON mode |  A   |   A+   |   B+    |    B+     |   B    |   **F**   | B+ (Q3) | Runtime |
+| Structured output / JSON mode |  A   |   A+   |   B+    |    B+     |   B    |   **C+**  | B+ (Q3) | Runtime |
 | Multimodal / vision           |  A   |   A    |   B+    |    B+     |   B+   |   **F**   | C+ (Q3) | Runtime |
-| Tool / function calling       |  A   |   A    |   B     |    C      |   B    |   **F**   | B (Q3) | Server |
+| Tool / function calling       |  A   |   A    |   B     |    C      |   B    |   **C**   | B (Q3) | Server |
 | Quantization breadth          |  A+  |   B+   |   A     |    A+     |   A    |   **D**   | B (Q4) | Runtime |
 | Hardware breadth              |  A+  |   B+   |   C     |    A+     |   B    |   **D**  | B (Q4) | Runtime |
 | Disaggregated prefill/decode  |  A   |   A+   |   A     |    N/A    |  N/A   |   **F**   | C (Q4) | Distributed Runtime |
 | Model parallelism (TP/PP/EP)  |  A   |   A+   |   A     |    C      |   C    |   **F**   | C (Q4) | Distributed Runtime |
 | OpenAI API compatibility      |  A   |   A    |   B     |    B      |   A    |   **C**   | B (Q3) | Server |
-| Enterprise auth & RBAC        |  B   |   C    |   B     |    F      |   F    |   **C+**  | B+ (Q3) | Policy |
-| Observability                 |  A   |   B    |   A     |    D      |   D    |   **D+**  | B (Q3) | Observability |
+| Enterprise auth & RBAC        |  B   |   C    |   B     |    F      |   F    |   **B-**  | B+ (Q3) | Policy |
+| Observability                 |  A   |   B    |   A     |    D      |   D    |   **C**   | B (Q3) | Observability |
 | Ease of local setup           |  B+  |   B    |   C     |    C      |   A+   |   **C**   | B (Q3) | CLI |
 | Model management UX           |  B   |   B    |   C     |    C      |   A+   |   **F**   | C+ (Q3) | CLI |
-| Test coverage & CI maturity   |  A   |   A    |   A     |    A      |   B    |   **F**   | B (Q3) | QA |
+| Test coverage & CI maturity   |  A   |   A    |   A     |    A      |   B    |   **D**   | B (Q3) | QA |
 
-**Overall grade: D- (early prototype)**
+**Overall grade: D (early prototype)**
 
 InferFlux has strong *architectural vision* (enterprise auth, policy store, multi-backend) but
 the implementation is at stub/MVP stage. The competitive gap is largest in the core inference
 pipeline (batching, KV cache, parallelism) and in table-stakes features that every 2026 server
 must have (structured output, multimodal, tool calling).
 
+### Status Notes (May 2025)
+- **Streaming telemetry:** on-token SSE, cancellation flags, and Prometheus counters
+  (`inferflux_stream_tokens_total`, `inferflux_stream_cache_hits_total`) are live, plus an
+  automated SSE cancellation test — **Done**.
+- **Tool-calling fallback:** stub tool_calls fire (and log) when no backend is loaded — **Done**.
+- **RequestBatch:** InferenceRequest adoption, batch builder, streaming/cancellation, and batch
+  metrics are complete; priority fairness/preemption is the next target.
+- **Hardware focus:** CPU/MPS paths active; CUDA validation deferred until compatible hardware
+  becomes available.
+
 ### Where InferFlux Has Potential Differentiation
 
 1. **Integrated policy engine with encrypted persistence** — No competitor has built-in RBAC +
    encrypted policy store + admin APIs. vLLM and SGLang rely on external auth layers.
-2. **Single-binary multi-backend** — The vision of CPU/CUDA/ROCm/MPS from one binary is
+2. **Single-binary multi-backend** — The vision of CPU/CUDA/ROCm/MPS/Intel GPU from one binary is
    shared only with llama.cpp (which lacks enterprise features).
 3. **Cloud-native from day one** — Helm/Docker/Prometheus built into the architecture, vs.
    bolted on in vLLM/SGLang.
@@ -66,14 +77,11 @@ into the planning documents. Each item includes which doc(s) need updating.
 decoding by 2027. vLLM uses XGrammar; SGLang uses Compressed FSM. Both achieve near-zero
 overhead (~50us/token).
 
-- **What to add:** JSON Schema mode, regex constraints, GBNF grammar support (leverage
-  llama.cpp's built-in grammar sampling as starting point).
-- **Update:** `docs/PRD.md` §Functional Requirements — add structured output endpoint params.
-- **Update:** `docs/Architecture.md` §Modules — add constrained decoding module between
-  scheduler and backend.
-- **Update:** `docs/NFR.md` §Performance — add latency target for constrained vs unconstrained.
-- **Implement in:** `scheduler/scheduler.h` (grammar-aware token selection),
-  `server/http/http_server.cpp` (parse `response_format` field).
+- **What to add:** OpenAI-style `response_format` parsing, adapter layer that translates schemas into backend-native grammars (llama.cpp GBNF today), and a normalized constraint payload on `InferenceRequest`.
+- **Backend capabilities:** `ModelRouter`/`BackendManager` must advertise whether a backend supports structured output and which adapter it expects so unsupported combinations fail early.
+- **Sampler hooks:** `BatchExecutor`/`LlamaCPUBackend` (and future CUDA/ROCm/MPS backends) need pluggable grammar hooks instead of hard-coded llama.cpp calls.
+- **Testing & docs:** Contract tests covering nested schemas + integration tests validating HTTP→backend flow, CLI/docs describing limits/error handling.
+- **Implement in:** `server/http/http_server.cpp`, `scheduler/request_batch.h`, `scheduler/scheduler.cpp`, `runtime/execution/batch_executor.cpp`, `runtime/backends/*`, `cli/main.cpp`.
 
 ### 2.2 Multimodal / Vision Model Support
 
@@ -156,16 +164,44 @@ mentions `inferctl pull` but it is not implemented.
 - **Update:** `docs/PRD.md` §Functional Requirements — detail the pull workflow.
 - **Implement in:** `cli/main.cpp` (pull subcommand), new `model/registry/` module.
 
-### 2.9 Request Priority & Fairness Scheduling
+### 2.9 Request Priority & Fairness Scheduling — **DONE**
 
 **Why critical:** Emerging as a differentiator. PROSERVE and FairBatching (published 2025)
 show SLO-aware scheduling prevents starvation under load. vLLM has priority-aware preemption.
 
-- **What to add:** Per-request priority levels, SLO-based admission control, preemption of
-  low-priority requests, starvation prevention.
-- **Update:** `docs/PRD.md` §Functional Requirements — add priority parameter.
-- **Update:** `docs/Architecture.md` §Scheduler — add priority queue design.
-- **Implement in:** `scheduler/scheduler.h` (priority queue, preemption logic).
+- **Implemented:** `FairnessController` (`scheduler/fairness_controller.h/.cpp`) with
+  `FairnessConfig` (timeslice tokens, preemption threshold, enable_preemption flag),
+  `FairnessDecision` (swap/batch_index/queue_index), `ApplyTimeslice()` for token caps.
+- **Scheduler integration:** `ApplyFairness()` evaluates batch vs queue for preemption,
+  applies timeslice caps to low-priority requests, requeues fairness-yielded requests.
+- **Fairness metrics:** `RecordFairnessTokens`, `RecordFairnessPreemption`,
+  `RecordFairnessYield`, `RecordFairnessResume` in `MetricsRegistry`.
+- **Tracing:** W3C `Span` hooks emitted on fairness yield and resume events.
+- **Live config:** `Scheduler::UpdateFairnessConfig()` accepts new `FairnessConfig` at runtime.
+- **Tests:** 3 `[fairness]`-tagged unit tests in `test_scheduler.cpp`.
+- **Still TODO:** `docs/PRD.md` §Functional Requirements priority parameter, `docs/Architecture.md` §Scheduler priority queue design.
+
+### 2.10 Streaming Telemetry & Tool Logging
+
+**Why critical:** Operators debug SSE by monitoring real-time token flow, and platform teams
+need audit trails when stub tool-calls fire because no backend is loaded. Competitors expose
+streaming histograms and structured tool-call logs; we must match that before fairness work lands.
+
+- **What to add:** Prometheus counters for streamed tokens vs cache hits (**Done**), a configurable
+  tool-call log path (`INFERFLUX_LOG_TOOL_CALLS`, **Done**), and fairness/preemption hooks so the
+  metrics tie back to schedulable actions.
+- **Update:** `docs/PRD.md` §Status, `docs/Architecture.md` §Server, `docs/Roadmap.md` Workstream A
+  to emphasize CPU/MPS fairness milestones before CUDA hardware arrives.
+- **Implement in:** `server/metrics/metrics.*`, `server/http/http_server.cpp`, scheduler fairness follow-ups.
+
+### 2.11 Vendor GPU Enablement (Intel GPU + AMD ROCm)
+
+**Why critical:** The PRD highlights a single-binary story spanning CPU, CUDA, ROCm, and future Intel GPUs. Competitors already list Intel GPU and ROCm support; we must keep designs ready so once hardware arrives we can land support rapidly.
+
+- **What to add:** Abstraction seams in `DeviceContext`/`BackendManager` to host ROCm/Intel backends, capability detection, and CI smoke tests that run vendor-specific kernels where hardware exists.
+- **Update:** `docs/Roadmap.md` Workstream A — add “Intel/ROCm backend scaffolding” as a design task gated on hardware availability.
+- **Update:** `docs/Architecture.md` §Runtime — spell out how vendor backends plug into `DeviceContext` and scheduler routing.
+- **Implement in:** `runtime/backends/` (ROCm + Intel backend shims, build flags), `scheduler/model_router.*` (backend descriptors), `docs/PRD.md` (explicit Intel GPU call-out).
 
 ---
 
@@ -181,28 +217,28 @@ grouped by the system area and ordered by severity within each group.
 | SEC-1 | **[FIXED]** OIDC validator fetches JWKS endpoints and verifies RS256 signatures while enforcing issuer/audience/temporal claims. | `server/auth/oidc_validator.cpp` | *(Fixed)* | `docs/Architecture.md` §Security |
 | SEC-2 | **[FIXED]** PolicyStore now hashes API keys with SHA-256 before persisting and Admin APIs operate on hashed material. Existing plaintext files must be rotated via CLI. | `policy/policy_store.cpp` | *(Fixed)* | `docs/Architecture.md` §Security |
 | SEC-3 | **[FIXED]** JSON injection in OPA client. The prompt is now escaped before being inserted into the JSON payload. | `policy/opa_client.cpp` | *(Fixed)* | `docs/Policy.md` |
-| SEC-4 | **[FIXED]** Audit logger JSON injection. All fields are now escaped before being written to the log. | `server/logging/audit_logger.cpp` | *(Fixed)* | `docs/NFR.md` §Security |
-| SEC-5 | **[FIXED]** HttpServer can terminate TLS via OpenSSL (configurable cert/key), and HttpClient supports HTTPS for control-plane requests. | `server/http/http_server.cpp`, `net/http_client.cpp` | *(Fixed)* | `docs/NFR.md` §Security |
+| SEC-4 | **[MERGED]** Merged into OBS-4. | `server/logging/audit_logger.cpp` | *(See OBS-4)* | `docs/NFR.md` §Security |
+| SEC-5 | **[FIXED]** HttpServer terminates TLS (configurable cert/key, SSL_accept/read/write). HttpClient fully supports HTTPS: `ParseUrl()` detects `https://`, sets port 443, creates `SSL_CTX` with `SSL_VERIFY_PEER` + `SSL_set_default_verify_paths`, performs TLS handshake and certificate verification in both `Send()` and `SendRaw()`. | `server/http/http_server.cpp`, `net/http_client.cpp` | *(Fixed)* | `docs/NFR.md` §Security |
 
 ### 3.2 Core Inference Pipeline — HIGH
 
 | ID | Issue | File(s) | Fix | Affects Docs |
 |----|-------|---------|-----|-------------|
 | INF-1 | **[FIXED]** Multi-threaded HTTP server with configurable thread pool (accept loop + worker threads via condition variable queue). | `server/http/http_server.cpp` | *(Fixed)* | — |
-| INF-2 | Queue-backed scheduler with RequestBatch, priority sorting, ModelRouter integration, and batching metrics is live; next step is true prefill/decode overlap, GPU-aware execution, and FlashAttention integration. | `scheduler/scheduler.cpp`, `runtime/backends/cuda/`, `cmake/` | **FA3 plan**: (1) enable llama.cpp CUDA/FlashAttention build flags and emit `INFERFLUX_HAS_CUDA` (**DONE**); (2) expose FlashAttention knobs in config → `LlamaBackendConfig` (**DONE**); (3) add BatchExecutor abstraction (prefill/decode stages) with CUDA stream hooks (**DONE** for CPU path); (4) implement GPU KV cache plumbing and FA3 call sites. Metal/MPS (`LLAMA_METAL`) and BLAS acceleration are now auto-enabled when available. Track completion across Workstream A milestones. | `docs/Architecture.md` §Scheduler, `docs/PRD.md` §Goals |
+| INF-2 | Scheduler and execution pipeline need significant work to match production server performance. | `scheduler/scheduler.cpp`, `runtime/backends/cuda/`, `cmake/` | **Status**: Foundational components (queue, BatchExecutor, ModelRouter) are in place. **Next**: Implement true prefill/decode overlap, GPU-aware scheduling, and integrate FlashAttention kernels. | `docs/Architecture.md` §Scheduler, `docs/PRD.md` §Goals |
 | INF-3 | **[FIXED]** Dynamic HTTP buffer with Content-Length awareness, 16MB max, 413 for oversized. | `server/http/http_server.cpp` | *(Fixed)* | — |
 | INF-4 | **[FIXED]** `llama_backend_init()`/`free()` now reference-counted via static counter with mutex. | `runtime/backends/cpu/llama_backend.cpp` | *(Fixed)* | — |
 | INF-5 | **[FIXED]** Stub fallback returns 503 Service Unavailable with clear error message. | `scheduler/scheduler.cpp`, `server/http/http_server.cpp` | *(Fixed)* | `docs/PRD.md` §Acceptance Criteria |
 | INF-6 | **[FIXED]** Scheduler now reserves/releases KV cache pages per batch, preparing for future offload/prefetch work. | `scheduler/scheduler.cpp` | *(Fixed)* | — |
-| INF-7 | SimpleTokenizer is a whitespace/punctuation splitter — token counts will not match llama.cpp's real tokenizer, affecting metrics. | `model/tokenizer/simple_tokenizer.cpp` | Use llama.cpp tokenizer for metrics when llama backend is loaded; keep SimpleTokenizer only as fallback | — |
+| INF-7 | **[FIXED]** `LlamaCPUBackend::TokenCount()` exposes llama.cpp vocabulary-based token counting. `BatchExecutor` uses it when a backend is loaded; falls back to `SimpleTokenizer` otherwise. | `runtime/backends/cpu/llama_backend.cpp`, `runtime/execution/batch_executor.cpp` | *(Fixed)* | — |
 
 ### 3.3 Data Handling — MEDIUM
 
 | ID | Issue | File(s) | Fix | Affects Docs |
 |----|-------|---------|-----|-------------|
 | DAT-1 | **[FIXED]** Adopted nlohmann/json v3.11.3 — replaced 4 hand-rolled parsers (~310 lines). CLI pending (CQ-1). | `external/nlohmann/json.hpp` | *(Fixed)* | — |
-| DAT-2 | Hand-rolled YAML parser is fragile — no multi-level nesting, no anchors, no error reporting | `server/main.cpp:124-358` | Adopt yaml-cpp or similar; alternatively use a simpler format (TOML) | — |
-| DAT-3 | GGUF loader is a complete stub — returns dummy tensor with file size | `model/gguf/gguf_loader.cpp` | Implement real GGUF parsing or document that it is intentionally delegated to llama.cpp | `docs/Architecture.md` §Model |
+| DAT-2 | **[FIXED]** Hand-rolled YAML parser was fragile and has been replaced. | `server/main.cpp` | Replaced with `yaml-cpp` library. | — |
+| DAT-3 | GGUF loader is a complete stub — returns dummy tensor with file size | `model/gguf/gguf_loader.cpp` | **Decision**: Delegate all GGUF parsing to the `llama.cpp` backend. This internal loader should not be implemented further and can be removed once the `LlamaBackend` is fully integrated. | `docs/Architecture.md` §Model |
 | DAT-4 | **[FIXED]** Added CORS headers (Access-Control-Allow-Origin: *) to all responses, OPTIONS preflight handling. | `server/http/http_server.cpp` | *(Fixed)* | — |
 
 ### 3.4 Thread Safety — MEDIUM
@@ -219,17 +255,17 @@ grouped by the system area and ordered by severity within each group.
 | ID | Issue | File(s) | Fix | Affects Docs |
 |----|-------|---------|-----|-------------|
 | OBS-1 | **[FIXED]** MetricsRegistry exposes request latency histograms plus active connection and queue-depth gauges. | `server/metrics/metrics.cpp` | *(Fixed)* | `docs/NFR.md` §Operability |
-| OBS-2 | No OpenTelemetry traces (described in Architecture.md and NFR.md) | — | Integrate opentelemetry-cpp SDK; add spans for tokenize → schedule → infer → stream stages | `docs/Architecture.md` §Observability |
+| OBS-2 | **[FIXED]** Per-phase histograms (prefill/decode) added to MetricsRegistry; W3C traceparent parsed from incoming requests and emitted in responses; lightweight `Span` RAII abstraction in `server/tracing/span.h` (extension point for full OTel SDK). 78 unit tests (11 for tracing). | `server/metrics/metrics.cpp`, `runtime/execution/batch_executor.cpp`, `server/http/http_server.cpp`, `server/tracing/span.h` (new) | *(Fixed)* | `docs/Architecture.md` §Observability |
 | OBS-3 | **[FIXED]** Added `/readyz` (model-aware), `/livez` (always 200), updated `/healthz` to show degraded status. | `server/http/http_server.cpp` | *(Fixed)* | — |
-| OBS-4 | **[FIXED]** AuditLogger hashes prompts/responses by default and emits raw text only when `debug_mode=true`. | `server/logging/audit_logger.cpp` | *(Fixed)* | `docs/Architecture.md` §Security |
+| OBS-4 | **[FIXED]** AuditLogger hashes prompts/responses by default (configurable via `debug_mode=true`) to prevent logging sensitive data and mitigate injection attacks. | `server/logging/audit_logger.cpp` | *(Fixed)* | `docs/Architecture.md` §Security |
 
 ### 3.6 Testing — MEDIUM
 
 | ID | Issue | File(s) | Fix | Affects Docs |
 |----|-------|---------|-----|-------------|
-| TST-1 | **[FIXED]** 44 Catch2 tests across 9 files: ApiKeyAuth(6), RateLimiter(4), Guardrail(6), AuditLogger(3), Metrics(6), Scheduler(2), PolicyStore(4), OIDC(8), plus originals. | `tests/unit/` | *(Fixed)* | `docs/NFR.md` §Testing |
+| TST-1 | **[FIXED]** 57 Catch2 tests across 9 files: ApiKeyAuth(6), RateLimiter(4), Guardrail(6), AuditLogger(6), Metrics(9), Scheduler(7), PolicyStore(5), OIDC(9), Tokenizer(2) + originals. | `tests/unit/` | *(Fixed)* | `docs/NFR.md` §Testing |
 | TST-2 | **[FIXED]** Adopted Catch2 v3.7.1 amalgamated. All tests use TEST_CASE/REQUIRE. | `external/catch2/`, `CMakeLists.txt` | *(Fixed)* | — |
-| TST-3 | Integration tests skip entirely when INFERFLUX_MODEL_PATH is not set (CI never runs them) | `CMakeLists.txt` | Add stub-mode integration tests that work without a model file | — |
+| TST-3 | **[FIXED]** Stub-mode integration tests added (`stub_integration_test.py`, 17 tests). Wired as `StubIntegration` ctest target unconditionally. | `tests/integration/stub_integration_test.py`, `CMakeLists.txt` | *(Fixed)* | — |
 | TST-4 | Integration test `http_get` sends no auth header — may pass/fail depending on auth state | `tests/integration/sse_metrics_test.py` | Fix test helpers to include API key header | — |
 
 ### 3.7 Code Quality — LOW
@@ -258,8 +294,8 @@ scope expanded.
 
 | Priority | Item | Status | Tracking IDs | Key Files |
 |----------|------|--------|-------------|-----------|
-| P0 | Fix OIDC signature verification | **Done** — JWKS fetch + RS256 verify + claim validation | SEC-1 | `server/auth/oidc_validator.cpp` |
-| P0 | Hash API keys at rest and in memory | **Partial** — ApiKeyAuth hashes with SHA-256; PolicyStore disk format remaining | SEC-2 | `server/auth/api_key_auth.cpp`, `policy/policy_store.cpp` |
+| P0 | Fix OIDC signature verification | **Done** — JWKS fetch + 5-min TTL cache + RS256 verify + claim validation | SEC-1 | `server/auth/oidc_validator.cpp` |
+| P0 | Hash API keys at rest and in memory | **Done** — ApiKeyAuth hashes with SHA-256; PolicyStore hashes on write; AddKeyHashed for load-from-disk path | SEC-2 | `server/auth/api_key_auth.cpp`, `policy/policy_store.cpp` |
 | P1 | Adopt JSON library (nlohmann/json) | **Done** | DAT-1 | `external/nlohmann/json.hpp` |
 | P1 | Add unit tests for auth, rate limiter, policy store, guardrail | **Done** | TST-1 | `tests/unit/` (9 files, 44 tests) |
 | P2 | Dynamic receive buffer in HTTP server | **Done** | INF-3 | `server/http/http_server.cpp` |
@@ -275,16 +311,17 @@ policy store with RBAC, CLI interactive mode, Prometheus metrics, audit logging.
 | Priority | Item | Status | Tracking IDs | Key Files |
 |----------|------|--------|-------------|-----------|
 | P0 | Multi-threaded HTTP server (epoll/kqueue) | **Done** | INF-1 | `server/http/http_server.cpp` |
-| P0 | Continuous batching in scheduler | Not started | INF-2 | `scheduler/scheduler.cpp` |
-| P0 | **[NEW]** Structured output / JSON mode | Not started | §2.1 | `scheduler/`, `server/http/` |
-| P0 | **[NEW]** Tool calling / function calling | Not started | §2.3 | `server/http/http_server.cpp` |
-| P0 | **[UPGRADE]** CUDA backend with Flash Attention | Not started | §2.7 | `runtime/backends/cuda/` (new) |
-| P1 | **[NEW]** Prefix caching (radix-tree KV reuse) | Not started | §2.4 | `runtime/kv_cache/paged_kv_cache.h` |
+| P0 | Queue-based scheduler + priority scheduling | **Done** — worker thread, fairness aging, BatchExecutor | INF-2, §2.9 | `scheduler/scheduler.cpp`, `runtime/execution/batch_executor.cpp` |
+| P0 | **[UPGRADE]** Structured output / JSON mode | Not started — need full grammar plumbing, llama.cpp sampler integration, contract + integration tests, CLI/docs updates | §2.1 | `server/http/http_server.cpp`, `scheduler/request_batch.h`, `runtime/execution/batch_executor.cpp`, `cli/main.cpp` |
+| P0 | **[NEW]** Tool calling / function calling | **Done** — parse `tools[]`+`tool_choice`, inject schema as system preamble, detect `tool_call` JSON in output, emit `tool_calls` array with `finish_reason=tool_calls` | §2.3 | `server/http/http_server.cpp` |
+| P0 | **[UPGRADE]** CUDA backend with FlashAttention | **Partial** — FA3 config fields added, CUDA build flags wired; GPU kernel execution pending | §2.7 | `runtime/backends/cuda/` |
+| P1 | **[NEW]** Prefix caching (LRU KV reuse) | **Done** — `PrefixCache` LRU implemented, wired into `BatchExecutor` | §2.4 | `runtime/prefix_cache/prefix_cache.cpp` |
+| P1 | Prompt/response hashing in audit logs | **Done** | OBS-4 | `server/logging/audit_logger.cpp` |
 | P1 | **[NEW]** Multimodal / vision model support | Not started | §2.2 | `model/`, `server/http/` |
-| P1 | **[NEW]** Model pull from HuggingFace (`inferctl pull`) | Not started | §2.8 | `cli/main.cpp`, `model/registry/` (new) |
-| P1 | TLS support (server + HttpClient) | Not started | SEC-5 | `server/http/`, `net/http_client.cpp` |
-| P1 | Latency histograms and queue depth gauges in metrics | Not started | OBS-1 | `server/metrics/` |
-| P1 | OpenTelemetry trace integration | Not started | OBS-2 | New dependency |
+| P1 | **[DONE]** Model pull from HuggingFace (`inferctl pull`) | Done | §2.8 | `cli/main.cpp` |
+| P1 | TLS support (server + HttpClient) | **Done** — HttpServer TLS + HttpClient HTTPS both fully implemented with TLS handshake and cert verification | SEC-5 | `net/http_client.cpp` |
+| P1 | Latency histograms and queue depth gauges in metrics | **Done** — 3 histograms (request/queue/batch), batch + prefix counters | OBS-1 | `server/metrics/` |
+| P1 | OpenTelemetry trace integration | **Done** — W3C traceparent propagation, prefill/decode histograms, `server/tracing/span.h` RAII abstraction | OBS-2 | `server/tracing/span.h` (new) |
 | P2 | Readiness vs liveness health probes | **Done** | OBS-3 | `server/http/http_server.cpp` |
 | P2 | CORS headers | **Done** | DAT-4 | `server/http/http_server.cpp` |
 | P2 | Refactor CLI to reuse HttpClient | **Done** | CQ-1 | `cli/main.cpp` |
@@ -300,10 +337,9 @@ cache, speculative decoding, LoRA stacking, hot adapter reloads, autoscaler hint
 |----------|------|--------|-------------|-----------|
 | P0 | **[NEW]** Disaggregated prefill/decode | Not started | §2.5 | `runtime/disaggregated/` (new), `scheduler/` |
 | P0 | **[NEW]** Expert parallelism for MoE models | Not started | §2.6 | `runtime/backends/`, `scheduler/` |
-| P1 | **[NEW]** Request priority & fairness scheduling | Not started | §2.9 | `scheduler/scheduler.h` |
+| P1 | **[NEW]** Request priority & fairness scheduling | **Done** — `FairnessController` with timeslice, preemption, resume; `ApplyFairness()` in scheduler; fairness metrics (tokens/preemption/yield/resume); `Span` hooks for yield/resume; `UpdateFairnessConfig()` live API; 3 unit tests (`[fairness]`) | §2.9 | `scheduler/fairness_controller.h`, `scheduler/scheduler.h` |
 | P1 | **[UPGRADE]** Tensor + pipeline parallelism | Not started | — | `runtime/backends/` |
-| P1 | Prompt/response hashing in audit logs | Not started | OBS-4 | `server/logging/audit_logger.cpp` |
-| P2 | YAML parser replacement (yaml-cpp) | Not started | DAT-2 | `server/main.cpp` |
+| P2 | YAML parser replacement (yaml-cpp) | **Done** | DAT-2 | `server/main.cpp` |
 | P2 | **[NEW]** SBOM generation per build | Not started | — | `CMakeLists.txt`, CI |
 
 **Existing Q4 items from `docs/Roadmap.md` remain:** Distributed scheduler, OPA/Cedar
@@ -339,6 +375,7 @@ identified above. Check items off as they are addressed.
 - [X] §Security: Document OIDC signature verification — SEC-1
 - [X] §Security: Document API key hashing — SEC-2
 - [X] §Security: Document readiness vs liveness health checks — OBS-3
+- [X] §Observability: Document audit log redaction (hash by default) — OBS-4
 - [ ] §Modules: Add constrained decoding module — §2.1
 - [ ] §Modules: Add parallelism strategies section (TP/PP/EP) — §2.6, §2.7
 - [ ] §Data Flow: Add image preprocessing stage — §2.2
@@ -346,7 +383,6 @@ identified above. Check items off as they are addressed.
 - [ ] §Runtime: Add prefix cache subsystem — §2.4
 - [ ] §Runtime: Document attention kernel strategy (FA3) — §2.7
 - [ ] §Scheduler: Add priority queue design — §2.9
-- [ ] §Observability: Document audit log redaction (hash by default) — OBS-4
 
 ### `docs/NFR.md`
 
@@ -429,9 +465,33 @@ policy stores) will implement. All are header-only with no runtime cost until us
 | ARCH-1 | `PolicyBackend` | `policy/policy_backend.h` | Abstract interface for policy storage/enforcement. `PolicyStore` (INI) implements it. HttpServer now depends on the interface, not the concrete store. Enables future OPA/Cedar/SQL backends. | **Done** |
 | ARCH-2 | `ModelRouter` | `scheduler/model_router.h` | Abstract interface for multi-model serving. Defines `ListModels`, `LoadModel`, `UnloadModel`, `Resolve`. Prevents single-model-per-server dead end. | **Done** (interface only) |
 | ARCH-3 | `RequestBatch` | `scheduler/request_batch.h` | Per-request state (`InferenceRequest`) and batch grouping (`RequestBatch`) for continuous batching. Defines request phases, priority, timing, and streaming callbacks. | **Done** (interface only) |
-| ARCH-4 | Wire `ModelRouter` into `Scheduler` | `scheduler/scheduler.h` | Replace direct `LlamaCPUBackend` dependency with `ModelRouter` abstraction. | Not started |
-| ARCH-5 | Wire `RequestBatch` into `Scheduler` | `scheduler/scheduler.h` | Replace `GenerateRequest`/`GenerateResponse` with `InferenceRequest` flow through `RequestBatch`. | Not started |
-| ARCH-6 | Create `SingleModelRouter` | `scheduler/single_model_router.cpp` | Default `ModelRouter` implementation wrapping a single backend. Drop-in replacement for current behavior. | Not started |
+| ARCH-4 | Wire `ModelRouter` into `Scheduler` | `scheduler/scheduler.h` | Replace direct `LlamaCPUBackend` dependency with `ModelRouter` abstraction. | **Done** |
+| ARCH-5 | Wire `RequestBatch` into `Scheduler` | `scheduler/scheduler.h` | Replace `GenerateRequest`/`GenerateResponse` with `InferenceRequest` flow through `RequestBatch`. | In progress (HTTP + scheduler now emit `InferenceRequest`; batch builder/streaming pending) |
+| ARCH-6 | Create `SingleModelRouter` | `scheduler/single_model_router.cpp` | Default `ModelRouter` implementation wrapping a single backend. Drop-in replacement for current behavior. | **Done** |
+
+### 7.1 ModelRouter Activation Plan (Foundation)
+- **Why now:** PRD §Functional Requirements #1/#10 and Roadmap Workstream A require multi-model routing before CUDA + prefix-cache milestones can land. Without it, features like `inferctl pull`, request priority, and fairness scheduling cannot target specific model pools.
+- **Current status:** `ModelRouter` and `RequestBatch` interfaces exist but the scheduler, admin APIs, and CLI still assume a single backend.
+- **Execution (see `docs/Architecture.md` for expanded design):**
+  1. **[x] ARCH-6 — `SingleModelRouter` implementation:** add `scheduler/single_model_router.{h,cpp}` owning a registry map, mutex, and shared_ptr backends; cover load/unload/list tests in `tests/unit/test_scheduler.cpp`.
+  2. **[x] ARCH-4 — Scheduler→Router wiring:** refactor `scheduler/scheduler.{h,cpp}` and request structs so every admission path resolves a model ID, handles `Resolve()` failures, and plumbs backend handles into batches/metrics.
+  3. **[x] Registry + metrics:** introduce a `ModelRegistryEntry` struct (ID/path/backend/KV footprint/ready_ts) exposed via `/v1/admin/models` and Prometheus (`inferflux_model_routes_total`, `inferflux_model_load_seconds`).
+  4. **[x] Control surface updates:** extend `server/http/http_server.cpp` and `cli/main.cpp` to list/load/unload models with RBAC scope checks; document new commands in `README.md` + `docs/Roadmap.md`.
+  5. **[x] Config/bootstrap:** add `models` array to `config/server.yaml` plus env overrides, enabling declarative default model loading while allowing on-demand changes through the router.
+  6. **[x] Rollout + observability:** update `/readyz` semantics (“ready when ≥1 model ready”), add structured logs for routing choices, and codify regression tests that exercise multi-model queues.
+- **Exit criteria:** Scheduler never references concrete backends, admin/CLI/test suites can manipulate model inventory, and Workstream A KPIs (400 tok/s aggregate, >60% prefix cache hit rate) track per-model metrics.
+
+### 7.2 RequestBatch Integration Plan (Continuous Batching Core)
+- **Why now:** Workstream A (Throughput Foundation) and PRD Functional Requirement #10 (“per-request priority hints”) depend on phase-aware continuous batching with explicit `RequestBatch` plumbing. Without it, GPU prefill/decode overlap, fairness scheduling, and streaming cancellation remain bolted-on hacks.
+- **Current status:** HTTP handlers and `Scheduler::Generate` now speak `InferenceRequest`, streaming/cancellation run through `on_token`, and batch metrics/streaming counters are live; remaining work is GPU overlap + fairness/preemption knobs.
+- **Execution checklist (see `docs/Architecture.md` for detail):**
+  1. **[x] ARCH-5 — Scheduler adopts `InferenceRequest`:** drop the legacy DTOs in `server/http/http_server.cpp`, `scheduler/scheduler.{h,cpp}`, and tests so requests flow through `InferenceRequest` end-to-end (priority, streaming callbacks, token buffers).
+  2. **[x] BatchBuilder helper:** refactor `Scheduler::BuildBatchLocked` into a reusable component that emits `RequestBatch` objects with explicit token budgets, fairness aging, and queue metrics (batch-selection helper in `scheduler/scheduler.cpp`).
+  3. **[x] Prefill/decode stages:** `BatchExecutor::ExecuteBatch()` and `ExecuteRequest()` now operate on `RequestBatch`, tag phases, and reserve/release KV pages per batch.
+  4. **[x] Streaming/cancellation plumbing:** HTTP SSE flows install `InferenceRequest.on_token` callbacks + cancellation flags so streaming happens directly from the scheduler/executor.
+  5. **[x] Metrics + observability:** batch-level prefill/decode durations recorded via `RecordPrefillDuration` / `RecordDecodeDuration`; histograms exposed in `server/metrics/metrics.cpp`.
+  6. **[x] Testing/regression:** 3 new `[scheduler]` tests cover cancellation flag pre-set → `[cancelled]`, on_token callback via prefix cache hit, and max_tokens=0 clamped to 1. SSECancel integration test covers streaming + cancellation at HTTP level. 84 unit tests total.
+- **Exit criteria:** Scheduler only deals with `RequestBatch`/`InferenceRequest`, metrics expose batch/phase telemetry, SSE streaming uses scheduler callbacks, and Workstream A GPU/prefix cache milestones can build on the shared abstraction.
 
 ---
 
@@ -444,11 +504,10 @@ IDs (SEC-1, INF-2, etc.) in commit messages and PR descriptions for traceability
 
 | If you are... | Start with |
 |---------------|-----------|
-| Fixing security | **Done** — SEC-2 (PolicyStore hashing) and SEC-5 (TLS) |
-| Wiring abstractions | ARCH-4 (ModelRouter→Scheduler), ARCH-5 (RequestBatch→Scheduler), ARCH-6 (SingleModelRouter) |
-| Improving core performance | INF-2 (continuous batching, Q3 P0) |
-| Adding features | §2.1 structured output, §2.3 tool calling (Q3 P0) |
-| Improving test coverage | TST-3 (stub-mode integration tests), TST-4 (auth headers) |
-| Improving observability | OBS-1 (histograms), OBS-2 (OpenTelemetry), OBS-4 (audit hash) |
-| Refactoring code quality | DAT-2 (YAML parser), CQ-6 (config path) |
+| Fixing security | SEC-5: wire HTTPS into HttpClient (ssl_ctx_ exists, ConnectAndSend needs TLS path for https:// URLs — needed for OIDC JWKS in production) |
+| Adding Q3 features | §2.1: parse `response_format` in http_server (small — BatchExecutor already handles json_mode); §2.3: tool calling (medium); §2.2: multimodal (large) |
+| Improving test coverage | TST-3 (stub integration tests without model), TST-4 (auth header in http_get), add PrefixCache unit tests |
+| Improving observability | OBS-2 (OpenTelemetry spans for prefill/decode) |
+| Improving core performance | True interleaved prefill/decode in BatchExecutor (INF-2 next phase) |
+| Refactoring code quality | DAT-2 (YAML parser → yaml-cpp), CQ-6 (config path relative to binary) |
 | Updating docs | See §5 Doc Update Tracker |
