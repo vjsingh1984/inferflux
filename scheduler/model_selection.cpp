@@ -12,6 +12,13 @@ namespace inferflux {
 
 namespace {
 
+std::string ToLower(std::string value) {
+  std::transform(
+      value.begin(), value.end(), value.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
 BackendCapabilities EffectiveCapabilities(const ModelInfo &info) {
   BackendCapabilities capabilities = info.capabilities;
   if (!info.supports_structured_output) {
@@ -21,10 +28,7 @@ BackendCapabilities EffectiveCapabilities(const ModelInfo &info) {
 }
 
 int BackendPreferenceRank(const std::string &backend_label) {
-  std::string lowered = backend_label;
-  std::transform(
-      lowered.begin(), lowered.end(), lowered.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::string lowered = ToLower(backend_label);
   if (lowered == "cuda") {
     return 0;
   }
@@ -103,6 +107,29 @@ PickFallbackCandidate(ModelRouter *router, const ModelInfo &primary,
 }
 
 } // namespace
+
+std::string CapabilityFallbackScopeToString(CapabilityFallbackScope scope) {
+  switch (scope) {
+  case CapabilityFallbackScope::kSamePathOnly:
+    return "same_path_only";
+  case CapabilityFallbackScope::kAnyCompatible:
+  default:
+    return "any_compatible";
+  }
+}
+
+CapabilityFallbackScope
+ParseCapabilityFallbackScope(const std::string &value,
+                             CapabilityFallbackScope default_scope) {
+  const std::string normalized = ToLower(value);
+  if (normalized == "same_path" || normalized == "same_path_only") {
+    return CapabilityFallbackScope::kSamePathOnly;
+  }
+  if (normalized == "any" || normalized == "any_compatible") {
+    return CapabilityFallbackScope::kAnyCompatible;
+  }
+  return default_scope;
+}
 
 ModelSelectionResult
 SelectModelForRequest(ModelRouter *router, const std::string &requested_model,

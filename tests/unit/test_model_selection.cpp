@@ -92,6 +92,26 @@ std::shared_ptr<LlamaCPUBackend> ReadyBackend() {
 
 } // namespace
 
+TEST_CASE("CapabilityFallbackScope parse and stringify are stable",
+          "[model_selection]") {
+  REQUIRE(CapabilityFallbackScopeToString(
+              CapabilityFallbackScope::kAnyCompatible) == "any_compatible");
+  REQUIRE(CapabilityFallbackScopeToString(
+              CapabilityFallbackScope::kSamePathOnly) == "same_path_only");
+
+  REQUIRE(ParseCapabilityFallbackScope("any") ==
+          CapabilityFallbackScope::kAnyCompatible);
+  REQUIRE(ParseCapabilityFallbackScope("same_path") ==
+          CapabilityFallbackScope::kSamePathOnly);
+  REQUIRE(ParseCapabilityFallbackScope("same_path_only") ==
+          CapabilityFallbackScope::kSamePathOnly);
+  REQUIRE(ParseCapabilityFallbackScope("ANY_COMPATIBLE") ==
+          CapabilityFallbackScope::kAnyCompatible);
+  REQUIRE(ParseCapabilityFallbackScope(
+              "unknown", CapabilityFallbackScope::kSamePathOnly) ==
+          CapabilityFallbackScope::kSamePathOnly);
+}
+
 TEST_CASE("SelectModelForRequest falls back for default routing when primary "
           "lacks required capability",
           "[model_selection]") {

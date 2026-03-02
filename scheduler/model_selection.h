@@ -38,6 +38,12 @@ struct ModelSelectionResult {
   std::string reason;
 };
 
+std::string CapabilityFallbackScopeToString(CapabilityFallbackScope scope);
+CapabilityFallbackScope
+ParseCapabilityFallbackScope(const std::string &value,
+                             CapabilityFallbackScope default_scope =
+                                 CapabilityFallbackScope::kAnyCompatible);
+
 ModelSelectionResult
 SelectModelForRequest(ModelRouter *router, const std::string &requested_model,
                       const BackendFeatureRequirements &requirements,

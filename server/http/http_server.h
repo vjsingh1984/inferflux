@@ -2,6 +2,7 @@
 
 #include "policy/policy_backend.h"
 #include "runtime/speculative/speculative_decoder.h"
+#include "scheduler/model_selection.h"
 #include "scheduler/scheduler.h"
 #include "server/auth/api_key_auth.h"
 #include "server/auth/oidc_validator.h"
@@ -49,7 +50,8 @@ public:
              Guardrail *guardrail, AuditLogger *audit_logger,
              PolicyBackend *policy_store,
              std::shared_ptr<SpeculativeDecoder> speculative_decoder,
-             TlsConfig tls_config, int num_workers = 4);
+             TlsConfig tls_config, int num_workers = 4,
+             const ModelSelectionOptions &model_selection_options = {});
   ~HttpServer();
 
   void Start();
@@ -93,6 +95,7 @@ private:
   AuditLogger *audit_logger_;
   PolicyBackend *policy_store_;
   std::shared_ptr<SpeculativeDecoder> speculative_decoder_;
+  ModelSelectionOptions model_selection_options_;
   bool tls_enabled_{false};
   SSL_CTX *ssl_ctx_{nullptr};
   std::atomic<bool> running_{false};

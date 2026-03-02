@@ -46,13 +46,15 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
                      std::shared_ptr<SpeculativeDecoder> speculative_decoder,
                      std::shared_ptr<RadixPrefixCache> prefix_cache,
                      const FairnessConfig &fairness_config,
-                     const DisaggregatedConfig &disagg_config)
+                     const DisaggregatedConfig &disagg_config,
+                     const ModelSelectionOptions &model_selection_options)
     : tokenizer_(tokenizer), device_(std::move(device)),
       cache_(std::move(cache)), router_(std::move(router)),
       speculative_decoder_(std::move(speculative_decoder)),
       prefix_cache_(std::move(prefix_cache)),
       fairness_controller_(fairness_config), fairness_config_(fairness_config),
       disagg_config_(disagg_config),
+      model_selection_options_(model_selection_options),
       seq_slots_free_((1ULL << kMaxSequenceSlots) - 1) {
   static_assert(kMaxSequenceSlots <= 64,
                 "seq_slots_free_ bitmask requires kMaxSequenceSlots <= 64");
@@ -1036,8 +1038,7 @@ void Scheduler::ResolveBackends(
 
     auto selection = SelectModelForRequest(
         router_.get(), pending->inference.model, requirements,
-        ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,
-                              /*require_ready_backend=*/true});
+        model_selection_options_);
 
     if (selection.status == ModelSelectionStatus::kNotFound) {
       GlobalMetrics().RecordModelRoute(pending->inference.model, "", false);

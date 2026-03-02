@@ -76,7 +76,7 @@
 
 | Category | Keys / Env | Purpose |
 | --- | --- | --- |
-| Backend selection | `runtime.backend_priority`, `runtime.backend_exposure.*`, `INFERFLUX_BACKEND_PRIORITY`, `INFERFLUX_BACKEND_PREFER_NATIVE`, `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` | Choose backend chain + fallback policy |
+| Backend selection | `runtime.backend_priority`, `runtime.backend_exposure.*`, `runtime.capability_routing.*`, `INFERFLUX_BACKEND_PRIORITY`, `INFERFLUX_BACKEND_PREFER_NATIVE`, `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK`, `INFERFLUX_ROUTING_ALLOW_DEFAULT_CAPABILITY_FALLBACK`, `INFERFLUX_ROUTING_REQUIRE_READY_BACKEND`, `INFERFLUX_ROUTING_FALLBACK_SCOPE` | Choose backend chain + capability fallback behavior |
 | Fairness | `runtime.fairness.enable_preemption`, `.high_priority_threshold`, `.max_timeslice_tokens` | Continuous batching fairness |
 | Registry (CQ-8) | `registry.path`, `registry.poll_interval_ms` | Hot-reload model manifests |
 | Authentication | `auth.api_keys[].scopes`, `INFERCTL_API_KEY` | RBAC for generate/read/admin |

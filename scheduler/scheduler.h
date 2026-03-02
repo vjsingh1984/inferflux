@@ -8,6 +8,7 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "runtime/speculative/speculative_decoder.h"
 #include "scheduler/fairness_controller.h"
+#include "scheduler/model_selection.h"
 #include "scheduler/model_router.h"
 #include "scheduler/request_batch.h"
 
@@ -47,7 +48,11 @@ public:
       std::shared_ptr<SpeculativeDecoder> speculative_decoder = nullptr,
       std::shared_ptr<RadixPrefixCache> prefix_cache = nullptr,
       const FairnessConfig &fairness_config = {},
-      const DisaggregatedConfig &disagg_config = {});
+      const DisaggregatedConfig &disagg_config = {},
+      const ModelSelectionOptions &model_selection_options =
+          ModelSelectionOptions{
+              /*allow_capability_fallback_for_default=*/true,
+              /*require_ready_backend=*/true});
   ~Scheduler();
 
   // Non-blocking admission: adds request to queue and returns a future result.
@@ -127,6 +132,7 @@ private:
   FairnessController fairness_controller_;
   FairnessConfig fairness_config_;
   DisaggregatedConfig disagg_config_;
+  ModelSelectionOptions model_selection_options_;
 
   // Sequence slot bookkeeping (§2.5).  Bitmask of 64 slots; 1 = free.
   // Using an atomic bitmask allows concurrent calls to AllocSeqSlot /

@@ -12,6 +12,7 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "runtime/speculative/speculative_decoder.h"
 #include "scheduler/model_registry.h"
+#include "scheduler/model_selection.h"
 #include "scheduler/model_router.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/single_model_router.h"
@@ -218,6 +219,11 @@ int main(int argc, char **argv) {
   std::string kv_transport_type = "channel"; // "channel" | "shm"
   std::vector<ModelConfig> configured_models;
   std::string default_model_override;
+  inferflux::ModelSelectionOptions routing_selection_options{};
+  routing_selection_options.allow_capability_fallback_for_default = true;
+  routing_selection_options.require_ready_backend = true;
+  routing_selection_options.capability_fallback_scope =
+      inferflux::CapabilityFallbackScope::kAnyCompatible;
   std::string
       mmproj_path; // §2.2: path to multimodal projector (empty = disabled).
   std::string registry_path; // CQ-8: hot-reload registry.yaml (empty = off)
@@ -316,6 +322,24 @@ int main(int argc, char **argv) {
           if (exposure["allow_universal_fallback"]) {
             backend_allow_universal_fallback =
                 exposure["allow_universal_fallback"].as<bool>();
+          }
+        }
+        if (config["runtime"]["capability_routing"]) {
+          const auto &routing = config["runtime"]["capability_routing"];
+          if (routing["allow_default_fallback"]) {
+            routing_selection_options.allow_capability_fallback_for_default =
+                routing["allow_default_fallback"].as<bool>();
+          }
+          if (routing["require_ready_backend"]) {
+            routing_selection_options.require_ready_backend =
+                routing["require_ready_backend"].as<bool>();
+          }
+          if (routing["fallback_scope"] &&
+              routing["fallback_scope"].IsScalar()) {
+            routing_selection_options.capability_fallback_scope =
+                inferflux::ParseCapabilityFallbackScope(
+                    routing["fallback_scope"].as<std::string>(),
+                    routing_selection_options.capability_fallback_scope);
           }
         }
         if (config["runtime"]["speculative_decoding"]) {
@@ -584,6 +608,23 @@ int main(int argc, char **argv) {
       backend_priority = std::move(parsed_priority);
     }
   }
+  if (const char *env_allow_default_cap_fallback = std::getenv(
+          "INFERFLUX_ROUTING_ALLOW_DEFAULT_CAPABILITY_FALLBACK")) {
+    routing_selection_options.allow_capability_fallback_for_default =
+        ParseBool(env_allow_default_cap_fallback);
+  }
+  if (const char *env_routing_require_ready =
+          std::getenv("INFERFLUX_ROUTING_REQUIRE_READY_BACKEND")) {
+    routing_selection_options.require_ready_backend =
+        ParseBool(env_routing_require_ready);
+  }
+  if (const char *env_routing_scope =
+          std::getenv("INFERFLUX_ROUTING_FALLBACK_SCOPE")) {
+    routing_selection_options.capability_fallback_scope =
+        inferflux::ParseCapabilityFallbackScope(
+            env_routing_scope,
+            routing_selection_options.capability_fallback_scope);
+  }
   inferflux::FairnessConfig fairness_config;
   fairness_config.enable_preemption = false;
   fairness_config.high_priority_threshold = 5;
@@ -683,6 +724,20 @@ int main(int argc, char **argv) {
           std::string(backend_prefer_native ? "true" : "false") +
           ", allow_universal_fallback=" +
           std::string(backend_allow_universal_fallback ? "true" : "false"));
+  inferflux::log::Info(
+      "server",
+      "Capability routing policy: allow_default_fallback=" +
+          std::string(routing_selection_options
+                          .allow_capability_fallback_for_default
+                      ? "true"
+                      : "false") +
+          ", require_ready_backend=" +
+          std::string(routing_selection_options.require_ready_backend
+                          ? "true"
+                          : "false") +
+          ", fallback_scope=" +
+          inferflux::CapabilityFallbackScopeToString(
+              routing_selection_options.capability_fallback_scope));
   inferflux::BackendManager backend_manager;
   std::string backend_label = "stub";
   std::string primary_model_id;
@@ -935,7 +990,8 @@ int main(int argc, char **argv) {
   disagg_config.kv_transport = kv_transport;
   inferflux::Scheduler scheduler(tokenizer, device, cache, router,
                                  speculative_decoder, prefix_cache,
-                                 fairness_config, disagg_config);
+                                 fairness_config, disagg_config,
+                                 routing_selection_options);
   sched_ptr = &scheduler;
   auto &metrics = inferflux::GlobalMetrics();
   metrics.SetBackend(backend_label);
@@ -994,7 +1050,8 @@ int main(int argc, char **argv) {
       rate_limit_per_minute > 0 ? &rate_limiter : nullptr,
       guardrail.Enabled() ? &guardrail : nullptr,
       audit_logger.Enabled() ? &audit_logger : nullptr, &policy_store,
-      speculative_decoder, tls_config, http_workers);
+      speculative_decoder, tls_config, http_workers,
+      routing_selection_options);
 
   // §2.5 item 12: disaggregated deployment role.
   inferflux::HttpServer::PoolRole server_role =

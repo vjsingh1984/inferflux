@@ -870,12 +870,14 @@ HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
                        RateLimiter *rate_limiter, Guardrail *guardrail,
                        AuditLogger *audit_logger, PolicyBackend *policy_store,
                        std::shared_ptr<SpeculativeDecoder> speculative_decoder,
-                       TlsConfig tls_config, int num_workers)
+                       TlsConfig tls_config, int num_workers,
+                       const ModelSelectionOptions &model_selection_options)
     : host_(std::move(host)), port_(port), scheduler_(scheduler),
       auth_(std::move(auth)), metrics_(metrics), oidc_(oidc),
       rate_limiter_(rate_limiter), guardrail_(guardrail),
       audit_logger_(audit_logger), policy_store_(policy_store),
       speculative_decoder_(std::move(speculative_decoder)),
+      model_selection_options_(model_selection_options),
       num_workers_(num_workers > 0 ? num_workers : 4) {
 #if INFERFLUX_ENABLE_WEBUI
   webui_renderer_ = std::make_unique<WebUiRenderer>();
@@ -1886,10 +1888,10 @@ void HttpServer::HandleClient(ClientSession &session) {
     std::string resolved_model = embed_model.empty() ? "default" : embed_model;
     if (router) {
       BackendFeatureRequirements requirements = BuildEmbeddingFeatureRequirements();
+      ModelSelectionOptions embedding_options = model_selection_options_;
+      embedding_options.require_ready_backend = true;
       auto selection = SelectModelForRequest(
-          router, embed_model, requirements,
-          ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,
-                                /*require_ready_backend=*/true});
+          router, embed_model, requirements, embedding_options);
       if (selection.status == ModelSelectionStatus::kUnsupported) {
         if (metrics_) {
           metrics_->RecordCapabilityRejection(selection.info.backend,
@@ -2118,10 +2120,11 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
 
     if (auto *router = scheduler_ ? scheduler_->Router() : nullptr) {
+      ModelSelectionOptions generation_options = model_selection_options_;
+      generation_options.require_ready_backend = false;
       auto selection = SelectModelForRequest(
           router, parsed.model, BuildGenerationRequirements(parsed),
-          ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,
-                                /*require_ready_backend=*/false});
+          generation_options);
       if (selection.status == ModelSelectionStatus::kUnsupported) {
         if (metrics_) {
           metrics_->RecordCapabilityRejection(selection.info.backend,

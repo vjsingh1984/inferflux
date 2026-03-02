@@ -275,6 +275,53 @@ TEST_CASE("Scheduler routes streaming requests to streaming-capable backend",
   REQUIRE_FALSE(resp.completion.empty());
 }
 
+TEST_CASE("Scheduler respects same-path fallback routing scope", "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+
+  ModelInfo primary;
+  primary.id = "default-cuda";
+  primary.path = "/tmp/shared.gguf";
+  primary.backend = "cuda";
+  REQUIRE(router->RegisterModel(
+      primary, std::make_shared<ReadyStubBackend>("from-cuda")));
+
+  ModelInfo cross_path_fallback;
+  cross_path_fallback.id = "other-cpu";
+  cross_path_fallback.path = "/tmp/other.gguf";
+  cross_path_fallback.backend = "cpu";
+  REQUIRE(router->RegisterModel(
+      cross_path_fallback, std::make_shared<ReadyStubBackend>("from-cpu")));
+  REQUIRE(router->SetDefaultModel(primary.id));
+
+  auto *resolved_primary = router->Resolve(primary.id);
+  REQUIRE(resolved_primary != nullptr);
+  resolved_primary->capabilities.supports_logprobs = false;
+
+  ModelSelectionOptions selection_options;
+  selection_options.allow_capability_fallback_for_default = true;
+  selection_options.require_ready_backend = true;
+  selection_options.capability_fallback_scope =
+      CapabilityFallbackScope::kSamePathOnly;
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, DisaggregatedConfig{},
+                      selection_options);
+
+  InferenceRequest req;
+  req.prompt = "hello";
+  req.max_tokens = 4;
+  req.collect_logprobs = true;
+
+  auto resp = scheduler.Generate(req).get();
+  REQUIRE(resp.no_backend);
+  REQUIRE(resp.model_id.empty());
+  REQUIRE(resp.completion.find("logprobs") != std::string::npos);
+}
+
 TEST_CASE("Scheduler does not auto-fallback for explicit model requests",
           "[scheduler]") {
   SimpleTokenizer tokenizer;

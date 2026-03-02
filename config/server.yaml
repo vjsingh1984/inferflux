@@ -20,6 +20,10 @@ runtime:
   backend_exposure:
     prefer_native: true
     allow_universal_fallback: true
+  capability_routing:
+    allow_default_fallback: true
+    require_ready_backend: true
+    fallback_scope: any_compatible # any_compatible | same_path_only
   tensor_parallel: 1
   mps_layers: 0
   fairness:
