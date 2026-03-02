@@ -1,76 +1,89 @@
 # InferFlux
 
-InferFlux is a high-performance, C++-based inference server inspired by vLLM. It targets drop-in compatibility with LM Studio and Ollama style APIs while supporting CUDA, ROCm, Metal (MPS), and CPU runtimes. Models in GGUF and tensor-based (safetensors) formats can be loaded directly from local storage or Hugging Face mirrors.
+> **Deliver high-performance LLM serving with predictable operations, consistent APIs, and a single codebase spanning CPU, CUDA/ROCm, Metal, and MLX backends.**
 
-## Highlights
-- Continuous batching scheduler with paged KV cache, speculative decoding hooks, and streaming SSE.
-- Modular device backends so CUDA/ROCm/MPS/CPU share a common interface, with automatic Metal offload knobs.
-- OpenAI-compatible REST/gRPC/WebSocket APIs plus a lightweight CLI (`inferctl`) featuring interactive transcripts and SSE playback.
-- Config-driven deployments (YAML/Terraform/Helm) and enterprise guardrails (OIDC, RBAC, rate limiting, audit logs).
-- Built-in metrics, tracing hooks, authentication, adapter hot-reload flows, and policy plugins for guardrails/PII scrubbing.
+| Guide | Audience | Focus | Location |
+| --- | --- | --- | --- |
+| 🧑‍💻 Developer Guide | contributors | build, debug, test | `docs/DeveloperGuide.md` |
+| 🙋 User Guide | practitioners | run, query, configure | `docs/UserGuide.md` |
+| 🛠️ Admin Guide | operators | deploy, secure, observe | `docs/AdminGuide.md` |
+| 📐 Design / PRD | everyone | intent & roadmap | `docs/Architecture.md`, `docs/PRD.md` |
 
-### Unique Selling Propositions
-1. **Any-Backend Runtime** – one binary spans CPU laptops, MPS-capable Macs, CUDA/ROCm servers, with auto-tuned paged KV caches.
-2. **Enterprise-Grade Security** – OIDC/API-key auth, per-tenant rate limiting, RBAC scopes, encrypted adapter storage, audit logs.
-3. **Cloud-Native Observability** – Prometheus + OpenTelemetry, `/metrics` endpoint, autoscaler hints, structured logs, debug UI hooks.
-4. **Model Portability** – GGUF + safetensors, manifest signing, LoRA stacking, adapter hot reloads, CLI conversions.
-5. **Developer Ergonomics** – `inferctl` streaming mode, interactive chat, SSE viewer, and admin APIs mirroring OpenAI.
-
-## Getting Started
-```bash
-./scripts/build.sh
-./scripts/run_dev.sh --config config/server.yaml
+### System-at-a-glance
+```
++----------+   HTTP/SSE   +------------------+   Device APIs   +------------+
+| Clients  |─────────────▶|  InferFlux Core  |───────────────▶| Backends   |
+| (SDK/CLI)|◀──stream─────|  Scheduler+HTTP  |◀──metrics──────| (CPU/MPS/…)|
++----------+              +------------------+                +------------+
+         ▲                 │      │      │
+         │                 │      │      └─ Guardrails / Auth / Registry
+         └────── CLI (inferctl)   └─ Paged KV / Speculative / Prefix Cache
 ```
 
-## CLI
-Set an API key (matching `config/server.yaml`) and query the server:
-```bash
-export INFERCTL_API_KEY=dev-key-123
-export INFERFLUX_MODEL_PATH=$HOME/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
-export INFERFLUX_RATE_LIMIT_PER_MINUTE=60
-export INFERFLUX_GUARDRAIL_BLOCKLIST=classified,pii
-export INFERFLUX_AUDIT_LOG=logs/audit.log
-export INFERFLUX_OIDC_ISSUER=https://issuer.example.com
-export INFERFLUX_OIDC_AUDIENCE=inferflux
-export INFERFLUX_POLICY_STORE=config/policy_store.conf
-export INFERFLUX_POLICY_PASSPHRASE="super-secret-passphrase"
-./build/inferctl status --host 127.0.0.1 --port 8080
-./build/inferctl completion --prompt "Hello from InferFlux" --api-key "$INFERCTL_API_KEY" --model llama3
-./build/inferctl chat --message "user:Hello" --stream --api-key "$INFERCTL_API_KEY"
-./build/inferctl chat --interactive --model tinyllama --stream
-./build/inferctl admin guardrails --list --api-key "$INFERCTL_API_KEY"
-./build/inferctl admin guardrails --set secret,pii --api-key "$INFERCTL_API_KEY"
-./build/inferctl admin rate-limit --set 200 --api-key "$INFERCTL_API_KEY"
-./build/inferctl admin api-keys --list --api-key "$INFERCTL_API_KEY"
-./build/inferctl admin api-keys --add new-key --scopes generate,read --api-key "$INFERCTL_API_KEY"
-./build/inferctl admin models --list --api-key "$INFERCTL_API_KEY"
-./build/inferctl admin models --load "$HOME/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf" --id llama3 --default --api-key "$INFERCTL_API_KEY"
-```
+### Platform pillars
+- **Any Runtime, One Binary** – CPU, CUDA/ROCm, Metal (MPS), and MLX share a unified backend interface with paged KV caches, speculative decoding, and streaming SSE.
+- **Operational Guardrails** – OIDC/API-key auth, rate limiting, RBAC scopes, encrypted policy store, external OPA integrations, and audit logs.
+- **Cloud-native Observability** – Prometheus metrics, tracing hooks, autoscaler hints, streaming counters, and admin APIs mirroring OpenAI semantics.
+- **Developer Ergonomics** – `inferctl` for streaming/chat/admin, hot reloads, policy tooling, and clear contribution workflows.
 
-## Speculative Decoding & Metrics
-Enable the draft/diffuser path via `runtime.speculative_decoding.enabled` or `INFERFLUX_SPECULATIVE_ENABLED=true`. `INFERFLUX_SPEC_DRAFT_MODEL`, `INFERFLUX_SPEC_MAX_PREFILL`, and `INFERFLUX_SPEC_CHUNK_SIZE` shape how many prompt tokens seed the draft model and how large each validation chunk is. When speculation is active the `/metrics` endpoint publishes `inferflux_spec_chunks_total`, `inferflux_spec_chunks_accepted_total`, and `inferflux_spec_tokens_reused_total`, so you can plot how often draft tokens survive the target validation pass.
+---
 
-## NVMe Paged KV Offload
-Point `runtime.nvme_offload.path` (or `INFERFLUX_NVME_OFFLOAD_PATH`) at a fast local disk to persist KV pages. Tune the async writer with `runtime.nvme_offload.workers` / `.queue_depth` or `INFERFLUX_NVME_WORKERS` / `INFERFLUX_NVME_QUEUE_DEPTH`; InferFlux logs the active values on startup. Host cache sizing is controlled by `runtime.paged_kv.cpu_pages` + `runtime.paged_kv.eviction` and can also be overridden with `INFERFLUX_KV_CPU_PAGES` / `INFERFLUX_KV_EVICTION` for quick experiments.
+## Quick Start Matrix
 
-## Guardrails & OPA Policies
-`guardrails.blocklist` remains the simplest way to stop known-bad strings, but you can now supply `guardrails.opa_endpoint` (file:// or http://) to evaluate every prompt through an external policy even when no blocklist terms are defined. Local JSON fixtures (e.g., `file://config/policy.json`) are handy for smoke tests, while HTTP endpoints let you connect to live OPA/Cedar deployments. Denials bubble up to clients as 400 responses and are also captured in the audit log.
+| Task | Command / File | Notes |
+| --- | --- | --- |
+| Build | `./scripts/build.sh` | Generates `build/` binaries |
+| Run dev server | `./scripts/run_dev.sh --config config/server.yaml` | Uses stub model if none provided |
+| Invoke CLI | `./build/inferctl completion --prompt "Hello"` | Set `INFERCTL_API_KEY` beforehand |
+| Run tests | `ctest --test-dir build --output-on-failure` | Full suite; see Dev Guide for filters |
 
-When `INFERFLUX_MODEL_PATH` (or `model.path` in `config/server.yaml`) points to a GGUF file, the server loads it through the integrated `llama.cpp` backend and returns human-readable completions. Without a model, a friendly stub response is returned for smoke tests.
+> 🔗 Dive deeper via the [Developer Guide](docs/DeveloperGuide.md) and [User Guide](docs/UserGuide.md).
 
-- Pass `--stream` to `inferctl completion|chat` to receive Server-Sent Events live, chunk by chunk, just like the OpenAI API.
-- Interactive mode (`inferctl chat --interactive`) reads multi-turn prompts from stdin and maintains the running transcript.
+---
 
-The HTTP service now exposes:
+## Feature Capsules
 
-- `/metrics` with Prometheus counters for requests, errors, and token counts (tagged by backend type).
-- Fairness knobs (`runtime.fairness.*` in `config/server.yaml`) let you enable preemption, set high-priority thresholds, and clamp timeslice tokens on CPU/MPS before CUDA validation lands.
-- Streaming counters (`inferflux_stream_tokens_total`, `inferflux_stream_cache_hits_total`) surface SSE throughput vs cached completions for ops visibility.
-- Streaming responses when `{ "stream": true }` is supplied to `/v1/completions` or `/v1/chat/completions`.
-- Admin APIs to inspect/update guardrail blocklists, rate limits, API keys, and loaded models, protected by RBAC scopes (`generate`, `read`, `admin`).
+### Speculative decoding & metrics
+- Toggle via `runtime.speculative_decoding.enabled` or `INFERFLUX_SPECULATIVE_ENABLED`.
+- Control draft cadence with `INFERFLUX_SPEC_DRAFT_MODEL`, `INFERFLUX_SPEC_MAX_PREFILL`, `INFERFLUX_SPEC_CHUNK_SIZE`.
+- Observe adoption with Prometheus counters: `inferflux_spec_chunks_total`, `inferflux_spec_chunks_accepted_total`, `inferflux_spec_tokens_reused_total`.
 
-API keys are defined in `config/server.yaml` with explicit scopes:
+### NVMe paged KV offload
+- Point `runtime.nvme_offload.path` (or `INFERFLUX_NVME_OFFLOAD_PATH`) to fast storage.
+- Tune writers via `runtime.nvme_offload.workers` and `.queue_depth`.
+- Host cache sizing: `runtime.paged_kv.cpu_pages`, `runtime.paged_kv.eviction` (override with `INFERFLUX_KV_CPU_PAGES`, `INFERFLUX_KV_EVICTION`).
 
+### Guardrails + policy flow
+- `guardrails.blocklist` for deny lists, `guardrails.opa_endpoint` (file/http) for contextual decisions.
+- Policy storage: `config/policy_store.conf` (override `INFERFLUX_POLICY_STORE`), encrypt via `INFERFLUX_POLICY_PASSPHRASE`.
+- Admin CLI snippets:
+  - `inferctl admin guardrails --set secret,pii --api-key $ADMIN_KEY`
+  - `inferctl admin rate-limit --set 200 --api-key $ADMIN_KEY`
+
+### Streaming CLI cheatsheet
+
+| Mode | Command | Purpose |
+| --- | --- | --- |
+| Status | `inferctl status --host 127.0.0.1 --port 8080` | Health probe |
+| Completion | `inferctl completion --prompt "Hi" --model llama3 --stream` | SSE streaming |
+| Chat (scripted) | `inferctl chat --message "user:Hello" --stream` | One-shot chat |
+| Chat (interactive) | `inferctl chat --interactive --model tinyllama` | Maintains dialogue |
+| Admin ops | `inferctl admin models --load foo.gguf --id llama3 --default` | Model lifecycle |
+
+---
+
+## Configuration Field Guide
+
+| Category | Keys / Env | Purpose |
+| --- | --- | --- |
+| Backend selection | `runtime.backend_priority`, `INFERFLUX_MODEL_PATH`, `INFERFLUX_MPS_LAYERS` | Choose device + model |
+| Fairness | `runtime.fairness.enable_preemption`, `.high_priority_threshold`, `.max_timeslice_tokens` | Continuous batching fairness |
+| Registry (CQ-8) | `registry.path`, `registry.poll_interval_ms` | Hot-reload model manifests |
+| Authentication | `auth.api_keys[].scopes`, `INFERCTL_API_KEY` | RBAC for generate/read/admin |
+| Guardrails | `guardrails.blocklist`, `guardrails.opa_endpoint` | Content filters & policy |
+| Observability | `/metrics`, `/readyz`, `/livez` | Prometheus endpoints |
+
+### API-key example
 ```yaml
 auth:
   api_keys:
@@ -78,25 +91,24 @@ auth:
       scopes: [generate, read, admin]
 ```
 
-Use admin-scoped keys with `inferctl admin ...` to modify guardrails, rate limits, API keys, and model inventory without restarts.
+---
 
-The persistent policy store lives at `config/policy_store.conf` (override via `INFERFLUX_POLICY_STORE`) and can be AES-GCM encrypted transparently by setting `INFERFLUX_POLICY_PASSPHRASE`. Admin updates mutate the encrypted store so multiple replicas stay consistent even across restarts.
+## Audience Guides
 
-To offload layers to Metal (MPS), set either `runtime.mps_layers` in `config/server.yaml` or export `INFERFLUX_MPS_LAYERS=<layer-count>` before launching `inferfluxd`. The metrics endpoint reports the active backend label (`cpu`, `mps`, or `stub`).
+- 🧑‍💻 **Developers** – build/test/debug instructions, coding standards, and profiling tips live in [docs/DeveloperGuide.md](docs/DeveloperGuide.md).
+- 🙋 **Users** – CLI walkthroughs, configuration snippets, and sample workflows live in [docs/UserGuide.md](docs/UserGuide.md).
+- 🛠️ **Admins** – deployment matrices, registry automation, observability dashboards, and security knobs live in [docs/AdminGuide.md](docs/AdminGuide.md).
 
-## Configuration Highlights
-- `runtime.speculative_decoding` toggles draft-model speculation (enable flag, draft model path, max prefill tokens, and `chunk_size` to control validation granularity).
-- `runtime.nvme_offload.path` configures an NVMe-backed paged KV cache directory.
-- `runtime.nvme_offload.workers` and `runtime.nvme_offload.queue_depth` tune the async writer (override via `INFERFLUX_NVME_WORKERS` / `INFERFLUX_NVME_QUEUE_DEPTH`).
-- `runtime.paged_kv.cpu_pages` and `runtime.paged_kv.eviction` (lru or clock, also adjustable with `INFERFLUX_KV_CPU_PAGES` / `INFERFLUX_KV_EVICTION`) size and prioritize the host cache.
-- `guardrails.opa_endpoint` reserves a future OPA/Cedar decision endpoint for contextual policies.
-- `models` allows you to declare multiple GGUF entries (`id`, `path`, optional `backend`, and `default`), and `INFERFLUX_MODELS` can override the list at runtime (`id=llama3,path=/models/llama3.gguf,backend=mps,default=true;...`).
-- `auth.api_keys[].scopes` map to RBAC scopes (`generate`, `read`, `admin`), and `INFERFLUX_POLICY_PASSPHRASE` encrypts the policy store.
-- `INFERFLUX_POLICY_STORE` overrides the location of the encrypted policy file (`config/policy_store.conf` by default).
+---
 
-See `docs/` for the PRD, design, and non-functional requirements, and browse `docs/Roadmap.md` for milestone details.
+## Tests & Validation
 
-## Tests
-- Unit tests: `ctest --test-dir build --output-on-failure`
-- Integration (requires `INFERFLUX_MODEL_PATH` pointing to a GGUF and `INFERCTL_API_KEY`):  
-  `ctest -R IntegrationSSE --output-on-failure`
+| Scope | Command | Notes |
+| --- | --- | --- |
+| Unit | `ctest --test-dir build --output-on-failure` | Full suite |
+| Integration (SSE) | `ctest -R IntegrationSSE --output-on-failure` | Requires `INFERFLUX_MODEL_PATH`, `INFERCTL_API_KEY` |
+| Targeted | `ctest -R "<pattern>"` | Curated labels: `[paged_kv]`, `[unified_batch]`, `[parallel]`, etc. |
+
+---
+
+For design deep-dives, non-functional requirements, and roadmap context, explore `docs/`. Contributions are always welcome—open a PR referencing the relevant guide and follow the coding checklists in the Developer Guide. Happy hacking! 🚀

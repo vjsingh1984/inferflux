@@ -208,15 +208,7 @@ void RadixPrefixCache::Insert(const std::vector<int> &tokens,
   if (kv_cache_ && !node->block_table.empty()) {
     kv_cache_->ReleaseBlocksRef(node->block_table);
   }
-  const int kTokensPerBlockForUpdate = 16;
-  std::size_t final_block_offset = offset / kTokensPerBlockForUpdate;
-  if (final_block_offset < block_table.size()) {
-    node->block_table.assign(
-        block_table.begin() + static_cast<std::ptrdiff_t>(final_block_offset),
-        block_table.end());
-  } else {
-    node->block_table.clear();
-  }
+  node->block_table = block_table;
 
   node->sequence_id = sequence_id;
   node->backend = backend;
