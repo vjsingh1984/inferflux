@@ -181,12 +181,9 @@ json BuildBackendExposureJson(const ModelInfo &info) {
 
 BackendFeatureRequirements
 BuildGenerationRequirements(const CompletionRequestPayload &payload) {
-  BackendFeatureRequirements requirements;
-  requirements.needs_streaming = payload.stream;
-  requirements.needs_logprobs = payload.logprobs;
-  requirements.needs_structured_output = payload.has_response_format;
-  requirements.needs_vision = payload.has_images;
-  return requirements;
+  return BuildGenerationFeatureRequirements(
+      payload.stream, payload.logprobs, payload.has_response_format,
+      payload.has_images);
 }
 
 CompletionRequestPayload ParseJsonPayload(const std::string &body) {
@@ -1888,8 +1885,7 @@ void HttpServer::HandleClient(ClientSession &session) {
     std::shared_ptr<LlamaCPUBackend> embed_backend;
     std::string resolved_model = embed_model.empty() ? "default" : embed_model;
     if (router) {
-      BackendFeatureRequirements requirements;
-      requirements.needs_embeddings = true;
+      BackendFeatureRequirements requirements = BuildEmbeddingFeatureRequirements();
       auto selection = SelectModelForRequest(
           router, embed_model, requirements,
           ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,

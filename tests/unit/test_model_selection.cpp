@@ -161,6 +161,40 @@ TEST_CASE("SelectModelForRequest default fallback can switch model paths",
   REQUIRE(selection.fallback_feature == "logprobs");
 }
 
+TEST_CASE("SelectModelForRequest can restrict fallback to same path",
+          "[model_selection]") {
+  StubRouter router;
+
+  ModelInfo primary;
+  primary.id = "default-cuda";
+  primary.path = "/models/default.gguf";
+  primary.backend = "cuda";
+  primary.capabilities.supports_logprobs = false;
+  router.AddModel(primary, ReadyBackend());
+
+  ModelInfo fallback;
+  fallback.id = "other-cpu";
+  fallback.path = "/models/other.gguf";
+  fallback.backend = "cpu";
+  fallback.capabilities.supports_logprobs = true;
+  router.AddModel(fallback, ReadyBackend());
+
+  REQUIRE(router.SetDefaultModel(primary.id));
+
+  BackendFeatureRequirements req;
+  req.needs_logprobs = true;
+  auto selection = SelectModelForRequest(
+      &router, "", req,
+      ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,
+                            /*require_ready_backend=*/true,
+                            /*capability_fallback_scope=*/
+                            CapabilityFallbackScope::kSamePathOnly});
+
+  REQUIRE(selection.status == ModelSelectionStatus::kUnsupported);
+  REQUIRE_FALSE(selection.used_fallback);
+  REQUIRE(selection.missing_feature == "logprobs");
+}
+
 TEST_CASE("SelectModelForRequest keeps explicit model pinned",
           "[model_selection]") {
   StubRouter router;

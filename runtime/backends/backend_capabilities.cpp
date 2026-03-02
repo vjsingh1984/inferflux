@@ -15,6 +15,28 @@ CapabilityCheckResult Missing(const std::string &feature,
 
 } // namespace
 
+BackendFeatureRequirements
+BuildGenerationFeatureRequirements(bool needs_streaming, bool needs_logprobs,
+                                   bool needs_structured_output,
+                                   bool needs_vision,
+                                   bool needs_speculative_decoding,
+                                   bool needs_fairness_preemption) {
+  BackendFeatureRequirements requirements;
+  requirements.needs_streaming = needs_streaming;
+  requirements.needs_logprobs = needs_logprobs;
+  requirements.needs_structured_output = needs_structured_output;
+  requirements.needs_vision = needs_vision;
+  requirements.needs_speculative_decoding = needs_speculative_decoding;
+  requirements.needs_fairness_preemption = needs_fairness_preemption;
+  return requirements;
+}
+
+BackendFeatureRequirements BuildEmbeddingFeatureRequirements() {
+  BackendFeatureRequirements requirements;
+  requirements.needs_embeddings = true;
+  return requirements;
+}
+
 CapabilityCheckResult
 CheckBackendCapabilities(const BackendCapabilities &capabilities,
                          const BackendFeatureRequirements &requirements) {

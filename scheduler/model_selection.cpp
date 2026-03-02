@@ -49,6 +49,7 @@ int BackendPreferenceRank(const std::string &backend_label) {
 std::optional<ModelSelectionResult>
 PickFallbackCandidate(ModelRouter *router, const ModelInfo &primary,
                       const BackendFeatureRequirements &requirements,
+                      CapabilityFallbackScope fallback_scope,
                       bool require_ready_backend,
                       const std::string &fallback_feature) {
   if (!router) {
@@ -61,6 +62,10 @@ PickFallbackCandidate(ModelRouter *router, const ModelInfo &primary,
 
   for (const auto &candidate_info : models) {
     if (candidate_info.id.empty() || candidate_info.id == primary.id) {
+      continue;
+    }
+    if (fallback_scope == CapabilityFallbackScope::kSamePathOnly &&
+        !primary.path.empty() && candidate_info.path != primary.path) {
       continue;
     }
 
@@ -128,7 +133,8 @@ SelectModelForRequest(ModelRouter *router, const std::string &requested_model,
   if (!primary_check.supported) {
     if (allow_default_fallback) {
       auto fallback = PickFallbackCandidate(
-          router, *primary, requirements, options.require_ready_backend,
+          router, *primary, requirements, options.capability_fallback_scope,
+          options.require_ready_backend,
           primary_check.missing_feature.empty()
               ? "unsupported_feature"
               : primary_check.missing_feature);
@@ -148,9 +154,9 @@ SelectModelForRequest(ModelRouter *router, const std::string &requested_model,
   auto backend = router->GetBackend(primary->id);
   if (options.require_ready_backend && (!backend || !backend->IsReady())) {
     if (allow_default_fallback) {
-      auto fallback = PickFallbackCandidate(router, *primary, requirements,
-                                            options.require_ready_backend,
-                                            "backend_unavailable");
+      auto fallback = PickFallbackCandidate(
+          router, *primary, requirements, options.capability_fallback_scope,
+          options.require_ready_backend, "backend_unavailable");
       if (fallback.has_value()) {
         return *fallback;
       }

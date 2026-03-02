@@ -15,9 +15,16 @@ enum class ModelSelectionStatus {
   kBackendUnavailable,
 };
 
+enum class CapabilityFallbackScope {
+  kAnyCompatible,
+  kSamePathOnly,
+};
+
 struct ModelSelectionOptions {
   bool allow_capability_fallback_for_default{true};
   bool require_ready_backend{false};
+  CapabilityFallbackScope capability_fallback_scope{
+      CapabilityFallbackScope::kAnyCompatible};
 };
 
 struct ModelSelectionResult {

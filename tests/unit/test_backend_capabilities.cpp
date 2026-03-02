@@ -15,6 +15,32 @@ TEST_CASE("CheckBackendCapabilities succeeds when requirements are empty",
   REQUIRE(result.reason.empty());
 }
 
+TEST_CASE("BuildGenerationFeatureRequirements maps request features",
+          "[backend_capabilities]") {
+  auto requirements = BuildGenerationFeatureRequirements(
+      true, true, false, true, true, true);
+
+  REQUIRE(requirements.needs_streaming);
+  REQUIRE(requirements.needs_logprobs);
+  REQUIRE_FALSE(requirements.needs_structured_output);
+  REQUIRE(requirements.needs_vision);
+  REQUIRE(requirements.needs_speculative_decoding);
+  REQUIRE(requirements.needs_fairness_preemption);
+  REQUIRE_FALSE(requirements.needs_embeddings);
+}
+
+TEST_CASE("BuildEmbeddingFeatureRequirements sets embeddings-only requirement",
+          "[backend_capabilities]") {
+  auto requirements = BuildEmbeddingFeatureRequirements();
+  REQUIRE(requirements.needs_embeddings);
+  REQUIRE_FALSE(requirements.needs_streaming);
+  REQUIRE_FALSE(requirements.needs_logprobs);
+  REQUIRE_FALSE(requirements.needs_structured_output);
+  REQUIRE_FALSE(requirements.needs_vision);
+  REQUIRE_FALSE(requirements.needs_speculative_decoding);
+  REQUIRE_FALSE(requirements.needs_fairness_preemption);
+}
+
 TEST_CASE("CheckBackendCapabilities rejects unsupported logprobs",
           "[backend_capabilities]") {
   BackendCapabilities capabilities;
