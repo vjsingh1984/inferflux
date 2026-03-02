@@ -1,5 +1,21 @@
 # InferFlux Roadmap
 
+| Workstream | Focus | Status |
+| --- | --- | --- |
+| Q2 MVP | CPU/MPS runtime + policy/audit foundation | ✅ Complete |
+| Workstream A | Throughput foundations | ⚙️ In progress |
+| Workstream B | Security & observability | ⚙️ In progress |
+| Workstream C | Developer experience & multimodal | ⚙️ In progress |
+| Workstream D | Distributed ops & fairness | 🔜 Q4 focus |
+
+```mermaid
+timeline
+    title Roadmap Flow
+    Q2 2026 : MVP shipped
+    Q3 2026 : Structured output • Tool calling • Multimodal
+    Q4 2026 : Disaggregated pools • Expert parallel • Registry v1
+```
+
 ## Q2 — MVP (complete)
 - [x] CPU & MPS backends with SSE streaming via llama.cpp.
 - [x] Policy store with RBAC scopes, guardrail/rate-limit admin APIs (AES-GCM encryption).

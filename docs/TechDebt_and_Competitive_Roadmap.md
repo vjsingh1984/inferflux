@@ -1,8 +1,24 @@
 # InferFlux: Competitive Assessment, Tech Debt & Strategic Roadmap
 
-This document tracks InferFlux's competitive positioning against best-in-class inference servers,
-identifies critical gaps in the codebase, and maps required changes to specific files, docs, and
-milestones. It is intended to persist across development sessions as a living tracker.
+This living tracker keeps a single view of competitive posture, blocking tech debt, and the roadmap ties that retire each gap.
+
+## Executive Snapshot
+
+| Track | Current Grade | Immediate Next Step | Owner |
+| --- | --- | --- | --- |
+| Throughput | F → needs CUDA kernels | Finalize FlashAttention plan, hardware sign-off | Runtime |
+| Continuous batching | D | Finish GPU overlap design doc | Scheduler |
+| Guardrails & Policy | B- | Measure guardrail verdict latency P95 | Policy |
+| Observability | B+ | Add per-priority fairness gauges | Observability |
+| Distributed runtime | D | Ship expert/tensor parallel UX | Distributed Runtime |
+
+```mermaid
+timeline
+    title Debt Burn-down
+    Q3 2026 : Prefix cache live : Fairness scheduler complete
+    Q4 2026 : Disaggregated pools GA : Expert/Tensor parallel beta
+    Q1 2027 : CUDA throughput parity milestone : Admin UI v1
+```
 
 ---
 
@@ -663,37 +679,23 @@ identified above. Check items off as they are addressed.
 
 ## 7. Vision Statement Gaps
 
-The current PRD positions InferFlux as a "vLLM-inspired replacement for LM Studio and Ollama."
-This positioning needs sharpening given the 2026 landscape:
+Current PRD text still frames InferFlux primarily as a drop-in replacement for LM Studio/Ollama. That description undersells the enterprise-control angle.
 
 ### Recommended Vision Pivot
 
 > **InferFlux: The enterprise-native inference server that runs anywhere.**
 >
-> While vLLM and SGLang optimize for raw throughput on GPU clusters, and Ollama optimizes for
-> local simplicity, InferFlux is the only inference server built from the ground up with
-> integrated enterprise controls (RBAC, encrypted policy, audit, guardrails) that runs
-> identically on a developer's MacBook and a 64-GPU Kubernetes cluster.
+> While vLLM and SGLang optimize for raw GPU throughput and Ollama optimizes for local simplicity, InferFlux differentiates by embedding enterprise controls (RBAC, encrypted policy, audit, guardrails) that behave consistently from a single laptop to a 64-GPU Kubernetes cluster.
 
 ### Key Narrative Shifts for PRD/README
 
-1. **Stop claiming vLLM-level throughput as a near-term goal.** vLLM has hundreds of
-   contributors and years of kernel optimization. Instead, position as "comparable throughput
-   via llama.cpp integration with enterprise features that vLLM lacks."
+1. **Reset throughput messaging.** Emphasize incremental improvements via llama.cpp integration instead of matching vLLM kernel depth in the near term.
 
-2. **Lead with the policy engine.** No competitor has built-in RBAC + encrypted policy +
-   admin APIs. This is the genuine differentiator. The PRD should promote this from a bullet
-   point to the primary narrative.
+2. **Lead with the policy engine.** Built-in RBAC + encrypted policy + admin APIs remain differentiators; surface them as a primary USP.
 
-3. **Embrace llama.cpp as the inference engine.** The GGUF loader stub and CPUDeviceContext
-   stub suggest an intent to reimplement inference. This is impractical. The strategic move is
-   to deeply integrate llama.cpp (which already supports CUDA, Metal, Vulkan, speculative
-   decoding, grammar sampling, multimodal) and focus InferFlux's value-add on the serving
-   layer above it.
+3. **Lean into llama.cpp.** Double down on llama.cpp as the inference core and focus InferFlux engineering on serving, security, and ops.
 
-4. **Add "agent-ready" to the USPs.** Structured output + tool calling + prefix caching
-   together make a server "agent-ready." This is the buying criterion for 2026 platform
-   engineers.
+4. **Highlight agent-readiness.** Structured output + tool calling + prefix caching together satisfy agent-platform evaluation criteria; market them explicitly.
 
 ---
 

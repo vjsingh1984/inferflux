@@ -39,6 +39,15 @@ layer above it.
 - **Goals**: OpenAI-compatible API serving via llama.cpp, drop-in compatibility with existing SDKs, enterprise-grade auth/policy/audit, multi-backend runtime (CPU/CUDA/ROCm/MPS), observability (Prometheus metrics), safe hot-reloads, and first-class MoE model support (expert detection, `EPDispatch` routing, future multi-GPU expert sharding).
 - **Non-Goals**: Training, fine-tuning pipelines, bespoke frontend UX, or reimplementing inference kernels that llama.cpp already provides.
 
+### Release Timeline
+```mermaid
+timeline
+    title Release Phases
+    Q2 2026 : MVP (CPU/MPS + policy/audit) : CLI + metrics + auth
+    Q3 2026 : Structured output : Tool calling : Multimodal vision
+    Q4 2026 : Disaggregated pools : Expert parallel preview : Registry GA
+```
+
 ### Current Status (early 2026)
 - **Streaming & Cancellation**: `InferenceRequest.on_token` now drives SSE responses directly from the scheduler, with shared cancellation flags so dropped clients stop generation in-flight.
 - **Batch Observability**: Prefill/decode timing and streamed token counters are exposed via `/metrics`; `inferflux_stream_tokens_total` vs `inferflux_stream_cache_hits_total` highlight live SSE health.
