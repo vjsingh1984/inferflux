@@ -1,0 +1,111 @@
+groups:
+  - name: inferflux
+    rules:
+
+      # -----------------------------------------------------------------------
+      # Latency
+      # -----------------------------------------------------------------------
+      - alert: InferFluxHighRequestLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            rate(inferflux_request_duration_ms_bucket[5m])
+          ) > 5000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "InferFlux p95 request latency > 5 s"
+          description: >
+            The 95th-percentile end-to-end request latency has exceeded 5 000 ms
+            for more than 2 minutes on backend={{ $labels.backend }}.
+            Current value: {{ $value | humanizeDuration }}.
+
+      - alert: InferFluxHighPrefillLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            rate(inferflux_llama_prefill_ms_bucket[5m])
+          ) > 2000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "InferFlux p95 GGML prefill latency > 2 s"
+          description: >
+            The 95th-percentile GGML-native prefill latency exceeded 2 000 ms
+            on backend={{ $labels.backend }}. Consider reducing context size
+            or enabling flash attention.
+
+      # -----------------------------------------------------------------------
+      # Throughput / liveness
+      # -----------------------------------------------------------------------
+      - alert: InferFluxNoGeneratedTokens
+        expr: |
+          rate(inferflux_llama_generated_tokens_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "InferFlux is not generating tokens"
+          description: >
+            No tokens have been generated in the last 5 minutes on
+            backend={{ $labels.backend }}. The server may be idle, hung,
+            or no model is loaded.
+
+      - alert: InferFluxHighErrorRate
+        expr: |
+          rate(inferflux_errors_total[5m])
+            / (rate(inferflux_requests_total[5m]) + 0.001)
+          > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "InferFlux error rate > 5 %"
+          description: >
+            More than 5 % of requests on backend={{ $labels.backend }} are
+            returning errors over the last 5 minutes.
+            Error rate: {{ $value | humanizePercentage }}.
+
+      # -----------------------------------------------------------------------
+      # Queue saturation
+      # -----------------------------------------------------------------------
+      - alert: InferFluxQueueSaturation
+        expr: inferflux_scheduler_queue_depth > 20
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "InferFlux scheduler queue depth > 20"
+          description: >
+            The scheduler queue has held more than 20 pending requests
+            for over 1 minute. Consider scaling replicas or raising
+            max_parallel_sequences.
+
+      - alert: InferFluxQueueLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            rate(inferflux_queue_wait_duration_ms_bucket[5m])
+          ) > 10000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "InferFlux p95 queue wait > 10 s"
+          description: >
+            Requests on backend={{ $labels.backend }} are waiting more than
+            10 s in the scheduler queue. The server is likely overloaded.
+
+      # -----------------------------------------------------------------------
+      # Model readiness
+      # -----------------------------------------------------------------------
+      - alert: InferFluxModelNotReady
+        expr: inferflux_model_ready == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "InferFlux model {{ $labels.model }} is not ready"
+          description: >
+            Model {{ $labels.model }} on backend {{ $labels.backend }} has
+            been in a not-ready state for more than 30 s. Check model
+            loading logs.

@@ -1,0 +1,371 @@
+name: Release Packaging
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+env:
+  BUILD_TYPE: Release
+  RELEASE_REF: ${{ github.event.workflow_run.head_sha }}
+  HEAD_BRANCH: ${{ github.event.workflow_run.head_branch || '' }}
+  SHOULD_PACKAGE: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || startsWith(github.event.workflow_run.head_branch, 'refs/tags/')) }}
+  IS_TAG_RELEASE: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'refs/tags/') }}
+
+jobs:
+  linux-packages:
+    name: Linux (tgz/deb/rpm)
+    runs-on: ubuntu-latest
+    if: ${{ env.SHOULD_PACKAGE == 'true' }}
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            libssl-dev \
+            libyaml-cpp-dev \
+            python3 \
+            rpm \
+            dpkg-dev \
+            fakeroot
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+            -DENABLE_WEBUI=ON \
+            -DENABLE_CUDA=OFF \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
+            -DENABLE_MTMD=OFF
+
+      - name: Build binaries
+        run: cmake --build build -j$(nproc) --target inferfluxd inferctl
+
+      - name: Install staging tree
+        run: cmake --install build --prefix build/install
+
+      - name: Package (tgz/deb/rpm)
+        run: |
+          cpack --config build/CPackConfig.cmake -G TGZ
+          cpack --config build/CPackConfig.cmake -G DEB
+          cpack --config build/CPackConfig.cmake -G RPM
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts/linux
+          mv inferflux-*Linux*.tar.gz artifacts/linux/ 2>/dev/null || true
+          mv inferflux-*Linux*.deb artifacts/linux/ 2>/dev/null || true
+          mv inferflux-*Linux*.rpm artifacts/linux/ 2>/dev/null || true
+          ls -R artifacts/linux
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: artifacts/linux
+          retention-days: 14
+
+  mac-packages:
+    name: macOS (tgz/pkg/dmg)
+    runs-on: macos-latest
+    if: ${{ env.SHOULD_PACKAGE == 'true' }}
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Install dependencies
+        run: |
+          brew update --quiet
+          brew install cmake ninja openssl@3 yaml-cpp
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+            -DENABLE_WEBUI=ON \
+            -DENABLE_CUDA=OFF \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=ON \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
+            -DENABLE_MTMD=OFF \
+            -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
+
+      - name: Build binaries
+        run: cmake --build build -j$(sysctl -n hw.logicalcpu) --target inferfluxd inferctl
+
+      - name: Install staging tree
+        run: cmake --install build --prefix build/install
+
+      - name: Package (tgz/pkg)
+        run: |
+          cpack --config build/CPackConfig.cmake -G TGZ
+          cpack --config build/CPackConfig.cmake -G productbuild
+          cpack --config build/CPackConfig.cmake -G DragNDrop
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts/macos
+          mv inferflux-*Darwin*.tar.gz artifacts/macos/ 2>/dev/null || true
+          mv inferflux-*.pkg artifacts/macos/ 2>/dev/null || true
+          mv inferflux-*.dmg artifacts/macos/ 2>/dev/null || true
+          ls -R artifacts/macos
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-packages
+          path: artifacts/macos
+          retention-days: 14
+
+  windows-packages:
+    name: Windows (MSI)
+    runs-on: windows-latest
+    if: ${{ env.SHOULD_PACKAGE == 'true' }}
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Install dependencies
+        run: |
+          choco install ninja wixtoolset --no-progress
+
+      - name: Configure
+        shell: pwsh
+        run: >
+          cmake -S . -B build
+          -G "Visual Studio 17 2022"
+          -A x64
+          -DCMAKE_BUILD_TYPE=$Env:BUILD_TYPE
+          -DENABLE_WEBUI=ON
+          -DENABLE_CUDA=OFF
+          -DENABLE_ROCM=OFF
+          -DENABLE_MPS=OFF
+          -DENABLE_BLAS=OFF
+          -DENABLE_VULKAN=OFF
+          -DENABLE_MTMD=OFF
+
+      - name: Build binaries
+        shell: pwsh
+        run: cmake --build build --config $Env:BUILD_TYPE --target inferfluxd inferctl
+
+      - name: Install staging tree
+        shell: pwsh
+        run: cmake --install build --config $Env:BUILD_TYPE --prefix build/install
+
+      - name: Package (WIX + ZIP)
+        shell: pwsh
+        run: |
+          cpack --config build/CPackConfig.cmake -G WIX
+          cpack --config build/CPackConfig.cmake -G ZIP
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts/windows -Force | Out-Null
+          Get-ChildItem -Path . -Filter "inferflux-*.msi" | ForEach-Object { Copy-Item $_.FullName artifacts/windows/ }
+          Get-ChildItem -Path . -Filter "inferflux-*.zip" | ForEach-Object { Copy-Item $_.FullName artifacts/windows/ }
+          Get-ChildItem -Recurse artifacts/windows
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          path: artifacts/windows
+          retention-days: 14
+
+  manifests:
+    name: Homebrew & Winget manifests
+    runs-on: ubuntu-latest
+    needs: [linux-packages, mac-packages, windows-packages]
+    if: ${{ env.SHOULD_PACKAGE == 'true' }}
+
+    steps:
+      - name: Checkout (templates)
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: _artifacts/linux
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-packages
+          path: _artifacts/macos
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-packages
+          path: _artifacts/windows
+
+      - name: Derive metadata
+        id: meta
+        shell: bash
+        env:
+          HEAD_BRANCH: ${{ env.HEAD_BRANCH }}
+          RELEASE_REF: ${{ env.RELEASE_REF }}
+        run: |
+          branch="${HEAD_BRANCH}"
+          sha="${RELEASE_REF}"
+          if [[ "$branch" == refs/tags/* ]]; then
+            tag="${branch#refs/tags/}"
+            version="${tag#v}"
+            src_url="https://github.com/inferencial/InferFlux/archive/refs/tags/${tag}.tar.gz"
+          elif [[ "$branch" == "main" ]]; then
+            short="${sha:0:7}"
+            tag="nightly-${short}"
+            version="0.0.0-dev-${short}"
+            src_url="https://github.com/inferencial/InferFlux/archive/${sha}.tar.gz"
+          else
+            short="${sha:0:7}"
+            tag="snapshot-${short}"
+            version="0.0.0-dev-${short}"
+            src_url="https://github.com/inferencial/InferFlux/archive/${sha}.tar.gz"
+          fi
+          curl -sSL "$src_url" -o source.tar.gz
+          src_sha=$(sha256sum source.tar.gz | awk '{print $1}')
+          msi_path=$(ls _artifacts/windows/*.msi | head -n 1)
+          msi_name=$(basename "$msi_path")
+          msi_sha=$(sha256sum "$msi_path" | awk '{print $1}')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "src_url=$src_url" >> "$GITHUB_OUTPUT"
+          echo "src_sha=$src_sha" >> "$GITHUB_OUTPUT"
+          echo "msi_name=$msi_name" >> "$GITHUB_OUTPUT"
+          echo "msi_sha=$msi_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Render manifests
+        shell: bash
+        env:
+          SRC_URL: ${{ steps.meta.outputs.src_url }}
+          SRC_SHA: ${{ steps.meta.outputs.src_sha }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          MSI_TAG: ${{ steps.meta.outputs.tag }}
+          MSI_NAME: ${{ steps.meta.outputs.msi_name }}
+          MSI_SHA: ${{ steps.meta.outputs.msi_sha }}
+        run: |
+          mkdir -p artifacts/manifests/homebrew artifacts/manifests/winget
+          cat > artifacts/manifests/homebrew/inferflux.rb <<EOF
+class Inferflux < Formula
+  desc "InferFlux inference server and CLI"
+  homepage "https://github.com/inferencial/InferFlux"
+  url "${SRC_URL}"
+  version "${VERSION}"
+  sha256 "${SRC_SHA}"
+  license "Apache-2.0"
+
+  depends_on "cmake" => :build
+  depends_on "openssl@3"
+  depends_on "yaml-cpp"
+
+  def install
+    system "cmake", "-S", ".", "-B", "build", "-DENABLE_WEBUI=ON", *std_cmake_args
+    system "cmake", "--build", "build", "-j"
+    bin.install "build/inferfluxd", "build/inferctl"
+    pkgshare.install "docs/Quickstart.md"
+  end
+
+  test do
+    assert_match "Usage", shell_output("#{bin}/inferctl status --help", 1)
+  end
+end
+EOF
+
+          installer_url="https://github.com/inferencial/InferFlux/releases/download/${MSI_TAG}/${MSI_NAME}"
+          cat > artifacts/manifests/winget/inferencial.inferflux.yaml <<EOF
+Id: Inferencial.InferFlux
+Name: InferFlux
+Publisher: Inferencial Labs
+PublisherUrl: https://inferencial.ai
+PackageUrl: https://github.com/inferencial/InferFlux
+License: Apache-2.0
+ShortDescription: C++ inference server and CLI with OpenAI-compatible APIs.
+Moniker: inferflux
+Version: ${VERSION}
+InstallerType: wix
+Installers:
+  - Architecture: x64
+    InstallerUrl: ${installer_url}
+    InstallerSha256: ${MSI_SHA}
+Commands:
+  - inferfluxd
+  - inferctl
+UpgradeBehavior: install
+ReleaseNotesUrl: https://github.com/inferencial/InferFlux/releases/tag/${MSI_TAG}
+EOF
+
+      - name: Upload manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifests
+          path: artifacts/manifests
+          retention-days: 14
+
+  create-release:
+    name: Publish tagged release
+    needs: [linux-packages, mac-packages, windows-packages, manifests]
+    if: ${{ env.IS_TAG_RELEASE == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: List assets
+        run: ls -R release-assets
+
+      - name: Derive tag name
+        id: release_tag
+        run: |
+          ref="${HEAD_BRANCH}"
+          ref="${ref#refs/tags/}"
+          echo "value=$ref" >> $GITHUB_OUTPUT
+        env:
+          HEAD_BRANCH: ${{ env.HEAD_BRANCH }}
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.release_tag.outputs.value }}
+          name: InferFlux ${{ steps.release_tag.outputs.value }}
+          draft: false
+          prerelease: false
+          files: release-assets/**/* 

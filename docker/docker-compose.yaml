@@ -1,0 +1,11 @@
+version: "3.8"
+services:
+  inferflux:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ~/.inferflux:/app/config
+    command: ["./inferfluxd", "--config", "/app/config/config.yaml", "--ui"]

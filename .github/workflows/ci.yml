@@ -146,6 +146,37 @@ jobs:
       - name: Run unit tests
         run: ctest --test-dir build --output-on-failure --timeout 90
 
+  build-check-mlx:
+    name: Build (macos-latest, MLX flag)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew update --quiet
+          brew install cmake yaml-cpp openssl python3
+
+      - name: Configure (ENABLE_MLX)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_CUDA=OFF \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=ON \
+            -DENABLE_MLX=ON \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
+            -DENABLE_MTMD=OFF \
+            -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
+
+      - name: Build
+        run: cmake --build build -j$(sysctl -n hw.logicalcpu) --target inferfluxd inferctl
+
   # ---------------------------------------------------------------------------
   # CUDA compile-check (no GPU runner required)
   # Installs the CUDA toolkit so CUDAToolkit_FOUND=true in CMake, then builds

@@ -1,0 +1,95 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# InferFlux full-stack compose: inferfluxd + Prometheus + Grafana
+#
+# Usage:
+#   # 1. Place a GGUF model file on the host (e.g. ~/models/tinyllama.gguf)
+#   # 2. Set INFERFLUX_MODEL_PATH in a .env file or export it before running:
+#   #      export INFERFLUX_MODEL_PATH=/models/tinyllama.gguf
+#   # 3. Set an API key:
+#   #      export INFERCTL_API_KEY=my-secret-key
+#   docker compose up
+#
+# Grafana:   http://localhost:3000  (admin / admin — change on first login)
+# Prometheus: http://localhost:9090
+# InferFlux:  http://localhost:8080
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # InferFlux inference server
+  # ──────────────────────────────────────────────────────────────────────────
+  inferflux:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: inferflux:latest
+    container_name: inferflux
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount the host model directory into the container.
+      # Set MODELS_DIR on the host (default: ~/models).
+      - "${MODELS_DIR:-${HOME}/models}:/models:ro"
+    environment:
+      # Required: path to the GGUF model file inside the container.
+      INFERFLUX_MODEL_PATH: "${INFERFLUX_MODEL_PATH:-/models/model.gguf}"
+      # API key (generate/read/admin scopes). Change before production use.
+      INFERCTL_API_KEY: "${INFERCTL_API_KEY:-dev-key-123}"
+      # Structured JSON logs to stdout so Docker log drivers can parse them.
+      INFERFLUX_LOG_FORMAT: "json"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Prometheus — scrapes /metrics from inferfluxd
+  # ──────────────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      - inferflux
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Grafana — pre-loads InferFlux dashboard
+  # ──────────────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Auto-provision Prometheus data source and InferFlux dashboard.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboard.json:/etc/grafana/provisioning/dashboards/inferflux.json:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:
