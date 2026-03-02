@@ -1,38 +1,41 @@
 #include "scheduler/fairness_controller.h"
-
+#include "scheduler/request_batch.h"
 #include <algorithm>
 
 namespace inferflux {
 
 FairnessController::FairnessController() = default;
 
-FairnessController::FairnessController(FairnessConfig config) : config_(config) {}
+FairnessController::FairnessController(FairnessConfig config)
+    : config_(config) {}
 
-void FairnessController::UpdateConfig(const FairnessConfig& config) {
+void FairnessController::UpdateConfig(const FairnessConfig &config) {
   config_ = config;
 }
 
-FairnessDecision FairnessController::Evaluate(const std::vector<FairnessEntry>& batch,
-                                              const std::vector<FairnessEntry>& queue) const {
+FairnessDecision
+FairnessController::Evaluate(const std::vector<FairnessEntry> &batch,
+                             const std::vector<FairnessEntry> &queue) const {
   FairnessDecision decision;
   if (!config_.enable_preemption || batch.empty() || queue.empty()) {
     return decision;
   }
 
-  auto high_it = std::max_element(
-      queue.begin(), queue.end(),
-      [](const FairnessEntry& a, const FairnessEntry& b) {
-        return a.priority_level < b.priority_level;
-      });
-  if (high_it == queue.end() || high_it->priority_level < config_.high_priority_threshold) {
+  auto high_it =
+      std::max_element(queue.begin(), queue.end(),
+                       [](const FairnessEntry &a, const FairnessEntry &b) {
+                         return a.priority_level < b.priority_level;
+                       });
+  if (high_it == queue.end() ||
+      high_it->priority_level < config_.high_priority_threshold) {
     return decision;
   }
 
-  auto low_it = std::min_element(
-      batch.begin(), batch.end(),
-      [](const FairnessEntry& a, const FairnessEntry& b) {
-        return a.priority_level < b.priority_level;
-      });
+  auto low_it =
+      std::min_element(batch.begin(), batch.end(),
+                       [](const FairnessEntry &a, const FairnessEntry &b) {
+                         return a.priority_level < b.priority_level;
+                       });
   if (low_it == batch.end()) {
     return decision;
   }
@@ -41,17 +44,19 @@ FairnessDecision FairnessController::Evaluate(const std::vector<FairnessEntry>& 
   }
 
   decision.swap = true;
-  decision.batch_index = static_cast<std::size_t>(std::distance(batch.begin(), low_it));
-  decision.queue_index = static_cast<std::size_t>(
-      std::distance(queue.begin(), high_it));
+  decision.batch_index =
+      static_cast<std::size_t>(std::distance(batch.begin(), low_it));
+  decision.queue_index =
+      static_cast<std::size_t>(std::distance(queue.begin(), high_it));
   return decision;
 }
 
-void FairnessController::ApplyTimeslice(std::vector<FairnessEntry>* batch) const {
+void FairnessController::ApplyTimeslice(
+    std::vector<FairnessEntry> *batch) const {
   if (!batch || config_.max_timeslice_tokens <= 0) {
     return;
   }
-  for (auto& entry : *batch) {
+  for (auto &entry : *batch) {
     if (!entry.request) {
       continue;
     }
@@ -66,4 +71,4 @@ void FairnessController::ApplyTimeslice(std::vector<FairnessEntry>* batch) const
   }
 }
 
-}  // namespace inferflux
+} // namespace inferflux

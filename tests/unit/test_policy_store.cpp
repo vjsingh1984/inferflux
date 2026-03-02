@@ -8,7 +8,8 @@
 #include <vector>
 
 TEST_CASE("PolicyStore round-trip without encryption", "[policy]") {
-  auto tmp_path = std::filesystem::temp_directory_path() / "inferflux_policy_test.conf";
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "inferflux_policy_test.conf";
 
   {
     inferflux::PolicyStore store(tmp_path.string());
@@ -36,7 +37,8 @@ TEST_CASE("PolicyStore round-trip without encryption", "[policy]") {
 }
 
 TEST_CASE("PolicyStore round-trip with AES-GCM encryption", "[policy]") {
-  auto tmp_path = std::filesystem::temp_directory_path() / "inferflux_policy_enc.conf";
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "inferflux_policy_enc.conf";
 
   {
     inferflux::PolicyStore store(tmp_path.string(), "my-secret-pass");
@@ -71,7 +73,8 @@ TEST_CASE("PolicyStore round-trip with AES-GCM encryption", "[policy]") {
 }
 
 TEST_CASE("PolicyStore RemoveApiKey", "[policy]") {
-  auto tmp_path = std::filesystem::temp_directory_path() / "inferflux_policy_rm.conf";
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "inferflux_policy_rm.conf";
   inferflux::PolicyStore store(tmp_path.string());
   store.SetApiKey("to-remove", {"read"});
   REQUIRE(store.ApiKeys().size() == 1);
@@ -90,22 +93,26 @@ TEST_CASE("PolicyStore Load from nonexistent file", "[policy]") {
   REQUIRE(!store.Load());
 }
 
-TEST_CASE("PolicyStore stores hashed keys; AddKeyHashed round-trip with ApiKeyAuth", "[policy][auth]") {
+TEST_CASE(
+    "PolicyStore stores hashed keys; AddKeyHashed round-trip with ApiKeyAuth",
+    "[policy][auth]") {
   // Keys stored in PolicyStore are SHA-256 hashed — never raw plaintext.
   inferflux::PolicyStore store("/tmp/inferflux_hash_test_xyz.conf");
   store.SetApiKey("plaintext-key", {"generate"});
 
   auto keys = store.ApiKeys();
   REQUIRE(keys.size() == 1);
-  // The stored value should be a 64-character hex string (SHA-256), not the original.
+  // The stored value should be a 64-character hex string (SHA-256), not the
+  // original.
   REQUIRE(keys[0].key != "plaintext-key");
-  REQUIRE(keys[0].key.size() == 64);  // SHA-256 hex = 32 bytes × 2
+  REQUIRE(keys[0].key.size() == 64); // SHA-256 hex = 32 bytes × 2
 
   // AddKeyHashed must let a pre-hashed key be authenticated.
   inferflux::ApiKeyAuth auth;
   auth.AddKeyHashed(keys[0].key, keys[0].scopes);
 
-  // The original plaintext is authenticated via normal IsAllowed (which also hashes).
+  // The original plaintext is authenticated via normal IsAllowed (which also
+  // hashes).
   REQUIRE(auth.IsAllowed("plaintext-key"));
 
   // A different plaintext is rejected.

@@ -10,14 +10,14 @@ struct OPAResult {
 };
 
 class OPAClient {
- public:
+public:
   OPAClient() = default;
   explicit OPAClient(std::string endpoint);
 
-  bool Evaluate(const std::string& prompt, OPAResult* result) const;
+  bool Evaluate(const std::string &prompt, OPAResult *result) const;
 
- private:
+private:
   std::string endpoint_;
 };
 
-}  // namespace inferflux
+} // namespace inferflux

@@ -13,7 +13,7 @@ using json = nlohmann::json;
 namespace inferflux {
 
 namespace {
-void ParseOPAResponse(const std::string& body, OPAResult* result) {
+void ParseOPAResponse(const std::string &body, OPAResult *result) {
   try {
     auto j = json::parse(body);
     if (j.contains("allow") && j["allow"].is_boolean()) {
@@ -22,9 +22,10 @@ void ParseOPAResponse(const std::string& body, OPAResult* result) {
     if (j.contains("reason") && j["reason"].is_string()) {
       result->reason = j["reason"].get<std::string>();
     }
-    // Also check nested result object (OPA v1 API returns {result: {allow: ...}}).
+    // Also check nested result object (OPA v1 API returns {result: {allow:
+    // ...}}).
     if (j.contains("result") && j["result"].is_object()) {
-      auto& r = j["result"];
+      auto &r = j["result"];
       if (r.contains("allow") && r["allow"].is_boolean()) {
         result->allow = r["allow"].get<bool>();
       }
@@ -32,15 +33,15 @@ void ParseOPAResponse(const std::string& body, OPAResult* result) {
         result->reason = r["reason"].get<std::string>();
       }
     }
-  } catch (const json::exception&) {
+  } catch (const json::exception &) {
     // Leave result unchanged on parse failure.
   }
 }
-}  // namespace
+} // namespace
 
 OPAClient::OPAClient(std::string endpoint) : endpoint_(std::move(endpoint)) {}
 
-bool OPAClient::Evaluate(const std::string& prompt, OPAResult* result) const {
+bool OPAClient::Evaluate(const std::string &prompt, OPAResult *result) const {
   if (!result) {
     return true;
   }
@@ -60,7 +61,8 @@ bool OPAClient::Evaluate(const std::string& prompt, OPAResult* result) const {
       result->reason = "OPA file unreadable";
       return true;
     }
-    std::string body((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    std::string body((std::istreambuf_iterator<char>(input)),
+                     std::istreambuf_iterator<char>());
     ParseOPAResponse(body, result);
     if (!result->allow && result->reason.empty()) {
       result->reason = "OPA policy denied prompt";
@@ -71,13 +73,14 @@ bool OPAClient::Evaluate(const std::string& prompt, OPAResult* result) const {
     HttpClient client;
     json payload = {{"input", {{"prompt", prompt}}}};
     try {
-      auto http_resp = client.Post(endpoint_, payload.dump(), {{"Content-Type", "application/json"}});
+      auto http_resp = client.Post(endpoint_, payload.dump(),
+                                   {{"Content-Type", "application/json"}});
       if (http_resp.status >= 200 && http_resp.status < 300) {
         ParseOPAResponse(http_resp.body, result);
         return result->allow;
       }
       result->reason = "OPA HTTP error: " + std::to_string(http_resp.status);
-    } catch (const std::exception& ex) {
+    } catch (const std::exception &ex) {
       result->reason = ex.what();
     }
     return true;
@@ -88,4 +91,4 @@ bool OPAClient::Evaluate(const std::string& prompt, OPAResult* result) const {
   return true;
 }
 
-}  // namespace inferflux
+} // namespace inferflux

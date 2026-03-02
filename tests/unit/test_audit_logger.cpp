@@ -18,7 +18,8 @@ TEST_CASE("AuditLogger disabled without path", "[audit]") {
 }
 
 TEST_CASE("AuditLogger writes valid JSON lines", "[audit]") {
-  auto tmp_path = std::filesystem::temp_directory_path() / "inferflux_audit_test.jsonl";
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "inferflux_audit_test.jsonl";
   {
     inferflux::AuditLogger logger(tmp_path.string());
     REQUIRE(logger.Enabled());
@@ -43,10 +44,12 @@ TEST_CASE("AuditLogger writes valid JSON lines", "[audit]") {
   std::filesystem::remove(tmp_path);
 }
 
-TEST_CASE("AuditLogger LogRequest hashes prompt and response by default", "[audit]") {
-  auto tmp_path = std::filesystem::temp_directory_path() / "inferflux_audit_hash.jsonl";
+TEST_CASE("AuditLogger LogRequest hashes prompt and response by default",
+          "[audit]") {
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "inferflux_audit_hash.jsonl";
   {
-    inferflux::AuditLogger logger(tmp_path.string());  // debug_mode=false
+    inferflux::AuditLogger logger(tmp_path.string()); // debug_mode=false
     logger.LogRequest("alice", "llama-3", "Hello world", "Hi there!", 2, 3);
   }
   std::ifstream in(tmp_path);
@@ -65,7 +68,8 @@ TEST_CASE("AuditLogger LogRequest hashes prompt and response by default", "[audi
 }
 
 TEST_CASE("AuditLogger LogRequest writes raw text in debug mode", "[audit]") {
-  auto tmp_path = std::filesystem::temp_directory_path() / "inferflux_audit_debug.jsonl";
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "inferflux_audit_debug.jsonl";
   {
     inferflux::AuditLogger logger(tmp_path.string(), /*debug_mode=*/true);
     logger.LogRequest("alice", "llama-3", "Hello world", "Hi there!", 2, 3);
@@ -89,7 +93,8 @@ TEST_CASE("AuditLogger HashContent is stable SHA-256", "[audit]") {
 }
 
 TEST_CASE("AuditLogger JSON-escapes special characters", "[audit]") {
-  auto tmp_path = std::filesystem::temp_directory_path() / "inferflux_audit_escape.jsonl";
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "inferflux_audit_escape.jsonl";
   {
     inferflux::AuditLogger logger(tmp_path.string());
     logger.Log("user\"evil", "model", "ok", "line\nnewline");

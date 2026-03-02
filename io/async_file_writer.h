@@ -15,7 +15,7 @@ struct AsyncWriteTask {
 };
 
 class AsyncFileWriter {
- public:
+public:
   explicit AsyncFileWriter(std::size_t max_queue_depth = 256);
   ~AsyncFileWriter();
 
@@ -24,7 +24,7 @@ class AsyncFileWriter {
   void Stop();
   void Enqueue(AsyncWriteTask task);
 
- private:
+private:
   void Worker();
 
   std::vector<std::thread> workers_;
@@ -38,4 +38,4 @@ class AsyncFileWriter {
   std::size_t max_queue_depth_{256};
 };
 
-}  // namespace inferflux
+} // namespace inferflux

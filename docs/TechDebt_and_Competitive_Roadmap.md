@@ -28,17 +28,17 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | Multimodal / vision           |  A   |   A    |   B+    |    B+     |   B+   |   **D**   | C+ (Q3) | Runtime |
 | Tool / function calling       |  A   |   A    |   B     |    C      |   B    |   **B**   | B (Q3) | Server |
 | Quantization breadth          |  A+  |   B+   |   A     |    A+     |   A    |   **D**   | B (Q4) | Runtime |
-| Hardware breadth              |  A+  |   B+   |   C     |    A+     |   B    |   **D**   | B (Q4) | Runtime |
+| Hardware breadth              |  A+  |   B+   |   C     |    A+     |   B    |   **D→C-**| B (Q4) | Runtime |
 | Disaggregated prefill/decode  |  A   |   A+   |   A     |    N/A    |  N/A   |   **D**   | C (Q4) | Distributed Runtime |
 | Model parallelism (TP/PP/EP)  |  A   |   A+   |   A     |    C      |   C    |   **D**   | C (Q4) | Distributed Runtime |
-| OpenAI API compatibility      |  A   |   A    |   B     |    B      |   A    |   **B**   | B (Q3) | Server |
+| OpenAI API compatibility      |  A   |   A    |   B     |    B      |   A    |   **B+**  | A (Q4) | Server |
 | Enterprise auth & RBAC        |  B   |   C    |   B     |    F      |   F    |   **B-**  | B+ (Q3) | Policy |
 | Observability                 |  A   |   B    |   A     |    D      |   D    |   **B+**  | B (Q3) | Observability |
 | Ease of local setup           |  B+  |   B    |   C     |    C      |   A+   |   **C**   | B (Q3) | CLI |
 | Model management UX           |  B   |   B    |   C     |    C      |   A+   |   **D**   | C+ (Q3) | CLI |
 | Test coverage & CI maturity   |  A   |   A    |   A     |    A      |   B    |   **B**   | B (Q3) | QA |
 
-**Overall grade: C (up from C-; KV warm prefix reuse + 5 correctness bug fixes in §2.5 prefix store; 3 additional debt items closed: misleading comment, seq_slots_free_ data race → atomic bitmask, INF-7 BPE prefix matching)**
+**Overall grade: C (up from C-; KV warm prefix reuse + 7 correctness bug fixes in §2.5 and §3.2; 3 additional debt items closed: misleading comment, seq_slots_free_ data race → atomic bitmask, INF-7 BPE prefix matching)**
 
 **Scorecard status notes (March 2026):**
 - **Production throughput: F** — CPU/MPS only via llama.cpp; no GPU kernel path, no true prefill/decode overlap. Unblocked only by CUDA hardware. Grade stays F.
@@ -78,7 +78,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
   - **Documentation & rollout**
     1. Update `docs/Architecture.md` with a “Model Parallelism” section once EP/TP MVP lands.
     2. Add operator guide (`docs/operators/tp_ep_setup.md`) plus Helm values for configuring TP/EP (per-stage GPU counts, process layout).
-- **OpenAI API compat: B** — Chat completions, completions, SSE streaming, structured output, image_url, tool calls, model-native chat templates, `/v1/models` + `/v1/models/{id}` (OpenAI list format, `read` scope, 4 integration tests), `stop` sequences (string or array, up to 4, per-piece suffix match in Generate/Decode/GenerateWithImages) all done. Missing: logprobs on streaming, `n>1`, best_of.
+- **OpenAI API compat: B→B+** — Chat completions, completions, SSE streaming, structured output, image_url, tool calls, model-native chat templates, `/v1/models` + `/v1/models/{id}`, `stop` sequences, `n>1` (multiple completions per request, 1-10), `best_of` (generate N server-side, return top n by cumulative logprob; integrates with internal logprob ranking) all done. Missing: logprobs on streaming.
 - **Enterprise auth/RBAC: B-** — OIDC RS256 (JWKS TTL cache), API-key SHA-256, rate-limiter, OPA client, encrypted policy store (AES-GCM), audit log (hash-by-default). Gap to B+: fine-grained per-model RBAC, key rotation UI.
 - **Observability: B+** — 5 latency histograms, Prometheus `/metrics`, W3C traceparent, `Span` RAII, audit log, fairness/preemption metrics, KV-transfer histogram, MoE counter, flash-attention gauge; structured JSON logs (`server/logging/logger.h`, `INFERFLUX_LOG_FORMAT=json`); Grafana dashboard (`deploy/grafana/dashboard.json`, 9 panels); 7 Prometheus alert rules (`deploy/prometheus/alerts.yml`); Docker + docker-compose stack (`deploy/Dockerfile`, `deploy/docker-compose.yml`). Gap to A: self-hosted GPU runner for live metric CI.
 - **Ease of local setup: C** — CLI quickstart + the embedded WebUI help with day-zero config, but we still lack packaged installers, polished Docker images, and a production-ready SPA. The new deployment files are placeholders; until we ship signed installers (brew/winget/tarball) and the UI is feature-complete, the grade stays at C.
@@ -86,24 +86,170 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
     1. Ship Homebrew/winget installers & publish an official Docker image with persisted config/model volumes.
     2. Expand `/ui` into a full SPA (chat history, model selection, admin views) with assets under `webui/static/`.
     3. Extend Quickstart/Troubleshooting with screenshots, diagnostics, and advanced workflows (cache warmers, persistence, multi-model hints).
-- **Model management UX: D→C** — `inferctl pull` live, `inferctl admin models --list/--load` via `/v1/admin/models`, `/v1/models` + `/v1/models/{id}` OpenAI-standard endpoints live, `inferctl models` top-level command (calls `GET /v1/models`, formats table of id/owned_by/created). Missing: hot reload.
-- **Test/CI: B** — 12 ctest targets (8 unit + 4 integration incl. SHM smoke, LoggerTests, StructuredTests), 5-job CI (build-test/MPS/CUDA-check/coverage/clang-format), SBOM artifact, Codecov (60% target). Gap to A: live GPU test runner, property-based tests.
-- **Hardware breadth: D** — CPUs + MPS ship today; CUDA/ROCm remain compile-only. A dedicated MLX backend design (`docs/design/mlx_backend.md`) plus `ENABLE_MLX`, CLI/config scaffolding, and a compile-check CI job are queued so we can bring MLX online first, then apply the same infrastructure to CUDA/ROCm when hardware is available.
+- **Model management UX: D→C+** — `inferctl pull` live, `inferctl admin models --list/--load` via `/v1/admin/models`, `/v1/models` + `/v1/models/{id}` OpenAI-standard endpoints live, `inferctl models` top-level command (calls `GET /v1/models`, formats table of id/owned_by/created). `ModelRegistry` hot-reload: watches `registry.yaml`, auto-loads/unloads models without restart (CQ-8 — Done).
+- **Test/CI: B** — 18 ctest targets (14 unit + 4 integration incl. SHM smoke, LoggerTests, StructuredTests, ModelRegistryTests), 5-job CI (build-test/MPS/CUDA-check/coverage/clang-format), SBOM artifact, Codecov (60% target). Gap to A: live GPU test runner, property-based tests.
+- **Hardware breadth: D→C-** — CPUs + MPS ship today; MLX backend is functional for Metal/Apple Silicon (safetensors + HF tokenizer, stochastic sampling, RoPE scaling, logprobs) and now has full phased execution parity (INF-8 Done: `Prefill`/`Decode`/`FreeSequence`/`CopySequencePrefix`/`ExecuteUnifiedBatch` overrides + per-sequence KV slot management). CUDA/ROCm remain compile-only stubs.
 
 InferFlux has strong *architectural vision* (enterprise auth, policy store, multi-backend) but
-the implementation is at stub/MVP stage. The competitive gap is largest in the core inference
+the implementation is at stub/MVP stage for vendor-specific acceleration. The competitive gap is largest in the core inference
 pipeline (batching, KV cache, parallelism) and in table-stakes features that every 2026 server
 must have (structured output, multimodal, tool calling).
 
-### Status Notes (May 2025)
+### Status Notes (March 2026)
 - **Streaming telemetry:** on-token SSE, cancellation flags, and Prometheus counters
   (`inferflux_stream_tokens_total`, `inferflux_stream_cache_hits_total`) are live, plus an
   automated SSE cancellation test — **Done**.
-- **Tool-calling fallback:** stub tool_calls fire (and log) when no backend is loaded — **Done**.
-- **RequestBatch:** InferenceRequest adoption, batch builder, streaming/cancellation, and batch
-  metrics are complete; priority fairness/preemption is the next target.
-- **Hardware focus:** CPU/MPS paths active; CUDA validation deferred until compatible hardware
-  becomes available.
+- **Tool-calling:** Multi-format detection (InferFlux, Hermes, Mistral, Bare) and SSE deltas for tool calls are live — **Done**.
+- **RequestBatch:** Full adoption of `InferenceRequest`, batch builder, streaming/cancellation, and batch
+  metrics are complete; priority fairness/preemption is live.
+- **Hardware focus:** CPU/MPS/MLX paths active; CUDA validation remains a critical gap (stub only).
+
+---
+
+## 2. Critical Features Missing from PRD/Requirements/Architecture
+
+These are **table-stakes for any serious inference server in 2026** and must be incorporated
+into the planning documents. Each item includes which doc(s) need updating.
+
+### 2.1 Structured Output / Constrained Decoding — **DONE**
+
+**Why critical:** Gartner predicts 95% of enterprise LLM deployments will use constrained
+decoding by 2027. vLLM uses XGrammar; SGLang uses Compressed FSM. Both achieve near-zero
+overhead (~50us/token).
+
+- **Implemented:** OpenAI-style `response_format` parsing, `StructuredOutputAdapter` layer that translates schemas into GBNF grammars, and normalized constraint payload on `InferenceRequest`.
+- **Backend capabilities:** `ModelRouter` advertises support; `BatchExecutor` enforces grammar sampling via `LlamaCPUBackend`.
+- **Implement in:** `server/http/http_server.cpp`, `scheduler/request_batch.h`, `scheduler/scheduler.cpp`, `runtime/execution/batch_executor.cpp`, `runtime/backends/*`.
+
+### 2.2 Multimodal / Vision Model Support — **DONE**
+
+**Why critical:** Every major competitor supports vision models. Ollama has drag-and-drop image
+support. llama.cpp added `libmtmd` in April 2025.
+
+- **Implemented:** Image input for VLMs (LLaVA, Qwen-VL), base64 and URL image inputs in
+  chat messages via `ImagePreprocessor`, leverage llama.cpp's `libmtmd`.
+- **Implement in:** `server/http/http_server.cpp`, `runtime/multimodal/`, `runtime/backends/cpu/llama_backend.cpp`.
+- **Gap to C+:** Streaming multimodal, batch image inputs.
+
+### 2.3 Tool Calling / Function Calling — **DONE**
+
+**Why critical:** Foundation for agent workflows. vLLM, SGLang, Ollama all support it.
+OpenAI-compatible tool calling is expected by every SDK (LangChain, LlamaIndex).
+
+- **Implemented:** `tools` and `tool_choice` parameters in chat completions, multi-format detection (InferFlux, Hermes, Mistral, Bare), streaming tool call deltas, model-native chat templates.
+- **Implement in:** `server/http/http_server.cpp`, `runtime/backends/cpu/llama_backend.cpp` (native templates).
+
+### 2.4 Prefix Caching / Automatic KV Cache Reuse — **DONE**
+
+**Why critical:** SGLang's RadixAttention achieves 85-95% cache hit for few-shot workloads vs.
+15-25% for naive paging. This is the single biggest throughput differentiator for multi-turn
+and agent workloads.
+
+- **Implemented:** `RadixPrefixCache` (`runtime/prefix_cache/radix_prefix_cache.{h,cpp}`) —
+  a compressed trie (radix tree) over token ID sequences. Nodes hold cached completions; `Lookup` returns the longest matching prefix plus a `matched_tokens` out-parameter for partial-hit metrics.
+- **Wiring:** `Scheduler` and `BatchExecutor` migrated to `RadixPrefixCache`. Metrics counters `inferflux_prefix_matched_tokens_total` and `inferflux_prefix_partial_hits_total` are live.
+- **Still TODO:** GPU KV page reuse (vLLM-style paged attention + zero-copy across requests).
+
+### 2.5 Disaggregated Prefill/Decode — Option A Done
+
+**Why critical:** Now the default production architecture. vLLM deploys it at Meta, LinkedIn,
+Mistral. SGLang tested it on 96 H100s. NVIDIA Dynamo provides orchestration for it.
+
+- **Implemented (Option A — in-process phased prefill/decode):**
+  - `LlamaCPUBackend::Prefill(prompt, seq_id)` evaluates prompt tokens into the KV cache for slot `seq_id`. `Decode(...)` continues from that position.
+  - `Scheduler` maintains a `seq_slots_free_` atomic bitmask.
+  - `ShmKVTransport` (`INFERFLUX_KV_TRANSPORT=shm`) for cross-process KV transfer.
+  - 11 `[phased]` unit tests in `tests/unit/test_phased_execution.cpp`.
+- **Remaining (multi-node):**
+  - RDMA transport (multi-node, multi-pod): requires RDMA-capable NICs; replace SHM with ibverbs or UCX.
+  - Chaos tests (inject SHM segment failures, validate graceful fallback).
+
+### 2.6 Expert Parallelism for MoE Models
+
+**Why critical:** DeepSeek-V3/R1 and Mixtral dominate open-source. SGLang achieves 5x
+throughput over vanilla TP for MoE models using expert parallelism.
+
+#### Implemented
+- MoE detection and stub `EPDispatch` are live.
+- Prometheus counter `inferflux_moe_requests_total` is live.
+
+#### Remaining
+- Multi-GPU expert sharding via NCCL or shared-memory ring.
+- EP-aware batch routing in `BatchExecutor`.
+
+---
+
+## 3. Tech Debt Registry
+
+### 3.1 Security — CRITICAL
+
+| ID | Issue | File(s) | Fix | Affects Docs |
+|----|-------|---------|-----|-------------|
+| SEC-1 | **[FIXED]** OIDC validator with RS256 signature verification and JWKS TTL cache. | `server/auth/oidc_validator.cpp` | *(Fixed)* | `docs/Architecture.md` |
+| SEC-2 | **[FIXED]** PolicyStore hashes API keys with SHA-256. | `policy/policy_store.cpp` | *(Fixed)* | `docs/Architecture.md` |
+| SEC-5 | **[FIXED]** HttpServer and HttpClient fully support TLS/HTTPS with cert verification. | `server/http/http_server.cpp`, `net/http_client.cpp` | *(Fixed)* | `docs/NFR.md` |
+
+### 3.2 Core Inference Pipeline — HIGH
+
+| ID | Issue | File(s) | Fix | Affects Docs |
+|----|-------|---------|-----|-------------|
+| INF-2 | Scheduler and execution pipeline need true prefill/decode overlap and GPU-aware scheduling. | `scheduler/scheduler.cpp`, `runtime/execution/batch_executor.cpp` | **Status**: Foundational components (phased execution, fairness) are in place. **Next**: Implement interleaved prefill/decode on GPU. | `docs/Architecture.md` |
+| INF-7 | **[FIXED]** BPE-token prefix matching for KV store ensures boundary alignment. | `runtime/backends/cpu/llama_backend.cpp` | *(Fixed)* | `docs/Architecture.md` |
+| INF-8 | **[FIXED]** MLX backend phased execution parity. `MlxBackend` overrides `Prefill`/`PrefillPartial`/`Decode`/`FreeSequence`/`CopySequencePrefix`/`ExecuteUnifiedBatch`; `MlxExecutionEngine` per-sequence KV slot management (`AllocSlot`/`FreeSlot`/`StepSeq`/`CopySlotPrefix`). | `runtime/backends/mlx/mlx_backend.cpp`, `mlx_execution.cpp` | *(Fixed)* | `docs/Architecture.md` |
+| INF-9 | **[NEW]** CUDA backend is a stub wrapping LlamaCPUBackend. | `runtime/backends/cuda/cuda_backend.cpp` | Integrate actual CUDA kernels and FlashAttention3. | `docs/Architecture.md` |
+| INF-10 | **[FIXED]** Stop sequences on first token. `BatchExecutor` now applies `ApplyStop` to the pre-sampled first token in phased and unified batches, ensuring immediate termination if a stop sequence is matched. | `runtime/execution/batch_executor.cpp` | *(Fixed)* | — |
+| INF-11 | **[FIXED]** Memory leak in RadixPrefixCache eviction. `EvictOneSequence` now correctly releases KV block references via `kv_cache_->ReleaseBlocksRef` before clearing the node. | `runtime/prefix_cache/radix_prefix_cache.cpp` | *(Fixed)* | — |
+
+### 3.3 Data Handling & Quality — MEDIUM
+
+| ID | Issue | File(s) | Fix | Affects Docs |
+|----|-------|---------|-----|-------------|
+| DAT-1 | **[FIXED]** Adopted nlohmann/json. | `external/nlohmann/json.hpp` | *(Fixed)* | — |
+| CQ-8 | **[FIXED]** Model Registry hot-reload. `ModelRegistry` (`scheduler/model_registry.h/.cpp`) polls `registry.yaml` every `poll_interval_ms`; diffs `path→id` map; auto-loads new entries, unloads removed ones. `INFERFLUX_REGISTRY_PATH` env var; `registry:` section in `server.yaml`; `config/registry.yaml` example; 8 `[model_registry]` unit tests. | `scheduler/model_registry.h/.cpp`, `server/main.cpp` | *(Fixed)* | `docs/Roadmap.md` |
+| CQ-9 | **[FIXED]** Replaced all `std::cerr`/`std::cout` calls in runtime/backend files with `log::Error()`/`log::Info()` from `server/logging/logger.h`. Component tags: `llama_backend`, `mlx_backend`, `mlx_execution`, `mlx_loader`, `mlx_tokenizer`, `shm_transport`, `batch_executor`, `backend_manager`, `cuda_backend`. | `runtime/backends/`, `runtime/execution/`, `runtime/disaggregated/` | *(Fixed)* | — |
+
+---
+
+## 4. Strategic Feature Roadmap — Revised
+
+### Q2 — MVP (current milestone)
+
+**Focus: Make what exists actually work correctly.**
+- [X] Fix OIDC signature verification (SEC-1)
+- [X] Hash API keys at rest (SEC-2)
+- [X] Adopt JSON library (DAT-1)
+- [X] Multi-threaded HTTP server (INF-1)
+- [X] Fairness/Priority Scheduling (§2.9) - **Done**
+- [X] Model Pull (`inferctl pull`) (§2.8) - **Done**
+
+### Q3 — Performance & Modern Features
+
+**Focus: Close the core inference gap, add table-stakes features.**
+
+| Priority | Item | Status | Tracking IDs | Key Files |
+|----------|------|--------|-------------|-----------|
+| P0 | Structured output / JSON mode | **Done** | §2.1 | `runtime/structured_output/` |
+| P0 | Tool calling / function calling | **Done** | §2.3 | `server/http/http_server.cpp` |
+| P1 | Prefix caching (radix tree KV reuse) | **Done** | §2.4 | `runtime/prefix_cache/` |
+| P1 | Multimodal / vision model support | **Done** | §2.2 | `runtime/multimodal/` |
+| P1 | MLX phased execution | **Done** | INF-8 | `runtime/backends/mlx/` |
+| P1 | Unified Backend Result type (structured logging) | **Done** | CQ-9 | `runtime/backends/` |
+| P2 | Model Registry hot-reload | **Done** | CQ-8 | `scheduler/model_registry.h` |
+| P2 | `n>1` and `best_of` completions | **Done** | — | `server/http/http_server.cpp` |
+
+### Q4 — Enterprise, Scale & Differentiation
+
+**Focus: Distributed operations, advanced scheduling, competitive differentiation.**
+
+| Priority | Item | Status | Tracking IDs | Key Files |
+|----------|------|--------|-------------|-----------|
+| P0 | Disaggregated prefill/decode (multi-node) | Option A done | §2.5 | `runtime/disaggregated/` |
+| P0 | Expert parallelism for MoE (multi-GPU) | Detection done | §2.6 | `runtime/backends/` |
+| P0 | **[NEW]** GPU Paged KV Cache (vLLM-style) | Not started | — | `runtime/kv_cache/` |
+| P0 | **[NEW]** CUDA kernel integration (FA3) | Stub only | INF-9 | `runtime/backends/cuda/` |
+| P1 | **[NEW]** Cross-node KV transfer (RDMA/UCX) | Not started | — | `runtime/disaggregated/` |
+| P1 | Tensor + pipeline parallelism | Not started | — | `runtime/backends/` |
+
 
 ### Where InferFlux Has Potential Differentiation
 

@@ -25,7 +25,8 @@ TEST_CASE("SimpleTokenizer handles empty input", "[tokenizer]") {
 }
 
 TEST_CASE("PagedKVCache LRU and Clock eviction policies", "[kv_cache]") {
-  inferflux::PagedKVCache cache(2, sizeof(float) * 4, inferflux::PagedKVCache::EvictionPolicy::kLRU);
+  inferflux::PagedKVCache cache(2, sizeof(float) * 4,
+                                inferflux::PagedKVCache::EvictionPolicy::kLRU);
   cache.ConfigureAsyncWriter(2, 8);
 
   int first = cache.ReservePage();
@@ -52,7 +53,7 @@ TEST_CASE("SpeculativeDecoder chunk validation", "[speculative]") {
   draft.chunks.push_back({0, 2});
   draft.chunks.push_back({2, 4});
 
-  decoder.SetValidationOverride([](const std::vector<int>&, int) {
+  decoder.SetValidationOverride([](const std::vector<int> &, int) {
     return std::vector<int>{1, 2, 9, 9};
   });
 
@@ -73,7 +74,8 @@ TEST_CASE("OPA guardrail file-based policy denial", "[guardrail]") {
   inferflux::Guardrail guardrail;
   REQUIRE(!guardrail.Enabled());
 
-  auto tmp_path = std::filesystem::temp_directory_path() / "inferflux_opa_test.json";
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "inferflux_opa_test.json";
   {
     std::ofstream out(tmp_path);
     out << R"({"result":{"allow":false,"reason":"deny"}})";

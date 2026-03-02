@@ -1,9 +1,9 @@
 #include "runtime/backends/mlx/mlx_loader.h"
+#include "server/logging/logger.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
-#include <iostream>
 
 #ifdef INFERFLUX_HAS_MLX
 #include "mlx/c/array.h"
@@ -75,7 +75,7 @@ MlxWeightLoader::ParseModelConfig(const std::filesystem::path &config_path) {
 
   std::ifstream f(config_path);
   if (!f.is_open()) {
-    std::cerr << "[mlx] Cannot open " << config_path << "\n";
+    log::Error("mlx_loader", "Cannot open " + config_path.string());
     return cfg;
   }
 
@@ -83,7 +83,8 @@ MlxWeightLoader::ParseModelConfig(const std::filesystem::path &config_path) {
   try {
     f >> j;
   } catch (const std::exception &e) {
-    std::cerr << "[mlx] config.json parse error: " << e.what() << "\n";
+    log::Error("mlx_loader",
+               std::string("config.json parse error: ") + e.what());
     return cfg;
   }
 
@@ -111,6 +112,19 @@ MlxWeightLoader::ParseModelConfig(const std::filesystem::path &config_path) {
   get_float("rms_norm_eps", cfg.rms_norm_eps);
   get_float("rope_theta", cfg.rope_theta);
 
+  // RoPE scaling: read from rope_scaling.factor if present.
+  if (j.contains("rope_scaling") && j["rope_scaling"].is_object()) {
+    const auto &rs = j["rope_scaling"];
+    if (rs.contains("factor") && rs["factor"].is_number_float()) {
+      float f = rs["factor"].get<float>();
+      if (f > 0.0f)
+        cfg.rope_freq_scale = 1.0f / f;
+    }
+  }
+  // Allow direct override via rope_freq_scale key.
+  if (j.contains("rope_freq_scale") && j["rope_freq_scale"].is_number_float())
+    cfg.rope_freq_scale = j["rope_freq_scale"].get<float>();
+
   // GQA fallback: if num_key_value_heads is absent, MHA applies (KV heads == Q
   // heads).
   if (cfg.num_key_value_heads == 0 && cfg.num_attention_heads > 0)
@@ -129,14 +143,15 @@ bool MlxWeightLoader::ReadSafetensorsHeader(
     std::vector<MlxTensorDescriptor> &out_tensors) {
   std::ifstream f(shard_path, std::ios::binary);
   if (!f.is_open()) {
-    std::cerr << "[mlx] Cannot open shard " << shard_path << "\n";
+    log::Error("mlx_loader", "Cannot open shard " + shard_path.string());
     return false;
   }
 
   // First 8 bytes: little-endian uint64 = header JSON length in bytes.
   uint8_t len_buf[8];
   if (!f.read(reinterpret_cast<char *>(len_buf), 8)) {
-    std::cerr << "[mlx] Shard " << shard_path << " too small for header\n";
+    log::Error("mlx_loader",
+               "Shard " + shard_path.string() + " too small for header");
     return false;
   }
   const uint64_t header_len = static_cast<uint64_t>(len_buf[0]) |
@@ -151,15 +166,16 @@ bool MlxWeightLoader::ReadSafetensorsHeader(
   // Sanity-check: real safetensors headers are never larger than 100 MB.
   constexpr uint64_t kMaxHeaderBytes = 100ULL * 1024 * 1024;
   if (header_len == 0 || header_len > kMaxHeaderBytes) {
-    std::cerr << "[mlx] Shard " << shard_path
-              << " has implausible header length " << header_len << "\n";
+    log::Error("mlx_loader", "Shard " + shard_path.string() +
+                                 " has implausible header length " +
+                                 std::to_string(header_len));
     return false;
   }
 
   std::string header_str(header_len, '\0');
   if (!f.read(header_str.data(), static_cast<std::streamsize>(header_len))) {
-    std::cerr << "[mlx] Shard " << shard_path
-              << " truncated before header end\n";
+    log::Error("mlx_loader",
+               "Shard " + shard_path.string() + " truncated before header end");
     return false;
   }
 
@@ -167,8 +183,8 @@ bool MlxWeightLoader::ReadSafetensorsHeader(
   try {
     hdr = json::parse(header_str);
   } catch (const std::exception &e) {
-    std::cerr << "[mlx] Shard " << shard_path
-              << " header JSON parse error: " << e.what() << "\n";
+    log::Error("mlx_loader", "Shard " + shard_path.string() +
+                                 " header JSON parse error: " + e.what());
     return false;
   }
 
@@ -214,38 +230,41 @@ MlxWeightLoader::LoadDirectory(const std::filesystem::path &model_dir) {
   desc.source_dir = model_dir;
 
   if (!std::filesystem::is_directory(model_dir)) {
-    std::cerr << "[mlx] Not a directory: " << model_dir << "\n";
+    log::Error("mlx_loader", "Not a directory: " + model_dir.string());
     return desc;
   }
 
   // Parse architecture config.
   desc.config = ParseModelConfig(model_dir / "config.json");
   if (!desc.config.valid) {
-    std::cerr << "[mlx] config.json missing or invalid in " << model_dir
-              << "\n";
+    log::Error("mlx_loader",
+               "config.json missing or invalid in " + model_dir.string());
     return desc;
   }
 
   // Discover and catalogue all safetensors shards.
   const auto shards = CollectShards(model_dir);
   if (shards.empty()) {
-    std::cerr << "[mlx] No *.safetensors files found in " << model_dir << "\n";
+    log::Error("mlx_loader",
+               "No *.safetensors files found in " + model_dir.string());
     return desc;
   }
 
   for (const auto &shard : shards) {
     desc.shard_files.push_back(shard.string());
     if (!ReadSafetensorsHeader(shard, desc.tensors)) {
-      std::cerr << "[mlx] Failed to read shard header: " << shard << "\n";
+      log::Error("mlx_loader",
+                 "Failed to read shard header: " + shard.string());
       return desc; // partial load — leave valid=false
     }
   }
 
   desc.valid = true;
-  std::cout << "[mlx] Descriptor loaded: model_type=" << desc.config.model_type
-            << " layers=" << desc.config.num_hidden_layers
-            << " tensors=" << desc.tensors.size()
-            << " shards=" << desc.shard_files.size() << "\n";
+  log::Info("mlx_loader",
+            "Descriptor loaded: model_type=" + desc.config.model_type +
+                " layers=" + std::to_string(desc.config.num_hidden_layers) +
+                " tensors=" + std::to_string(desc.tensors.size()) +
+                " shards=" + std::to_string(desc.shard_files.size()));
   return desc;
 }
 
@@ -258,19 +277,20 @@ MlxWeightLoader::LoadWeights(const MlxModelDescriptor &descriptor) {
   MlxWeightStore store;
 
   if (!descriptor.valid) {
-    std::cerr
-        << "[mlx] LoadWeights: descriptor is invalid — skipping weight load\n";
+    log::Error("mlx_loader",
+               "LoadWeights: descriptor is invalid — skipping weight load");
     return store;
   }
   if (descriptor.shard_files.empty()) {
-    std::cerr << "[mlx] LoadWeights: no shard files in descriptor\n";
+    log::Error("mlx_loader", "LoadWeights: no shard files in descriptor");
     return store;
   }
 
 #ifndef INFERFLUX_HAS_MLX
   (void)descriptor;
-  std::cerr << "[mlx] LoadWeights: built without INFERFLUX_HAS_MLX — no "
-               "weights loaded\n";
+  log::Error(
+      "mlx_loader",
+      "LoadWeights: built without INFERFLUX_HAS_MLX — no weights loaded");
   return store;
 #else
   // Use the default Metal GPU stream for loading.
@@ -286,8 +306,7 @@ MlxWeightLoader::LoadWeights(const MlxModelDescriptor &descriptor) {
     mlx_map_string_to_string_free(metadata);
 
     if (rc != 0) {
-      std::cerr << "[mlx] mlx_load_safetensors failed for " << shard_path
-                << "\n";
+      log::Error("mlx_loader", "mlx_load_safetensors failed for " + shard_path);
       mlx_map_string_to_array_free(shard_map);
       mlx_stream_free(stream);
       return store; // leave ok=false
@@ -314,8 +333,9 @@ MlxWeightLoader::LoadWeights(const MlxModelDescriptor &descriptor) {
 
   store.count = total;
   store.ok = true;
-  std::cout << "[mlx] Weights loaded: " << total << " tensors across "
-            << descriptor.shard_files.size() << " shard(s)\n";
+  log::Info("mlx_loader",
+            "Weights loaded: " + std::to_string(total) + " tensors across " +
+                std::to_string(descriptor.shard_files.size()) + " shard(s)");
   return store;
 #endif
 }

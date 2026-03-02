@@ -142,6 +142,12 @@ struct CompletionRequestPayload {
   std::vector<std::string> stop;
   // stream_options.include_usage: emit a final SSE usage chunk before [DONE].
   bool stream_include_usage{false};
+  // OpenAI `n` and `best_of` for multiple completions.
+  // n: number of completions to return (1-10; not compatible with stream).
+  // best_of: number of completions to generate server-side; only the top n
+  //   (by cumulative log-probability) are returned. best_of >= n.
+  int n{1};
+  int best_of{1};
 };
 
 CompletionRequestPayload ParseJsonPayload(const std::string &body) {
@@ -365,6 +371,18 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
         payload.stream_include_usage = so["include_usage"].get<bool>();
       }
     }
+    // `n`: number of completions to return (1-10).
+    if (j.contains("n") && j["n"].is_number_integer()) {
+      payload.n = std::min(std::max(j["n"].get<int>(), 1), 10);
+    }
+    // `best_of`: generate this many completions, return top n (best_of >= n).
+    if (j.contains("best_of") && j["best_of"].is_number_integer()) {
+      payload.best_of = std::min(std::max(j["best_of"].get<int>(), 1), 20);
+    }
+    // Enforce best_of >= n (clamp up rather than error at parse time).
+    if (payload.best_of < payload.n) {
+      payload.best_of = payload.n;
+    }
   } catch (const json::exception &) {
     // Return defaults on parse failure.
   }
@@ -543,105 +561,127 @@ ToolCallResult DetectToolCall(const std::string &text) {
   return result;
 }
 
-std::string
-BuildCompletionBody(const InferenceResult &result,
-                    const CompletionRequestPayload &request, bool chat_mode,
-                    const ToolCallResult &tool_call = ToolCallResult{}) {
-  auto now = std::chrono::system_clock::now();
-  auto ts =
-      std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch())
-          .count();
-  std::string id_prefix = chat_mode ? "chatcmpl-" : "cmpl-";
-
-  json usage = {
-      {"prompt_tokens", result.prompt_tokens},
-      {"completion_tokens", result.completion_tokens},
-      {"total_tokens", result.prompt_tokens + result.completion_tokens}};
-
-  json j;
-  j["id"] = id_prefix + std::to_string(ts);
-  j["object"] = chat_mode ? "chat.completion" : "text_completion";
-  j["created"] = ts;
-  j["model"] = request.model;
-  j["usage"] = usage;
-
-  // Build logprobs object (null when not requested or no tokens collected).
-  // Chat completions format: {"content": [{token, logprob, bytes,
-  // top_logprobs}]} Completions format:      {tokens, token_logprobs,
-  // top_logprobs}
-  json logprobs_json = nullptr;
-  if (!result.logprobs.empty()) {
-    if (chat_mode) {
-      json content = json::array();
-      for (const auto &tlp : result.logprobs) {
-        json top_arr = json::array();
-        for (const auto &[alt_tok, alt_lp] : tlp.top_logprobs) {
-          // bytes for alternative token
-          std::vector<int> alt_bytes;
-          alt_bytes.reserve(alt_tok.size());
-          for (unsigned char c : alt_tok)
-            alt_bytes.push_back(static_cast<int>(c));
-          top_arr.push_back(
-              {{"token", alt_tok}, {"logprob", alt_lp}, {"bytes", alt_bytes}});
-        }
-        content.push_back({{"token", tlp.token},
-                           {"logprob", tlp.logprob},
-                           {"bytes", tlp.bytes},
-                           {"top_logprobs", top_arr}});
+// Build logprobs JSON for one result (shared helper).
+// Chat format: {"content":[...]}; completions format: {tokens, token_logprobs,
+// top_logprobs}.
+static json BuildLogprobsJson(const InferenceResult &result, bool chat_mode) {
+  if (result.logprobs.empty())
+    return nullptr;
+  if (chat_mode) {
+    json content = json::array();
+    for (const auto &tlp : result.logprobs) {
+      json top_arr = json::array();
+      for (const auto &[alt_tok, alt_lp] : tlp.top_logprobs) {
+        std::vector<int> alt_bytes;
+        alt_bytes.reserve(alt_tok.size());
+        for (unsigned char c : alt_tok)
+          alt_bytes.push_back(static_cast<int>(c));
+        top_arr.push_back(
+            {{"token", alt_tok}, {"logprob", alt_lp}, {"bytes", alt_bytes}});
       }
-      logprobs_json = {{"content", content}};
-    } else {
-      json tokens_arr = json::array();
-      json token_logprobs_arr = json::array();
-      json top_logprobs_arr = json::array();
-      for (const auto &tlp : result.logprobs) {
-        tokens_arr.push_back(tlp.token);
-        token_logprobs_arr.push_back(tlp.logprob);
-        json alt_map = json::object();
-        for (const auto &[alt_tok, alt_lp] : tlp.top_logprobs) {
-          alt_map[alt_tok] = alt_lp;
-        }
-        top_logprobs_arr.push_back(alt_map);
-      }
-      logprobs_json = {{"tokens", tokens_arr},
-                       {"token_logprobs", token_logprobs_arr},
-                       {"top_logprobs", top_logprobs_arr}};
+      content.push_back({{"token", tlp.token},
+                         {"logprob", tlp.logprob},
+                         {"bytes", tlp.bytes},
+                         {"top_logprobs", top_arr}});
     }
+    return {{"content", content}};
+  } else {
+    json tokens_arr = json::array();
+    json token_logprobs_arr = json::array();
+    json top_logprobs_arr = json::array();
+    for (const auto &tlp : result.logprobs) {
+      tokens_arr.push_back(tlp.token);
+      token_logprobs_arr.push_back(tlp.logprob);
+      json alt_map = json::object();
+      for (const auto &[alt_tok, alt_lp] : tlp.top_logprobs)
+        alt_map[alt_tok] = alt_lp;
+      top_logprobs_arr.push_back(alt_map);
+    }
+    return {{"tokens", tokens_arr},
+            {"token_logprobs", token_logprobs_arr},
+            {"top_logprobs", top_logprobs_arr}};
   }
+}
 
+// Build one choice object for a single result.
+static json BuildChoice(int idx, const InferenceResult &result,
+                        const ToolCallResult &tool_call, bool chat_mode) {
+  json logprobs_json = BuildLogprobsJson(result, chat_mode);
   if (chat_mode) {
     if (tool_call.detected) {
-      // §2.3: emit tool_calls array with finish_reason="tool_calls".
       json tc_arr =
           json::array({{{"id", tool_call.call_id},
                         {"type", "function"},
                         {"function",
                          {{"name", tool_call.function_name},
                           {"arguments", tool_call.arguments_json}}}}});
-      j["choices"] = json::array({{{"index", 0},
-                                   {"message",
-                                    {{"role", "assistant"},
-                                     {"content", nullptr},
-                                     {"tool_calls", tc_arr}}},
-                                   {"logprobs", logprobs_json},
-                                   {"finish_reason", "tool_calls"}}});
+      return {{"index", idx},
+              {"message",
+               {{"role", "assistant"},
+                {"content", nullptr},
+                {"tool_calls", tc_arr}}},
+              {"logprobs", logprobs_json},
+              {"finish_reason", "tool_calls"}};
     } else {
       const std::string fr = result.finish_reason_length ? "length" : "stop";
-      j["choices"] = json::array(
-          {{{"index", 0},
-            {"message",
-             {{"role", "assistant"}, {"content", result.completion}}},
-            {"logprobs", logprobs_json},
-            {"finish_reason", fr}}});
+      return {
+          {"index", idx},
+          {"message", {{"role", "assistant"}, {"content", result.completion}}},
+          {"logprobs", logprobs_json},
+          {"finish_reason", fr}};
     }
   } else {
     const std::string fr = result.finish_reason_length ? "length" : "stop";
-    j["choices"] = json::array({{{"index", 0},
-                                 {"text", result.completion},
-                                 {"logprobs", logprobs_json},
-                                 {"finish_reason", fr}}});
+    return {{"index", idx},
+            {"text", result.completion},
+            {"logprobs", logprobs_json},
+            {"finish_reason", fr}};
   }
+}
+
+// Multi-result overload: used when n>1 or best_of>1.
+// total_completion_tokens covers all generated completions (including
+// best_of candidates not returned), matching OpenAI's usage counting.
+std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
+                                int total_completion_tokens,
+                                const CompletionRequestPayload &request,
+                                bool chat_mode,
+                                const std::vector<ToolCallResult> &tool_calls) {
+  auto now = std::chrono::system_clock::now();
+  auto ts =
+      std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch())
+          .count();
+  std::string id_prefix = chat_mode ? "chatcmpl-" : "cmpl-";
+  int prompt_toks = results.empty() ? 0 : results[0].prompt_tokens;
+
+  json j;
+  j["id"] = id_prefix + std::to_string(ts);
+  j["object"] = chat_mode ? "chat.completion" : "text_completion";
+  j["created"] = ts;
+  j["model"] = request.model;
+  j["usage"] = {{"prompt_tokens", prompt_toks},
+                {"completion_tokens", total_completion_tokens},
+                {"total_tokens", prompt_toks + total_completion_tokens}};
+
+  json choices = json::array();
+  for (int i = 0; i < static_cast<int>(results.size()); ++i) {
+    const ToolCallResult &tc = (i < static_cast<int>(tool_calls.size()))
+                                   ? tool_calls[i]
+                                   : ToolCallResult{};
+    choices.push_back(BuildChoice(i, results[i], tc, chat_mode));
+  }
+  j["choices"] = choices;
   return j.dump();
+}
+
+// Single-result overload: preserves the original call sites unchanged.
+std::string
+BuildCompletionBody(const InferenceResult &result,
+                    const CompletionRequestPayload &request, bool chat_mode,
+                    const ToolCallResult &tool_call = ToolCallResult{}) {
+  return BuildCompletionBody(std::vector<InferenceResult>{result},
+                             result.completion_tokens, request, chat_mode,
+                             std::vector<ToolCallResult>{tool_call});
 }
 
 std::string BuildErrorBody(const std::string &error) {
@@ -667,10 +707,13 @@ std::vector<std::string> SplitForStreaming(const std::string &text) {
   return chunks;
 }
 
+// `logprob` is non-null when the caller collected per-token logprobs (i.e.
+// the request had logprobs=true with streaming).  Ignored on finish chunks.
 std::string BuildStreamChunk(const std::string &id, const std::string &model,
                              std::time_t ts, const std::string &content,
                              bool finish,
-                             const std::string &finish_reason = "stop") {
+                             const std::string &finish_reason = "stop",
+                             const TokenLogprob *logprob = nullptr) {
   json j;
   j["id"] = id;
   j["object"] = "chat.completion.chunk";
@@ -682,9 +725,30 @@ std::string BuildStreamChunk(const std::string &id, const std::string &model,
                                  {"delta", json::object()},
                                  {"finish_reason", finish_reason}}});
   } else {
-    j["choices"] = json::array({{{"index", 0},
-                                 {"delta", {{"content", content}}},
-                                 {"finish_reason", nullptr}}});
+    json choice = {{"index", 0},
+                   {"delta", {{"content", content}}},
+                   {"finish_reason", nullptr}};
+    if (logprob != nullptr) {
+      // Per-token logprob in OpenAI streaming format.
+      std::vector<int> tok_bytes;
+      tok_bytes.reserve(content.size());
+      for (unsigned char c : content)
+        tok_bytes.push_back(static_cast<int>(c));
+      json top_arr = json::array();
+      for (const auto &[alt_tok, alt_lp] : logprob->top_logprobs) {
+        std::vector<int> alt_bytes;
+        for (unsigned char c : alt_tok)
+          alt_bytes.push_back(static_cast<int>(c));
+        top_arr.push_back(
+            {{"token", alt_tok}, {"logprob", alt_lp}, {"bytes", alt_bytes}});
+      }
+      choice["logprobs"] = {
+          {"content", json::array({{{"token", logprob->token},
+                                    {"logprob", logprob->logprob},
+                                    {"bytes", tok_bytes},
+                                    {"top_logprobs", top_arr}}})}};
+    }
+    j["choices"] = json::array({choice});
   }
   return "data: " + j.dump() + "\n\n";
 }
@@ -1149,10 +1213,11 @@ void HttpServer::HandleClient(ClientSession &session) {
 
   // Unauthenticated health/readiness probes.
   if (method == "GET" && path == "/healthz") {
+    // Liveness probe: always 200 while the process is running.
+    // Use /readyz for readiness (model loaded + pool warm).
     bool ready = model_ready_.load();
-    json j = {{"status", ready ? "ok" : "degraded"}, {"model_ready", ready}};
-    SendAll(session, BuildResponse(j.dump(), ready ? 200 : 503,
-                                   ready ? "OK" : "Service Unavailable"));
+    json j = {{"status", "ok"}, {"model_ready", ready}};
+    SendAll(session, BuildResponse(j.dump()));
     return;
   }
   if (method == "GET" && path == "/livez") {
@@ -1648,29 +1713,25 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
     std::vector<int> tokens;
-    std::string completion;
-    int completion_tokens = 0;
+    std::vector<int> block_table;
     try {
       auto j = json::parse(body);
       if (j.contains("tokens") && j["tokens"].is_array()) {
         tokens = j["tokens"].get<std::vector<int>>();
       }
-      if (j.contains("completion") && j["completion"].is_string()) {
-        completion = j["completion"].get<std::string>();
-      }
-      if (j.contains("completion_tokens") &&
-          j["completion_tokens"].is_number_integer()) {
-        completion_tokens = j["completion_tokens"].get<int>();
+      if (j.contains("block_table") && j["block_table"].is_array()) {
+        block_table = j["block_table"].get<std::vector<int>>();
       }
     } catch (const json::exception &) {
     }
-    if (tokens.empty() || completion.empty()) {
-      SendAll(session, BuildResponse(
-                           BuildErrorBody("tokens and completion are required"),
-                           400, "Bad Request"));
+    if (tokens.empty() || block_table.empty()) {
+      SendAll(session, BuildResponse(BuildErrorBody(
+                                         "tokens and block_table are required"),
+                                     400, "Bad Request"));
       return;
     }
-    cache->Insert(tokens, completion, completion_tokens);
+    // We use a dummy sequence_id and null backend for administrative warming.
+    cache->Insert(tokens, block_table, -1, nullptr);
     SendAll(session,
             BuildResponse(json({{"status", "ok"},
                                 {"size", static_cast<int64_t>(cache->Size())}})
@@ -1848,21 +1909,9 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
     req.stream = parsed.stream;
     if (parsed.logprobs) {
-      if (parsed.stream) {
-        // Logprobs in the SSE streaming path are not yet implemented: the
-        // on_token callback only passes text chunks and has no way to carry
-        // per-token logprob payloads.  Reject clearly rather than silently
-        // discarding the logprob data while still paying the compute cost.
-        SendAll(session,
-                BuildResponse(
-                    BuildErrorBody("logprobs_not_supported_with_streaming"),
-                    400, "Bad Request"));
-        return;
-      }
       req.collect_logprobs = true;
       // top_logprobs=0 means selected-token logprob only (no alternatives).
-      // Keep logprob_top_n at 0 — CollectLogprob skips the O(V log V)
-      // partial-sort when top_n==0, so we only pay the O(V) log-softmax.
+      // CollectLogprob skips the O(V log V) partial-sort when top_n==0.
       req.logprob_top_n = parsed.top_logprobs; // 0-20, already clamped above
     }
 
@@ -1992,6 +2041,131 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
       return;
     }
+    // ── Multi-completion path (n>1 or best_of>1) ──────────────────────────
+    // Must be handled before the streaming setup because n>1 is incompatible
+    // with SSE streaming (no way to interleave independent completion tokens).
+    if (parsed.n > 1 || parsed.best_of > 1) {
+      if (parsed.stream) {
+        SendAll(session,
+                BuildResponse(
+                    BuildErrorBody("n>1 and best_of not supported with stream"),
+                    400, "Bad Request"));
+        return;
+      }
+      const int n_return = parsed.n;
+      const int n_generate = parsed.best_of; // best_of >= n enforced at parse
+
+      // For best_of ranking we need per-token logprobs; force them internally
+      // even when the caller did not request them.
+      bool need_internal_logprobs =
+          (n_generate > n_return) && !req.collect_logprobs;
+      if (need_internal_logprobs) {
+        req.collect_logprobs = true;
+        // logprob_top_n stays 0: only selected-token logprob needed for sum.
+      }
+
+      std::vector<std::future<InferenceResult>> futures;
+      futures.reserve(n_generate);
+      try {
+        for (int i = 0; i < n_generate; ++i) {
+          InferenceRequest cur = req;
+          // Give each generation a different seed so results vary.
+          if (i > 0) {
+            cur.sampling.seed = (parsed.seed == UINT32_MAX)
+                                    ? UINT32_MAX
+                                    : parsed.seed + static_cast<uint32_t>(i);
+          }
+          futures.push_back(scheduler_->Generate(std::move(cur)));
+        }
+      } catch (const std::exception &ex) {
+        if (metrics_)
+          metrics_->RecordError();
+        SendAll(session,
+                BuildResponse(BuildErrorBody(ex.what()), 500, "Error"));
+        return;
+      }
+
+      std::vector<InferenceResult> all_results;
+      all_results.reserve(n_generate);
+      int total_completion_tokens = 0;
+      for (auto &f : futures) {
+        auto r = f.get();
+        total_completion_tokens += r.completion_tokens;
+        all_results.push_back(std::move(r));
+      }
+
+      // If best_of > n, rank by cumulative logprob and keep top n.
+      if (n_generate > n_return) {
+        auto cumlogprob = [](const InferenceResult &r) -> double {
+          double s = 0.0;
+          for (const auto &tlp : r.logprobs)
+            s += static_cast<double>(tlp.logprob);
+          return s;
+        };
+        std::sort(all_results.begin(), all_results.end(),
+                  [&](const InferenceResult &a, const InferenceResult &b) {
+                    return cumlogprob(a) > cumlogprob(b);
+                  });
+        all_results.resize(n_return);
+        // Strip logprobs if they were only needed for ranking.
+        if (need_internal_logprobs) {
+          for (auto &r : all_results)
+            r.logprobs.clear();
+        }
+      }
+
+      // Detect tool calls per choice.
+      std::vector<ToolCallResult> tool_calls;
+      tool_calls.reserve(all_results.size());
+      for (auto &r : all_results) {
+        if (use_tools) {
+          bool is_stub =
+              r.no_backend || r.completion.find("No model backend is loaded") !=
+                                  std::string::npos;
+          if (is_stub && !parsed.tools.empty()) {
+            ToolCallResult tc;
+            tc.detected = true;
+            tc.function_name = parsed.tools.front().function.name;
+            if (tc.function_name.empty())
+              tc.function_name = "stub_tool";
+            tc.call_id = "call_stub_" + tc.function_name;
+            tc.arguments_json = json{{"reason", "no_model_available"}}.dump();
+            tool_calls.push_back(std::move(tc));
+          } else {
+            tool_calls.push_back(DetectToolCall(r.completion));
+          }
+        } else {
+          tool_calls.push_back(ToolCallResult{});
+        }
+      }
+
+      // Record aggregate metrics using the first result for token counts.
+      if (metrics_ && !all_results.empty() && !all_results[0].no_backend) {
+        metrics_->RecordSuccess(all_results[0].prompt_tokens,
+                                total_completion_tokens);
+      }
+      if (audit_logger_ && !all_results.empty()) {
+        audit_logger_->LogRequest(auth_ctx.subject, parsed.model, req.prompt,
+                                  all_results[0].completion,
+                                  all_results[0].prompt_tokens,
+                                  total_completion_tokens);
+      }
+
+      SpanContext mc_parent;
+      mc_parent.trace_id = req.trace_id;
+      SpanContext mc_ctx = tracing::ChildContext(mc_parent);
+      std::string mc_trace_hdr;
+      if (mc_ctx.valid())
+        mc_trace_hdr = "traceparent: " + mc_ctx.ToTraceparent() + "\r\n";
+
+      SendAll(session, BuildResponse(BuildCompletionBody(
+                                         all_results, total_completion_tokens,
+                                         parsed, chat_mode, tool_calls),
+                                     200, "OK", mc_trace_hdr));
+      return;
+    }
+    // ── End multi-completion path ──────────────────────────────────────────
+
     // Build a child SpanContext for this request so downstream services can
     // correlate spans. The traceparent is emitted in the response header.
     SpanContext parent_ctx;
@@ -2039,10 +2213,12 @@ void HttpServer::HandleClient(ClientSession &session) {
       //   then stop chunk
       // When use_tools=false the buffer is never populated and the normal
       // per-token streaming path runs unchanged.
+      bool stream_collect_logprobs = req.collect_logprobs;
       req.on_token = [this, stream_session, stream_mutex, stream_active,
                       stream_had_chunk, stream_cancel_flag, stream_id,
-                      stream_model, stream_ts, token_buffer,
-                      buffer_tokens](const std::string &chunk) {
+                      stream_model, stream_ts, token_buffer, buffer_tokens,
+                      stream_collect_logprobs](const std::string &chunk,
+                                               const TokenLogprob *lp) {
         if (chunk.empty() || !stream_active->load()) {
           return;
         }
@@ -2050,6 +2226,23 @@ void HttpServer::HandleClient(ClientSession &session) {
           // Accumulate without sending; will be replayed or discarded below.
           std::lock_guard<std::mutex> lock(*stream_mutex);
           token_buffer->push_back(chunk);
+          return;
+        }
+        // When logprobs are requested emit the full token as a single SSE
+        // delta (no splitting) so the logprob is paired 1:1 with its token.
+        if (stream_collect_logprobs && lp != nullptr) {
+          std::string payload = BuildStreamChunk(
+              stream_id, stream_model, stream_ts, chunk, false, "stop", lp);
+          std::lock_guard<std::mutex> lock(*stream_mutex);
+          if (!stream_active->load()) {
+            return;
+          }
+          if (!SendAll(*stream_session, payload)) {
+            stream_active->store(false);
+            stream_cancel_flag->store(true);
+            return;
+          }
+          stream_had_chunk->store(true);
           return;
         }
         auto pieces = SplitForStreaming(chunk);
@@ -2071,7 +2264,8 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
 
     try {
-      auto result = scheduler_->Generate(std::move(req));
+      auto future = scheduler_->Generate(std::move(req));
+      auto result = future.get();
       if (result.no_backend) {
         if (metrics_) {
           metrics_->RecordError();

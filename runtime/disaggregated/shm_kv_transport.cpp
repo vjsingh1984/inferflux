@@ -1,9 +1,9 @@
 #include "runtime/disaggregated/shm_kv_transport.h"
+#include "server/logging/logger.h"
 
 #include <atomic>
 #include <cerrno>
 #include <cstring>
-#include <iostream>
 #include <sstream>
 
 #ifdef _WIN32
@@ -22,9 +22,10 @@ namespace {
 // Process-level counter to make SHM segment names unique even when the same
 // request_id is reused rapidly (e.g. during fairness-yield loops).
 std::atomic<uint64_t> g_shm_seq{0};
-}  // namespace
+} // namespace
 
-ShmKVTransport::ShmKVTransport(std::size_t capacity) : control_queue_(capacity) {}
+ShmKVTransport::ShmKVTransport(std::size_t capacity)
+    : control_queue_(capacity) {}
 
 ShmKVTransport::~ShmKVTransport() = default;
 
@@ -37,19 +38,22 @@ std::string ShmKVTransport::MakeShmName(uint64_t request_id) {
 }
 
 // static
-std::string ShmKVTransport::ExtractShmName(const std::string& metadata) {
+std::string ShmKVTransport::ExtractShmName(const std::string &metadata) {
   auto pos = metadata.find("|shm=");
-  if (pos == std::string::npos) return {};
-  pos += 5;  // skip "|shm="
+  if (pos == std::string::npos)
+    return {};
+  pos += 5; // skip "|shm="
   auto end = metadata.find('|', pos);
-  return metadata.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+  return metadata.substr(pos, end == std::string::npos ? std::string::npos
+                                                       : end - pos);
 }
 
 // static
-std::size_t ShmKVTransport::ExtractShmSize(const std::string& metadata) {
+std::size_t ShmKVTransport::ExtractShmSize(const std::string &metadata) {
   auto pos = metadata.find("|size=");
-  if (pos == std::string::npos) return 0;
-  pos += 6;  // skip "|size="
+  if (pos == std::string::npos)
+    return 0;
+  pos += 6; // skip "|size="
   try {
     return static_cast<std::size_t>(std::stoull(metadata.substr(pos)));
   } catch (...) {
@@ -72,22 +76,25 @@ bool ShmKVTransport::Enqueue(KVPacket packet) {
 
   int fd = ::shm_open(shm_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
   if (fd < 0) {
-    std::cerr << "[ShmKVTransport] shm_open(write) failed for " << shm_name
-              << ": " << std::strerror(errno) << "\n";
+    log::Error("shm_transport", "shm_open(write) failed for " + shm_name +
+                                    ": " + std::strerror(errno));
     return false;
   }
 
   if (::ftruncate(fd, static_cast<off_t>(blob_size)) != 0) {
-    std::cerr << "[ShmKVTransport] ftruncate failed: " << std::strerror(errno) << "\n";
+    log::Error("shm_transport",
+               std::string("ftruncate failed: ") + std::strerror(errno));
     ::close(fd);
     ::shm_unlink(shm_name.c_str());
     return false;
   }
 
-  void* ptr = ::mmap(nullptr, blob_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  void *ptr =
+      ::mmap(nullptr, blob_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   ::close(fd);
   if (ptr == MAP_FAILED) {
-    std::cerr << "[ShmKVTransport] mmap(write) failed: " << std::strerror(errno) << "\n";
+    log::Error("shm_transport",
+               std::string("mmap(write) failed: ") + std::strerror(errno));
     ::shm_unlink(shm_name.c_str());
     return false;
   }
@@ -112,31 +119,33 @@ bool ShmKVTransport::Enqueue(KVPacket packet) {
 
 std::optional<KVPacket> ShmKVTransport::TryDequeue() {
   auto maybe = control_queue_.TryDequeue();
-  if (!maybe) return std::nullopt;
+  if (!maybe)
+    return std::nullopt;
 
 #ifdef _WIN32
-  return maybe;  // Windows: kv_blob already inline.
+  return maybe; // Windows: kv_blob already inline.
 #else
-  KVPacket& pkt = *maybe;
+  KVPacket &pkt = *maybe;
   std::string shm_name = ExtractShmName(pkt.metadata);
   std::size_t blob_size = ExtractShmSize(pkt.metadata);
 
   if (!shm_name.empty() && blob_size > 0) {
     int fd = ::shm_open(shm_name.c_str(), O_RDWR, 0);
     if (fd >= 0) {
-      void* ptr = ::mmap(nullptr, blob_size, PROT_READ, MAP_SHARED, fd, 0);
+      void *ptr = ::mmap(nullptr, blob_size, PROT_READ, MAP_SHARED, fd, 0);
       ::close(fd);
       if (ptr != MAP_FAILED) {
         pkt.kv_blob.resize(blob_size);
         std::memcpy(pkt.kv_blob.data(), ptr, blob_size);
         ::munmap(ptr, blob_size);
       } else {
-        std::cerr << "[ShmKVTransport] mmap(read) failed: " << std::strerror(errno) << "\n";
+        log::Error("shm_transport",
+                   std::string("mmap(read) failed: ") + std::strerror(errno));
       }
       ::shm_unlink(shm_name.c_str());
     } else {
-      std::cerr << "[ShmKVTransport] shm_open(read) failed for " << shm_name
-                << ": " << std::strerror(errno) << "\n";
+      log::Error("shm_transport", "shm_open(read) failed for " + shm_name +
+                                      ": " + std::strerror(errno));
     }
   }
 
@@ -144,8 +153,10 @@ std::optional<KVPacket> ShmKVTransport::TryDequeue() {
 #endif
 }
 
-std::size_t ShmKVTransport::Capacity() const { return control_queue_.Capacity(); }
+std::size_t ShmKVTransport::Capacity() const {
+  return control_queue_.Capacity();
+}
 std::size_t ShmKVTransport::Size() const { return control_queue_.Size(); }
 
-}  // namespace disaggregated
-}  // namespace inferflux
+} // namespace disaggregated
+} // namespace inferflux

@@ -47,6 +47,10 @@ public:
   int32_t VocabSize() const { return vocab_size_; }
   bool IsSpecial(int32_t id) const { return special_ids_.count(id) > 0; }
 
+  // Chat template (Jinja2 string from tokenizer_config.json, if present).
+  const std::string &ChatTemplate() const { return chat_template_; }
+  bool HasChatTemplate() const { return !chat_template_.empty(); }
+
 private:
   enum class PreTokenizerType { Metaspace, ByteLevel, Unknown };
 
@@ -65,6 +69,8 @@ private:
   int32_t bos_id_{1};
   int32_t eos_id_{2};
   int32_t vocab_size_{0};
+
+  std::string chat_template_; // Jinja2 template string, empty if absent
 
   // Split UTF-8 string into individual codepoint strings (1–4 bytes each).
   static std::vector<std::string> SplitUtf8(const std::string &s);

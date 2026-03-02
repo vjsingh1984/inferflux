@@ -1,8 +1,8 @@
 #include "runtime/backends/mlx/mlx_tokenizer.h"
+#include "server/logging/logger.h"
 
 #include <climits>
 #include <fstream>
-#include <iostream>
 #include <sstream>
 
 #include "nlohmann/json.hpp"
@@ -222,7 +222,7 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
   const auto tok_path = model_dir / "tokenizer.json";
   std::ifstream f(tok_path);
   if (!f.is_open()) {
-    std::cerr << "[mlx_tok] Cannot open " << tok_path << "\n";
+    log::Error("mlx_tokenizer", "Cannot open " + tok_path.string());
     return false;
   }
 
@@ -230,18 +230,19 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
   try {
     f >> j;
   } catch (const std::exception &e) {
-    std::cerr << "[mlx_tok] tokenizer.json parse error: " << e.what() << "\n";
+    log::Error("mlx_tokenizer",
+               std::string("tokenizer.json parse error: ") + e.what());
     return false;
   }
 
   // Parse model section.
   if (!j.contains("model") || !j["model"].is_object()) {
-    std::cerr << "[mlx_tok] Missing 'model' section\n";
+    log::Error("mlx_tokenizer", "Missing 'model' section");
     return false;
   }
   const auto &model = j["model"];
   if (!model.contains("type") || model["type"] != "BPE") {
-    std::cerr << "[mlx_tok] Only BPE model type is supported\n";
+    log::Error("mlx_tokenizer", "Only BPE model type is supported");
     return false;
   }
 
@@ -326,12 +327,17 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
       bos_id_ = vocab_.at(bos_str);
     if (!eos_str.empty() && vocab_.count(eos_str))
       eos_id_ = vocab_.at(eos_str);
+
+    // Chat template (Jinja2 string used by FormatChatMessages override).
+    if (cfg.contains("chat_template") && cfg["chat_template"].is_string())
+      chat_template_ = cfg["chat_template"].get<std::string>();
   }
 
   loaded_ = true;
-  std::cout << "[mlx_tok] Loaded: vocab=" << vocab_size_
-            << " merges=" << merge_rank_.size() << " bos=" << bos_id_
-            << " eos=" << eos_id_ << "\n";
+  log::Info("mlx_tokenizer",
+            "Loaded: vocab=" + std::to_string(vocab_size_) +
+                " merges=" + std::to_string(merge_rank_.size()) + " bos=" +
+                std::to_string(bos_id_) + " eos=" + std::to_string(eos_id_));
   return true;
 }
 

@@ -4,11 +4,13 @@
 
 namespace inferflux {
 
-AsyncFileWriter::AsyncFileWriter(std::size_t max_queue_depth) : max_queue_depth_(max_queue_depth) {}
+AsyncFileWriter::AsyncFileWriter(std::size_t max_queue_depth)
+    : max_queue_depth_(max_queue_depth) {}
 
 AsyncFileWriter::~AsyncFileWriter() { Stop(); }
 
-void AsyncFileWriter::Configure(std::size_t workers, std::size_t max_queue_depth) {
+void AsyncFileWriter::Configure(std::size_t workers,
+                                std::size_t max_queue_depth) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (workers == 0) {
     workers = 1;
@@ -45,7 +47,7 @@ void AsyncFileWriter::Stop() {
   }
   cv_.notify_all();
   producer_cv_.notify_all();
-  for (auto& worker : workers_) {
+  for (auto &worker : workers_) {
     if (worker.joinable()) {
       worker.join();
     }
@@ -58,7 +60,8 @@ void AsyncFileWriter::Enqueue(AsyncWriteTask task) {
   bool need_start = false;
   {
     std::unique_lock<std::mutex> lock(mutex_);
-    producer_cv_.wait(lock, [&] { return stop_ || tasks_.size() < max_queue_depth_; });
+    producer_cv_.wait(
+        lock, [&] { return stop_ || tasks_.size() < max_queue_depth_; });
     if (stop_) {
       return;
     }
@@ -89,8 +92,9 @@ void AsyncFileWriter::Worker() {
     if (!out.good()) {
       continue;
     }
-    out.write(task.buffer.data(), static_cast<std::streamsize>(task.buffer.size()));
+    out.write(task.buffer.data(),
+              static_cast<std::streamsize>(task.buffer.size()));
   }
 }
 
-}  // namespace inferflux
+} // namespace inferflux

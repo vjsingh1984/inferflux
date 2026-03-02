@@ -10,18 +10,18 @@
 namespace inferflux {
 
 class BackendManager {
- public:
+public:
   BackendManager() = default;
 
-  std::shared_ptr<LlamaCPUBackend> LoadBackend(const std::string& name,
-                                               const std::string& path,
-                                               const LlamaBackendConfig& config,
+  std::shared_ptr<LlamaCPUBackend> LoadBackend(const std::string &name,
+                                               const std::string &path,
+                                               const LlamaBackendConfig &config,
                                                bool prefer_cuda = false);
-  std::shared_ptr<LlamaCPUBackend> GetBackend(const std::string& name) const;
+  std::shared_ptr<LlamaCPUBackend> GetBackend(const std::string &name) const;
 
- private:
+private:
   mutable std::mutex mutex_;
   std::unordered_map<std::string, std::shared_ptr<LlamaCPUBackend>> backends_;
 };
 
-}  // namespace inferflux
+} // namespace inferflux

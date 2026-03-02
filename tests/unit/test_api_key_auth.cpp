@@ -19,7 +19,7 @@ TEST_CASE("ApiKeyAuth add and check keys", "[auth]") {
 TEST_CASE("ApiKeyAuth stores keys by SHA-256 hash", "[auth]") {
   inferflux::ApiKeyAuth auth;
   auto hash = inferflux::ApiKeyAuth::HashKey("test-key");
-  REQUIRE(hash.size() == 64);  // SHA-256 hex = 64 chars
+  REQUIRE(hash.size() == 64); // SHA-256 hex = 64 chars
 
   // Same input always produces same hash.
   REQUIRE(inferflux::ApiKeyAuth::HashKey("test-key") == hash);

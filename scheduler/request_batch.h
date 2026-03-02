@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "runtime/logprob.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "runtime/structured_output/structured_constraint.h"
 
@@ -27,6 +28,23 @@ struct SamplingParams {
   float repetition_penalty{1.0f}; // multiplicative; 1.0 = disabled
   int penalty_last_n{64};         // lookback window for penalties
   uint32_t seed{UINT32_MAX};      // UINT32_MAX = random per call
+};
+
+// InferenceResult surfaced by the scheduler and BatchExecutor to HTTP handlers.
+struct InferenceResult {
+  std::string model_id;
+  std::string completion;
+  int completion_tokens{0};
+  int prompt_tokens{0};
+  bool no_backend{false};
+  bool finish_reason_length{false};
+  std::vector<TokenLogprob> logprobs;
+
+  struct {
+    int total_chunks{0};
+    int accepted_chunks{0};
+    int reused_tokens{0};
+  } speculative;
 };
 
 // Phase of an inference request in the continuous batching pipeline.
@@ -74,6 +92,7 @@ struct InferenceRequest {
   // length. Used by DonateKVPrefix to record n_kv_tokens for
   // CopySequencePrefix.
   int prompt_bpe_tokens{-1};
+  int prefill_offset{0}; // Progress through chunked prefill (§P1d).
   // BPE token IDs produced by LlamaCPUBackend::TokenizeForCache() during the
   // prefill block.  Used by LookupKVPrefix / DonateKVPrefix instead of
   // prompt_tokens (SimpleTokenizer) to ensure prefix matching is done in the
@@ -102,6 +121,17 @@ struct InferenceRequest {
   std::string response_format_error;
   StructuredConstraint response_constraint;
 
+  // Persistent execution state for iteration-level continuous batching.
+  // These fields allow BatchExecutor to pause and resume a request at any token
+  // step without losing progress.
+  bool exec_active{true};
+  int exec_tokens_generated{0};
+  int exec_decode_limit{0};
+  int exec_current_token{-1};
+  bool exec_slice_active{false};
+  bool exec_in_prefill{false};
+  InferenceResult exec_result{};
+
   std::vector<DecodedImage>
       images; // §2.2: decoded images (parallel to <__media__> markers).
 
@@ -117,15 +147,20 @@ struct InferenceRequest {
   // Empty string if no traceparent was present in the request.
   std::string trace_id;
 
-  // Callback for streaming: invoked with each generated token string.
+  // Callback for streaming: invoked with each generated token string and an
+  // optional per-token logprob pointer (non-null when collect_logprobs=true).
   // Null for non-streaming requests.
-  std::function<void(const std::string &)> on_token;
+  std::function<void(const std::string &, const TokenLogprob *)> on_token;
   std::string
       accumulated_output; // Aggregated completion text across fairness slices.
 
   // Shared cancellation flag toggled when the HTTP connection closes.
   std::shared_ptr<std::atomic<bool>> cancellation_flag;
-  int kv_page{-1};
+  std::vector<int> block_table; // Logical-to-physical KV block mappings.
+
+  // Swapping state (§P1c).
+  bool is_swapped{false};
+  std::vector<int> swapped_host_handles; // Handles to blocks in Host RAM.
 
   // Logprob collection (OpenAI logprobs API).
   // collect_logprobs enables per-token logprob recording.

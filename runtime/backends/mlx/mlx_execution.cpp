@@ -1,7 +1,10 @@
 #include "runtime/backends/mlx/mlx_execution.h"
+#include "runtime/backends/backend_utils.h"
+#include "server/logging/logger.h"
 
+#include <algorithm>
 #include <cmath>
-#include <iostream>
+#include <random>
 #include <string>
 
 #ifdef INFERFLUX_HAS_MLX
@@ -52,7 +55,8 @@ struct Arr {
 Arr GetW(const mlx_map_string_to_array &m, const char *name) {
   mlx_array a{};
   if (mlx_map_string_to_array_get(&a, m, name) != 0 || !a.ctx) {
-    std::cerr << "[mlx_exec] missing weight: " << name << "\n";
+    inferflux::log::Error("mlx_execution",
+                          std::string("missing weight: ") + name);
     return Arr{};
   }
   return Arr(a);
@@ -126,6 +130,125 @@ Arr Cat2(mlx_array a, mlx_array b, int axis, mlx_stream s) {
   return Arr(res);
 }
 
+// ---------------------------------------------------------------------------
+// SampleToken — pure C++ sampling from a float logit array.
+// Applies repetition/frequency/presence penalties, then optionally samples
+// stochastically (top-k → min-p → top-p → temperature → categorical).
+// Returns greedy token when sp.temperature <= 0.
+// ---------------------------------------------------------------------------
+int32_t SampleToken(const float *logits, int vocab_size,
+                    const std::vector<int32_t> &token_history,
+                    const SamplingParams &sp, std::mt19937 &rng) {
+  // Make a mutable copy for penalty application.
+  std::vector<float> l(logits, logits + vocab_size);
+
+  // Apply repetition / frequency / presence penalties.
+  const bool has_penalties =
+      (sp.frequency_penalty != 0.0f || sp.presence_penalty != 0.0f ||
+       sp.repetition_penalty != 1.0f);
+  if (has_penalties && !token_history.empty()) {
+    const int last_n =
+        std::min(sp.penalty_last_n, static_cast<int>(token_history.size()));
+    // Count token occurrences in the lookback window.
+    std::vector<int> counts(vocab_size, 0);
+    for (int i = static_cast<int>(token_history.size()) - last_n;
+         i < static_cast<int>(token_history.size()); ++i) {
+      int32_t t = token_history[i];
+      if (t >= 0 && t < vocab_size)
+        counts[t]++;
+    }
+    for (int i = 0; i < vocab_size; ++i) {
+      if (counts[i] == 0)
+        continue;
+      // Repetition penalty (multiplicative).
+      if (sp.repetition_penalty != 1.0f) {
+        if (l[i] < 0.0f)
+          l[i] *= sp.repetition_penalty;
+        else
+          l[i] /= sp.repetition_penalty;
+      }
+      // Frequency penalty (additive, per-occurrence).
+      if (sp.frequency_penalty != 0.0f)
+        l[i] -= sp.frequency_penalty * counts[i];
+      // Presence penalty (additive, flat per unique token).
+      if (sp.presence_penalty != 0.0f)
+        l[i] -= sp.presence_penalty;
+    }
+  }
+
+  // Greedy shortcut.
+  if (sp.temperature <= 0.0f) {
+    return static_cast<int32_t>(
+        std::distance(l.begin(), std::max_element(l.begin(), l.end())));
+  }
+
+  // Temperature scaling.
+  for (auto &v : l)
+    v /= sp.temperature;
+
+  // Softmax.
+  float max_l = *std::max_element(l.begin(), l.end());
+  double sum_exp = 0.0;
+  for (auto &v : l) {
+    v = std::exp(v - max_l);
+    sum_exp += v;
+  }
+  for (auto &v : l)
+    v = static_cast<float>(v / sum_exp);
+
+  // Build index array for filtering.
+  std::vector<int32_t> indices(vocab_size);
+  std::iota(indices.begin(), indices.end(), 0);
+
+  // Top-K filter.
+  if (sp.top_k > 0 && sp.top_k < vocab_size) {
+    std::partial_sort(indices.begin(), indices.begin() + sp.top_k,
+                      indices.end(),
+                      [&](int32_t a, int32_t b) { return l[a] > l[b]; });
+    indices.resize(sp.top_k);
+  } else {
+    std::sort(indices.begin(), indices.end(),
+              [&](int32_t a, int32_t b) { return l[a] > l[b]; });
+  }
+
+  // Min-P filter: remove tokens with prob < min_p * max_prob.
+  if (sp.min_p > 0.0f) {
+    float max_p = l[indices[0]];
+    float threshold = sp.min_p * max_p;
+    auto it = std::find_if(indices.begin(), indices.end(),
+                           [&](int32_t i) { return l[i] < threshold; });
+    if (it != indices.begin()) // keep at least one
+      indices.erase(it, indices.end());
+  }
+
+  // Top-P (nucleus) filter.
+  if (sp.top_p < 1.0f) {
+    float cum = 0.0f;
+    size_t keep = indices.size();
+    for (size_t i = 0; i < indices.size(); ++i) {
+      cum += l[indices[i]];
+      if (cum >= sp.top_p) {
+        keep = i + 1;
+        break;
+      }
+    }
+    indices.resize(keep);
+  }
+
+  // Re-normalise the surviving logits and sample.
+  std::vector<float> probs;
+  probs.reserve(indices.size());
+  float tot = 0.0f;
+  for (int32_t idx : indices)
+    tot += l[idx];
+  for (int32_t idx : indices)
+    probs.push_back(l[idx] / tot);
+
+  std::discrete_distribution<int32_t> dist(probs.begin(), probs.end());
+  int32_t sampled = dist(rng);
+  return indices[static_cast<size_t>(sampled)];
+}
+
 } // anonymous namespace
 #endif // INFERFLUX_HAS_MLX
 
@@ -143,7 +266,7 @@ bool MlxExecutionEngine::Initialize() {
     return true;
   stream_ = mlx_default_gpu_stream_new();
   initialized_ = true;
-  std::cout << "[mlx_exec] Engine initialised on Metal GPU stream.\n";
+  log::Info("mlx_execution", "Engine initialised on Metal GPU stream.");
   return true;
 #endif
 }
@@ -151,6 +274,15 @@ bool MlxExecutionEngine::Initialize() {
 void MlxExecutionEngine::Shutdown() {
 #ifdef INFERFLUX_HAS_MLX
   if (initialized_) {
+    // Free all phased sequence slots.
+    for (auto &[id, slot] : slots_) {
+      for (auto &k : slot.key_cache)
+        mlx_array_free(k);
+      for (auto &v : slot.val_cache)
+        mlx_array_free(v);
+    }
+    slots_.clear();
+    active_seq_ = -1;
     Reset();
     mlx_stream_free(stream_);
     stream_ = {};
@@ -168,7 +300,7 @@ bool MlxExecutionEngine::LoadWeights(const MlxWeightStore &store,
   return false;
 #else
   if (!store.ok) {
-    std::cerr << "[mlx_exec] LoadWeights: store not ready\n";
+    log::Error("mlx_execution", "LoadWeights: store not ready");
     return false;
   }
   weights_ = &store;
@@ -176,8 +308,9 @@ bool MlxExecutionEngine::LoadWeights(const MlxWeightStore &store,
   Reset();
   key_cache_.resize(cfg.num_hidden_layers);
   val_cache_.resize(cfg.num_hidden_layers);
-  std::cout << "[mlx_exec] Weights wired: " << store.count << " tensors, "
-            << cfg.num_hidden_layers << " layers.\n";
+  log::Info("mlx_execution",
+            "Weights wired: " + std::to_string(store.count) + " tensors, " +
+                std::to_string(cfg.num_hidden_layers) + " layers.");
   return true;
 #endif
 }
@@ -193,19 +326,240 @@ void MlxExecutionEngine::Reset() {
     v = {};
   }
   n_past_ = 0;
+  token_history_.clear();
+  rng_seeded_ = false;
+  // Reset does NOT touch phased slots — those are managed by FreeSlot().
+  active_seq_ = -1;
 #endif
 }
 
-int32_t MlxExecutionEngine::Step(const std::vector<int32_t> &token_ids) {
+// ---------------------------------------------------------------------------
+// Phased slot management (INF-8)
+// ---------------------------------------------------------------------------
+
+void MlxExecutionEngine::AllocSlot(int seq_id) {
+#ifdef INFERFLUX_HAS_MLX
+  if (slots_.count(seq_id))
+    return; // already allocated
+  SlotState &s = slots_[seq_id];
+  s.key_cache.assign(config_.num_hidden_layers, mlx_array{});
+  s.val_cache.assign(config_.num_hidden_layers, mlx_array{});
+  s.n_past = 0;
+  s.rng_seeded = false;
+#else
+  (void)seq_id;
+#endif
+}
+
+void MlxExecutionEngine::FreeSlot(int seq_id) {
+#ifdef INFERFLUX_HAS_MLX
+  if (active_seq_ == seq_id) {
+    // The slot's arrays are currently in the flat members — free them.
+    for (auto &k : key_cache_) {
+      mlx_array_free(k);
+      k = {};
+    }
+    for (auto &v : val_cache_) {
+      mlx_array_free(v);
+      v = {};
+    }
+    n_past_ = 0;
+    token_history_.clear();
+    rng_seeded_ = false;
+    active_seq_ = -1;
+  }
+  auto it = slots_.find(seq_id);
+  if (it == slots_.end())
+    return;
+  for (auto &k : it->second.key_cache)
+    mlx_array_free(k);
+  for (auto &v : it->second.val_cache)
+    mlx_array_free(v);
+  slots_.erase(it);
+#else
+  (void)seq_id;
+#endif
+}
+
+void MlxExecutionEngine::SaveActiveSlot() {
+#ifdef INFERFLUX_HAS_MLX
+  if (active_seq_ < 0)
+    return;
+  SlotState &s = slots_[active_seq_];
+  // Transfer flat arrays into the slot.
+  s.key_cache = std::move(key_cache_);
+  s.val_cache = std::move(val_cache_);
+  s.n_past = n_past_;
+  s.rng = rng_;
+  s.rng_seeded = rng_seeded_;
+  s.token_history = token_history_;
+  // Re-allocate the flat arrays so Forward() can still use them.
+  key_cache_.assign(config_.num_hidden_layers, mlx_array{});
+  val_cache_.assign(config_.num_hidden_layers, mlx_array{});
+  n_past_ = 0;
+  token_history_.clear();
+  rng_seeded_ = false;
+  active_seq_ = -1;
+#endif
+}
+
+void MlxExecutionEngine::LoadSlot(int seq_id) {
+#ifdef INFERFLUX_HAS_MLX
+  if (active_seq_ == seq_id)
+    return;
+  SaveActiveSlot();
+  // Create slot if it doesn't exist yet.
+  if (!slots_.count(seq_id)) {
+    AllocSlot(seq_id);
+  }
+  SlotState &s = slots_[seq_id];
+  key_cache_ = std::move(s.key_cache);
+  val_cache_ = std::move(s.val_cache);
+  n_past_ = s.n_past;
+  rng_ = s.rng;
+  rng_seeded_ = s.rng_seeded;
+  token_history_ = s.token_history;
+  if (key_cache_.size() < static_cast<size_t>(config_.num_hidden_layers))
+    key_cache_.resize(config_.num_hidden_layers);
+  if (val_cache_.size() < static_cast<size_t>(config_.num_hidden_layers))
+    val_cache_.resize(config_.num_hidden_layers);
+  active_seq_ = seq_id;
+#else
+  (void)seq_id;
+#endif
+}
+
+void MlxExecutionEngine::CopySlotPrefix(int src_seq, int dst_seq,
+                                        int n_tokens) {
+#ifdef INFERFLUX_HAS_MLX
+  if (n_tokens <= 0 || !initialized_)
+    return;
+
+  // Get source arrays (may be in flat members if src is active).
+  const std::vector<mlx_array> *src_k = nullptr;
+  const std::vector<mlx_array> *src_v = nullptr;
+  int src_n_past = 0;
+  if (active_seq_ == src_seq) {
+    src_k = &key_cache_;
+    src_v = &val_cache_;
+    src_n_past = n_past_;
+  } else {
+    auto it = slots_.find(src_seq);
+    if (it == slots_.end())
+      return;
+    src_k = &it->second.key_cache;
+    src_v = &it->second.val_cache;
+    src_n_past = it->second.n_past;
+  }
+  if (n_tokens > src_n_past)
+    n_tokens = src_n_past;
+
+  // Free any existing dst slot, then create a fresh one.
+  // Note: dst must not be the currently active slot (would corrupt flat state).
+  if (active_seq_ == dst_seq) {
+    for (auto &k : key_cache_) {
+      mlx_array_free(k);
+      k = {};
+    }
+    for (auto &v : val_cache_) {
+      mlx_array_free(v);
+      v = {};
+    }
+    n_past_ = 0;
+    token_history_.clear();
+    rng_seeded_ = false;
+    active_seq_ = -1;
+  }
+  {
+    auto it = slots_.find(dst_seq);
+    if (it != slots_.end()) {
+      for (auto &k : it->second.key_cache)
+        mlx_array_free(k);
+      for (auto &v : it->second.val_cache)
+        mlx_array_free(v);
+      slots_.erase(it);
+    }
+  }
+  SlotState &dst = slots_[dst_seq];
+  dst.key_cache.assign(config_.num_hidden_layers, mlx_array{});
+  dst.val_cache.assign(config_.num_hidden_layers, mlx_array{});
+  dst.n_past = n_tokens;
+  dst.rng_seeded = false;
+
+  // Slice first n_tokens from each layer: KV shape [1, n_kv, total, head_dim].
+  for (int i = 0; i < config_.num_hidden_layers; ++i) {
+    if (!(*src_k)[i].ctx)
+      continue;
+    const int *sh = mlx_array_shape((*src_k)[i]);
+    if (!sh)
+      continue;
+    // start = {0, 0, 0, 0}, stop = {sh[0], sh[1], n_tokens, sh[3]}, stride
+    // all 1.
+    int start[4] = {0, 0, 0, 0};
+    int stop[4] = {sh[0], sh[1], n_tokens, sh[3]};
+    int stride[4] = {1, 1, 1, 1};
+    mlx_slice(&dst.key_cache[i], (*src_k)[i], start, 4, stop, 4, stride, 4,
+              stream_);
+    mlx_slice(&dst.val_cache[i], (*src_v)[i], start, 4, stop, 4, stride, 4,
+              stream_);
+    mlx_array_eval(dst.key_cache[i]);
+    mlx_array_eval(dst.val_cache[i]);
+  }
+#else
+  (void)src_seq;
+  (void)dst_seq;
+  (void)n_tokens;
+#endif
+}
+
+int32_t MlxExecutionEngine::StepSeq(int seq_id,
+                                    const std::vector<int32_t> &token_ids,
+                                    const SamplingParams &sp, int logprob_top_n,
+                                    std::vector<TokenLogprob> *out_logprobs) {
+#ifndef INFERFLUX_HAS_MLX
+  (void)seq_id;
+  (void)token_ids;
+  (void)sp;
+  (void)logprob_top_n;
+  (void)out_logprobs;
+  return -1;
+#else
+  if (!weights_)
+    return -1;
+  LoadSlot(seq_id);
+  return Forward(token_ids, sp, logprob_top_n, out_logprobs);
+#endif
+}
+
+int MlxExecutionEngine::SeqNPast(int seq_id) const {
+#ifdef INFERFLUX_HAS_MLX
+  if (active_seq_ == seq_id)
+    return n_past_;
+  auto it = slots_.find(seq_id);
+  if (it == slots_.end())
+    return -1;
+  return it->second.n_past;
+#else
+  (void)seq_id;
+  return -1;
+#endif
+}
+
+int32_t MlxExecutionEngine::Step(const std::vector<int32_t> &token_ids,
+                                 const SamplingParams &sp, int logprob_top_n,
+                                 std::vector<TokenLogprob> *out_logprobs) {
 #ifndef INFERFLUX_HAS_MLX
   (void)token_ids;
+  (void)sp;
+  (void)logprob_top_n;
+  (void)out_logprobs;
   return -1;
 #else
   if (!weights_) {
-    std::cerr << "[mlx_exec] Step called before LoadWeights\n";
+    log::Error("mlx_execution", "Step called before LoadWeights");
     return -1;
   }
-  return Forward(token_ids);
+  return Forward(token_ids, sp, logprob_top_n, out_logprobs);
 #endif
 }
 
@@ -215,7 +569,9 @@ int32_t MlxExecutionEngine::Step(const std::vector<int32_t> &token_ids) {
 
 #ifdef INFERFLUX_HAS_MLX
 
-int32_t MlxExecutionEngine::Forward(const std::vector<int32_t> &token_ids) {
+int32_t MlxExecutionEngine::Forward(const std::vector<int32_t> &token_ids,
+                                    const SamplingParams &sp, int logprob_top_n,
+                                    std::vector<TokenLogprob> *out_logprobs) {
   const int seq_len = static_cast<int>(token_ids.size());
   const int n_heads = config_.num_attention_heads;
   const int n_kv = config_.num_key_value_heads;
@@ -281,10 +637,10 @@ int32_t MlxExecutionEngine::Forward(const std::vector<int32_t> &token_ids) {
     {
       mlx_array null_freqs{};
       mlx_array qr{}, kr{};
-      mlx_fast_rope(&qr, q.get(), head_dim, false, rope_base, 1.0f, n_past_,
-                    null_freqs, s);
-      mlx_fast_rope(&kr, k.get(), head_dim, false, rope_base, 1.0f, n_past_,
-                    null_freqs, s);
+      mlx_fast_rope(&qr, q.get(), head_dim, false, rope_base,
+                    config_.rope_freq_scale, n_past_, null_freqs, s);
+      mlx_fast_rope(&kr, k.get(), head_dim, false, rope_base,
+                    config_.rope_freq_scale, n_past_, null_freqs, s);
       q = Arr(qr);
       k = Arr(kr);
     }
@@ -357,24 +713,62 @@ int32_t MlxExecutionEngine::Forward(const std::vector<int32_t> &token_ids) {
     return -1;
   Arr logits = Linear(x, lm_w, s);
 
-  // ── 5. Greedy sample from last-position logits ────────────────────────
-  // Extract position seq_len-1 along axis 1 → [1, vocab] (scalar idx removes
-  // dim).
+  // ── 5. Extract last-position logits [1, vocab] ────────────────────────
   Arr last_idx(mlx_array_new_int(seq_len - 1));
-  mlx_array last_logits{};
-  mlx_take_axis(&last_logits, logits.get(), last_idx.get(), 1, s);
-  Arr ll(last_logits);
+  mlx_array last_logits_raw{};
+  mlx_take_axis(&last_logits_raw, logits.get(), last_idx.get(), 1, s);
+  Arr ll(last_logits_raw);
 
-  // Argmax over vocab (last) axis.
-  int ndim = static_cast<int>(mlx_array_ndim(ll.get()));
-  mlx_array tok_arr{};
-  mlx_argmax_axis(&tok_arr, ll.get(), ndim - 1, false, s);
-  Arr tok(tok_arr);
+  // Cast to float32 and force GPU→CPU evaluation so we can read logits.
+  {
+    mlx_array lf32{};
+    mlx_astype(&lf32, ll.get(), MLX_FLOAT32, s);
+    ll = Arr(lf32);
+  }
+  mlx_array_eval(ll.get());
 
-  // Force evaluation and read scalar token ID.
-  mlx_array_eval(tok.get());
+  const int vocab_size = config_.vocab_size;
+  const float *lp = mlx_array_data_float32(ll.get());
+
+  // Seed the PRNG lazily.
+  if (!rng_seeded_) {
+    if (sp.seed != UINT32_MAX) {
+      rng_.seed(sp.seed);
+    } else {
+      std::random_device rd;
+      rng_.seed(rd());
+    }
+    rng_seeded_ = true;
+  } else if (sp.seed != UINT32_MAX) {
+    // Re-seed for deterministic sequences when caller provides a fixed seed.
+    rng_.seed(sp.seed + static_cast<uint32_t>(n_past_));
+  }
+
+  // Collect logprobs before sampling (logits still valid here).
   int32_t token_id = -1;
-  mlx_array_item_int32(&token_id, tok.get());
+  if (lp && vocab_size > 0) {
+    // Sample token using SamplingParams (greedy when temperature <= 0).
+    token_id = SampleToken(lp, vocab_size, token_history_, sp, rng_);
+
+    if (out_logprobs && logprob_top_n > 0) {
+      // id_to_token function: return empty string for out-of-range ids.
+      auto id_to_token_fn = [](int32_t /*id*/) -> std::string { return ""; };
+      out_logprobs->push_back(ComputeLogprob(lp, vocab_size, token_id, "",
+                                             logprob_top_n, id_to_token_fn));
+    }
+  } else {
+    // Fallback: read scalar via argmax (shouldn't happen with valid config).
+    int ndim = static_cast<int>(mlx_array_ndim(ll.get()));
+    mlx_array tok_arr{};
+    mlx_argmax_axis(&tok_arr, ll.get(), ndim - 1, false, s);
+    Arr tok(tok_arr);
+    mlx_array_eval(tok.get());
+    mlx_array_item_int32(&token_id, tok.get());
+  }
+
+  // Append sampled token to lookback history.
+  if (token_id >= 0)
+    token_history_.push_back(token_id);
 
   // Materialise KV cache for the next step (avoids lazy-graph accumulation).
   for (int i = 0; i < config_.num_hidden_layers; ++i) {

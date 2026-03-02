@@ -23,7 +23,7 @@ struct PolicyKeyEntry {
 };
 
 class PolicyBackend {
- public:
+public:
   virtual ~PolicyBackend() = default;
 
   // Lifecycle
@@ -32,12 +32,14 @@ class PolicyBackend {
 
   // API key management
   virtual std::vector<PolicyKeyEntry> ApiKeys() const = 0;
-  virtual void SetApiKey(const std::string& key, const std::vector<std::string>& scopes) = 0;
-  virtual bool RemoveApiKey(const std::string& key) = 0;
+  virtual void SetApiKey(const std::string &key,
+                         const std::vector<std::string> &scopes) = 0;
+  virtual bool RemoveApiKey(const std::string &key) = 0;
 
   // Guardrail configuration
   virtual std::vector<std::string> GuardrailBlocklist() const = 0;
-  virtual void SetGuardrailBlocklist(const std::vector<std::string>& blocklist) = 0;
+  virtual void
+  SetGuardrailBlocklist(const std::vector<std::string> &blocklist) = 0;
 
   // Rate limiting
   virtual int RateLimitPerMinute() const = 0;
@@ -47,4 +49,4 @@ class PolicyBackend {
   virtual std::string Name() const = 0;
 };
 
-}  // namespace inferflux
+} // namespace inferflux

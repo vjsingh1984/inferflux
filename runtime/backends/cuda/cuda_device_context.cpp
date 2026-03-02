@@ -1,7 +1,7 @@
 #include "runtime/backends/cuda/cuda_device_context.h"
+#include "server/logging/logger.h"
 
 #include <cstdlib>
-#include <iostream>
 
 namespace inferflux {
 
@@ -12,14 +12,15 @@ CudaDeviceContext::CudaDeviceContext() {
   available_ = false;
 #endif
   if (!available_) {
-    std::cerr << "[cuda] CUDA runtime not linked; falling back to host allocations.\n";
+    log::Error("cuda_backend",
+               "CUDA runtime not linked; falling back to host allocations.");
   }
 }
 
 CudaDeviceContext::~CudaDeviceContext() = default;
 
 std::unique_ptr<DeviceBuffer> CudaDeviceContext::Allocate(std::size_t bytes) {
-  void* ptr = std::malloc(bytes);
+  void *ptr = std::malloc(bytes);
   if (!ptr) {
     throw std::bad_alloc();
   }
@@ -33,4 +34,4 @@ void CudaDeviceContext::Free(std::unique_ptr<DeviceBuffer> buffer) {
   std::free(buffer->data());
 }
 
-}  // namespace inferflux
+} // namespace inferflux

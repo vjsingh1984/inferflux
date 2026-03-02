@@ -25,14 +25,15 @@ class LlamaCPUBackend;
 struct EPRank {
   int rank{0};
   int world_size{1};
-  int expert_start{0};  // inclusive
-  int expert_end{0};    // exclusive
+  int expert_start{0}; // inclusive
+  int expert_end{0};   // exclusive
 };
 
 // EPDispatch routes MoE forward passes across an EP group.
-// Future implementation will shard expert layers and all-reduce activations.
+// Full implementation shards expert layers and performs all-to-all
+// communication (§P1f).
 class EPDispatch {
- public:
+public:
   virtual ~EPDispatch() = default;
 
   // Returns the local rank configuration for this worker.
@@ -41,27 +42,58 @@ class EPDispatch {
   // Returns true if this worker owns expert `expert_id`.
   virtual bool OwnsExpert(int expert_id) const = 0;
 
-  // Stub: returns the name of this dispatch strategy (e.g., "local", "nccl").
+  // Routes hidden states to the ranks owning the required experts and
+  // gathers the results back (§P1f).
+  // `hidden_states` are the inputs to the MoE layer.
+  // `expert_indices` are the indices of the experts to be invoked for each
+  // token.
+  virtual std::vector<float> Route(const std::vector<float> &hidden_states,
+                                   const std::vector<int> &expert_indices) = 0;
+
+  // Stub: returns the name of this dispatch strategy (e.g., "local", "dist").
   virtual std::string Name() const = 0;
 };
 
 // LocalEPDispatch: single-process stub — owns all experts, world_size=1.
-// Used when no multi-device EP topology is configured.
 class LocalEPDispatch : public EPDispatch {
- public:
-  explicit LocalEPDispatch(int n_experts)
-      : rank_{0, 1, 0, n_experts} {}
+public:
+  explicit LocalEPDispatch(int n_experts) : rank_{0, 1, 0, n_experts} {}
 
   EPRank LocalRank() const override { return rank_; }
   bool OwnsExpert(int expert_id) const override {
-    return rank_.expert_end > 0 &&
-           expert_id >= rank_.expert_start &&
-           expert_id < rank_.expert_end;
+    return expert_id >= rank_.expert_start && expert_id < rank_.expert_end;
   }
+
+  std::vector<float> Route(const std::vector<float> &hidden_states,
+                           const std::vector<int> &) override {
+    // In local mode, just return the states (expert computation is local).
+    return hidden_states;
+  }
+
   std::string Name() const override { return "local"; }
 
- private:
+private:
   EPRank rank_;
 };
 
-}  // namespace inferflux
+// DistributedEPDispatch: routes experts across multiple ranks using CommBackend
+// (§P1f).
+class DistributedEPDispatch : public EPDispatch {
+public:
+  DistributedEPDispatch(int rank, int world_size, int n_experts);
+
+  EPRank LocalRank() const override { return rank_; }
+  bool OwnsExpert(int expert_id) const override {
+    return expert_id >= rank_.expert_start && expert_id < rank_.expert_end;
+  }
+
+  std::vector<float> Route(const std::vector<float> &hidden_states,
+                           const std::vector<int> &expert_indices) override;
+
+  std::string Name() const override { return "distributed"; }
+
+private:
+  EPRank rank_;
+};
+
+} // namespace inferflux

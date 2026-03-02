@@ -52,3 +52,6 @@ logging:
   level: info
   format: json
   audit_log: logs/audit.log
+registry:
+  path: ""                # Path to registry.yaml; empty = disabled (CQ-8)
+  poll_interval_ms: 5000  # How often to check for file changes

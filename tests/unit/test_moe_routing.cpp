@@ -53,7 +53,8 @@ TEST_CASE("ModelInfo MoE fields are assignable", "[moe]") {
 // (backend has no model loaded → fields stay false/0)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SingleModelRouter RegisterModel populates MoE fields (no model)", "[moe]") {
+TEST_CASE("SingleModelRouter RegisterModel populates MoE fields (no model)",
+          "[moe]") {
   auto backend = std::make_shared<LlamaCPUBackend>();
   ModelInfo info;
   info.id = "test-model";
@@ -63,7 +64,7 @@ TEST_CASE("SingleModelRouter RegisterModel populates MoE fields (no model)", "[m
   SingleModelRouter router;
   REQUIRE(router.RegisterModel(info, backend));
 
-  auto* resolved = router.Resolve("test-model");
+  auto *resolved = router.Resolve("test-model");
   REQUIRE(resolved != nullptr);
   // Backend has no model loaded → MoE fields must be false/0.
   REQUIRE_FALSE(resolved->is_moe);

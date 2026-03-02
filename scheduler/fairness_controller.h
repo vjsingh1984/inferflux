@@ -1,11 +1,11 @@
 #pragma once
 
-#include "scheduler/request_batch.h"
-
 #include <cstddef>
 #include <vector>
 
 namespace inferflux {
+
+struct InferenceRequest;
 
 struct FairnessConfig {
   int high_priority_threshold{5};
@@ -14,7 +14,7 @@ struct FairnessConfig {
 };
 
 struct FairnessEntry {
-  InferenceRequest* request{nullptr};
+  InferenceRequest *request{nullptr};
   int priority_level{0};
   std::size_t queue_index{0};
 };
@@ -26,17 +26,17 @@ struct FairnessDecision {
 };
 
 class FairnessController {
- public:
+public:
   FairnessController();
   explicit FairnessController(FairnessConfig config);
 
-  void UpdateConfig(const FairnessConfig& config);
-  FairnessDecision Evaluate(const std::vector<FairnessEntry>& batch,
-                            const std::vector<FairnessEntry>& queue) const;
-  void ApplyTimeslice(std::vector<FairnessEntry>* batch) const;
+  void UpdateConfig(const FairnessConfig &config);
+  FairnessDecision Evaluate(const std::vector<FairnessEntry> &batch,
+                            const std::vector<FairnessEntry> &queue) const;
+  void ApplyTimeslice(std::vector<FairnessEntry> *batch) const;
 
- private:
+private:
   FairnessConfig config_;
 };
 
-}  // namespace inferflux
+} // namespace inferflux

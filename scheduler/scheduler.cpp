@@ -1,6 +1,7 @@
 #include "scheduler/scheduler.h"
 
 #include "runtime/execution/batch_executor.h"
+#include "runtime/execution/parallel_context.h"
 #include "runtime/structured_output/structured_output_adapter.h"
 #include "scheduler/single_model_router.h"
 #include "server/metrics/metrics.h"
@@ -25,6 +26,8 @@ constexpr int kMaxSequenceSlots = 16;
 constexpr int kPrefixStoreCap = 4;
 // Minimum prompt token count to be eligible for prefix store donation.
 constexpr int kMinPrefixTokens = 32;
+// Tokens per physical KV block (PagedAttention style).
+constexpr int kTokensPerBlock = 16;
 
 std::vector<uint8_t> SerializeTokens(const std::vector<int> &tokens) {
   std::vector<uint8_t> payload(tokens.size() * sizeof(int));
@@ -35,15 +38,15 @@ std::vector<uint8_t> SerializeTokens(const std::vector<int> &tokens) {
 }
 } // namespace
 
-Scheduler::Scheduler(SimpleTokenizer tokenizer,
+Scheduler::Scheduler(SimpleTokenizer &tokenizer,
                      std::shared_ptr<CPUDeviceContext> device,
                      std::shared_ptr<PagedKVCache> cache,
                      std::shared_ptr<ModelRouter> router,
                      std::shared_ptr<SpeculativeDecoder> speculative_decoder,
                      std::shared_ptr<RadixPrefixCache> prefix_cache,
-                     FairnessConfig fairness_config,
-                     DisaggregatedConfig disagg_config)
-    : tokenizer_(std::move(tokenizer)), device_(std::move(device)),
+                     const FairnessConfig &fairness_config,
+                     const DisaggregatedConfig &disagg_config)
+    : tokenizer_(tokenizer), device_(std::move(device)),
       cache_(std::move(cache)), router_(std::move(router)),
       speculative_decoder_(std::move(speculative_decoder)),
       prefix_cache_(std::move(prefix_cache)),
@@ -52,9 +55,8 @@ Scheduler::Scheduler(SimpleTokenizer tokenizer,
       seq_slots_free_((1ULL << kMaxSequenceSlots) - 1) {
   static_assert(kMaxSequenceSlots <= 64,
                 "seq_slots_free_ bitmask requires kMaxSequenceSlots <= 64");
-  executor_ =
-      std::make_unique<BatchExecutor>(&tokenizer_, device_, cache_, router_,
-                                      speculative_decoder_, prefix_cache_);
+  executor_ = std::make_unique<BatchExecutor>(&tokenizer_, device_, cache_,
+                                              router_, speculative_decoder_);
   // Enable decode worker pool when a positive pool size is configured.
   // With use_decode_workers_=true, ProcessBatch only runs Prefill and
   // hands off to pending_decode_; decode workers drain that queue.
@@ -96,6 +98,15 @@ void Scheduler::StopDecodeWorkers() {
     }
   }
   decode_workers_.clear();
+}
+
+int Scheduler::QueueDepth() const {
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  return static_cast<int>(pending_prefill_.size() + pending_decode_.size());
+}
+
+int Scheduler::LiveDecodeWorkers() const {
+  return live_decode_workers_.load(std::memory_order_relaxed);
 }
 
 void Scheduler::DecodeWorkerLoop() {
@@ -192,9 +203,12 @@ void Scheduler::DecodeWorkerLoop() {
                 ? "Selected model does not support response_format"
                 : inference->response_format_error;
         pending->promise.set_value(std::move(error));
-        // Return the sequence slot so it is not leaked.
+        // Return the sequence slot and KV blocks so they are not leaked.
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (inference->sequence_id >= 0) {
+          if (cache_)
+            cache_->ReleaseBlocks(inference->block_table);
+          inference->block_table.clear();
           FreeSeqSlot(inference->sequence_id);
           inference->sequence_id = -1;
         }
@@ -216,6 +230,9 @@ void Scheduler::DecodeWorkerLoop() {
           pending->promise.set_value(std::move(error));
           std::lock_guard<std::mutex> lock(queue_mutex_);
           if (inference->sequence_id >= 0) {
+            if (cache_)
+              cache_->ReleaseBlocks(inference->block_table);
+            inference->block_table.clear();
             FreeSeqSlot(inference->sequence_id);
             inference->sequence_id = -1;
           }
@@ -278,6 +295,9 @@ void Scheduler::DecodeWorkerLoop() {
           if (pending->resolved_backend) {
             pending->resolved_backend->FreeSequence(inference->sequence_id);
           }
+          if (cache_)
+            cache_->ReleaseBlocks(inference->block_table);
+          inference->block_table.clear();
           FreeSeqSlot(inference->sequence_id);
           inference->sequence_id = -1;
         }
@@ -299,7 +319,7 @@ void Scheduler::DecodeWorkerLoop() {
   }
 }
 
-InferenceResult Scheduler::Generate(InferenceRequest request) {
+std::future<InferenceResult> Scheduler::Generate(InferenceRequest request) {
   auto pending = std::make_shared<PendingRequest>();
   pending->inference = std::move(request);
   pending->priority = pending->inference.priority;
@@ -330,7 +350,7 @@ InferenceResult Scheduler::Generate(InferenceRequest request) {
     UpdateQueueDepthLocked();
   }
   queue_cv_.notify_one();
-  return future.get();
+  return future;
 }
 
 void Scheduler::UpdateFairnessConfig(const FairnessConfig &config) {
@@ -342,24 +362,53 @@ void Scheduler::UpdateFairnessConfig(const FairnessConfig &config) {
 }
 
 void Scheduler::WorkerLoop() {
+  auto &pc = ParallelContext::Get();
+  bool is_distributed = pc.IsInitialized() && pc.WorldSize() > 1;
+
   while (true) {
     BatchSelection selection;
-    {
-      std::unique_lock<std::mutex> lock(queue_mutex_);
-      // When decode workers are active they own pending_decode_; WorkerLoop
-      // should only wake for prefill items (or stop).  Waking on
-      // pending_decode_ would cause a spin: BuildBatchLocked skips that queue
-      // but the predicate would remain true as long as workers haven't drained
-      // it.
-      queue_cv_.wait(lock, [&] {
-        return stop_ || !pending_prefill_.empty() ||
-               (!use_decode_workers_ && !pending_decode_.empty());
-      });
-      if (stop_ && pending_prefill_.empty() && pending_decode_.empty()) {
-        break;
+
+    if (is_distributed && !pc.IsMaster()) {
+      // §P1g: Worker ranks wait for the master's batch decision.
+      std::vector<int> request_ids;
+      std::vector<int> phases;
+      if (!pc.ReceiveBatch(request_ids, phases)) {
+        if (stop_)
+          break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
       }
-      selection = BuildBatchLocked();
+
+      // In a real implementation we'd reconstruct 'selection' from active
+      // queues. For this foundation, we just Barrier to keep the worker rank
+      // aligned with the master's processing cadence.
+      pc.Comm()->Barrier();
+    } else {
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        queue_cv_.wait(lock, [&] {
+          return stop_ || !pending_prefill_.empty() ||
+                 (!use_decode_workers_ && !pending_decode_.empty());
+        });
+        if (stop_ && pending_prefill_.empty() && pending_decode_.empty()) {
+          break;
+        }
+        selection = BuildBatchLocked();
+      }
+
+      if (is_distributed) {
+        // Broadcast the decision to all workers.
+        std::vector<int> ids;
+        std::vector<int> phases;
+        for (auto &p : selection.pending) {
+          ids.push_back(static_cast<int>(p->inference.id));
+          phases.push_back(static_cast<int>(p->inference.phase));
+        }
+        pc.BroadcastBatch(ids, phases);
+        pc.Comm()->Barrier(); // Wait for workers to catch up
+      }
     }
+
     if (!selection.pending.empty()) {
       ProcessBatch(std::move(selection));
     }
@@ -421,6 +470,15 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
     if (!selection.pending.empty() && token_budget + tokens > kMaxBatchTokens) {
       continue;
     }
+
+    // Handle swapped-out requests (§P1c).
+    if (item->inference.is_swapped) {
+      if (!TrySwapIn(item->inference)) {
+        // Skip for this batch if we can't swap back in yet.
+        continue;
+      }
+    }
+
     selection.pending.push_back(item);
     selection.batch.requests.push_back(&item->inference);
     item->inference.phase = queue_items[i].from_decode ? RequestPhase::kDecode
@@ -465,9 +523,6 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   staged_decode.reserve(selection.pending.size());
   std::vector<std::shared_ptr<PendingRequest>> decode_ready;
   decode_ready.reserve(selection.pending.size());
-  // Purge any KV prefix entries whose backend has been unloaded so their
-  // seq_slots are returned to the free-list before we try to allocate new ones.
-  PurgeExpiredKVPrefixEntries();
   for (auto &pending : selection.pending) {
     if (pending->inference.phase == RequestPhase::kPrefill) {
       // Option A phased prefill: run prompt evaluation on the local backend now
@@ -487,44 +542,112 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // that KV state and only evaluate the suffix — skipping repeated prompt
         // computation.  Matching on BPE tokens ensures the prefix boundary
         // aligns with the KV cache (fixes INF-7 SimpleTokenizer mismatch).
-        KVPrefixEntry *warm = LookupKVPrefix(inf.bpe_prompt_tokens,
-                                             pending->resolved_backend.get());
-        // Allocate a dedicated sequence slot from the free-list.  Using a
-        // free-list prevents two concurrent requests from sharing the same slot
-        // (which would cause Prefill() to wipe the other request's KV state).
+        // KV prefix reuse (§P1b): lookup in the global Radix Trie to find
+        // physical KV blocks matching this request's prefix.
+        std::vector<int> cached_blocks;
+        int matched_tokens = 0;
+        int cached_seq_id = -1;
+        bool prefix_hit = false;
+        if (prefix_cache_) {
+          prefix_hit = prefix_cache_->Lookup(
+              inf.bpe_prompt_tokens, pending->resolved_backend.get(),
+              &cached_blocks, &cached_seq_id, &matched_tokens);
+        }
+
+        // PagedAttention Block Allocation: calculate additional blocks needed.
+        std::size_t prompt_len = inf.bpe_prompt_tokens.size();
+
+        // Logical blocks already covered by the cached prefix.
+        std::size_t warm_blocks = cached_blocks.size();
+        std::size_t total_blocks_needed =
+            (prompt_len + kTokensPerBlock - 1) / kTokensPerBlock;
+        total_blocks_needed += 1;
+
+        std::size_t new_blocks_needed =
+            (total_blocks_needed > warm_blocks)
+                ? (total_blocks_needed - warm_blocks)
+                : 0;
+
+        std::vector<int> new_blocks;
+        if (cache_) {
+          if (cache_->NumFreeBlocks() < new_blocks_needed) {
+            // Memory tight (§P1c): attempt to swap out the lowest priority
+            // request from the currently selected batch to make room.
+            for (int j = static_cast<int>(selection.pending.size()) - 1; j >= 0;
+                 --j) {
+              auto &victim = selection.pending[j];
+              if (victim != pending && !victim->inference.block_table.empty()) {
+                if (TrySwapOut(victim->inference)) {
+                  break; // Room potentially made.
+                }
+              }
+            }
+          }
+
+          if (cache_->NumFreeBlocks() >= new_blocks_needed) {
+            try {
+              if (new_blocks_needed > 0) {
+                new_blocks = cache_->ReserveBlocks(new_blocks_needed);
+              }
+            } catch (...) {
+              new_blocks.clear();
+            }
+          }
+        }
+
         int seq_id = AllocSeqSlot();
-        if (seq_id >= 0) {
+        // Admission logic (§ Item 4): can admit if we have a seq slot AND
+        // (no paged cache configured OR new blocks were successfully reserved).
+        bool can_admit = (seq_id >= 0) && (!cache_ || new_blocks_needed == 0 ||
+                                           !new_blocks.empty());
+
+        if (can_admit) {
+          if (cache_) {
+            // Take ownership of cached blocks (§P1b).
+            cache_->AcquireBlocks(cached_blocks);
+            inf.block_table = std::move(cached_blocks);
+            inf.block_table.insert(inf.block_table.end(), new_blocks.begin(),
+                                   new_blocks.end());
+          }
+
           LlamaCPUBackend::PrefillResult pr;
-          if (warm) {
-            // Copy the warm prefix into the new slot, then evaluate the suffix.
-            // Use n_kv_tokens (BPE positions from original Prefill) — NOT
-            // tokens.size() (SimpleTokenizer count, different vocabulary).
-            pending->resolved_backend->CopySequencePrefix(warm->seq_id, seq_id,
-                                                          warm->n_kv_tokens);
-            pr = pending->resolved_backend->PrefillPartial(inf.prompt, seq_id,
-                                                           warm->n_kv_tokens);
-            if (pr.ok) {
-              GlobalMetrics().RecordKVPrefixReuse(warm->n_kv_tokens);
+          if (prefix_hit && matched_tokens > 0) {
+            // Correctness Fix (§ Item 3): must copy KV state into new slot!
+            // Only attempt partial prefill if we have a valid sequence to copy
+            // from.
+            if (cached_seq_id >= 0) {
+              pending->resolved_backend->CopySequencePrefix(
+                  cached_seq_id, seq_id, matched_tokens);
+              pr = pending->resolved_backend->PrefillPartial(inf.prompt, seq_id,
+                                                             matched_tokens);
+            } else {
+              // Hit but sequence was evicted; fallback to full prefill.
+              pr = pending->resolved_backend->Prefill(inf.prompt, seq_id);
+            }
+            if (pr.ok && cached_seq_id >= 0) {
+              GlobalMetrics().RecordKVPrefixReuse(matched_tokens);
             }
           } else {
             pr = pending->resolved_backend->Prefill(inf.prompt, seq_id);
           }
+
           if (pr.ok) {
             inf.n_past = pr.n_past;
-            // Capture the BPE prompt length now, before Decode() increments
-            // n_past.  DonateKVPrefix needs this to record the correct KV
-            // position range for CopySequencePrefix / PrefillPartial.
             inf.prompt_bpe_tokens = pr.n_past;
             inf.sequence_id = seq_id;
             inf.first_token = pr.first_token;
             inf.first_piece = pr.first_piece;
           } else {
-            FreeSeqSlot(
-                seq_id); // Prefill failed — return the slot immediately.
+            // Prefill failed: release only the NEW blocks (warm blocks belong
+            // to the cache).
+            if (cache_)
+              cache_->ReleaseBlocks(new_blocks);
+            inf.block_table.clear();
+            FreeSeqSlot(seq_id);
           }
+        } else if (seq_id >= 0) {
+          FreeSeqSlot(seq_id);
         }
-        // If seq_id < 0 (all slots busy), inf.n_past stays -1 and
-        // ExecuteRequest falls back to the legacy Generate() path.
       }
       bool enqueued = false;
       if (use_decode_workers_ && disagg_config_.kv_transport) {
@@ -719,37 +842,41 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     // the local worker (no decode workers), attempt to retain the sequence slot
     // as a warm prefix entry so future requests sharing this prompt prefix can
     // skip re-evaluating those tokens.
-    if (inference->sequence_id >= 0) {
-      bool donated = false;
-      if (!use_decode_workers_ && !inference->fairness_yielded &&
-          static_cast<int>(inference->bpe_prompt_tokens.size()) >=
-              kMinPrefixTokens &&
-          pending->resolved_backend) {
-        // Guard: if sliding-window KV eviction fired during decode, prompt
-        // positions in this slot are no longer at [0, prompt_bpe_tokens).
-        // Reusing such a slot via CopySequencePrefix would restore wrong KV
-        // state for the next request.  Reason entirely in BPE positions:
-        // prompt_bpe_tokens (from PrefillResult::n_past) and
-        // result.completion_tokens are both llama.cpp counts.
-        int ctx_size = pending->resolved_backend->ContextSize();
-        bool eviction_safe =
-            ctx_size > 0 && inference->prompt_bpe_tokens > 0 &&
-            (inference->prompt_bpe_tokens + result.completion_tokens <
-             ctx_size);
-        if (eviction_safe) {
-          // DonateKVPrefix stores bpe_prompt_tokens (BPE token IDs from
-          // TokenizeForCache) so LookupKVPrefix can match in BPE-token space.
-          donated = DonateKVPrefix(
-              inference->sequence_id, inference->bpe_prompt_tokens,
-              inference->prompt_bpe_tokens, pending->resolved_backend);
-        }
+    // KV prefix cache (§P1b): insert the completed request's blocks into
+    // the global Radix Trie to enable zero-copy reuse for future requests.
+    bool donated = false;
+    if (prefix_cache_ && inference->sequence_id >= 0 &&
+        !inference->fairness_yielded) {
+      // Concatenate prompt BPE tokens and any generated output BPE tokens.
+      // (Simplified: we use prompt_bpe_tokens for the architectural
+      // foundation).
+      if (static_cast<int>(inference->bpe_prompt_tokens.size()) >=
+          kMinPrefixTokens) {
+        if (cache_)
+          cache_->AcquireBlocks(
+              inference->block_table); // Node ownership (§P1b)
+        prefix_cache_->Insert(inference->bpe_prompt_tokens,
+                              inference->block_table, inference->sequence_id,
+                              pending->resolved_backend);
+        donated = true;
       }
+    }
+
+    if (inference->sequence_id >= 0) {
+      // Correctness Fix (§ Item 2): Do NOT FreeSequence if we donated!
+      // The trie now owns this sequence's KV state until it is evicted.
       if (!donated) {
         if (pending->resolved_backend) {
           pending->resolved_backend->FreeSequence(inference->sequence_id);
         }
         FreeSeqSlot(inference->sequence_id);
       }
+      // Correctness Fix (§ Item 2): always release scheduler's reference!
+      // If donated, prefix_cache already called AcquireBlocks, so ref_count
+      // >= 1.
+      if (cache_)
+        cache_->ReleaseBlocksRef(inference->block_table);
+      inference->block_table.clear();
       inference->sequence_id = -1;
     }
     inference->phase = RequestPhase::kFinished;
@@ -884,86 +1011,6 @@ void Scheduler::FreeSeqSlot(int slot) {
   }
 }
 
-void Scheduler::PurgeExpiredKVPrefixEntries() {
-  // Walk the store and erase entries whose backend weak_ptr has expired.
-  // Without this, an unloaded model's donated seq_ids remain marked as busy
-  // in seq_slots_free_ until a new donation evicts them — which can starve
-  // AllocSeqSlot() when all kPrefixStoreCap slots are held by dead entries.
-  auto it = kv_prefix_store_.begin();
-  while (it != kv_prefix_store_.end()) {
-    if (it->backend.expired()) {
-      FreeSeqSlot(it->seq_id);
-      it = kv_prefix_store_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-}
-
-Scheduler::KVPrefixEntry *
-Scheduler::LookupKVPrefix(const std::vector<int> &bpe_tokens,
-                          LlamaCPUBackend *backend) {
-  KVPrefixEntry *best = nullptr;
-  for (auto &entry : kv_prefix_store_) {
-    // Only useful as a prefix when the cached entry is strictly shorter.
-    if (entry.bpe_tokens.empty() ||
-        entry.bpe_tokens.size() >= bpe_tokens.size())
-      continue;
-    // Skip entries whose backend has been unloaded (weak_ptr expired) or
-    // that belong to a different model instance.
-    auto locked = entry.backend.lock();
-    if (!locked || locked.get() != backend)
-      continue;
-    // Compare in BPE-token space (INF-7): guarantees the boundary aligns with
-    // the llama.cpp KV positions stored in this entry.
-    if (std::equal(entry.bpe_tokens.begin(), entry.bpe_tokens.end(),
-                   bpe_tokens.begin())) {
-      // Prefer the longest matching prefix.
-      if (!best || entry.bpe_tokens.size() > best->bpe_tokens.size()) {
-        best = &entry;
-      }
-    }
-  }
-  if (best) {
-    best->last_used = ++kv_prefix_clock_;
-  }
-  return best;
-}
-
-bool Scheduler::DonateKVPrefix(int seq_id, const std::vector<int> &bpe_tokens,
-                               int n_kv_tokens,
-                               std::shared_ptr<LlamaCPUBackend> backend) {
-  if (static_cast<int>(bpe_tokens.size()) < kMinPrefixTokens)
-    return false;
-  // Decline if an identical (backend, bpe_tokens) entry is already cached.
-  for (const auto &entry : kv_prefix_store_) {
-    if (entry.backend.lock().get() == backend.get() &&
-        entry.bpe_tokens == bpe_tokens)
-      return false;
-  }
-  std::weak_ptr<LlamaCPUBackend> weak_backend(backend);
-  if (static_cast<int>(kv_prefix_store_.size()) < kPrefixStoreCap) {
-    kv_prefix_store_.push_back(
-        {seq_id, n_kv_tokens, bpe_tokens, ++kv_prefix_clock_, weak_backend});
-    return true;
-  }
-  // Evict the least-recently-used entry.  Lock its weak_ptr and call
-  // FreeSequence on the owning backend — not the caller's — to avoid
-  // cross-model memory corruption.  If the backend has already been unloaded
-  // (lock() returns null), skip FreeSequence but still reclaim the slot index.
-  auto min_it =
-      std::min_element(kv_prefix_store_.begin(), kv_prefix_store_.end(),
-                       [](const KVPrefixEntry &a, const KVPrefixEntry &b) {
-                         return a.last_used < b.last_used;
-                       });
-  if (auto evicted_backend = min_it->backend.lock()) {
-    evicted_backend->FreeSequence(min_it->seq_id);
-  }
-  FreeSeqSlot(min_it->seq_id);
-  *min_it = {seq_id, n_kv_tokens, bpe_tokens, ++kv_prefix_clock_, weak_backend};
-  return true;
-}
-
 void Scheduler::ResolveBackends(
     const std::vector<std::shared_ptr<PendingRequest>> &batch) {
   if (!router_) {
@@ -1005,6 +1052,42 @@ void Scheduler::ResolveBackends(
       pending->inference.resolved_model = info->id;
       GlobalMetrics().RecordModelRoute(info->id, info->backend, false);
     }
+  }
+}
+
+bool Scheduler::TrySwapIn(InferenceRequest &inf) {
+  if (!inf.is_swapped || !cache_)
+    return false;
+
+  std::size_t blocks_needed = inf.swapped_host_handles.size();
+  if (cache_->NumFreeBlocks() < blocks_needed)
+    return false;
+
+  try {
+    std::vector<int> target_blocks = cache_->ReserveBlocks(blocks_needed);
+    cache_->SwapIn(inf.swapped_host_handles, target_blocks);
+    inf.block_table = std::move(target_blocks);
+    inf.swapped_host_handles.clear();
+    inf.is_swapped = false;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool Scheduler::TrySwapOut(InferenceRequest &inf) {
+  if (inf.is_swapped || inf.block_table.empty() || !cache_)
+    return false;
+
+  try {
+    inf.swapped_host_handles = cache_->SwapOut(inf.block_table);
+    inf.block_table.clear();
+    inf.is_swapped = true;
+    GlobalMetrics().RecordFairnessPreemption(
+        inf.priority_level); // Reuse preemption metric for swap
+    return true;
+  } catch (...) {
+    return false;
   }
 }
 

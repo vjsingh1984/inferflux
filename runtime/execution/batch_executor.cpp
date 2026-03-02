@@ -1,12 +1,12 @@
 #include "runtime/execution/batch_executor.h"
-
+#include "runtime/backends/backend_utils.h"
+#include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <chrono>
-#include <iostream>
 #include <stdexcept>
 
 using json = nlohmann::json;
@@ -31,6 +31,17 @@ public:
     active_ = true;
   }
 
+  // Alternate constructor for unified batch phased execution where grammar and
+  // sampling params are provided directly (not via InferenceRequest).
+  SamplerScope(LlamaCPUBackend *backend, const std::string &grammar,
+               const std::string &root, const SamplingParams &sp)
+      : backend_(backend) {
+    if (!backend_)
+      return;
+    backend_->SetupSampler(grammar, root, sp);
+    active_ = true;
+  }
+
   SamplerScope(const SamplerScope &) = delete;
   SamplerScope &operator=(const SamplerScope &) = delete;
 
@@ -50,12 +61,10 @@ private:
 BatchExecutor::BatchExecutor(
     SimpleTokenizer *tokenizer, std::shared_ptr<CPUDeviceContext> device,
     std::shared_ptr<PagedKVCache> cache, std::shared_ptr<ModelRouter> router,
-    std::shared_ptr<SpeculativeDecoder> speculative_decoder,
-    std::shared_ptr<RadixPrefixCache> prefix_cache)
+    std::shared_ptr<SpeculativeDecoder> speculative_decoder)
     : tokenizer_(tokenizer), device_(std::move(device)),
       cache_(std::move(cache)), router_(std::move(router)),
-      speculative_decoder_(std::move(speculative_decoder)),
-      prefix_cache_(std::move(prefix_cache)) {}
+      speculative_decoder_(std::move(speculative_decoder)) {}
 
 std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
     const RequestBatch &batch,
@@ -91,13 +100,15 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
     }
   }
 
-  if (eligible_indices.size() >= 2 && homogeneous_backend && shared_be) {
+  if (!eligible_indices.empty() && homogeneous_backend && shared_be) {
     std::vector<InferenceRequest *> eligible_reqs;
     eligible_reqs.reserve(eligible_indices.size());
     for (auto idx : eligible_indices) {
       eligible_reqs.push_back(batch.requests[idx]);
     }
-    auto outcomes = ExecuteBatchDecodePhased(eligible_reqs, shared_be);
+    // Use the unified execution path (§P1b) to interleave prefill and decode
+    // tokens.
+    auto outcomes = ExecuteUnifiedBatchPhased(eligible_reqs, shared_be);
     for (std::size_t j = 0; j < eligible_indices.size(); ++j) {
       results[eligible_indices[j]] = std::move(outcomes[j].result);
       total_decode_ms += outcomes[j].decode_ms;
@@ -105,7 +116,7 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
     }
   }
 
-  // Process remaining requests individually (non-eligible or batch size < 2).
+  // Process remaining requests individually (non-eligible).
   for (std::size_t i = 0; i < n; ++i) {
     if (handled[i])
       continue;
@@ -143,32 +154,6 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
     response.no_backend = true;
     response.completion = "[cancelled]";
     return outcome;
-  }
-
-  if (prefix_cache_) {
-    std::string cached_completion;
-    int cached_tokens = 0;
-    int matched_tokens = 0;
-    if (prefix_cache_->Lookup(inference.prompt_tokens, &cached_completion,
-                              &cached_tokens, &matched_tokens)) {
-      GlobalMetrics().RecordPrefixLookup(true);
-      response.completion = cached_completion;
-      response.completion_tokens = cached_tokens;
-      inference.phase = RequestPhase::kFinished;
-      inference.first_token_time = std::chrono::steady_clock::now();
-      if (inference.on_token && !cached_completion.empty()) {
-        if (inference.stream) {
-          GlobalMetrics().RecordStreamCacheHit();
-        }
-        inference.on_token(cached_completion);
-      }
-      return outcome;
-    }
-    GlobalMetrics().RecordPrefixLookup(false);
-    if (matched_tokens > 0) {
-      GlobalMetrics().RecordPartialPrefixHit();
-      GlobalMetrics().RecordPrefixMatchedTokens(matched_tokens);
-    }
   }
 
   std::string resolved_model = inference.resolved_model;
@@ -217,10 +202,12 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   if (cache_) {
     try {
       kv_page = cache_->ReservePage();
-      inference.kv_page = kv_page;
+      if (kv_page >= 0) {
+        inference.block_table = {kv_page};
+      }
     } catch (const std::exception &ex) {
-      std::cerr << "[BatchExecutor] KV cache reserve failed: " << ex.what()
-                << std::endl;
+      log::Error("batch_executor",
+                 std::string("KV cache reserve failed: ") + ex.what());
     }
   }
 
@@ -250,13 +237,14 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   if (response.completion.empty() &&
       (!inference.cancellation_flag || !inference.cancellation_flag->load())) {
     if (backend && backend->IsReady()) {
-      std::function<bool(const std::string &)> chunk_cb;
+      std::function<bool(const std::string &, const TokenLogprob *)> chunk_cb;
       if (inference.on_token) {
         auto on_token = inference.on_token;
         auto cancel_flag = inference.cancellation_flag;
-        chunk_cb = [on_token, cancel_flag](const std::string &token_chunk) {
+        chunk_cb = [on_token, cancel_flag](const std::string &token_chunk,
+                                           const TokenLogprob *lp) {
           GlobalMetrics().RecordStreamTokens(1);
-          on_token(token_chunk);
+          on_token(token_chunk, lp);
           if (cancel_flag && cancel_flag->load()) {
             return false;
           }
@@ -387,9 +375,9 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
         inference.phase = RequestPhase::kFinished;
         inference.fairness_yielded = false;
         if (cache_ && kv_page >= 0) {
-          cache_->ReleasePage(kv_page);
+          cache_->ReleaseBlocks(inference.block_table);
           kv_page = -1;
-          inference.kv_page = -1;
+          inference.block_table.clear();
         }
         inference.first_token_time = std::chrono::steady_clock::now();
         return outcome;
@@ -415,14 +403,8 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
     inference.output_tokens = tokenizer_->Encode(response.completion);
   }
   if (cache_ && kv_page >= 0) {
-    cache_->ReleasePage(kv_page);
-    inference.kv_page = -1;
-  }
-
-  if (!inference.fairness_yielded && prefix_cache_ && !response.no_backend &&
-      !response.completion.empty()) {
-    prefix_cache_->Insert(inference.prompt_tokens, response.completion,
-                          response.completion_tokens);
+    cache_->ReleaseBlocks(inference.block_table);
+    inference.block_table.clear();
   }
 
   inference.first_token_time = std::chrono::steady_clock::now();
@@ -483,14 +465,22 @@ BatchExecutor::ExecuteBatchDecodePhased(
     // fresh).
     if (req->first_token >= 0) {
       states[i].current_token = req->first_token;
-      out.completion += req->first_piece;
+
+      // Correctness Fix (§ Item 1): decode and check for stop sequences.
+      std::string piece = req->first_piece;
+      out.completion += piece;
       states[i].tokens_generated = 1;
-      if (req->on_token) {
+
+      std::string emit_piece;
+      bool stop_hit = ApplyStop(piece, out.completion, req->stop, &emit_piece);
+
+      if (req->on_token && !emit_piece.empty()) {
         GlobalMetrics().RecordStreamTokens(1);
-        req->on_token(req->first_piece);
+        req->on_token(emit_piece, nullptr);
       }
-      // Immediately check cancellation after the first token callback.
-      if (req->cancellation_flag && req->cancellation_flag->load()) {
+
+      if (stop_hit ||
+          (req->cancellation_flag && req->cancellation_flag->load())) {
         states[i].active = false;
       }
     } else {
@@ -545,7 +535,7 @@ BatchExecutor::ExecuteBatchDecodePhased(
       outcomes[i].result.completion += sr.piece;
       if (req->on_token) {
         GlobalMetrics().RecordStreamTokens(1);
-        req->on_token(sr.piece);
+        req->on_token(sr.piece, nullptr);
         // Recheck cancellation after the streaming callback (connection may
         // have closed mid-chunk).
         if (req->cancellation_flag && req->cancellation_flag->load()) {
@@ -613,6 +603,269 @@ BatchExecutor::ExecuteBatchDecodePhased(
   return outcomes;
 }
 
+std::vector<BatchExecutor::ExecutionOutcome>
+BatchExecutor::ExecuteUnifiedBatchPhased(
+    std::vector<InferenceRequest *> &eligible,
+    std::shared_ptr<LlamaCPUBackend> backend) {
+  std::size_t n = eligible.size();
+  std::vector<ExecutionOutcome> outcomes(n);
+
+  struct ReqState {
+    bool active{true};
+    int tokens_generated{0};
+    int decode_limit{0};
+    int current_token{-1};
+    bool slice_active{false};
+    bool in_prefill{false};
+  };
+  std::vector<ReqState> states(n);
+
+  auto exec_start = std::chrono::steady_clock::now();
+
+  for (std::size_t i = 0; i < n; ++i) {
+    auto *req = eligible[i];
+    auto &out = outcomes[i].result;
+    req->fairness_yielded = false;
+    out.model_id =
+        req->resolved_model.empty() ? req->model : req->resolved_model;
+    out.prompt_tokens = static_cast<int>(req->prompt_tokens.size());
+
+    int limit = req->max_tokens;
+    if (req->remaining_decode_tokens >= 0) {
+      limit = std::min(limit, req->remaining_decode_tokens);
+    }
+    int slice = req->timeslice_tokens;
+    req->last_timeslice_tokens = slice;
+    req->timeslice_tokens = 0;
+    if (slice > 0) {
+      limit = std::min(limit, slice);
+    }
+    if (limit <= 0)
+      limit = 1;
+    states[i].decode_limit = limit;
+    states[i].slice_active = (slice > 0);
+
+    // If n_past is 0 and bpe_prompt_tokens is not empty, this is a fresh
+    // prefill. (Note: In the current scheduler, Prefill() is called BEFORE
+    // ExecuteBatch, so req->n_past > 0 and req->first_token is already set. We
+    // handle both cases for future flexibility where Prefill might be
+    // interleaved).
+    if (req->n_past >= 0 && req->first_token >= 0) {
+      states[i].current_token = req->first_token;
+
+      // Correctness Fix (§ Item 1): decode and check for stop sequences.
+      std::string piece = req->first_piece;
+      out.completion += piece;
+      states[i].tokens_generated = 1;
+
+      std::string emit_piece;
+      bool stop_hit = ApplyStop(piece, out.completion, req->stop, &emit_piece);
+
+      if (req->on_token && !emit_piece.empty()) {
+        GlobalMetrics().RecordStreamTokens(1);
+        req->on_token(emit_piece, nullptr);
+      }
+
+      if (stop_hit ||
+          (req->cancellation_flag && req->cancellation_flag->load())) {
+        states[i].active = false;
+      }
+    } else if (req->n_past == 0 && !req->bpe_prompt_tokens.empty()) {
+      states[i].in_prefill = true;
+    } else {
+      states[i].active = false;
+      out.completion = "[batch state error]";
+    }
+  }
+
+  const int kMaxPrefillChunkSize = 512; // §P1d
+  int loop_count = 0;
+
+  while (true) {
+    if (++loop_count > 10000) {
+      log::Error("batch_executor", "DEADLOCK GUARD: ExecuteUnifiedBatchPhased "
+                                   "exceeded 10000 iterations");
+      break;
+    }
+
+    std::vector<LlamaCPUBackend::UnifiedBatchInput> batch_inputs;
+    std::vector<std::size_t> active_idx;
+
+    for (std::size_t i = 0; i < n; ++i) {
+      if (!states[i].active)
+        continue;
+      auto *req = eligible[i];
+      if (req->cancellation_flag && req->cancellation_flag->load()) {
+        states[i].active = false;
+        continue;
+      }
+
+      if (states[i].in_prefill) {
+        // Slice the next chunk of the prompt (§P1d).
+        int remaining = static_cast<int>(req->bpe_prompt_tokens.size()) -
+                        req->prefill_offset;
+        int chunk_size = std::min(remaining, kMaxPrefillChunkSize);
+        if (chunk_size <= 0) {
+          states[i].in_prefill = false; // Safety
+          continue;
+        }
+        bool is_last_chunk = (req->prefill_offset + chunk_size >=
+                              static_cast<int>(req->bpe_prompt_tokens.size()));
+
+        std::vector<int> chunk(
+            req->bpe_prompt_tokens.begin() + req->prefill_offset,
+            req->bpe_prompt_tokens.begin() + req->prefill_offset + chunk_size);
+
+        // Only request logits on the final chunk of the prefill.
+        batch_inputs.push_back({req->sequence_id, req->prefill_offset,
+                                std::move(chunk), is_last_chunk,
+                                req->sampling});
+        active_idx.push_back(i);
+      } else if (states[i].tokens_generated < states[i].decode_limit) {
+        batch_inputs.push_back({req->sequence_id,
+                                req->n_past,
+                                {states[i].current_token},
+                                true,
+                                req->sampling});
+        active_idx.push_back(i);
+      } else {
+        states[i].active = false;
+      }
+    }
+
+    if (active_idx.empty())
+      break;
+
+    auto step = backend->ExecuteUnifiedBatch(batch_inputs);
+    if (step.empty()) {
+      // Backend returned nothing for active inputs — fail them to avoid loop.
+      for (auto idx : active_idx)
+        states[idx].active = false;
+      break;
+    }
+
+    for (std::size_t j = 0; j < active_idx.size(); ++j) {
+      std::size_t i = active_idx[j];
+      auto *req = eligible[i];
+      const auto &res = step[j];
+
+      if (states[i].in_prefill) {
+        int chunk_processed = static_cast<int>(batch_inputs[j].tokens.size());
+        req->prefill_offset += chunk_processed;
+        req->n_past = req->prefill_offset;
+
+        if (req->prefill_offset >=
+            static_cast<int>(req->bpe_prompt_tokens.size())) {
+          states[i].in_prefill = false;
+          // After final chunk, the 'res' contains the first generated token.
+          if (!res.ok || res.token < 0) {
+            states[i].active = false;
+            continue;
+          }
+          states[i].current_token = res.token;
+          states[i].tokens_generated++;
+
+          // Correctness Fix (§ Item 1): decode and check for stop sequences.
+          std::string piece = res.piece;
+          outcomes[i].result.completion += piece;
+
+          std::string emit_piece;
+          bool stop_hit = ApplyStop(piece, outcomes[i].result.completion,
+                                    req->stop, &emit_piece);
+
+          if (req->on_token && !emit_piece.empty()) {
+            GlobalMetrics().RecordStreamTokens(1);
+            req->on_token(emit_piece, nullptr);
+          }
+
+          if (stop_hit) {
+            states[i].active = false;
+          }
+        }
+      } else {
+        // Decode step processing.
+        req->n_past += 1;
+        if (!res.ok || res.token < 0) {
+          states[i].active = false;
+          continue;
+        }
+
+        states[i].current_token = res.token;
+        states[i].tokens_generated++;
+
+        // Correctness Fix (§P1d): decode and check for stop sequences.
+        std::string piece = res.piece;
+        outcomes[i].result.completion += piece;
+
+        std::string emit_piece;
+        bool stop_hit = ApplyStop(piece, outcomes[i].result.completion,
+                                  req->stop, &emit_piece);
+
+        if (req->on_token && !emit_piece.empty()) {
+          GlobalMetrics().RecordStreamTokens(1);
+          req->on_token(emit_piece, nullptr);
+          if (req->cancellation_flag && req->cancellation_flag->load()) {
+            states[i].active = false;
+          }
+        }
+
+        if (stop_hit) {
+          states[i].active = false;
+        }
+      }
+    }
+  }
+
+  double total_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - exec_start)
+                        .count();
+
+  for (std::size_t i = 0; i < n; ++i) {
+    auto *req = eligible[i];
+    auto &out = outcomes[i].result;
+    int gen = states[i].tokens_generated;
+    out.completion_tokens = gen;
+    outcomes[i].decode_ms = total_ms / static_cast<double>(n);
+
+    bool first_slice = (req->total_completion_tokens == 0);
+    int fairness_delta = gen;
+    if (first_slice) {
+      int prompt_comp = out.prompt_tokens;
+      if (prompt_comp <= 0 && req->reported_prompt_tokens >= 0) {
+        prompt_comp = req->reported_prompt_tokens;
+      }
+      fairness_delta += prompt_comp;
+    }
+    if (fairness_delta > 0) {
+      GlobalMetrics().RecordFairnessTokens(req->priority_level, fairness_delta);
+    }
+    req->service_tokens += gen;
+    req->total_completion_tokens += gen;
+
+    bool exhausted = states[i].slice_active && gen >= states[i].decode_limit;
+    if (states[i].slice_active && exhausted &&
+        req->remaining_decode_tokens > 0) {
+      req->fairness_yielded = true;
+      GlobalMetrics().RecordFairnessYield(req->priority_level, gen,
+                                          req->remaining_decode_tokens);
+      req->phase = RequestPhase::kPending;
+    } else {
+      req->phase = RequestPhase::kFinished;
+    }
+
+    if (!out.completion.empty() && out.completion != "[batch state error]") {
+      req->accumulated_output.append(out.completion);
+      if (req->remaining_decode_tokens >= 0) {
+        req->remaining_decode_tokens =
+            std::max(0, req->remaining_decode_tokens - gen);
+      }
+    }
+    req->first_token_time = std::chrono::steady_clock::now();
+  }
+
+  return outcomes;
+}
+
 std::shared_ptr<LlamaCPUBackend>
 BatchExecutor::ResolveBackend(const std::string &requested_model,
                               std::string *resolved_id) {
@@ -627,6 +880,123 @@ BatchExecutor::ResolveBackend(const std::string &requested_model,
     *resolved_id = info->id;
   }
   return router_->GetBackend(info->id);
+}
+
+void BatchExecutor::ExecuteUnifiedBatchStep(
+    RequestBatch &batch, std::shared_ptr<LlamaCPUBackend> backend) {
+  if (!backend || batch.empty())
+    return;
+
+  const int kMaxPrefillChunkSize = 512;
+  std::vector<LlamaCPUBackend::UnifiedBatchInput> batch_inputs;
+  std::vector<InferenceRequest *> active_reqs;
+
+  for (auto *req : batch.requests) {
+    if (!req->exec_active || req->phase == RequestPhase::kFinished ||
+        req->phase == RequestPhase::kAborted) {
+      continue;
+    }
+
+    if (req->cancellation_flag && req->cancellation_flag->load()) {
+      req->exec_active = false;
+      req->phase = RequestPhase::kAborted;
+      continue;
+    }
+
+    if (req->exec_in_prefill) {
+      int remaining =
+          static_cast<int>(req->bpe_prompt_tokens.size()) - req->prefill_offset;
+      int chunk_size = std::min(remaining, kMaxPrefillChunkSize);
+      if (chunk_size <= 0) {
+        req->exec_in_prefill = false;
+        continue;
+      }
+      bool is_last_chunk = (req->prefill_offset + chunk_size >=
+                            static_cast<int>(req->bpe_prompt_tokens.size()));
+      std::vector<int> chunk(
+          req->bpe_prompt_tokens.begin() + req->prefill_offset,
+          req->bpe_prompt_tokens.begin() + req->prefill_offset + chunk_size);
+      batch_inputs.push_back({req->sequence_id, req->prefill_offset,
+                              std::move(chunk), is_last_chunk, req->sampling});
+      active_reqs.push_back(req);
+    } else if (req->exec_tokens_generated < req->exec_decode_limit) {
+      batch_inputs.push_back({req->sequence_id,
+                              req->n_past,
+                              {req->exec_current_token},
+                              true,
+                              req->sampling});
+      active_reqs.push_back(req);
+    } else {
+      req->exec_active = false;
+      req->phase = RequestPhase::kFinished;
+    }
+  }
+
+  if (active_reqs.empty()) {
+    return;
+  }
+
+  auto step_outputs = backend->ExecuteUnifiedBatch(batch_inputs);
+  if (step_outputs.empty()) {
+    for (auto *req : active_reqs)
+      req->exec_active = false;
+    return;
+  }
+
+  for (std::size_t j = 0; j < active_reqs.size(); ++j) {
+    auto *req = active_reqs[j];
+    const auto &res = step_outputs[j];
+
+    if (req->exec_in_prefill) {
+      req->prefill_offset += static_cast<int>(batch_inputs[j].tokens.size());
+      if (req->prefill_offset >=
+          static_cast<int>(req->bpe_prompt_tokens.size())) {
+        req->exec_in_prefill = false;
+        if (!res.ok || res.token < 0) {
+          req->exec_active = false;
+          continue;
+        }
+        req->exec_current_token = res.token;
+        req->exec_tokens_generated++;
+        req->n_past = req->prefill_offset;
+
+        std::string piece = res.piece;
+        req->exec_result.completion += piece;
+        std::string emit_piece;
+        bool stop_hit = ApplyStop(piece, req->exec_result.completion, req->stop,
+                                  &emit_piece);
+        if (req->on_token && !emit_piece.empty()) {
+          GlobalMetrics().RecordStreamTokens(1);
+          req->on_token(emit_piece, nullptr);
+        }
+        if (stop_hit)
+          req->exec_active = false;
+      }
+    } else {
+      req->n_past += 1;
+      if (!res.ok || res.token < 0) {
+        req->exec_active = false;
+        continue;
+      }
+      req->exec_current_token = res.token;
+      req->exec_tokens_generated++;
+
+      std::string piece = res.piece;
+      req->exec_result.completion += piece;
+      std::string emit_piece;
+      bool stop_hit =
+          ApplyStop(piece, req->exec_result.completion, req->stop, &emit_piece);
+      if (req->on_token && !emit_piece.empty()) {
+        GlobalMetrics().RecordStreamTokens(1);
+        req->on_token(emit_piece, nullptr);
+        if (req->cancellation_flag && req->cancellation_flag->load()) {
+          req->exec_active = false;
+        }
+      }
+      if (stop_hit)
+        req->exec_active = false;
+    }
+  }
 }
 
 } // namespace inferflux

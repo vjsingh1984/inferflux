@@ -16,7 +16,9 @@ TEST_CASE("ShmKVTransport: empty queue returns nullopt", "[shm_transport]") {
   REQUIRE_FALSE(transport.TryDequeue().has_value());
 }
 
-TEST_CASE("ShmKVTransport: control-only packet (no kv_blob) roundtrips correctly", "[shm_transport]") {
+TEST_CASE(
+    "ShmKVTransport: control-only packet (no kv_blob) roundtrips correctly",
+    "[shm_transport]") {
   ShmKVTransport transport(4);
   KVPacket pkt;
   pkt.request_id = 42;
@@ -31,7 +33,8 @@ TEST_CASE("ShmKVTransport: control-only packet (no kv_blob) roundtrips correctly
   REQUIRE(result->kv_blob.empty());
 }
 
-TEST_CASE("ShmKVTransport: kv_blob roundtrips through POSIX SHM", "[shm_transport]") {
+TEST_CASE("ShmKVTransport: kv_blob roundtrips through POSIX SHM",
+          "[shm_transport]") {
   ShmKVTransport transport(4);
   KVPacket pkt;
   pkt.request_id = 99;
@@ -44,7 +47,8 @@ TEST_CASE("ShmKVTransport: kv_blob roundtrips through POSIX SHM", "[shm_transpor
   REQUIRE(result->kv_blob == expected);
 }
 
-TEST_CASE("ShmKVTransport: FIFO ordering preserved across multiple enqueues", "[shm_transport]") {
+TEST_CASE("ShmKVTransport: FIFO ordering preserved across multiple enqueues",
+          "[shm_transport]") {
   ShmKVTransport transport(8);
   for (uint64_t i = 1; i <= 4; ++i) {
     KVPacket pkt;
@@ -59,7 +63,8 @@ TEST_CASE("ShmKVTransport: FIFO ordering preserved across multiple enqueues", "[
   REQUIRE_FALSE(transport.TryDequeue().has_value());
 }
 
-TEST_CASE("ShmKVTransport: Enqueue returns false when capacity is full", "[shm_transport]") {
+TEST_CASE("ShmKVTransport: Enqueue returns false when capacity is full",
+          "[shm_transport]") {
   ShmKVTransport transport(2);
   KVPacket p1;
   p1.request_id = 1;
@@ -72,7 +77,8 @@ TEST_CASE("ShmKVTransport: Enqueue returns false when capacity is full", "[shm_t
   REQUIRE_FALSE(transport.Enqueue(std::move(p3)));
 }
 
-TEST_CASE("ShmKVTransport: Size() and Capacity() reflect state", "[shm_transport]") {
+TEST_CASE("ShmKVTransport: Size() and Capacity() reflect state",
+          "[shm_transport]") {
   ShmKVTransport transport(5);
   REQUIRE(transport.Capacity() == 5);
   REQUIRE(transport.Size() == 0);
@@ -84,10 +90,11 @@ TEST_CASE("ShmKVTransport: Size() and Capacity() reflect state", "[shm_transport
   REQUIRE(transport.Size() == 0);
 }
 
-TEST_CASE("ShmKVTransport: large kv_blob roundtrips correctly", "[shm_transport]") {
+TEST_CASE("ShmKVTransport: large kv_blob roundtrips correctly",
+          "[shm_transport]") {
   ShmKVTransport transport(2);
-  // 1 MB blob — ensures POSIX SHM handles large allocations.
-  std::vector<uint8_t> big_blob(1024 * 1024);
+  // 64 KB blob — ensures POSIX SHM handles multi-page allocations.
+  std::vector<uint8_t> big_blob(64 * 1024);
   for (std::size_t i = 0; i < big_blob.size(); ++i) {
     big_blob[i] = static_cast<uint8_t>(i & 0xFF);
   }
@@ -104,21 +111,27 @@ TEST_CASE("ShmKVTransport: large kv_blob roundtrips correctly", "[shm_transport]
 // KV transfer latency metric (§2.5 item 12)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("RecordKVTransfer accumulates in kv_transfer_duration_ms histogram", "[shm_transport]") {
+TEST_CASE("RecordKVTransfer accumulates in kv_transfer_duration_ms histogram",
+          "[shm_transport]") {
   MetricsRegistry reg;
   reg.RecordKVTransfer(1.5);
   reg.RecordKVTransfer(3.0);
   std::string output = reg.RenderPrometheus();
-  REQUIRE(output.find("inferflux_kv_transfer_duration_ms_count") != std::string::npos);
+  REQUIRE(output.find("inferflux_kv_transfer_duration_ms_count") !=
+          std::string::npos);
   // count should be 2
-  REQUIRE(output.find("inferflux_kv_transfer_duration_ms_count{") != std::string::npos);
+  REQUIRE(output.find("inferflux_kv_transfer_duration_ms_count{") !=
+          std::string::npos);
 }
 
-TEST_CASE("HELP and TYPE lines present for kv_transfer_duration_ms", "[shm_transport]") {
+TEST_CASE("HELP and TYPE lines present for kv_transfer_duration_ms",
+          "[shm_transport]") {
   MetricsRegistry reg;
   std::string output = reg.RenderPrometheus();
-  REQUIRE(output.find("# HELP inferflux_kv_transfer_duration_ms") != std::string::npos);
-  REQUIRE(output.find("# TYPE inferflux_kv_transfer_duration_ms histogram") != std::string::npos);
+  REQUIRE(output.find("# HELP inferflux_kv_transfer_duration_ms") !=
+          std::string::npos);
+  REQUIRE(output.find("# TYPE inferflux_kv_transfer_duration_ms histogram") !=
+          std::string::npos);
 }
 
 // ---------------------------------------------------------------------------

@@ -50,6 +50,8 @@ struct MlxModelConfig {
   int vocab_size{0};
   float rms_norm_eps{1e-5f};
   float rope_theta{10000.0f};
+  float rope_freq_scale{
+      1.0f}; // 1.0 = no scaling; derived from rope_scaling.factor
   int intermediate_size{0};
   int max_position_embeddings{4096};
   bool valid{false};

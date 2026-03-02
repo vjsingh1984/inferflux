@@ -51,7 +51,8 @@ TEST_CASE("Guardrail OPA file-based policy denial", "[guardrail]") {
   inferflux::Guardrail guardrail;
   REQUIRE(!guardrail.Enabled());
 
-  auto tmp_path = std::filesystem::temp_directory_path() / "inferflux_opa_test.json";
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "inferflux_opa_test.json";
   {
     std::ofstream out(tmp_path);
     out << R"({"result":{"allow":false,"reason":"deny"}})";
@@ -70,7 +71,8 @@ TEST_CASE("Guardrail OPA file-based policy denial", "[guardrail]") {
 TEST_CASE("Guardrail OPA file-based policy allow", "[guardrail]") {
   inferflux::Guardrail guardrail;
 
-  auto tmp_path = std::filesystem::temp_directory_path() / "inferflux_opa_allow.json";
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "inferflux_opa_allow.json";
   {
     std::ofstream out(tmp_path);
     out << R"({"result":{"allow":true}})";

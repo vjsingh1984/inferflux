@@ -1,11 +1,13 @@
 #include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/backend_utils.h"
+#include "runtime/execution/parallel_context.h"
+#include "server/logging/logger.h"
 
 #include <llama.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
-#include <iostream>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -39,31 +41,6 @@ void BatchAddSeq(llama_batch &batch, llama_token id, llama_pos pos,
   batch.seq_id[batch.n_tokens][0] = seq_id;
   batch.logits[batch.n_tokens] = logits ? 1 : 0;
   batch.n_tokens++;
-}
-
-// Check whether output ends with any stop sequence.
-// If matched: output is trimmed to remove the stop suffix, and *emit_piece is
-// set to the portion of piece that precedes the stop (may be empty if the
-// entire piece was the stop sequence or part of it).
-// Returns true when a stop sequence was matched.
-bool ApplyStop(const std::string &piece, std::string &output,
-               const std::vector<std::string> &stops, std::string *emit_piece) {
-  *emit_piece = piece;
-  for (const auto &s : stops) {
-    if (s.empty())
-      continue;
-    if (output.size() >= s.size() &&
-        output.compare(output.size() - s.size(), s.size(), s) == 0) {
-      size_t pre_piece_len = output.size() - piece.size();
-      size_t stop_start = output.size() - s.size();
-      output.resize(stop_start);
-      *emit_piece = (stop_start > pre_piece_len)
-                        ? piece.substr(0, stop_start - pre_piece_len)
-                        : "";
-      return true;
-    }
-  }
-  return false;
 }
 
 } // namespace
@@ -119,8 +96,8 @@ bool LlamaCPUBackend::LoadModel(const std::filesystem::path &model_path,
                                 const LlamaBackendConfig &config) {
   test_ready_ = false;
   if (!std::filesystem::exists(model_path)) {
-    std::cerr << "[LlamaCPUBackend] model path does not exist: " << model_path
-              << std::endl;
+    log::Error("llama_backend",
+               "model path does not exist: " + model_path.string());
     return false;
   }
   llama_model_params model_params = llama_model_default_params();
@@ -129,8 +106,8 @@ bool LlamaCPUBackend::LoadModel(const std::filesystem::path &model_path,
   model_ =
       llama_model_load_from_file(model_path.string().c_str(), model_params);
   if (!model_) {
-    std::cerr << "[LlamaCPUBackend] failed to load model from " << model_path
-              << std::endl;
+    log::Error("llama_backend",
+               "failed to load model from " + model_path.string());
     return false;
   }
 
@@ -150,22 +127,36 @@ bool LlamaCPUBackend::LoadModel(const std::filesystem::path &model_path,
                                    ? LLAMA_FLASH_ATTN_TYPE_ENABLED
                                    : LLAMA_FLASH_ATTN_TYPE_DISABLED;
   if (config.use_flash_attention) {
-    std::cout << "[LlamaCPUBackend] FlashAttention enabled (tile="
-              << config.flash_attention_tile << ")\n";
+    log::Info("llama_backend", "FlashAttention enabled (tile=" +
+                                   std::to_string(config.flash_attention_tile) +
+                                   ")");
   }
 
   context_ = llama_init_from_model(model_, ctx_params);
   if (!context_) {
-    std::cerr << "[LlamaCPUBackend] failed to create context" << std::endl;
+    log::Error("llama_backend", "failed to create context");
     return false;
   }
   vocab_ = llama_model_get_vocab(model_);
   if (!vocab_) {
-    std::cerr << "[LlamaCPUBackend] failed to obtain vocabulary" << std::endl;
+    log::Error("llama_backend", "failed to obtain vocabulary");
     return false;
   }
   n_vocab_ = llama_vocab_n_tokens(vocab_);
   config_ = config;
+
+  // §P1f: Initialize Expert Parallel dispatcher.
+  if (IsMoE()) {
+    int n_experts = ExpertCount();
+    auto &pc = ParallelContext::Get();
+    if (pc.IsInitialized() && pc.WorldSize() > 1) {
+      ep_dispatch_ = std::make_shared<DistributedEPDispatch>(
+          pc.Rank(), pc.WorldSize(), n_experts);
+    } else {
+      ep_dispatch_ = std::make_shared<LocalEPDispatch>(n_experts);
+    }
+  }
+
   return true;
 }
 
@@ -284,7 +275,8 @@ std::string LlamaCPUBackend::TokenToString(int token) const {
 
 std::string LlamaCPUBackend::Generate(
     const std::string &prompt, int max_tokens,
-    const std::function<bool(const std::string &)> &on_chunk,
+    const std::function<bool(const std::string &, const TokenLogprob *)>
+        &on_chunk,
     const std::function<bool()> &should_stop, int logprob_top_n,
     std::vector<TokenLogprob> *out_logprobs,
     const std::vector<std::string> &stop_seqs) {
@@ -306,8 +298,7 @@ std::string LlamaCPUBackend::Generate(
              i == prompt_tokens.size() - 1);
   }
   if (llama_decode(context_, batch) != 0) {
-    std::cerr << "[LlamaCPUBackend] llama_decode failed for prompt"
-              << std::endl;
+    log::Error("llama_backend", "llama_decode failed for prompt");
     llama_batch_free(batch);
     return {};
   }
@@ -335,7 +326,10 @@ std::string LlamaCPUBackend::Generate(
     std::string emit_piece;
     bool stop_triggered = ApplyStop(piece, output, stop_seqs, &emit_piece);
     if (on_chunk && !emit_piece.empty()) {
-      if (!on_chunk(emit_piece)) {
+      const TokenLogprob *lp_ptr = (out_logprobs && !out_logprobs->empty())
+                                       ? &out_logprobs->back()
+                                       : nullptr;
+      if (!on_chunk(emit_piece, lp_ptr)) {
         break;
       }
     }
@@ -363,8 +357,7 @@ std::string LlamaCPUBackend::Generate(
     }
     BatchAdd(batch, token, position++, true);
     if (llama_decode(context_, batch) != 0) {
-      std::cerr << "[LlamaCPUBackend] llama_decode failed while generating"
-                << std::endl;
+      log::Error("llama_backend", "llama_decode failed while generating");
       break;
     }
     BatchClear(batch);
@@ -385,8 +378,7 @@ std::string LlamaCPUBackend::Generate(
 bool LlamaCPUBackend::LoadMmproj(const std::filesystem::path &mmproj_path) {
 #ifdef INFERFLUX_HAS_MTMD
   if (!model_) {
-    std::cerr
-        << "[LlamaCPUBackend] LoadMmproj: text model must be loaded first\n";
+    log::Error("llama_backend", "LoadMmproj: text model must be loaded first");
     return false;
   }
   if (mtmd_ctx_) {
@@ -401,25 +393,27 @@ bool LlamaCPUBackend::LoadMmproj(const std::filesystem::path &mmproj_path) {
   params.warmup = false;
   mtmd_ctx_ = mtmd_init_from_file(mmproj_path.string().c_str(), model_, params);
   if (!mtmd_ctx_) {
-    std::cerr << "[LlamaCPUBackend] failed to load mmproj from " << mmproj_path
-              << "\n";
+    log::Error("llama_backend",
+               "failed to load mmproj from " + mmproj_path.string());
     return false;
   }
   vision_ready_ = mtmd_support_vision(mtmd_ctx_);
-  std::cout << "[LlamaCPUBackend] mmproj loaded from " << mmproj_path
-            << " (vision=" << vision_ready_ << ")\n";
+  log::Info("llama_backend", "mmproj loaded from " + mmproj_path.string() +
+                                 " (vision=" + std::to_string(vision_ready_) +
+                                 ")");
   return vision_ready_;
 #else
   (void)mmproj_path;
-  std::cerr
-      << "[LlamaCPUBackend] ENABLE_MTMD=OFF; vision support unavailable\n";
+  log::Error("llama_backend", "ENABLE_MTMD=OFF; vision support unavailable");
   return false;
 #endif
 }
 
 std::string LlamaCPUBackend::GenerateWithImages(
     const std::string &prompt, const std::vector<DecodedImage> &images,
-    int max_tokens, const std::function<bool(const std::string &)> &on_chunk,
+    int max_tokens,
+    const std::function<bool(const std::string &, const TokenLogprob *)>
+        &on_chunk,
     const std::function<bool()> &should_stop,
     const std::vector<std::string> &stop_seqs) {
 #ifdef INFERFLUX_HAS_MTMD
@@ -437,8 +431,8 @@ std::string LlamaCPUBackend::GenerateWithImages(
     auto *bmp = mtmd_helper_bitmap_init_from_buf(
         mtmd_ctx_, img.raw_bytes.data(), img.raw_bytes.size());
     if (!bmp) {
-      std::cerr << "[LlamaCPUBackend] failed to decode image bitmap; falling "
-                   "back to text-only\n";
+      log::Error("llama_backend",
+                 "failed to decode image bitmap; falling back to text-only");
       for (auto *b : bitmaps)
         mtmd_bitmap_free(b);
       return Generate(prompt, max_tokens, on_chunk, should_stop, 0, nullptr,
@@ -468,8 +462,8 @@ std::string LlamaCPUBackend::GenerateWithImages(
   for (auto *b : bitmaps)
     mtmd_bitmap_free(b);
   if (rc != 0) {
-    std::cerr << "[LlamaCPUBackend] mtmd_tokenize failed (rc=" << rc
-              << "); falling back\n";
+    log::Error("llama_backend", "mtmd_tokenize failed (rc=" +
+                                    std::to_string(rc) + "); falling back");
     mtmd_input_chunks_free(chunks);
     return Generate(prompt, max_tokens, on_chunk, should_stop, 0, nullptr,
                     stop_seqs);
@@ -482,8 +476,8 @@ std::string LlamaCPUBackend::GenerateWithImages(
                                /*logits_last=*/true, &n_past);
   mtmd_input_chunks_free(chunks);
   if (rc != 0) {
-    std::cerr << "[LlamaCPUBackend] mtmd_helper_eval_chunks failed (rc=" << rc
-              << ")\n";
+    log::Error("llama_backend", "mtmd_helper_eval_chunks failed (rc=" +
+                                    std::to_string(rc) + ")");
     return {};
   }
 
@@ -505,7 +499,7 @@ std::string LlamaCPUBackend::GenerateWithImages(
     output += piece;
     std::string emit_piece;
     bool stop_triggered = ApplyStop(piece, output, stop_seqs, &emit_piece);
-    if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece))
+    if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece, nullptr))
       break;
     if (stop_triggered)
       break;
@@ -513,8 +507,7 @@ std::string LlamaCPUBackend::GenerateWithImages(
       break;
     BatchAdd(batch, token, n_past++, true);
     if (llama_decode(context_, batch) != 0) {
-      std::cerr
-          << "[LlamaCPUBackend] llama_decode failed (vision decode loop)\n";
+      log::Error("llama_backend", "llama_decode failed (vision decode loop)");
       break;
     }
     BatchClear(batch);
@@ -551,8 +544,8 @@ LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
                 /*logits=*/i == prompt_tokens.size() - 1);
   }
   if (llama_decode(context_, batch) != 0) {
-    std::cerr << "[LlamaCPUBackend] Prefill: llama_decode failed for seq "
-              << sequence_id << std::endl;
+    log::Error("llama_backend", "Prefill: llama_decode failed for seq " +
+                                    std::to_string(sequence_id));
     llama_batch_free(batch);
     return {};
   }
@@ -622,8 +615,8 @@ LlamaCPUBackend::PrefillPartial(const std::string &prompt, int sequence_id,
                 /*logits=*/i == n_total - 1);
   }
   if (llama_decode(context_, batch) != 0) {
-    std::cerr << "[LlamaCPUBackend] PrefillPartial: llama_decode failed seq "
-              << sequence_id << std::endl;
+    log::Error("llama_backend", "PrefillPartial: llama_decode failed seq " +
+                                    std::to_string(sequence_id));
     llama_batch_free(batch);
     return {};
   }
@@ -649,7 +642,8 @@ LlamaCPUBackend::PrefillPartial(const std::string &prompt, int sequence_id,
 
 std::string LlamaCPUBackend::Decode(
     int n_past, int sequence_id, int max_tokens,
-    const std::function<bool(const std::string &)> &on_chunk,
+    const std::function<bool(const std::string &, const TokenLogprob *)>
+        &on_chunk,
     const std::function<bool()> &should_stop, int logprob_top_n,
     std::vector<TokenLogprob> *out_logprobs, int first_token,
     const std::vector<std::string> &stop_seqs) {
@@ -676,9 +670,14 @@ std::string LlamaCPUBackend::Decode(
     tokens_remaining--;
     std::string emit_ft;
     bool ft_stop = ApplyStop(piece, output, stop_seqs, &emit_ft);
-    if (on_chunk && !emit_ft.empty() && !on_chunk(emit_ft)) {
-      llama_batch_free(batch);
-      return output;
+    if (on_chunk && !emit_ft.empty()) {
+      const TokenLogprob *ft_lp = (out_logprobs && !out_logprobs->empty())
+                                      ? &out_logprobs->back()
+                                      : nullptr;
+      if (!on_chunk(emit_ft, ft_lp)) {
+        llama_batch_free(batch);
+        return output;
+      }
     }
     if (ft_stop) {
       llama_batch_free(batch);
@@ -710,8 +709,13 @@ std::string LlamaCPUBackend::Decode(
     output += piece;
     std::string emit_piece;
     bool stop_triggered = ApplyStop(piece, output, stop_seqs, &emit_piece);
-    if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece))
-      break;
+    if (on_chunk && !emit_piece.empty()) {
+      const TokenLogprob *lp_ptr = (out_logprobs && !out_logprobs->empty())
+                                       ? &out_logprobs->back()
+                                       : nullptr;
+      if (!on_chunk(emit_piece, lp_ptr))
+        break;
+    }
     if (stop_triggered)
       break;
     if (should_stop && should_stop())
@@ -737,8 +741,8 @@ std::string LlamaCPUBackend::Decode(
     BatchAddSeq(batch, token, position++,
                 static_cast<llama_seq_id>(sequence_id), true);
     if (llama_decode(context_, batch) != 0) {
-      std::cerr << "[LlamaCPUBackend] Decode: llama_decode failed for seq "
-                << sequence_id << std::endl;
+      log::Error("llama_backend", "Decode: llama_decode failed for seq " +
+                                      std::to_string(sequence_id));
       break;
     }
     BatchClear(batch);
@@ -786,7 +790,7 @@ LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
   }
 
   if (llama_decode(context_, batch) != 0) {
-    std::cerr << "[LlamaCPUBackend] BatchDecodeStep: llama_decode failed\n";
+    log::Error("llama_backend", "BatchDecodeStep: llama_decode failed");
     llama_batch_free(batch);
     return {};
   }
@@ -810,6 +814,108 @@ LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
       results[static_cast<std::size_t>(i)].piece = TokenToString(tok);
     }
   }
+  return results;
+}
+
+std::vector<LlamaCPUBackend::UnifiedBatchOutput>
+LlamaCPUBackend::ExecuteUnifiedBatch(
+    const std::vector<UnifiedBatchInput> &inputs) {
+  if (!context_ || !vocab_ || inputs.empty()) {
+    return {};
+  }
+
+  // Count total tokens and requests for logits.
+  int total_tokens = 0;
+  int requests_with_logits = 0;
+  for (const auto &inp : inputs) {
+    total_tokens += static_cast<int>(inp.tokens.size());
+    if (inp.request_logits) {
+      requests_with_logits++;
+    }
+  }
+
+  if (total_tokens == 0) {
+    return std::vector<UnifiedBatchOutput>(inputs.size());
+  }
+
+  llama_batch batch = llama_batch_init(total_tokens, 0, 1);
+  std::vector<int> logit_indices(inputs.size(), -1);
+  int token_offset = 0;
+  int logit_counter = 0;
+
+  for (std::size_t i = 0; i < inputs.size(); ++i) {
+    const auto &inp = inputs[i];
+    if (inp.tokens.empty())
+      continue;
+
+    for (std::size_t j = 0; j < inp.tokens.size(); ++j) {
+      bool is_last = (j == inp.tokens.size() - 1);
+      bool should_request = is_last && inp.request_logits;
+
+      BatchAddSeq(batch, inp.tokens[j], static_cast<llama_pos>(inp.n_past + j),
+                  static_cast<llama_seq_id>(inp.sequence_id), should_request);
+
+      if (should_request) {
+        logit_indices[i] = logit_counter++;
+      }
+      token_offset++;
+    }
+  }
+
+  std::vector<UnifiedBatchOutput> results(inputs.size());
+  if (llama_decode(context_, batch) != 0) {
+    log::Error("llama_backend", "ExecuteUnifiedBatch: llama_decode failed");
+    llama_batch_free(batch);
+    return results;
+  }
+  llama_batch_free(batch);
+
+  llama_token eos = llama_vocab_eos(vocab_);
+  for (std::size_t i = 0; i < inputs.size(); ++i) {
+    if (logit_indices[i] >= 0) {
+      const auto &inp = inputs[i];
+
+      // Correctness Fix (§P1b): Use per-request sampling parameters.
+      // We leverage SetupSampler to prepare the backend's active_sampler_
+      // for this specific sequence's logit set.
+      SetupSampler("", "", inp.sampling);
+
+      if (active_sampler_) {
+        int tok =
+            llama_sampler_sample(active_sampler_, context_, logit_indices[i]);
+        llama_sampler_accept(active_sampler_, tok);
+
+        results[i].ok = true;
+        if (tok == eos) {
+          results[i].token = -1;
+        } else {
+          results[i].token = tok;
+          results[i].piece = TokenToString(tok);
+        }
+      } else {
+        // Fallback to greedy if SetupSampler failed.
+        const float *logits = llama_get_logits_ith(context_, logit_indices[i]);
+        if (logits) {
+          auto max_it = std::max_element(logits, logits + n_vocab_);
+          int tok = static_cast<int>(std::distance(logits, max_it));
+          results[i].ok = true;
+          if (tok == eos) {
+            results[i].token = -1;
+          } else {
+            results[i].token = tok;
+            results[i].piece = TokenToString(tok);
+          }
+        }
+      }
+      TeardownSampler();
+    } else if (inputs[i].request_logits) {
+      // Requested logits but no tokens were provided in this batch step.
+      results[i].ok = false;
+    } else {
+      results[i].ok = true; // No logits requested, step succeeded.
+    }
+  }
+
   return results;
 }
 
@@ -887,50 +993,8 @@ TokenLogprob LlamaCPUBackend::CollectLogprob(int token_id,
                                              const std::string &token_str,
                                              int top_n) const {
   const float *logits = llama_get_logits(context_);
-  TokenLogprob tlp;
-  tlp.token = token_str;
-
-  if (!logits || n_vocab_ <= 0) {
-    return tlp;
-  }
-  if (token_id < 0 || token_id >= n_vocab_) {
-    return tlp; // sampler returned out-of-range token; return zero logprob
-  }
-
-  // Numerically stable log-softmax: subtract max before exp.
-  float max_l = logits[0];
-  for (int i = 1; i < n_vocab_; ++i) {
-    if (logits[i] > max_l)
-      max_l = logits[i];
-  }
-  double sum_exp = 0.0;
-  for (int i = 0; i < n_vocab_; ++i) {
-    sum_exp += std::exp(static_cast<double>(logits[i] - max_l));
-  }
-  float log_denom = static_cast<float>(std::log(sum_exp)) + max_l;
-
-  tlp.logprob = logits[token_id] - log_denom;
-
-  // UTF-8 bytes of the token string.
-  tlp.bytes.reserve(token_str.size());
-  for (unsigned char c : token_str) {
-    tlp.bytes.push_back(static_cast<int>(c));
-  }
-
-  if (top_n > 0) {
-    int k = std::min(top_n, n_vocab_);
-    std::vector<int> indices(n_vocab_);
-    std::iota(indices.begin(), indices.end(), 0);
-    std::partial_sort(indices.begin(), indices.begin() + k, indices.end(),
-                      [&](int a, int b) { return logits[a] > logits[b]; });
-    tlp.top_logprobs.reserve(k);
-    for (int i = 0; i < k; ++i) {
-      int alt_id = indices[i];
-      tlp.top_logprobs.push_back(
-          {TokenToString(alt_id), logits[alt_id] - log_denom});
-    }
-  }
-  return tlp;
+  return ComputeLogprob(logits, n_vocab_, token_id, token_str, top_n,
+                        [this](int32_t id) { return TokenToString(id); });
 }
 
 // §2.3 — model-native chat template formatting.
@@ -1030,7 +1094,7 @@ std::vector<float> LlamaCPUBackend::Embed(const std::string &text) {
   }
 
   if (llama_decode(embed_ctx_, batch) != 0) {
-    std::cerr << "[LlamaCPUBackend] Embed: llama_decode failed\n";
+    log::Error("llama_backend", "Embed: llama_decode failed");
     llama_batch_free(batch);
     return {};
   }
@@ -1038,8 +1102,8 @@ std::vector<float> LlamaCPUBackend::Embed(const std::string &text) {
 
   float *emb = llama_get_embeddings_seq(embed_ctx_, 0);
   if (!emb) {
-    std::cerr
-        << "[LlamaCPUBackend] Embed: llama_get_embeddings_seq returned null\n";
+    log::Error("llama_backend",
+               "Embed: llama_get_embeddings_seq returned null");
     // Reset context state for this sequence.
     llama_memory_seq_rm(llama_get_memory(embed_ctx_), 0, -1, -1);
     return {};

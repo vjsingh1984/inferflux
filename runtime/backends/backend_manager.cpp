@@ -1,13 +1,12 @@
 #include "runtime/backends/backend_manager.h"
-
-#include <iostream>
+#include "server/logging/logger.h"
 
 namespace inferflux {
 
-std::shared_ptr<LlamaCPUBackend> BackendManager::LoadBackend(const std::string& name,
-                                                             const std::string& path,
-                                                             const LlamaBackendConfig& config,
-                                                             bool prefer_cuda) {
+std::shared_ptr<LlamaCPUBackend>
+BackendManager::LoadBackend(const std::string &name, const std::string &path,
+                            const LlamaBackendConfig &config,
+                            bool prefer_cuda) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = backends_.find(name);
   if (it != backends_.end() && it->second && it->second->IsReady()) {
@@ -15,21 +14,25 @@ std::shared_ptr<LlamaCPUBackend> BackendManager::LoadBackend(const std::string& 
   }
   if (prefer_cuda) {
 #ifdef INFERFLUX_HAS_CUDA
-    std::cout << "[backend] CUDA support detected; GPU backend integration pending.\n";
+    log::Info("backend_manager",
+              "CUDA support detected; GPU backend integration pending.");
 #else
-    std::cerr << "[backend] CUDA requested but binary was built without CUDA support.\n";
+    log::Error("backend_manager",
+               "CUDA requested but binary was built without CUDA support.");
 #endif
   }
   auto backend = std::make_shared<LlamaCPUBackend>();
   if (!backend->LoadModel(path, config)) {
-    std::cerr << "BackendManager: failed to load model " << path << " for " << name << std::endl;
+    log::Error("backend_manager",
+               "failed to load model " + path + " for " + name);
     return nullptr;
   }
   backends_[name] = backend;
   return backend;
 }
 
-std::shared_ptr<LlamaCPUBackend> BackendManager::GetBackend(const std::string& name) const {
+std::shared_ptr<LlamaCPUBackend>
+BackendManager::GetBackend(const std::string &name) const {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = backends_.find(name);
   if (it == backends_.end()) {
@@ -38,4 +41,4 @@ std::shared_ptr<LlamaCPUBackend> BackendManager::GetBackend(const std::string& n
   return it->second;
 }
 
-}  // namespace inferflux
+} // namespace inferflux

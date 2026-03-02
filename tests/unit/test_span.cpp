@@ -33,7 +33,7 @@ TEST_CASE("SpanContext: ToTraceparent format", "[tracing]") {
 }
 
 TEST_CASE("SpanContext: ToTraceparent empty on invalid context", "[tracing]") {
-  SpanContext ctx;  // default — invalid
+  SpanContext ctx; // default — invalid
   REQUIRE_FALSE(ctx.valid());
   REQUIRE(ctx.ToTraceparent().empty());
 }
@@ -55,7 +55,8 @@ TEST_CASE("ParseTraceparent: rejects short/malformed input", "[tracing]") {
   REQUIRE_FALSE(ParseTraceparent("garbage").valid());
 }
 
-TEST_CASE("ChildContext: inherits trace_id, generates new span_id", "[tracing]") {
+TEST_CASE("ChildContext: inherits trace_id, generates new span_id",
+          "[tracing]") {
   auto parent = NewContext();
   auto child = ChildContext(parent);
   REQUIRE(child.trace_id == parent.trace_id);
@@ -75,7 +76,7 @@ TEST_CASE("Span: records duration via callback", "[tracing]") {
   std::string recorded_name;
   {
     Span span("test-phase", NewContext(),
-              [&](const std::string& name, const SpanContext&, double ms) {
+              [&](const std::string &name, const SpanContext &, double ms) {
                 recorded_name = name;
                 recorded_ms = ms;
               });
@@ -87,10 +88,11 @@ TEST_CASE("Span: records duration via callback", "[tracing]") {
 
 TEST_CASE("Span: Finish() is idempotent", "[tracing]") {
   int call_count = 0;
-  Span span("op", NewContext(),
-            [&](const std::string&, const SpanContext&, double) { ++call_count; });
+  Span span(
+      "op", NewContext(),
+      [&](const std::string &, const SpanContext &, double) { ++call_count; });
   span.Finish();
-  span.Finish();  // Second call must not double-fire.
+  span.Finish(); // Second call must not double-fire.
   // Destructor fires but span is already finished.
   // call_count stays at 1 after scope exit.
   REQUIRE(call_count == 1);
@@ -103,7 +105,8 @@ TEST_CASE("Span: ElapsedMs is non-negative", "[tracing]") {
 }
 
 TEST_CASE("NewContext: unique per call", "[tracing]") {
-  // Generate several contexts and confirm no duplicates (probabilistic, astronomically unlikely).
+  // Generate several contexts and confirm no duplicates (probabilistic,
+  // astronomically unlikely).
   std::vector<std::string> ids;
   for (int i = 0; i < 20; ++i) {
     ids.push_back(NewContext().trace_id);

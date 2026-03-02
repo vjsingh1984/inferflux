@@ -43,6 +43,10 @@ add_library(inferflux_core
   runtime/speculative/speculative_decoder.h
   runtime/execution/batch_executor.cpp
   runtime/execution/batch_executor.h
+  runtime/execution/parallel_context.cpp
+  runtime/execution/parallel_context.h
+  runtime/backends/ep_dispatch.cpp
+  runtime/backends/ep_dispatch.h
   runtime/prefix_cache/prefix_cache.cpp
   runtime/prefix_cache/prefix_cache.h
   runtime/prefix_cache/radix_prefix_cache.cpp
@@ -54,6 +58,8 @@ add_library(inferflux_core
   scheduler/scheduler.h
   scheduler/single_model_router.cpp
   scheduler/single_model_router.h
+  scheduler/model_registry.cpp
+  scheduler/model_registry.h
   server/http/http_server.cpp
   server/http/http_server.h
   server/auth/api_key_auth.cpp
@@ -323,6 +329,13 @@ add_executable(inferflux_tests
   tests/unit/test_mlx_loader.cpp
   tests/unit/test_mlx_tokenizer.cpp
   tests/unit/test_mlx_execution.cpp
+  tests/unit/test_mlx_backend.cpp
+  tests/unit/test_paged_kv_cache.cpp
+  tests/unit/test_unified_batching.cpp
+  tests/unit/test_model_registry.cpp
+  tests/unit/test_stop_sequences.cpp
+  tests/unit/test_parallel_context.cpp
+  tests/unit/test_ep_dispatch.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -330,6 +343,14 @@ target_link_libraries(inferflux_tests PRIVATE inferflux_core)
 add_test(NAME UnitTests COMMAND inferflux_tests)
 add_test(NAME FairnessTests COMMAND inferflux_tests "[fairness]")
 set_tests_properties(FairnessTests PROPERTIES LABELS fairness)
+add_test(NAME PagedKVTests COMMAND inferflux_tests "[paged_kv]")
+set_tests_properties(PagedKVTests PROPERTIES LABELS paged_kv)
+add_test(NAME UnifiedBatchTests COMMAND inferflux_tests "[unified_batch]")
+set_tests_properties(UnifiedBatchTests PROPERTIES LABELS unified_batch)
+add_test(NAME ParallelTests COMMAND inferflux_tests "[parallel]")
+set_tests_properties(ParallelTests PROPERTIES LABELS parallel)
+add_test(NAME EPTests COMMAND inferflux_tests "[ep]")
+set_tests_properties(EPTests PROPERTIES LABELS ep)
 add_test(NAME MoETests COMMAND inferflux_tests "[moe]")
 set_tests_properties(MoETests PROPERTIES LABELS moe)
 add_test(NAME FlashAttnTests COMMAND inferflux_tests "[flash_attn]")
@@ -344,6 +365,10 @@ add_test(NAME LoggerTests COMMAND inferflux_tests "[logger]")
 set_tests_properties(LoggerTests PROPERTIES LABELS logger)
 add_test(NAME StructuredTests COMMAND inferflux_tests "[structured]")
 set_tests_properties(StructuredTests PROPERTIES LABELS structured)
+add_test(NAME ModelRegistryTests COMMAND inferflux_tests "[model_registry]")
+set_tests_properties(ModelRegistryTests PROPERTIES LABELS model_registry)
+add_test(NAME StopSequenceTests COMMAND inferflux_tests "[stop_sequences]")
+set_tests_properties(StopSequenceTests PROPERTIES LABELS stop_sequences)
 add_test(NAME MlxLoaderTests COMMAND inferflux_tests "[mlx_loader]")
 set_tests_properties(MlxLoaderTests PROPERTIES LABELS mlx_loader)
 if(MLX_C_LIB_DIR)

@@ -1,4 +1,6 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
+#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/kv_cache/paged_kv_cache.h"
 
 #include <algorithm>
 #include <cassert>
@@ -8,8 +10,8 @@ namespace inferflux {
 namespace {
 
 // Return the length of the longest common prefix between two token spans.
-std::size_t CommonPrefixLength(const std::vector<int>& edge,
-                               const std::vector<int>& tokens,
+std::size_t CommonPrefixLength(const std::vector<int> &edge,
+                               const std::vector<int> &tokens,
                                std::size_t tokens_offset) {
   std::size_t len = 0;
   std::size_t edge_len = edge.size();
@@ -21,20 +23,42 @@ std::size_t CommonPrefixLength(const std::vector<int>& edge,
   return len;
 }
 
-}  // namespace
+} // namespace
 
-RadixPrefixCache::RadixPrefixCache(std::size_t capacity)
-    : capacity_(capacity), root_(std::make_unique<RadixNode>()) {}
+RadixPrefixCache::RadixPrefixCache(std::shared_ptr<PagedKVCache> kv_cache,
+                                   EvictCallback on_evict_seq,
+                                   std::size_t capacity,
+                                   std::size_t max_sequences)
+    : kv_cache_(std::move(kv_cache)), on_evict_seq_(std::move(on_evict_seq)),
+      capacity_(capacity), max_sequences_(max_sequences),
+      root_(std::make_unique<RadixNode>()) {}
 
 std::size_t RadixPrefixCache::Size() const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
   return size_;
 }
 
-std::pair<RadixNode*, std::size_t> RadixPrefixCache::FindLongestPrefix(
-    const std::vector<int>& tokens) const {
-  RadixNode* node = root_.get();
+std::size_t RadixPrefixCache::LiveSequences() const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  return live_sequences_;
+}
+
+bool RadixPrefixCache::Lookup(const std::vector<int> &tokens,
+                              LlamaCPUBackend *backend,
+                              std::vector<int> *out_block_table,
+                              int *out_sequence_id, int *matched_tokens) {
+  if (capacity_ == 0 || tokens.empty()) {
+    if (matched_tokens)
+      *matched_tokens = 0;
+    return false;
+  }
+
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  RadixNode *node = root_.get();
   std::size_t offset = 0;
+  std::vector<int> blocks;
+  int last_seq_id = -1;
+  bool node_hit = false;
 
   while (offset < tokens.size()) {
     int first = tokens[offset];
@@ -42,117 +66,134 @@ std::pair<RadixNode*, std::size_t> RadixPrefixCache::FindLongestPrefix(
     if (it == node->children.end()) {
       break;
     }
-    RadixNode* child = it->second.get();
+    RadixNode *child = it->second.get();
     std::size_t common = CommonPrefixLength(child->edge, tokens, offset);
+
     if (common < child->edge.size()) {
-      // Partial edge match — advance the offset by the matched portion and stop.
+      // Mid-edge divergence (§ Item 3): record partial match length but hit is
+      // false.
       offset += common;
+      node_hit = false;
       break;
     }
+
+    // Backend validation logic for full node reuse.
+    if (child->sequence_id >= 0) {
+      auto locked_be = child->backend.lock();
+      if (locked_be.get() != backend) {
+        // Mismatch — we still count these tokens but can't reuse the node.
+        offset += common;
+        node_hit = false;
+        break;
+      }
+    }
+
     offset += common;
     node = child;
-  }
-
-  return {node, offset};
-}
-
-bool RadixPrefixCache::Lookup(const std::vector<int>& tokens,
-                              std::string* completion,
-                              int* completion_tokens,
-                              int* matched_tokens) {
-  if (capacity_ == 0) {
-    if (matched_tokens) *matched_tokens = 0;
-    return false;
-  }
-
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  auto [node, matched] = FindLongestPrefix(tokens);
-
-  // Also count tokens matched into the first untraversed child edge (partial match).
-  std::size_t total_matched = matched;
-  if (matched_tokens && matched < tokens.size()) {
-    int first_rem = tokens[matched];
-    auto child_it = node->children.find(first_rem);
-    if (child_it != node->children.end()) {
-      total_matched += CommonPrefixLength(child_it->second->edge, tokens, matched);
+    node_hit = true;
+    if (!node->block_table.empty()) {
+      blocks.insert(blocks.end(), node->block_table.begin(),
+                    node->block_table.end());
     }
+    if (node->sequence_id >= 0) {
+      last_seq_id = node->sequence_id;
+    }
+    node->last_used = ++clock_;
   }
 
   if (matched_tokens) {
-    *matched_tokens = static_cast<int>(total_matched);
+    *matched_tokens = static_cast<int>(offset);
   }
 
-  if (matched == tokens.size() && node != root_.get() && node->has_completion) {
-    // Exact match.
-    node->last_used = ++clock_;
-    if (completion) *completion = node->completion;
-    if (completion_tokens) *completion_tokens = node->completion_tokens;
+  if (node_hit && node != root_.get()) {
+    if (out_block_table)
+      *out_block_table = std::move(blocks);
+    if (out_sequence_id)
+      *out_sequence_id = last_seq_id;
     return true;
   }
 
   return false;
 }
 
-void RadixPrefixCache::SplitEdge(RadixNode* parent, int first_token, std::size_t split_at) {
-  // Take ownership of the original child.
+void RadixPrefixCache::SplitEdge(RadixNode *parent, int first_token,
+                                 std::size_t split_at) {
   auto original = std::move(parent->children[first_token]);
 
-  // Create intermediate node: edge = original->edge[0..split_at)
   auto intermediate = std::make_unique<RadixNode>();
+  intermediate->parent = parent;
   intermediate->edge.assign(original->edge.begin(),
-                            original->edge.begin() + static_cast<std::ptrdiff_t>(split_at));
+                            original->edge.begin() +
+                                static_cast<std::ptrdiff_t>(split_at));
 
-  // Truncate original's edge to the suffix.
+  intermediate->block_table = {};
+  intermediate->sequence_id = -1;
+
   int original_first = original->edge[split_at];
+  original->parent = intermediate.get();
   original->edge.erase(original->edge.begin(),
-                       original->edge.begin() + static_cast<std::ptrdiff_t>(split_at));
+                       original->edge.begin() +
+                           static_cast<std::ptrdiff_t>(split_at));
 
-  // Wire: intermediate → original
   intermediate->children[original_first] = std::move(original);
-
-  // Wire: parent → intermediate
   parent->children[first_token] = std::move(intermediate);
+  size_++;
 }
 
-void RadixPrefixCache::Insert(const std::vector<int>& tokens,
-                              const std::string& completion,
-                              int completion_tokens) {
-  if (capacity_ == 0) {
+void RadixPrefixCache::Insert(const std::vector<int> &tokens,
+                              const std::vector<int> &block_table,
+                              int sequence_id,
+                              std::shared_ptr<LlamaCPUBackend> backend) {
+  if (capacity_ == 0 || tokens.empty() || block_table.empty()) {
     return;
   }
 
   std::unique_lock<std::shared_mutex> lock(mutex_);
 
-  RadixNode* node = root_.get();
+  RadixNode *node = root_.get();
   std::size_t offset = 0;
+  const int kTokensPerBlock = 16;
 
   while (offset < tokens.size()) {
     int first = tokens[offset];
     auto it = node->children.find(first);
 
     if (it == node->children.end()) {
-      // Create a new leaf with edge = remaining tokens.
       auto leaf = std::make_unique<RadixNode>();
-      leaf->edge.assign(tokens.begin() + static_cast<std::ptrdiff_t>(offset), tokens.end());
-      leaf->has_completion = true;
-      leaf->completion = completion;
-      leaf->completion_tokens = completion_tokens;
+      leaf->parent = node;
+      leaf->edge.assign(tokens.begin() + static_cast<std::ptrdiff_t>(offset),
+                        tokens.end());
+
+      std::size_t block_offset = offset / kTokensPerBlock;
+      if (block_offset < block_table.size()) {
+        leaf->block_table.assign(block_table.begin() +
+                                     static_cast<std::ptrdiff_t>(block_offset),
+                                 block_table.end());
+      }
+
+      leaf->sequence_id = sequence_id;
+      leaf->backend = backend;
+      if (sequence_id >= 0)
+        live_sequences_++;
+
       leaf->last_used = ++clock_;
       node->children[first] = std::move(leaf);
-      ++size_;
+      size_++;
+
+      while (live_sequences_ > max_sequences_) {
+        EvictOneSequence();
+      }
       while (size_ > capacity_) {
         EvictOne();
       }
       return;
     }
 
-    RadixNode* child = it->second.get();
+    RadixNode *child = it->second.get();
     std::size_t common = CommonPrefixLength(child->edge, tokens, offset);
 
     if (common < child->edge.size()) {
-      // Need to split the existing edge.
       SplitEdge(node, first, common);
-      // After split, node->children[first] is now the intermediate node.
       child = node->children[first].get();
     }
 
@@ -160,49 +201,91 @@ void RadixPrefixCache::Insert(const std::vector<int>& tokens,
     node = child;
   }
 
-  // node is the insertion point.
-  if (!node->has_completion) {
-    ++size_;
-  }
-  node->has_completion = true;
-  node->completion = completion;
-  node->completion_tokens = completion_tokens;
+  if (node->sequence_id < 0 && sequence_id >= 0)
+    live_sequences_++;
+  node->sequence_id = sequence_id;
+  node->backend = backend;
   node->last_used = ++clock_;
-
-  while (size_ > capacity_) {
-    EvictOne();
-  }
 }
 
-void RadixPrefixCache::CollectLeaves(const RadixNode* node,
-                                     std::vector<std::pair<uint64_t, RadixNode*>>& out) const {
-  if (node->has_completion) {
-    out.emplace_back(node->last_used, const_cast<RadixNode*>(node));
+void RadixPrefixCache::CollectNodes(
+    RadixNode *node, std::function<bool(const RadixNode *)> criteria,
+    std::vector<std::pair<uint64_t, RadixNode *>> &out) const {
+  if (criteria(node)) {
+    out.emplace_back(node->last_used, node);
   }
-  for (const auto& [key, child] : node->children) {
-    CollectLeaves(child.get(), out);
+  for (const auto &[key, child] : node->children) {
+    CollectNodes(child.get(), criteria, out);
   }
 }
 
 void RadixPrefixCache::EvictOne() {
-  std::vector<std::pair<uint64_t, RadixNode*>> leaves;
+  std::vector<std::pair<uint64_t, RadixNode *>> leaves;
   leaves.reserve(size_);
-  CollectLeaves(root_.get(), leaves);
+  CollectNodes(
+      root_.get(),
+      [](const RadixNode *n) {
+        return n->children.empty() && n->parent != nullptr;
+      },
+      leaves);
 
-  if (leaves.empty()) {
+  if (leaves.empty())
     return;
-  }
 
-  // Pick the node with the smallest last_used.
   auto victim_it = std::min_element(
       leaves.begin(), leaves.end(),
-      [](const auto& a, const auto& b) { return a.first < b.first; });
+      [](const auto &a, const auto &b) { return a.first < b.first; });
 
-  RadixNode* victim = victim_it->second;
-  victim->has_completion = false;
-  victim->completion.clear();
-  victim->completion_tokens = 0;
-  --size_;
+  RadixNode *victim = victim_it->second;
+  if (victim->sequence_id >= 0) {
+    if (auto locked_be = victim->backend.lock()) {
+      locked_be->FreeSequence(victim->sequence_id);
+    }
+    if (on_evict_seq_) {
+      on_evict_seq_(victim->sequence_id);
+    }
+    live_sequences_--;
+  }
+
+  if (kv_cache_ && !victim->block_table.empty()) {
+    kv_cache_->ReleaseBlocksRef(victim->block_table);
+  }
+
+  // Prune from trie.
+  int first_token = victim->edge[0];
+  victim->parent->children.erase(first_token);
+  size_--;
 }
 
-}  // namespace inferflux
+void RadixPrefixCache::EvictOneSequence() {
+  std::vector<std::pair<uint64_t, RadixNode *>> seq_nodes;
+  CollectNodes(
+      root_.get(), [](const RadixNode *n) { return n->sequence_id >= 0; },
+      seq_nodes);
+
+  if (seq_nodes.empty())
+    return;
+
+  auto victim_it = std::min_element(
+      seq_nodes.begin(), seq_nodes.end(),
+      [](const auto &a, const auto &b) { return a.first < b.first; });
+
+  RadixNode *victim = victim_it->second;
+  if (auto locked_be = victim->backend.lock()) {
+    locked_be->FreeSequence(victim->sequence_id);
+  }
+  if (on_evict_seq_) {
+    on_evict_seq_(victim->sequence_id);
+  }
+
+  // Correctness Fix (§ Item 2): release block references back to the cache!
+  if (kv_cache_ && !victim->block_table.empty()) {
+    kv_cache_->ReleaseBlocksRef(victim->block_table);
+  }
+  victim->block_table.clear();
+
+  victim->sequence_id = -1;
+  live_sequences_--;
+}
+
+} // namespace inferflux

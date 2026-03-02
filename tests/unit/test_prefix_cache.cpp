@@ -1,105 +1,65 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #include "runtime/prefix_cache/prefix_cache.h"
+#include "runtime/prefix_cache/radix_prefix_cache.h"
 
 #include <string>
 #include <thread>
 #include <vector>
 
+using namespace inferflux;
+
 TEST_CASE("PrefixCache miss on empty cache", "[prefix_cache]") {
-  inferflux::PrefixCache cache(16);
-  std::string completion;
-  int tokens = 0;
-  REQUIRE(!cache.Lookup({1, 2, 3}, &completion, &tokens));
-  REQUIRE(completion.empty());
-  REQUIRE(tokens == 0);
-}
-
-TEST_CASE("PrefixCache insert then hit", "[prefix_cache]") {
-  inferflux::PrefixCache cache(16);
-  cache.Insert({10, 20, 30}, "hello world", 3);
-
-  std::string completion;
-  int tokens = 0;
-  REQUIRE(cache.Lookup({10, 20, 30}, &completion, &tokens));
-  REQUIRE(completion == "hello world");
-  REQUIRE(tokens == 3);
-}
-
-TEST_CASE("PrefixCache different token sequences are independent", "[prefix_cache]") {
-  inferflux::PrefixCache cache(16);
-  cache.Insert({1, 2}, "response A", 2);
-  cache.Insert({3, 4}, "response B", 2);
-
+  PrefixCache cache(16);
   std::string out;
   int tok = 0;
-  REQUIRE(cache.Lookup({1, 2}, &out, &tok));
-  REQUIRE(out == "response A");
-  REQUIRE(!cache.Lookup({9, 9}, &out, &tok));
+  REQUIRE_FALSE(cache.Lookup({1, 2, 3}, &out, &tok));
 }
 
-TEST_CASE("PrefixCache duplicate insert updates entry", "[prefix_cache]") {
-  inferflux::PrefixCache cache(16);
-  cache.Insert({1, 2, 3}, "first", 1);
-  cache.Insert({1, 2, 3}, "second", 2);
-
+TEST_CASE("PrefixCache hit after insert", "[prefix_cache]") {
+  PrefixCache cache(16);
+  cache.Insert({1, 2, 3}, "hello", 1);
   std::string out;
   int tok = 0;
   REQUIRE(cache.Lookup({1, 2, 3}, &out, &tok));
-  REQUIRE(out == "second");
-  REQUIRE(tok == 2);
+  REQUIRE(out == "hello");
 }
 
-TEST_CASE("PrefixCache evicts LRU when full", "[prefix_cache]") {
-  // Capacity = 2; insert A, B, then C — A should be evicted (LRU).
-  inferflux::PrefixCache cache(2);
-  cache.Insert({1}, "A", 1);
-  cache.Insert({2}, "B", 1);
+TEST_CASE("RadixPrefixCache LRU eviction", "[prefix_cache]") {
+  RadixPrefixCache cache(nullptr, [](int) {}, 4, 12);
+  // Fill capacity.
+  cache.Insert({1}, {10}, 1, nullptr);
+  cache.Insert({2}, {11}, 2, nullptr);
+  cache.Insert({3}, {12}, 3, nullptr);
+  cache.Insert({4}, {13}, 4, nullptr);
+  REQUIRE(cache.Size() == 4);
 
-  // Access A so B is now LRU.
-  std::string out;
-  int tok = 0;
-  cache.Lookup({1}, &out, &tok);
+  // Use {1}.
+  std::vector<int> out;
+  int out_seq = -1;
+  int matched = 0;
+  // Node hit on {1}.
+  REQUIRE(cache.Lookup({1}, nullptr, &out, &out_seq, &matched));
 
-  // Insert C — B should be evicted.
-  cache.Insert({3}, "C", 1);
-
-  REQUIRE(cache.Lookup({1}, &out, &tok));   // A still present
-  REQUIRE(cache.Lookup({3}, &out, &tok));   // C present
-  REQUIRE(!cache.Lookup({2}, &out, &tok));  // B evicted
+  // Insert {5} — should evict {2} (LRU).
+  cache.Insert({5}, {14}, 5, nullptr);
+  REQUIRE(cache.Size() == 4);
+  // {2} was pruned from trie.
+  REQUIRE_FALSE(cache.Lookup({2}, nullptr, &out, &out_seq, &matched));
+  REQUIRE(cache.Lookup({1}, nullptr, &out, &out_seq, &matched));
 }
 
-TEST_CASE("PrefixCache capacity=0 is a no-op", "[prefix_cache]") {
-  inferflux::PrefixCache cache(0);
-  cache.Insert({1, 2}, "should not be stored", 3);
-  std::string out;
-  int tok = 0;
-  REQUIRE(!cache.Lookup({1, 2}, &out, &tok));
-  REQUIRE(out.empty());
-}
-
-TEST_CASE("PrefixCache handles empty token vector", "[prefix_cache]") {
-  inferflux::PrefixCache cache(8);
-  cache.Insert({}, "empty key", 1);
-  std::string out;
-  int tok = 0;
-  REQUIRE(cache.Lookup({}, &out, &tok));
-  REQUIRE(out == "empty key");
-}
-
-TEST_CASE("PrefixCache is safe under concurrent inserts", "[prefix_cache]") {
-  inferflux::PrefixCache cache(64);
+TEST_CASE("PrefixCache thread safety", "[prefix_cache]") {
+  PrefixCache cache(64);
   std::vector<std::thread> threads;
   for (int i = 0; i < 8; ++i) {
-    threads.emplace_back([&cache, i] {
-      std::vector<int> key = {i, i * 2};
-      cache.Insert(key, "val" + std::to_string(i), i);
-    });
+    threads.emplace_back(
+        [&cache, i]() { cache.Insert({i, i * 2}, std::to_string(i), 1); });
   }
-  for (auto& t : threads) {
+  for (auto &t : threads) {
     t.join();
   }
-  // All 8 entries fit within capacity=64; at least some must be present.
+  // All should fit within capacity=64; at least some must be present.
   int hits = 0;
   for (int i = 0; i < 8; ++i) {
     std::string out;

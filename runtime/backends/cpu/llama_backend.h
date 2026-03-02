@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/backends/ep_dispatch.h"
 #include "runtime/logprob.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "scheduler/request_batch.h"
@@ -30,12 +31,16 @@ struct LlamaBackendConfig {
   // Maximum number of KV-cache sequences that can be live simultaneously.
   // Must be >= kMaxSequenceSlots (16) for multi-sequence batch decode.
   int max_parallel_sequences{16};
+
+  // Distributed Parallelism Degrees (§P1e).
+  int tp_degree{1}; // Tensor Parallel degree
+  int pp_degree{1}; // Pipeline Parallel degree
 };
 
 class LlamaCPUBackend {
 public:
   LlamaCPUBackend();
-  ~LlamaCPUBackend();
+  virtual ~LlamaCPUBackend();
 
   bool LoadModel(const std::filesystem::path &model_path,
                  const LlamaBackendConfig &config = {});
@@ -76,101 +81,90 @@ public:
     std::string piece; // text of token; empty when token == -1
   };
 
-  // Phased prefill/decode API (§2.5 Option A — in-process disaggregated
-  // execution). Each concurrent request gets a unique sequence_id (use
-  // request_id % kMaxSequenceSlots). Prefill() clears the sequence slot first,
-  // so reuse of the same id is safe.
+  // Input/output for one step of unified batch execution (§P1b).
+  // A single ExecuteUnifiedBatch() call can mix prefill (multiple tokens,
+  // n_past=0) and decode (one token, n_past>0) sequences in the same
+  // forward pass.
+  struct UnifiedBatchInput {
+    int sequence_id;
+    int n_past;
+    std::vector<int> tokens;
+    bool request_logits{true}; // true to sample a token after this step
+    SamplingParams sampling;   // Per-request sampling parameters (§P1b)
+  };
+  struct UnifiedBatchOutput {
+    int token{-1};
+    std::string piece;
+    bool ok{false};
+  };
+
+  // Execute a mixed batch of prefill and decode sequences.
+  // Returns results for all inputs where request_logits=true.
+  virtual std::vector<UnifiedBatchOutput>
+  ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs);
 
   // Evaluate all prompt tokens for sequence_id and populate the KV cache.
-  // Returns {ok=false} when the context is not loaded or the prompt is empty.
-  PrefillResult Prefill(const std::string &prompt, int sequence_id);
+  virtual PrefillResult Prefill(const std::string &prompt, int sequence_id);
 
   // Autoregressive decode starting from n_past (returned by Prefill) for
   // sequence_id. Grammar constraints must be set via EnableGrammarConstraint
   // before calling.  logprob_top_n / out_logprobs work identically to Generate.
-  // first_token: when >= 0, this token (pre-sampled by Prefill while logits
-  // were fresh) is emitted and fed back before the auto-regressive loop starts,
-  // correcting the logit-buffer race that arises after multi-sequence prefill.
-  std::string
+  virtual std::string
   Decode(int n_past, int sequence_id, int max_tokens,
-         const std::function<bool(const std::string &)> &on_chunk = {},
+         const std::function<bool(const std::string &, const TokenLogprob *)>
+             &on_chunk = {},
          const std::function<bool()> &should_stop = {}, int logprob_top_n = 0,
          std::vector<TokenLogprob> *out_logprobs = nullptr,
          int first_token = -1, const std::vector<std::string> &stop_seqs = {});
 
   // Execute one shared decode step for N sequences simultaneously.
-  // For each input, inserts feed_token at n_past, calls one llama_decode()
-  // covering all N sequences, then samples the next token per sequence using
-  // llama_get_logits_ith().  inputs[i].n_past is incremented in-place.
-  // Returns empty vector on context-not-loaded or llama_decode failure.
   std::vector<BatchDecodeOutput>
   BatchDecodeStep(std::vector<BatchDecodeInput> &inputs);
 
   // Copy KV cache entries for positions [0, n_tokens) from src_seq to dst_seq.
-  // dst_seq is cleared first so no stale cells remain.  Used by the KV prefix
-  // reuse path: CopySequencePrefix + PrefillPartial replaces a full Prefill
-  // call when a warm matching prefix is available in the prefix store.
-  // No-op when the context is not loaded.
-  void CopySequencePrefix(int src_seq, int dst_seq, int n_tokens);
+  virtual void CopySequencePrefix(int src_seq, int dst_seq, int n_tokens);
 
   // Partial prefill that evaluates only the suffix of prompt starting at
-  // n_past_start.  Positions [0, n_past_start) must already be populated in
-  // sequence_id's KV slot (via CopySequencePrefix).  Returns {ok=false} when
-  // the context is not loaded, the prompt is empty, or llama_decode fails.
-  // If n_past_start >= total prompt token count, returns
-  // {ok=true, n_past=count, first_token=-1}: the prefix already covers the
-  // full prompt so no suffix evaluation is needed (and no fresh logits are
-  // available to sample a first token).
-  PrefillResult PrefillPartial(const std::string &prompt, int sequence_id,
-                               int n_past_start);
+  // n_past_start.
+  virtual PrefillResult PrefillPartial(const std::string &prompt,
+                                       int sequence_id, int n_past_start);
 
   // Release KV cache slots for the given sequence_id.
-  void FreeSequence(int sequence_id);
+  virtual void FreeSequence(int sequence_id);
 
   // Serialize the KV cache state for sequence_id to a byte buffer.
-  // Returns an empty vector when the context is not loaded or serialization
-  // fails. Used for cross-process KV transfer (§2.5 disaggregated path).
   std::vector<uint8_t> SerializeSequence(int sequence_id);
 
   // Restore KV cache state for dest_sequence_id from a previously serialized
-  // buffer. Returns false when the context is not loaded, the buffer is empty,
-  // or restore fails.
+  // buffer.
   bool HydrateSequence(int dest_sequence_id, const std::vector<uint8_t> &blob);
 
-  // MoE detection helpers (§2.6).  Return 0 / false when the model is not
-  // loaded or the GGUF metadata key is absent (i.e., the model is not a MoE
-  // model).
   bool IsMoE() const;
   int ExpertCount() const;
   int ActiveExperts() const;
 
-  // Generate completion for `prompt`.  When `logprob_top_n > 0`, one
-  // TokenLogprob entry per generated token is appended to *out_logprobs
-  // (logprob_top_n alternatives are stored in TokenLogprob::top_logprobs).
-  // Pass nullptr to disable collection (default).
+  // Generate completion for `prompt`.
   virtual std::string
   Generate(const std::string &prompt, int max_tokens,
-           const std::function<bool(const std::string &)> &on_chunk = {},
+           const std::function<bool(const std::string &, const TokenLogprob *)>
+               &on_chunk = {},
            const std::function<bool()> &should_stop = {}, int logprob_top_n = 0,
            std::vector<TokenLogprob> *out_logprobs = nullptr,
            const std::vector<std::string> &stop_seqs = {});
 
-  // Vision-aware generation. Prompt must contain <__media__> markers matching
-  // images. Falls back to Generate() when vision is not ready or images is
-  // empty.
+  // Vision-aware generation.
   std::string GenerateWithImages(
       const std::string &prompt, const std::vector<DecodedImage> &images,
       int max_tokens,
-      const std::function<bool(const std::string &)> &on_chunk = {},
+      const std::function<bool(const std::string &, const TokenLogprob *)>
+          &on_chunk = {},
       const std::function<bool()> &should_stop = {},
       const std::vector<std::string> &stop_seqs = {});
 
   // Set up a unified sampler chain for grammar + sampling params.
-  // Must be called before Generate()/Decode(). TeardownSampler() is called
-  // automatically at the start (idempotent). Grammar string may be empty.
-  void SetupSampler(const std::string &grammar, const std::string &root,
-                    const SamplingParams &sp);
-  void TeardownSampler();
+  virtual void SetupSampler(const std::string &grammar, const std::string &root,
+                            const SamplingParams &sp);
+  virtual void TeardownSampler();
 
   // Backward-compat wrappers (grammar-only, default SamplingParams).
   void EnableGrammarConstraint(const std::string &grammar,
@@ -180,19 +174,12 @@ public:
   virtual bool IsReady() const { return context_ != nullptr || test_ready_; }
 
   // Returns the effective context size (in tokens) for the loaded model.
-  // Returns 0 when no model is loaded.
   int ContextSize() const {
     return context_ ? static_cast<int>(llama_n_ctx(context_)) : 0;
   }
 
-  // Flash Attention (§2.7): returns true when FA was requested in
-  // LlamaBackendConfig and the context was successfully created with
-  // LLAMA_FLASH_ATTN_TYPE_ENABLED.
   bool FlashAttentionEnabled() const { return config_.use_flash_attention; }
 
-  // GGML-native performance data captured after the last Generate()/Decode().
-  // Accumulated by the context's internal counters; reset after TakePerf() is
-  // called so values reflect exactly the most-recent call.
   struct PerfSnapshot {
     double prefill_ms{0};
     double decode_ms{0};
@@ -200,49 +187,36 @@ public:
     int32_t generated_tokens{0};
   };
 
-  // Returns and clears the perf data from the most recent Generate/Decode.
-  // Not thread-safe — call from the same thread that called Generate/Decode.
-  PerfSnapshot TakePerf();
+  virtual PerfSnapshot TakePerf();
 
-  // §2.3 — model-native chat template formatting.
-  // Format a sequence of {role, content} message pairs using the model's
-  // built-in chat template (read from GGUF metadata via
-  // llama_chat_apply_template). When add_assistant_prefix=true the returned
-  // string ends with the model-specific prefix tokens that start the assistant
-  // turn, which is what inference expects.  Returns {valid=false} when no model
-  // is loaded, the template is unsupported, or messages is empty.
   struct ChatTemplateResult {
     bool valid{false};
     std::string prompt;
   };
-  ChatTemplateResult FormatChatMessages(
+  virtual ChatTemplateResult FormatChatMessages(
       const std::vector<std::pair<std::string, std::string>> &messages,
       bool add_assistant_prefix = true);
 
   virtual int TokenCount(const std::string &text) const;
   void ForceReadyForTests() { test_ready_ = true; }
 
-  // Embeddings (§P1a): returns a MEAN-pooled embedding vector for text.
-  // Lazily initialises a separate llama_context sharing model_ weights (no
-  // second copy of weights in RAM). Returns an empty vector on error or when
-  // the model does not support embeddings.
   std::vector<float> Embed(const std::string &text);
   int EmbedDims() const;
 
-  // Returns the BPE token ID vector for `prompt` (with BOS prepended).
-  // Used by the scheduler's KV prefix store so that prefix matching is done
-  // in BPE-token space instead of via the SimpleTokenizer proxy, avoiding the
-  // boundary-mismatch that arises when the two tokenizers disagree on word
-  // splits.  Returns an empty vector when no model is loaded (null context).
-  std::vector<int> TokenizeForCache(const std::string &prompt) const;
+  virtual std::vector<int> TokenizeForCache(const std::string &prompt) const;
+
+  // Rank within the Tensor Parallel group.
+  int TPRank() const { return tp_rank_; }
+
+protected:
+  struct llama_sampler *active_sampler_{nullptr};
+  std::shared_ptr<EPDispatch> ep_dispatch_;
+  int tp_rank_{0};
 
 private:
   std::vector<int> Tokenize(const std::string &prompt, bool add_bos) const;
   std::string TokenToString(int token) const;
 
-  // Build a TokenLogprob from the current context_ logits for `token_id`.
-  // Computes log-softmax and optionally finds top-`top_n` alternatives.
-  // Must be called immediately after llama_decode() and before the next decode.
   TokenLogprob CollectLogprob(int token_id, const std::string &token_str,
                               int top_n) const;
 
@@ -252,7 +226,6 @@ private:
   int32_t n_vocab_{0};
   LlamaBackendConfig config_;
   bool test_ready_{false};
-  struct llama_sampler *active_sampler_{nullptr};
   PerfSnapshot last_perf_{};
   llama_context *embed_ctx_{nullptr};
   bool EnsureEmbedCtx();

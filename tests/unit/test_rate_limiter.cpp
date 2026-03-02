@@ -28,7 +28,7 @@ TEST_CASE("RateLimiter per-key isolation", "[ratelimit]") {
   inferflux::RateLimiter limiter(1);
 
   REQUIRE(limiter.Allow("user-a"));
-  REQUIRE(!limiter.Allow("user-a"));  // exhausted for user-a
+  REQUIRE(!limiter.Allow("user-a")); // exhausted for user-a
 
   // user-b has its own bucket.
   REQUIRE(limiter.Allow("user-b"));

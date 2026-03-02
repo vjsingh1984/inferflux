@@ -11,7 +11,7 @@ using json = nlohmann::json;
 
 namespace {
 
-std::string Base64UrlEncode(const std::string& input) {
+std::string Base64UrlEncode(const std::string &input) {
   static const char table[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   std::string out;
@@ -28,9 +28,11 @@ std::string Base64UrlEncode(const std::string& input) {
   if (valb > -6) {
     out.push_back(table[((val << 8) >> (valb + 8)) & 0x3F]);
   }
-  for (char& c : out) {
-    if (c == '+') c = '-';
-    if (c == '/') c = '_';
+  for (char &c : out) {
+    if (c == '+')
+      c = '-';
+    if (c == '/')
+      c = '_';
   }
   while (!out.empty() && out.back() == '=') {
     out.pop_back();
@@ -38,11 +40,13 @@ std::string Base64UrlEncode(const std::string& input) {
   return out;
 }
 
-std::string Base64UrlDecode(const std::string& input) {
+std::string Base64UrlDecode(const std::string &input) {
   std::string normalized = input;
-  for (char& c : normalized) {
-    if (c == '-') c = '+';
-    if (c == '_') c = '/';
+  for (char &c : normalized) {
+    if (c == '-')
+      c = '+';
+    if (c == '_')
+      c = '/';
   }
   while (normalized.size() % 4 != 0) {
     normalized.push_back('=');
@@ -50,11 +54,16 @@ std::string Base64UrlDecode(const std::string& input) {
   std::string output;
   output.reserve(normalized.size() * 3 / 4);
   auto decode_char = [](char c) -> int {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
+    if (c >= 'A' && c <= 'Z')
+      return c - 'A';
+    if (c >= 'a' && c <= 'z')
+      return c - 'a' + 26;
+    if (c >= '0' && c <= '9')
+      return c - '0' + 52;
+    if (c == '+')
+      return 62;
+    if (c == '/')
+      return 63;
     return -1;
   };
   for (std::size_t i = 0; i < normalized.size(); i += 4) {
@@ -77,7 +86,7 @@ std::string Base64UrlDecode(const std::string& input) {
   return output;
 }
 
-const std::string& TestJwksJson() {
+const std::string &TestJwksJson() {
   static std::string jwks = R"({
     "keys": [
       {
@@ -93,28 +102,30 @@ const std::string& TestJwksJson() {
   return jwks;
 }
 
-const std::string& TestSignatureB64() {
+const std::string &TestSignatureB64() {
   static std::string sig = Base64UrlEncode("signature-ok");
   return sig;
 }
 
-std::string MakeSignedJWT(const json& payload, const std::string& signature_b64 = TestSignatureB64()) {
+std::string
+MakeSignedJWT(const json &payload,
+              const std::string &signature_b64 = TestSignatureB64()) {
   json header = {{"alg", "RS256"}, {"kid", "test-key"}, {"typ", "JWT"}};
-  return Base64UrlEncode(header.dump()) + "." + Base64UrlEncode(payload.dump()) + "." + signature_b64;
+  return Base64UrlEncode(header.dump()) + "." +
+         Base64UrlEncode(payload.dump()) + "." + signature_b64;
 }
 
-void ConfigureValidator(inferflux::OIDCValidator* validator) {
+void ConfigureValidator(inferflux::OIDCValidator *validator) {
   validator->LoadJwksForTesting(TestJwksJson());
   validator->SetSignatureVerifierForTesting(
-      [](const std::string& header_payload,
-         const std::string& signature,
-         const inferflux::OIDCValidator::JwkKey& jwk) {
+      [](const std::string &header_payload, const std::string &signature,
+         const inferflux::OIDCValidator::JwkKey &jwk) {
         (void)header_payload;
         return jwk.kid == "test-key" && signature == TestSignatureB64();
       });
 }
 
-}  // namespace
+} // namespace
 
 TEST_CASE("OIDCValidator disabled without config", "[oidc]") {
   inferflux::OIDCValidator validator;
@@ -123,7 +134,8 @@ TEST_CASE("OIDCValidator disabled without config", "[oidc]") {
 }
 
 TEST_CASE("OIDCValidator validates issuer and audience", "[oidc]") {
-  inferflux::OIDCValidator validator("https://issuer.example.com", "my-audience");
+  inferflux::OIDCValidator validator("https://issuer.example.com",
+                                     "my-audience");
   ConfigureValidator(&validator);
 
   auto now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -231,4 +243,3 @@ TEST_CASE("OIDCValidator rejects malformed token", "[oidc]") {
   REQUIRE(!validator.Validate("not-a-jwt", nullptr));
   REQUIRE(!validator.Validate("only.one.dot", nullptr));
 }
-

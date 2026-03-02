@@ -128,3 +128,112 @@ TEST_CASE("InferenceResult finish_reason_length can be set to true",
   r.finish_reason_length = true;
   REQUIRE(r.finish_reason_length);
 }
+
+// ---------------------------------------------------------------------------
+// best_of: cumulative logprob ranking (pure algorithm tests)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("best_of cumulative logprob ranking selects highest-logprob result",
+          "[sampling]") {
+  using inferflux::InferenceResult;
+  using inferflux::TokenLogprob;
+
+  // Build three results with known cumulative log-probs: -1, -5, -2.
+  auto makeResult = [](float lp1, float lp2, const std::string &text) {
+    InferenceResult r;
+    r.completion = text;
+    TokenLogprob t1, t2;
+    t1.logprob = lp1;
+    t2.logprob = lp2;
+    r.logprobs = {t1, t2};
+    r.completion_tokens = 2;
+    return r;
+  };
+
+  std::vector<InferenceResult> results = {
+      makeResult(-0.5f, -0.5f, "best"),   // cumsum = -1.0
+      makeResult(-2.5f, -2.5f, "worst"),  // cumsum = -5.0
+      makeResult(-0.9f, -1.1f, "middle"), // cumsum = -2.0
+  };
+
+  // Apply the same ranking as the production code.
+  auto cumlogprob = [](const InferenceResult &r) -> double {
+    double s = 0.0;
+    for (const auto &tlp : r.logprobs)
+      s += static_cast<double>(tlp.logprob);
+    return s;
+  };
+  std::sort(results.begin(), results.end(),
+            [&](const InferenceResult &a, const InferenceResult &b) {
+              return cumlogprob(a) > cumlogprob(b);
+            });
+
+  REQUIRE(results[0].completion == "best");
+  REQUIRE(results[1].completion == "middle");
+  REQUIRE(results[2].completion == "worst");
+}
+
+TEST_CASE("best_of n=1 best_of=3 keeps only top result", "[sampling]") {
+  using inferflux::InferenceResult;
+  using inferflux::TokenLogprob;
+
+  auto makeResult = [](float lp, const std::string &text) {
+    InferenceResult r;
+    r.completion = text;
+    TokenLogprob t;
+    t.logprob = lp;
+    r.logprobs = {t};
+    r.completion_tokens = 1;
+    return r;
+  };
+
+  std::vector<InferenceResult> results = {
+      makeResult(-3.0f, "c"),
+      makeResult(-1.0f, "a"),
+      makeResult(-2.0f, "b"),
+  };
+
+  auto cumlogprob = [](const InferenceResult &r) -> double {
+    double s = 0.0;
+    for (const auto &tlp : r.logprobs)
+      s += static_cast<double>(tlp.logprob);
+    return s;
+  };
+  std::sort(results.begin(), results.end(),
+            [&](const InferenceResult &a, const InferenceResult &b) {
+              return cumlogprob(a) > cumlogprob(b);
+            });
+  results.resize(1);
+
+  REQUIRE(results.size() == 1u);
+  REQUIRE(results[0].completion == "a");
+}
+
+TEST_CASE("best_of with equal logprobs is stable (no crash)", "[sampling]") {
+  using inferflux::InferenceResult;
+  using inferflux::TokenLogprob;
+
+  std::vector<InferenceResult> results(3);
+  for (auto &r : results) {
+    TokenLogprob t;
+    t.logprob = -1.0f;
+    r.logprobs = {t};
+    r.completion_tokens = 1;
+  }
+  results[0].completion = "x";
+  results[1].completion = "y";
+  results[2].completion = "z";
+
+  auto cumlogprob = [](const InferenceResult &r) -> double {
+    double s = 0.0;
+    for (const auto &tlp : r.logprobs)
+      s += static_cast<double>(tlp.logprob);
+    return s;
+  };
+  REQUIRE_NOTHROW(
+      std::sort(results.begin(), results.end(),
+                [&](const InferenceResult &a, const InferenceResult &b) {
+                  return cumlogprob(a) > cumlogprob(b);
+                }));
+  REQUIRE(results.size() == 3u);
+}

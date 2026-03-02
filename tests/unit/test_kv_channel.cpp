@@ -35,18 +35,20 @@ TEST_CASE("KVChannel respects capacity", "[kv_channel]") {
   REQUIRE_FALSE(channel.Enqueue(another));
 }
 
-TEST_CASE("KVChannel is thread-safe for simple producers/consumers", "[kv_channel]") {
+TEST_CASE("KVChannel is thread-safe for simple producers/consumers",
+          "[kv_channel]") {
   inferflux::disaggregated::KVChannel channel(10);
   std::vector<std::thread> producers;
   for (int i = 0; i < 5; ++i) {
     producers.emplace_back([&channel, i]() {
       inferflux::disaggregated::KVPacket pkt;
       pkt.request_id = static_cast<uint64_t>(i);
-      pkt.prompt_tokens = {static_cast<uint8_t>(i), static_cast<uint8_t>(i + 1)};
+      pkt.prompt_tokens = {static_cast<uint8_t>(i),
+                           static_cast<uint8_t>(i + 1)};
       channel.Enqueue(std::move(pkt));
     });
   }
-  for (auto& t : producers) {
+  for (auto &t : producers) {
     t.join();
   }
   int seen = 0;

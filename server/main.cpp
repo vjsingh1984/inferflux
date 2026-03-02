@@ -5,10 +5,12 @@
 #include "runtime/backends/cpu/llama_backend.h"
 #include "runtime/disaggregated/kv_channel.h"
 #include "runtime/disaggregated/shm_kv_transport.h"
+#include "runtime/execution/parallel_context.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/prefix_cache/prefix_cache.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "runtime/speculative/speculative_decoder.h"
+#include "scheduler/model_registry.h"
 #include "scheduler/model_router.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/single_model_router.h"
@@ -120,6 +122,28 @@ int main(int argc, char **argv) {
     inferflux::log::SetJsonMode(s == "json" || s == "JSON");
   }
 
+  // §P1e: Initialize distributed parallel environment.
+  int dist_rank = 0;
+  int dist_world_size = 1;
+  std::string dist_backend = "stub";
+  if (const char *env_rank = std::getenv("INFERFLUX_RANK")) {
+    dist_rank = std::stoi(env_rank);
+  }
+  if (const char *env_ws = std::getenv("INFERFLUX_WORLD_SIZE")) {
+    dist_world_size = std::stoi(env_ws);
+  }
+  if (const char *env_be = std::getenv("INFERFLUX_DIST_BACKEND")) {
+    dist_backend = env_be;
+  }
+
+  if (dist_world_size > 1) {
+    inferflux::ParallelContext::Get().Initialize(dist_rank, dist_world_size,
+                                                 dist_backend);
+    std::cout << "[distributed] initialized rank=" << dist_rank
+              << " world_size=" << dist_world_size
+              << " backend=" << dist_backend << "\n";
+  }
+
   std::string config_path = "config/server.yaml";
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -168,6 +192,8 @@ int main(int argc, char **argv) {
   std::string default_model_override;
   std::string
       mmproj_path; // §2.2: path to multimodal projector (empty = disabled).
+  std::string registry_path; // CQ-8: hot-reload registry.yaml (empty = off)
+  int registry_poll_ms = 5000;
 
   struct ApiKeyEntry {
     std::string key;
@@ -211,6 +237,14 @@ int main(int argc, char **argv) {
             configured_models.push_back(mc);
           }
         }
+      }
+
+      // Registry config (CQ-8: hot-reload model registry)
+      if (config["registry"]) {
+        if (config["registry"]["path"])
+          registry_path = config["registry"]["path"].as<std::string>();
+        if (config["registry"]["poll_interval_ms"])
+          registry_poll_ms = config["registry"]["poll_interval_ms"].as<int>();
       }
 
       // Runtime config
@@ -376,6 +410,9 @@ int main(int argc, char **argv) {
 
   if (const char *env_model = std::getenv("INFERFLUX_MODEL_PATH")) {
     model_path = env_model;
+  }
+  if (const char *env_reg = std::getenv("INFERFLUX_REGISTRY_PATH")) {
+    registry_path = env_reg;
   }
   if (const char *env_mmproj = std::getenv("INFERFLUX_MMPROJ_PATH")) {
     mmproj_path = env_mmproj;
@@ -679,6 +716,17 @@ int main(int argc, char **argv) {
     backend_label = cuda_enabled ? "cuda" : (mps_layers > 0 ? "mps" : "cpu");
   }
 
+  // CQ-8: Start the hot-reload model registry (if configured).
+  std::unique_ptr<inferflux::ModelRegistry> model_registry;
+  if (!registry_path.empty()) {
+    model_registry = std::make_unique<inferflux::ModelRegistry>(router);
+    int n = model_registry->LoadAndWatch(registry_path, registry_poll_ms);
+    inferflux::log::Info(
+        "server", "Model registry loaded " + std::to_string(n) +
+                      " model(s) from " + registry_path +
+                      " (poll_ms=" + std::to_string(registry_poll_ms) + ")");
+  }
+
   // §2.2: Load multimodal projector if specified.
   if (llama_backend && !mmproj_path.empty()) {
     if (llama_backend->LoadMmproj(mmproj_path)) {
@@ -759,8 +807,17 @@ int main(int argc, char **argv) {
 
   // Build ModelRouter (SingleModelRouter is the default; future multi-model
   // routers can be substituted here without touching Scheduler or HttpServer).
-  auto prefix_cache =
-      std::make_shared<inferflux::RadixPrefixCache>(prefix_cache_capacity);
+  // The prefix cache needs a callback to free scheduler sequence slots on
+  // eviction. Using a pointer-to-scheduler to break the circular initialization
+  // dependency.
+  inferflux::Scheduler *sched_ptr = nullptr;
+  auto prefix_cache = std::make_shared<inferflux::RadixPrefixCache>(
+      cache,
+      [&sched_ptr](int seq_id) {
+        if (sched_ptr)
+          sched_ptr->FreeSeqSlot(seq_id);
+      },
+      prefix_cache_capacity);
   std::shared_ptr<inferflux::disaggregated::IKVTransport> kv_transport;
   if (kv_transport_type == "shm") {
     kv_transport = std::make_shared<inferflux::disaggregated::ShmKVTransport>(
@@ -780,6 +837,7 @@ int main(int argc, char **argv) {
   inferflux::Scheduler scheduler(tokenizer, device, cache, router,
                                  speculative_decoder, prefix_cache,
                                  fairness_config, disagg_config);
+  sched_ptr = &scheduler;
   auto &metrics = inferflux::GlobalMetrics();
   metrics.SetBackend(backend_label);
   inferflux::OIDCValidator oidc_validator(oidc_issuer, oidc_audience);
@@ -819,6 +877,19 @@ int main(int argc, char **argv) {
     } catch (...) {
     }
   }
+  if (inferflux::ParallelContext::Get().IsInitialized() &&
+      !inferflux::ParallelContext::Get().IsMaster()) {
+    std::cout << "[distributed] rank=" << dist_rank
+              << " entering shard worker mode\n";
+    while (g_running) {
+      // In a full implementation, shard workers wait for a broadcasted batch
+      // from the master rank and execute it.
+      // For this foundation, we just sleep.
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    return 0;
+  }
+
   inferflux::HttpServer server(
       host, port, &scheduler, auth, &metrics, &oidc_validator,
       rate_limit_per_minute > 0 ? &rate_limiter : nullptr,

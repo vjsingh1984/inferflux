@@ -1,0 +1,34 @@
+# InferFlux Model Registry — hot-reloaded without server restart.
+#
+# Add, remove, or change entries here; the server polls this file every
+# poll_interval_ms (default 5 s) and applies the diff automatically:
+#   • New entries  → model is loaded
+#   • Removed entries → model is unloaded (in-flight requests finish first)
+#
+# Fields:
+#   path     (required) Filesystem path to a .gguf file or safetensors dir.
+#   id       (optional) Model ID used in API requests. Auto-derived from
+#            filename stem if omitted.
+#   backend  (optional) "cpu" | "mps" | "cuda" | "mlx". Defaults to cpu.
+#
+# Enable in server.yaml:
+#   registry:
+#     path: config/registry.yaml
+#     poll_interval_ms: 5000
+#
+# Or via env var:   INFERFLUX_REGISTRY_PATH=config/registry.yaml
+
+models: []
+
+# Example entries (uncomment to use):
+#
+#  - id: llama3-8b
+#    path: models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
+#    backend: cpu
+#
+#  - id: mistral-7b
+#    path: models/Mistral-7B-Instruct-v0.2.Q4_K_M.gguf
+#    backend: mps
+#
+#  - path: /mnt/models/my-mlx-model/   # MLX directory load
+#    backend: mlx

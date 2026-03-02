@@ -376,3 +376,52 @@ TEST_CASE("MlxTokenizer resolves bos/eos from object in tokenizer_config",
 
   fs::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// Chat template tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("MlxTokenizer parses chat_template from tokenizer_config",
+          "[mlx_tokenizer]") {
+  const auto dir = fs::temp_directory_path() / "ifx_tok_chat_tmpl";
+  WriteMetaspaceTokenizer(dir);
+  {
+    nlohmann::json cfg;
+    cfg["bos_token"] = "<s>";
+    cfg["eos_token"] = "</s>";
+    cfg["chat_template"] = "{% for msg in messages %}{{ msg.role }}: {{ "
+                           "msg.content }}\n{% endfor %}";
+    std::ofstream f(dir / "tokenizer_config.json");
+    f << cfg.dump();
+    // f closed here (end of scope) so bytes are flushed before Load().
+  }
+
+  MlxTokenizer tok;
+  REQUIRE(tok.Load(dir));
+  REQUIRE(tok.HasChatTemplate());
+  REQUIRE(!tok.ChatTemplate().empty());
+  REQUIRE(tok.ChatTemplate().find("msg.role") != std::string::npos);
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer HasChatTemplate false when key absent",
+          "[mlx_tokenizer]") {
+  const auto dir = fs::temp_directory_path() / "ifx_tok_no_tmpl";
+  WriteMetaspaceTokenizer(dir);
+  {
+    // tokenizer_config.json without chat_template key.
+    nlohmann::json cfg;
+    cfg["bos_token"] = "<s>";
+    cfg["eos_token"] = "</s>";
+    std::ofstream f(dir / "tokenizer_config.json");
+    f << cfg.dump();
+  }
+
+  MlxTokenizer tok;
+  REQUIRE(tok.Load(dir));
+  REQUIRE_FALSE(tok.HasChatTemplate());
+  REQUIRE(tok.ChatTemplate().empty());
+
+  fs::remove_all(dir);
+}
