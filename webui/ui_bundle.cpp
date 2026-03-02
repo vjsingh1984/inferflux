@@ -25,10 +25,19 @@ const std::string &UiHtml() {
         </div>
       </header>
       <section class="split">
-        <div class="left">
+        <div class="card left">
           <label for="modelSelect">Models</label>
           <select id="modelSelect"></select>
-          <button onclick="refreshModels()">Refresh</button>
+          <div class="btn-row">
+            <button class="secondary" onclick="refreshModels()">Refresh</button>
+            <button class="secondary" onclick="setDefaultModel()">Set Default</button>
+            <button class="secondary" onclick="unloadModel()">Unload</button>
+          </div>
+          <label for="loadModelPath">Load Model (path)</label>
+          <input id="loadModelPath" placeholder="/models/llama3.gguf" />
+          <label for="loadModelBackend">Backend</label>
+          <input id="loadModelBackend" placeholder="cpu/cuda" />
+          <button onclick="loadModel()">Load Model</button>
           <label for="prompt">Prompt</label>
           <textarea id="prompt" rows="6">Hello, InferFlux!</textarea>
           <div class="btn-row">
@@ -36,13 +45,45 @@ const std::string &UiHtml() {
             <button onclick="sendChat()">Chat</button>
           </div>
         </div>
-        <div class="right">
+        <div class="card right">
           <label>Output</label>
           <pre id="output"></pre>
         </div>
       </section>
-      <section>
-        <h2>Chat History</h2>
+      <section class="card status-card">
+        <div class="status-header">
+          <div>
+            <h2>Status</h2>
+            <p id="statusText">Loading...</p>
+          </div>
+          <div class="btn-row">
+            <button class="secondary" onclick="refreshStatus()">Refresh</button>
+            <button class="secondary" onclick="exportHistory()">Export History</button>
+            <label class="file-btn">
+              Import<input type="file" id="importFile" onchange="importHistory(event)" />
+            </label>
+          </div>
+        </div>
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <h3>Queue Depth</h3>
+            <p id="metricQueue">--</p>
+          </div>
+          <div class="metric-card">
+            <h3>Requests Total</h3>
+            <p id="metricRequests">--</p>
+          </div>
+          <div class="metric-card">
+            <h3>Errors Total</h3>
+            <p id="metricErrors">--</p>
+          </div>
+        </div>
+      </section>
+      <section class="card">
+        <div class="history-header">
+          <h2>Chat History</h2>
+          <button class="secondary" onclick="clearHistory()">Clear History</button>
+        </div>
         <ul id="history"></ul>
       </section>
     </div>
@@ -63,7 +104,7 @@ body {
   color: #f8fafc;
 }
 .container {
-  max-width: 1000px;
+  max-width: 1100px;
   margin: 0 auto;
 }
 header {
@@ -78,21 +119,29 @@ header {
 }
 .api-key {
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
   gap: 8px;
-}
-.api-key input {
-  width: 240px;
+  min-width: 260px;
 }
 .split {
   display: flex;
   gap: 24px;
   flex-wrap: wrap;
 }
+.card {
+  background: #0b1224;
+  border-radius: 12px;
+  padding: 18px;
+  border: 1px solid #1e293b;
+  flex: 1;
+}
 .left,
 .right {
-  flex: 1;
-  min-width: 300px;
+  min-width: 320px;
+}
+.status-card .btn-row {
+  justify-content: flex-end;
+  flex-wrap: wrap;
 }
 textarea,
 input,
@@ -109,6 +158,7 @@ select {
 .btn-row {
   display: flex;
   gap: 12px;
+  flex-wrap: wrap;
 }
 button {
   border: none;
@@ -119,28 +169,81 @@ button {
   color: #0f172a;
   font-weight: 600;
 }
+button.secondary {
+  background: #1e293b;
+  color: #f8fafc;
+  border: 1px solid #334155;
+}
 pre {
   white-space: pre-wrap;
   background: #020617;
   border-radius: 8px;
   padding: 16px;
-  min-height: 200px;
+  min-height: 220px;
   border: 1px solid #1e293b;
+}
+.history-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 ul#history {
   list-style: none;
   padding: 0;
-  border: 1px solid #1e293b;
-  border-radius: 8px;
-  max-height: 240px;
+  margin: 12px 0 0;
+  max-height: 260px;
   overflow-y: auto;
 }
 ul#history li {
-  padding: 8px 12px;
+  padding: 10px 12px;
   border-bottom: 1px solid #1e293b;
 }
 ul#history li:last-child {
   border-bottom: none;
+}
+.file-btn {
+  position: relative;
+  overflow: hidden;
+  display: inline-flex;
+  align-items: center;
+  padding: 10px 16px;
+  border-radius: 6px;
+  background: #1e293b;
+  color: #f8fafc;
+  cursor: pointer;
+}
+.file-btn input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+.metrics-grid {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.metric-card {
+  flex: 1;
+  min-width: 160px;
+  background: #020617;
+  border-radius: 10px;
+  padding: 12px;
+  border: 1px solid #1e293b;
+}
+.metric-card h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: #94a3b8;
+}
+.metric-card p {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 600;
 }
 )CSS";
   return kCss;
@@ -149,6 +252,10 @@ ul#history li:last-child {
 const std::string &UiJs() {
   static const std::string kJs = R"JS(
 const apiKeyInput = document.getElementById("apiKey");
+const historyList = document.getElementById("history");
+const promptBox = document.getElementById("prompt");
+const modelSelect = document.getElementById("modelSelect");
+
 function headers() {
   const token =
     localStorage.getItem("inferflux_api_key") ||
@@ -159,26 +266,71 @@ function headers() {
 function saveApiKey() {
   localStorage.setItem("inferflux_api_key", apiKeyInput.value);
 }
+function saveHistory() {
+  localStorage.setItem("inferflux_history", historyList.innerHTML);
+}
+function restoreHistory() {
+  const saved = localStorage.getItem("inferflux_history");
+  if (saved) historyList.innerHTML = saved;
+}
+function clearHistory() {
+  historyList.innerHTML = "";
+  saveHistory();
+}
+function persistPrompt() {
+  localStorage.setItem("inferflux_prompt", promptBox.value);
+}
 async function refreshModels() {
-  const select = document.getElementById("modelSelect");
-  select.innerHTML = "";
+  modelSelect.innerHTML = "";
   try {
     const res = await fetch("/v1/models", { headers: headers() });
     const data = await res.json();
     data.data.forEach((model) => {
       const opt = document.createElement("option");
       opt.value = model.id;
-      opt.textContent = model.id;
-      select.appendChild(opt);
+      opt.textContent = `${model.id} ${model.ready ? '✅' : '⏳'}`;
+      modelSelect.appendChild(opt);
     });
+    const saved = localStorage.getItem("inferflux_model");
+    if (saved) modelSelect.value = saved;
   } catch (err) {
     document.getElementById("output").textContent =
       "Failed to load models: " + err;
   }
 }
+async function refreshStatus() {
+  try {
+    const health = await fetch("/healthz").then((r) => r.json());
+    const ready = await fetch("/readyz").then((r) => r.json());
+    document.getElementById("statusText").textContent =
+      `Health: ${health.status} | Ready: ${ready.status}`;
+  } catch (err) {
+    document.getElementById("statusText").textContent =
+      "Status error: " + err;
+  }
+  try {
+    const metrics = await fetch("/metrics").then((r) => r.text());
+    const queueMatch = metrics.match(/inferflux_scheduler_queue_depth\s+(\d+)/);
+    const reqMatch = metrics.match(/inferflux_requests_total\s+(\d+)/);
+    const errMatch = metrics.match(/inferflux_errors_total\s+(\d+)/);
+    document.getElementById("metricQueue").textContent =
+      queueMatch ? queueMatch[1] : "--";
+    document.getElementById("metricRequests").textContent =
+      reqMatch ? reqMatch[1] : "--";
+    document.getElementById("metricErrors").textContent =
+      errMatch ? errMatch[1] : "--";
+  } catch (err) {
+    document.getElementById("metricQueue").textContent = "--";
+    document.getElementById("metricRequests").textContent = "--";
+    document.getElementById("metricErrors").textContent = "--";
+  }
+}
+
 async function sendCompletion() {
-  const prompt = document.getElementById("prompt").value;
-  const model = document.getElementById("modelSelect").value;
+  const prompt = promptBox.value;
+  const model = modelSelect.value;
+  localStorage.setItem("inferflux_model", model);
+  persistPrompt();
   const res = await fetch("/v1/completions", {
     method: "POST",
     headers: headers(),
@@ -186,11 +338,14 @@ async function sendCompletion() {
   });
   const text = await res.text();
   document.getElementById("output").textContent = text;
+  appendHistory("completion", prompt, text);
 }
 async function sendChat() {
-  const prompt = document.getElementById("prompt").value;
-  const model = document.getElementById("modelSelect").value;
-  const history = document.getElementById("history");
+  const prompt = promptBox.value;
+  const model = modelSelect.value;
+  localStorage.setItem("inferflux_model", model);
+  persistPrompt();
+  appendHistory("user", prompt);
   const res = await fetch("/v1/chat/completions", {
     method: "POST",
     headers: headers(),
@@ -202,25 +357,103 @@ async function sendChat() {
   });
   const data = await res.json();
   const choice = data.choices?.[0]?.message?.content || JSON.stringify(data);
-  const liUser = document.createElement("li");
-  liUser.textContent = "User: " + prompt;
-  const liAssistant = document.createElement("li");
-  liAssistant.textContent = "Assistant: " + choice;
-  history.prepend(liAssistant);
-  history.prepend(liUser);
+  appendHistory("assistant", choice);
   document.getElementById("output").textContent = JSON.stringify(
     data,
     null,
     2
   );
 }
+function appendHistory(role, text, raw = "") {
+  const li = document.createElement("li");
+  li.textContent =
+    role === "assistant"
+      ? "Assistant: " + text
+      : role === "completion"
+      ? "Completion:\n" + raw
+      : "User: " + text;
+  historyList.prepend(li);
+  saveHistory();
+}
 window.addEventListener("DOMContentLoaded", () => {
-  const saved = localStorage.getItem("inferflux_api_key");
-  if (saved) {
-    apiKeyInput.value = saved;
-  }
+  const savedKey = localStorage.getItem("inferflux_api_key");
+  if (savedKey) apiKeyInput.value = savedKey;
+  const savedPrompt = localStorage.getItem("inferflux_prompt");
+  if (savedPrompt) promptBox.value = savedPrompt;
+  restoreHistory();
   refreshModels();
+  refreshStatus();
 });
+promptBox.addEventListener("change", persistPrompt);
+
+function exportHistory() {
+  const blob = new Blob([historyList.innerHTML], { type: "text/html" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "inferflux-history.html";
+  link.click();
+}
+
+function importHistory(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    historyList.innerHTML = e.target.result;
+    saveHistory();
+  };
+  reader.readAsText(file);
+}
+
+async function loadModel() {
+  const path = document.getElementById("loadModelPath").value.trim();
+  if (!path) return;
+  const backend = document.getElementById("loadModelBackend").value.trim();
+  const payload = { path };
+  if (backend) payload.backend = backend;
+  try {
+    const res = await fetch("/v1/admin/models", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify(payload),
+    });
+    document.getElementById("output").textContent = await res.text();
+    refreshModels();
+  } catch (err) {
+    document.getElementById("output").textContent = err;
+  }
+}
+
+async function unloadModel() {
+  const model = modelSelect.value;
+  if (!model) return;
+  try {
+    const res = await fetch("/v1/admin/models", {
+      method: "DELETE",
+      headers: headers(),
+      body: JSON.stringify({ id: model }),
+    });
+    document.getElementById("output").textContent = await res.text();
+    refreshModels();
+  } catch (err) {
+    document.getElementById("output").textContent = err;
+  }
+}
+
+async function setDefaultModel() {
+  const model = modelSelect.value;
+  if (!model) return;
+  try {
+    const res = await fetch("/v1/admin/models/default", {
+      method: "PUT",
+      headers: headers(),
+      body: JSON.stringify({ id: model }),
+    });
+    document.getElementById("output").textContent = await res.text();
+  } catch (err) {
+    document.getElementById("output").textContent = err;
+  }
+}
 )JS";
   return kJs;
 }

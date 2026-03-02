@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -59,6 +60,9 @@ std::filesystem::path DefaultConfigPath() {
   return InferfluxHome() / "config.yaml";
 }
 
+std::string SelectBestGguf(const std::vector<std::string> &files);
+std::filesystem::path ModelsDir();
+
 json BuildChatPayload(const std::vector<ChatMessage> &messages,
                       const std::string &model, int max_tokens, bool stream) {
   json j;
@@ -92,8 +96,10 @@ void PrintUsage() {
       << "      Download the best GGUF from HuggingFace Hub "
          "(~/.cache/inferflux/models/).\n"
       << "      Prints the local path on success.\n"
-      << "  inferctl quickstart <model-id> [--profile cpu-laptop]\n"
-      << "      Writes a starter config (~/.inferflux/config.yaml) and prints "
+      << "  inferctl quickstart <model-id> [--profile cpu-laptop] [--backend "
+         "cpu|mps|cuda|mlx]\n"
+      << "      Writes a starter config (~/.inferflux/config.yaml) with the "
+         "desired backend and prints "
          "next steps.\n"
       << "  inferctl serve [--config ~/.inferflux/config.yaml] [--no-ui]\n"
       << "      Launch inferfluxd using the specified config (defaults to "
@@ -114,8 +120,16 @@ void PrintUsage() {
          "NAME] [--default]\n"
          "                       | --unload ID | --set-default ID [--host ... "
          "--port ... --api-key KEY]\n"
+      << "  inferctl admin cache [--status] [--host ... --port ... --api-key "
+         "KEY]\n"
+      << "  inferctl admin cache --warm --tokens ID,ID,... --completion TEXT\n"
+         "                       [--completion-tokens N] [--host ... --port "
+         "... --api-key KEY]\n"
       << "  inferctl admin api-keys [--list | --add KEY --scopes read,admin | "
-         "--remove KEY]\n";
+         "--remove KEY]\n"
+      << "  inferctl models [--host 127.0.0.1] [--port 8080] [--api-key KEY]\n"
+         "      List loaded models (calls GET /v1/models; requires 'read' "
+         "scope).\n";
 }
 
 bool ProcessStreamChunks(std::string &buffer, std::string *accumulated) {
@@ -230,32 +244,91 @@ void InteractiveChat(const std::string &host, int port,
   }
 }
 
-int CmdQuickstart(const std::string &model_id, const std::string &profile) {
+bool ResolveBestGguf(inferflux::HttpClient &client, const std::string &repo,
+                     std::string *selected_out) {
+  if (repo.find('/') == std::string::npos) {
+    std::cerr << "Repository must be in owner/model-name format (e.g. "
+                 "TheBloke/Llama-2-7B-GGUF)\n";
+    return false;
+  }
+  std::string api_url = "https://huggingface.co/api/models/" + repo;
+  std::cerr << "Fetching model info for " << repo << "...\n";
+  auto resp = client.Get(api_url, {{"Accept", "application/json"}});
+  if (resp.status != 200) {
+    std::cerr << "HuggingFace API error " << resp.status << " for " << repo
+              << "\n";
+    return false;
+  }
+  std::vector<std::string> gguf_files;
+  try {
+    auto j = json::parse(resp.body);
+    if (j.contains("siblings") && j["siblings"].is_array()) {
+      for (const auto &s : j["siblings"]) {
+        if (!s.contains("rfilename"))
+          continue;
+        std::string fname = s["rfilename"].get<std::string>();
+        std::string lower = fname;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.find(".gguf") != std::string::npos) {
+          gguf_files.push_back(fname);
+        }
+      }
+    }
+  } catch (const json::exception &e) {
+    std::cerr << "Failed to parse HuggingFace API response: " << e.what()
+              << "\n";
+    return false;
+  }
+  if (gguf_files.empty()) {
+    std::cerr << "No GGUF files found in " << repo << "\n";
+    return false;
+  }
+  *selected_out = SelectBestGguf(gguf_files);
+  std::cerr << "Selected: " << *selected_out << "\n";
+  return true;
+}
+
+int CmdQuickstart(const std::string &repo, const std::string &profile,
+                  const std::string &backend_hint) {
+  inferflux::HttpClient client;
+  std::string selected;
+  if (!ResolveBestGguf(client, repo, &selected)) {
+    return 1;
+  }
   namespace fs = std::filesystem;
   fs::path base_dir = InferfluxHome();
   fs::create_directories(base_dir);
   fs::path config_path = base_dir / "config.yaml";
-  auto model_dir = base_dir / "models";
+  fs::path model_dir = ModelsDir() / repo;
   fs::create_directories(model_dir);
+  fs::path model_path = model_dir / selected;
+
   std::ofstream cfg(config_path);
   if (!cfg) {
     std::cerr << "Failed to write config at " << config_path << std::endl;
     return 1;
   }
+  std::string model_id = repo;
+  std::replace(model_id.begin(), model_id.end(), '/', '_');
+  std::string backend = backend_hint.empty() ? "cpu" : backend_hint;
+  std::transform(backend.begin(), backend.end(), backend.begin(), ::tolower);
   cfg << "# InferFlux quickstart config (profile: " << profile << ")\n"
       << "server:\n"
       << "  host: 0.0.0.0\n"
       << "  http_port: 8080\n"
       << "auth:\n"
       << "  api_keys:\n"
-      << "    - dev-key-123\n"
-      << "runtime:\n"
-      << "  model:\n"
-      << "    path: \"" << (model_dir / model_id).string() << "\"\n";
+      << "    - key: dev-key-123\n"
+      << "      scopes: [generate, read, admin]\n"
+      << "models:\n"
+      << "  - id: " << model_id << "\n"
+      << "    path: \"" << model_path.string() << "\"\n"
+      << "    backend: " << backend << "\n"
+      << "    default: true\n";
   cfg.close();
   std::cout << "Wrote config to " << config_path << "\n";
   std::cout << "Next steps:\n"
-            << "  1. inferctl pull " << model_id << "\n"
+            << "  1. inferctl pull " << repo << "\n"
             << "  2. inferctl serve --config " << config_path << "\n";
   return 0;
 }
@@ -282,14 +355,7 @@ int CmdServe(const std::string &config_path, bool enable_ui) {
 
 // ---- inferctl pull helpers ----
 
-std::string GetCacheDir() {
-  const char *xdg = std::getenv("XDG_CACHE_HOME");
-  if (xdg && xdg[0] != '\0') {
-    return std::string(xdg) + "/inferflux/models";
-  }
-  const char *home = std::getenv("HOME");
-  return std::string(home ? home : "/tmp") + "/.cache/inferflux/models";
-}
+std::filesystem::path ModelsDir() { return InferfluxHome() / "models"; }
 
 // Prefer quantization quality order: Q4_K_M > Q4_K_S > Q4_K > Q4_0 > Q4 >
 // Q5_K_M > Q5 > Q8 > any .gguf
@@ -500,60 +566,17 @@ int DownloadToFile(inferflux::HttpClient &client, const std::string &url,
 }
 
 int CmdPull(const std::string &repo) {
-  if (repo.find('/') == std::string::npos) {
-    std::cerr << "Repository must be in owner/model-name format (e.g. "
-                 "TheBloke/Llama-2-7B-GGUF)\n";
-    return 1;
-  }
-
   inferflux::HttpClient client;
-
-  // Step 1: Fetch repository metadata from HuggingFace Hub API.
-  std::string api_url = "https://huggingface.co/api/models/" + repo;
-  std::cerr << "Fetching model info for " << repo << "...\n";
-  auto resp = client.Get(api_url, {{"Accept", "application/json"}});
-  if (resp.status != 200) {
-    std::cerr << "HuggingFace API error " << resp.status << " for " << repo
-              << "\n";
+  std::string selected;
+  if (!ResolveBestGguf(client, repo, &selected)) {
     return 1;
   }
-
-  // Step 2: Parse siblings to collect GGUF filenames.
-  std::vector<std::string> gguf_files;
-  try {
-    auto j = json::parse(resp.body);
-    if (j.contains("siblings") && j["siblings"].is_array()) {
-      for (const auto &s : j["siblings"]) {
-        if (!s.contains("rfilename"))
-          continue;
-        std::string fname = s["rfilename"].get<std::string>();
-        std::string lower = fname;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-        if (lower.find(".gguf") != std::string::npos) {
-          gguf_files.push_back(fname);
-        }
-      }
-    }
-  } catch (const json::exception &e) {
-    std::cerr << "Failed to parse HuggingFace API response: " << e.what()
-              << "\n";
-    return 1;
-  }
-
-  if (gguf_files.empty()) {
-    std::cerr << "No GGUF files found in " << repo << "\n";
-    return 1;
-  }
-
-  // Step 3: Select the best-quantised file.
-  std::string selected = SelectBestGguf(gguf_files);
-  std::cerr << "Selected: " << selected << "\n";
 
   // Step 4: Resolve destination path.
-  std::string cache_dir = GetCacheDir();
-  std::string dest_dir = cache_dir + "/" + repo;
+  auto cache_dir = ModelsDir();
+  std::filesystem::path dest_dir = cache_dir / repo;
   std::filesystem::create_directories(dest_dir);
-  std::string dest_path = dest_dir + "/" + selected;
+  std::filesystem::path dest_path = dest_dir / selected;
 
   if (std::filesystem::exists(dest_path)) {
     std::cerr << "Already cached: " << dest_path << "\n";
@@ -568,7 +591,7 @@ int CmdPull(const std::string &repo) {
       "https://huggingface.co/" + repo + "/resolve/main/" + selected;
   std::cerr << "Downloading " << selected << "...\n";
 
-  int rc = DownloadToFile(client, download_url, dest_path);
+  int rc = DownloadToFile(client, download_url, dest_path.string());
   if (rc != 0)
     return rc;
 
@@ -595,6 +618,7 @@ int main(int argc, char **argv) {
   bool interactive_mode = false;
   std::vector<ChatMessage> chat_messages;
   std::string quickstart_profile = "default";
+  std::string quickstart_backend = "cpu";
   std::string serve_config_override;
   bool serve_no_ui = false;
   if (const char *env_key = std::getenv("INFERCTL_API_KEY")) {
@@ -622,6 +646,8 @@ int main(int argc, char **argv) {
       interactive_mode = true;
     } else if (arg == "--profile" && i + 1 < argc) {
       quickstart_profile = argv[++i];
+    } else if (arg == "--backend" && i + 1 < argc) {
+      quickstart_backend = argv[++i];
     } else if (arg == "--config" && i + 1 < argc) {
       serve_config_override = argv[++i];
     } else if (arg == "--no-ui") {
@@ -654,11 +680,11 @@ int main(int argc, char **argv) {
   }
   if (command == "quickstart") {
     if (argc < 3) {
-      std::cerr
-          << "Usage: inferctl quickstart <model-id> [--profile cpu-laptop]\n";
+      std::cerr << "Usage: inferctl quickstart <model-id> [--profile "
+                   "cpu-laptop] [--backend cpu|mps|cuda|mlx]\n";
       return 1;
     }
-    return CmdQuickstart(argv[2], quickstart_profile);
+    return CmdQuickstart(argv[2], quickstart_profile, quickstart_backend);
   }
   if (command == "serve") {
     return CmdServe(serve_config_override.empty() ? DefaultConfigPath().string()
@@ -807,6 +833,54 @@ int main(int argc, char **argv) {
         PrintUsage();
         return 1;
       }
+      if (target == "cache") {
+        bool do_warm = false;
+        std::string warm_tokens_str;
+        std::string warm_completion;
+        int warm_completion_tokens = 0;
+        for (int i = 3; i < argc; ++i) {
+          std::string arg = argv[i];
+          if (arg == "--warm") {
+            do_warm = true;
+          } else if (arg == "--tokens" && i + 1 < argc) {
+            warm_tokens_str = argv[++i];
+          } else if (arg == "--completion" && i + 1 < argc) {
+            warm_completion = argv[++i];
+          } else if (arg == "--completion-tokens" && i + 1 < argc) {
+            warm_completion_tokens = std::stoi(argv[++i]);
+          }
+        }
+        if (do_warm) {
+          if (warm_tokens_str.empty() || warm_completion.empty()) {
+            std::cerr << "Usage: inferctl admin cache --warm "
+                         "--tokens ID,... --completion TEXT\n";
+            return 1;
+          }
+          json tokens_arr = json::array();
+          std::stringstream tok_ss(warm_tokens_str);
+          std::string tok;
+          while (std::getline(tok_ss, tok, ',')) {
+            try {
+              tokens_arr.push_back(std::stoi(Trim(tok)));
+            } catch (...) {
+              std::cerr << "Invalid token id: " << tok << "\n";
+              return 1;
+            }
+          }
+          json body_j{{"tokens", tokens_arr},
+                      {"completion", warm_completion},
+                      {"completion_tokens", warm_completion_tokens}};
+          auto resp = client.Post(BuildUrl(host, port, "/v1/admin/cache/warm"),
+                                  body_j.dump(), headers);
+          std::cout << resp.body << std::endl;
+          return 0;
+        }
+        // Default: status
+        auto resp =
+            client.Get(BuildUrl(host, port, "/v1/admin/cache"), headers);
+        std::cout << resp.body << std::endl;
+        return 0;
+      }
       if (target == "api-keys" || target == "api-key") {
         bool list = false, remove = false, add = false;
         std::string new_key, scopes_csv;
@@ -860,6 +934,41 @@ int main(int argc, char **argv) {
     if (command == "status") {
       auto resp = client.Get(BuildUrl(host, port, "/healthz"), headers);
       std::cout << resp.body << std::endl;
+      return 0;
+    }
+    if (command == "models") {
+      auto resp = client.Get(BuildUrl(host, port, "/v1/models"), headers);
+      if (resp.status == 401 || resp.status == 403) {
+        std::cerr << "inferctl models: authentication required (set --api-key "
+                     "or INFERCTL_API_KEY)\n";
+        return 1;
+      }
+      try {
+        auto j = json::parse(resp.body);
+        if (!j.contains("data") || !j["data"].is_array()) {
+          std::cout << resp.body << std::endl;
+          return 0;
+        }
+        const auto &data = j["data"];
+        if (data.empty()) {
+          std::cout << "(no models loaded)\n";
+          return 0;
+        }
+        // Print a simple table: ID | owned_by | created
+        std::cout << std::left << std::setw(36) << "ID" << std::setw(20)
+                  << "OWNED-BY"
+                  << "CREATED\n";
+        std::cout << std::string(70, '-') << "\n";
+        for (const auto &m : data) {
+          std::string id = m.value("id", "");
+          std::string owned_by = m.value("owned_by", "");
+          int64_t created = m.value("created", int64_t{0});
+          std::cout << std::left << std::setw(36) << id << std::setw(20)
+                    << owned_by << created << "\n";
+        }
+      } catch (const json::exception &) {
+        std::cout << resp.body << std::endl;
+      }
       return 0;
     }
     if (command == "completion") {
