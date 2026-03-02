@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
 project(InferFlux VERSION 0.1.0 LANGUAGES CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -14,6 +16,11 @@ option(ENABLE_MPS "Enable Metal/MPS runtime" ON)
 option(ENABLE_BLAS "Enable BLAS acceleration" ON)
 option(ENABLE_VULKAN "Enable Vulkan GPU backend via llama.cpp" ON)
 option(ENABLE_WEBUI "Enable embedded WebUI (litehtml-based) support" OFF)
+option(ENABLE_MLX "Enable experimental MLX backend" OFF)
+# MLX_C_TAG: mlx-c release to fetch when MLX_C_ROOT is not provided.
+# Bump this together with the `pip install mlx==X.Y.Z` version in the README.
+set(MLX_C_TAG "v0.5.0" CACHE STRING "mlx-c git tag to use when building from source")
+
 option(ENABLE_CPU "Enable CPU runtime" ON)
 option(ENABLE_MTMD "Enable multimodal (vision) support via libmtmd" OFF)
 
@@ -40,8 +47,6 @@ add_library(inferflux_core
   runtime/prefix_cache/prefix_cache.h
   runtime/prefix_cache/radix_prefix_cache.cpp
   runtime/prefix_cache/radix_prefix_cache.h
-  model/gguf/gguf_loader.cpp
-  model/gguf/gguf_loader.h
   model/tokenizer/simple_tokenizer.cpp
   model/tokenizer/simple_tokenizer.h
   scheduler/scheduler.cpp
@@ -61,6 +66,8 @@ add_library(inferflux_core
   server/auth/oidc_validator.h
   server/logging/audit_logger.cpp
   server/logging/audit_logger.h
+  server/logging/logger.cpp
+  server/logging/logger.h
   server/policy/guardrail.cpp
   server/policy/guardrail.h
   policy/policy_store.cpp
@@ -77,6 +84,10 @@ add_library(inferflux_core
   runtime/disaggregated/shm_kv_transport.h
   runtime/multimodal/image_preprocessor.cpp
   runtime/multimodal/image_preprocessor.h
+  runtime/backends/mlx/mlx_backend.cpp
+  runtime/backends/mlx/mlx_loader.cpp
+  runtime/backends/mlx/mlx_execution.cpp
+  runtime/backends/mlx/mlx_tokenizer.cpp
   external/llama.cpp/common/json-schema-to-grammar.cpp
   io/async_file_writer.cpp
   io/async_file_writer.h
@@ -157,6 +168,59 @@ else()
   target_compile_definitions(inferflux_core PUBLIC INFERFLUX_ENABLE_WEBUI=0)
 endif()
 
+if(ENABLE_MLX)
+  message(STATUS "ENABLE_MLX=ON — configuring mlx-c dependency")
+  set(MLX_C_HINTS $ENV{MLX_C_ROOT} ${MLX_C_ROOT})
+  if(MLX_C_HINTS)
+    # Fast path: user supplied a pre-built mlx-c installation.
+    find_path(MLX_C_INCLUDE_DIR mlx/c/mlx.h HINTS ${MLX_C_HINTS} PATH_SUFFIXES include)
+    find_library(MLX_C_LIBRARY NAMES mlxc mlx HINTS ${MLX_C_HINTS} PATH_SUFFIXES lib)
+  else()
+    # Slow path: fetch mlx-c from GitHub at the pinned tag and build it.
+    # Requires `pip install mlx==${MLX_C_TAG compatible version}` first.
+    message(STATUS "MLX_C_ROOT not set — fetching mlx-c ${MLX_C_TAG} via FetchContent")
+    include(FetchContent)
+    FetchContent_Declare(
+      mlxc
+      GIT_REPOSITORY https://github.com/ml-explore/mlx-c.git
+      GIT_TAG        ${MLX_C_TAG}
+      GIT_SHALLOW    TRUE
+    )
+    set(MLX_C_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(MLX_C_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(mlxc)
+    # FetchContent builds the 'mlxc' target; expose its include + lib paths.
+    set(MLX_C_INCLUDE_DIR ${mlxc_SOURCE_DIR})
+    set(MLX_C_LIBRARY mlxc)
+  endif()
+  if(MLX_C_INCLUDE_DIR AND MLX_C_LIBRARY)
+    message(STATUS "mlx-c include dir: ${MLX_C_INCLUDE_DIR}")
+    target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_MLX=1)
+    target_include_directories(inferflux_core PUBLIC ${MLX_C_INCLUDE_DIR})
+    target_link_libraries(inferflux_core PUBLIC ${MLX_C_LIBRARY})
+    # Record the directory of mlxc so ctest can set DYLD_LIBRARY_PATH / LD_LIBRARY_PATH.
+    get_filename_component(MLX_C_LIB_DIR "${MLX_C_LIBRARY}" DIRECTORY)
+    set(MLX_C_LIB_DIR "${MLX_C_LIB_DIR}" CACHE INTERNAL "")
+    # Also find the MLX C++ library for rpath embedding.
+    find_library(MLX_LIBRARY NAMES mlx
+                 HINTS ${MLX_C_HINTS} $ENV{MLX_ROOT}
+                 PATHS /opt/anaconda3/lib/python3.13/site-packages/mlx
+                       /opt/homebrew/lib
+                 PATH_SUFFIXES lib ../lib)
+    if(MLX_LIBRARY)
+      get_filename_component(MLX_LIB_DIR "${MLX_LIBRARY}" DIRECTORY)
+      set_target_properties(inferflux_core PROPERTIES
+        BUILD_RPATH   "${MLX_C_LIB_DIR};${MLX_LIB_DIR}"
+        INSTALL_RPATH "${MLX_C_LIB_DIR};${MLX_LIB_DIR}")
+    endif()
+  else()
+    message(WARNING "ENABLE_MLX=ON but mlx-c headers/libraries not found. Disabling MLX backend.")
+    target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_MLX=0)
+  endif()
+else()
+  target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_MLX=0)
+endif()
+
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
@@ -222,6 +286,16 @@ target_link_libraries(inferfluxd PRIVATE inferflux_core)
 add_executable(inferctl cli/main.cpp)
 target_link_libraries(inferctl PRIVATE inferflux_core)
 
+install(TARGETS inferfluxd inferctl
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+install(FILES README.md docs/Quickstart.md docs/Troubleshooting.md
+        DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
+install(FILES config/server.yaml
+        DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/inferflux
+        RENAME inferflux.yaml)
+
 enable_testing()
 add_executable(inferflux_tests
   tests/unit/test_tokenizer.cpp
@@ -243,6 +317,12 @@ add_executable(inferflux_tests
   tests/unit/test_flash_attn.cpp
   tests/unit/test_shm_transport.cpp
   tests/unit/test_chat_template.cpp
+  tests/unit/test_sampling.cpp
+  tests/unit/test_logger.cpp
+  tests/unit/test_structured_output.cpp
+  tests/unit/test_mlx_loader.cpp
+  tests/unit/test_mlx_tokenizer.cpp
+  tests/unit/test_mlx_execution.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -258,6 +338,46 @@ add_test(NAME ShmTransportTests COMMAND inferflux_tests "[shm_transport]")
 set_tests_properties(ShmTransportTests PROPERTIES LABELS shm_transport)
 add_test(NAME ChatTemplateTests COMMAND inferflux_tests "[chat_template]")
 set_tests_properties(ChatTemplateTests PROPERTIES LABELS chat_template)
+add_test(NAME SamplingTests COMMAND inferflux_tests "[sampling]")
+set_tests_properties(SamplingTests PROPERTIES LABELS sampling)
+add_test(NAME LoggerTests COMMAND inferflux_tests "[logger]")
+set_tests_properties(LoggerTests PROPERTIES LABELS logger)
+add_test(NAME StructuredTests COMMAND inferflux_tests "[structured]")
+set_tests_properties(StructuredTests PROPERTIES LABELS structured)
+add_test(NAME MlxLoaderTests COMMAND inferflux_tests "[mlx_loader]")
+set_tests_properties(MlxLoaderTests PROPERTIES LABELS mlx_loader)
+if(MLX_C_LIB_DIR)
+  # Provide the mlx-c and MLX dylib locations to the test runner on macOS.
+  set_tests_properties(MlxLoaderTests PROPERTIES
+    ENVIRONMENT "DYLD_LIBRARY_PATH=${MLX_C_LIB_DIR}:$ENV{DYLD_LIBRARY_PATH}")
+endif()
+add_test(NAME MlxTokenizerTests COMMAND inferflux_tests "[mlx_tokenizer]")
+set_tests_properties(MlxTokenizerTests PROPERTIES LABELS mlx_tokenizer)
+add_test(NAME MlxExecutionTests COMMAND inferflux_tests "[mlx_execution]")
+set_tests_properties(MlxExecutionTests PROPERTIES LABELS mlx_execution)
+if(MLX_C_LIB_DIR)
+  set_tests_properties(MlxExecutionTests PROPERTIES
+    ENVIRONMENT "DYLD_LIBRARY_PATH=${MLX_C_LIB_DIR}:$ENV{DYLD_LIBRARY_PATH}")
+endif()
+
+set(CPACK_PACKAGE_NAME "inferflux")
+set(CPACK_PACKAGE_VENDOR "Inferencial Labs")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "InferFlux inference server and CLI")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGE_CONTACT "support@inferencial.ai")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+set(CPACK_PACKAGE_FILE_NAME
+    "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+set(CPACK_STRIP_FILES TRUE)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "libssl3, libyaml-cpp0.7")
+set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
+set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
+set(CPACK_RPM_PACKAGE_REQUIRES "openssl, yaml-cpp")
+set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
+    "${CMAKE_INSTALL_SYSCONFDIR}/inferflux")
+set(CPACK_GENERATOR "TGZ")
+include(CPack)
 
 # ---------------------------------------------------------------------------
 # SBOM — generate CycloneDX / SPDX bill-of-materials after every build.

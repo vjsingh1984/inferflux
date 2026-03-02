@@ -1,4 +1,5 @@
 build/
+build_*/
 *.log
 .DS_Store
 models/
@@ -7,3 +8,10 @@ server.log
 *.gguf
 .env.local
 config/policy_store.conf
+blogs/
+
+# MLX external dependencies — fetched by CMake FetchContent or cloned manually;
+# never committed to the repo.
+external/mlx/
+external/mlx-c/
+external/mlx-lm/
