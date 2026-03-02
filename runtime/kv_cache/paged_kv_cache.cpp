@@ -25,6 +25,7 @@ int PagedKVCache::ReservePage() {
   auto &page = pages_[candidate];
   page.last_used = usage_counter_++;
   page.in_use = true;
+  page.ref_count = 1; // Initial reference (§P1b)
   page.dirty = false;
   if (page.data.size() != page_size_bytes_ / sizeof(float)) {
     page.data.assign(page_size_bytes_ / sizeof(float), 0.0f);
