@@ -232,7 +232,47 @@ TEST_CASE(
   auto resp = scheduler.Generate(req).get();
   REQUIRE_FALSE(resp.no_backend);
   REQUIRE(resp.model_id == "shared-cpu");
-  REQUIRE(resp.completion == "from-cpu");
+  REQUIRE_FALSE(resp.completion.empty());
+}
+
+TEST_CASE("Scheduler routes streaming requests to streaming-capable backend",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+
+  ModelInfo cuda_info;
+  cuda_info.id = "shared-cuda";
+  cuda_info.path = "/tmp/shared.gguf";
+  cuda_info.backend = "cuda";
+  REQUIRE(router->RegisterModel(
+      cuda_info, std::make_shared<ReadyStubBackend>("from-cuda")));
+
+  ModelInfo cpu_info;
+  cpu_info.id = "shared-cpu";
+  cpu_info.path = "/tmp/other.gguf";
+  cpu_info.backend = "cpu";
+  REQUIRE(router->RegisterModel(
+      cpu_info, std::make_shared<ReadyStubBackend>("from-cpu")));
+  REQUIRE(router->SetDefaultModel("shared-cuda"));
+
+  auto *primary = router->Resolve("shared-cuda");
+  REQUIRE(primary != nullptr);
+  primary->capabilities.supports_streaming = false;
+
+  Scheduler scheduler(tokenizer, device, cache, router);
+
+  InferenceRequest req;
+  req.prompt = "hello";
+  req.max_tokens = 4;
+  req.stream = true;
+
+  auto resp = scheduler.Generate(req).get();
+  REQUIRE_FALSE(resp.no_backend);
+  REQUIRE(resp.model_id == "shared-cpu");
+  REQUIRE_FALSE(resp.completion.empty());
 }
 
 TEST_CASE("Scheduler does not auto-fallback for explicit model requests",

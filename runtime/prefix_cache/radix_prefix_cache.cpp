@@ -152,6 +152,7 @@ void RadixPrefixCache::Insert(const std::vector<int> &tokens,
 
   RadixNode *node = root_.get();
   std::size_t offset = 0;
+  std::size_t node_start_offset = 0;
   const int kTokensPerBlock = 16;
 
   while (offset < tokens.size()) {
@@ -197,6 +198,7 @@ void RadixPrefixCache::Insert(const std::vector<int> &tokens,
       child = node->children[first].get();
     }
 
+    node_start_offset = offset;
     offset += common;
     node = child;
   }
@@ -204,11 +206,20 @@ void RadixPrefixCache::Insert(const std::vector<int> &tokens,
   if (node->sequence_id < 0 && sequence_id >= 0)
     live_sequences_++;
 
-  // Correctness Fix (§ Item 2): update the block_table and release the old one!
+  // Update the block table for this node only (prefix blocks are owned by
+  // ancestor nodes and are concatenated during lookup).
+  std::vector<int> node_blocks;
+  std::size_t block_offset = node_start_offset / kTokensPerBlock;
+  if (block_offset < block_table.size()) {
+    node_blocks.assign(block_table.begin() +
+                           static_cast<std::ptrdiff_t>(block_offset),
+                       block_table.end());
+  }
+
   if (kv_cache_ && !node->block_table.empty()) {
     kv_cache_->ReleaseBlocksRef(node->block_table);
   }
-  node->block_table = block_table;
+  node->block_table = std::move(node_blocks);
 
   node->sequence_id = sequence_id;
   node->backend = backend;

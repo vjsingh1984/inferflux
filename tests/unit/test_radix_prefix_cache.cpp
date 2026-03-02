@@ -74,6 +74,35 @@ TEST_CASE("RadixPrefixCache: deep radix tree with progressive prefixes",
   REQUIRE(out_seq == 2);
 }
 
+TEST_CASE("RadixPrefixCache: reinserting existing node keeps suffix blocks only",
+          "[radix_cache]") {
+  RadixPrefixCache cache(nullptr, [](int) {}, 64, 12);
+
+  std::vector<int> prefix_tokens;
+  std::vector<int> full_tokens;
+  for (int i = 1; i <= 16; ++i) {
+    prefix_tokens.push_back(i);
+    full_tokens.push_back(i);
+  }
+  for (int i = 17; i <= 32; ++i) {
+    full_tokens.push_back(i);
+  }
+
+  cache.Insert(prefix_tokens, {100}, 1, nullptr);
+  cache.Insert(full_tokens, {100, 200}, 2, nullptr);
+  cache.Insert(full_tokens, {100, 201}, 3, nullptr);
+
+  std::vector<int> out;
+  int out_seq = -1;
+  int matched = 0;
+  bool hit = cache.Lookup(full_tokens, nullptr, &out, &out_seq, &matched);
+
+  REQUIRE(hit);
+  REQUIRE(matched == 32);
+  REQUIRE(out == std::vector<int>{100, 201});
+  REQUIRE(out_seq == 3);
+}
+
 TEST_CASE("RadixPrefixCache: sequence slot capping and eviction",
           "[radix_cache]") {
   int evicted_seq = -1;

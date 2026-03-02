@@ -15,3 +15,7 @@ blogs/
 external/mlx/
 external/mlx-c/
 external/mlx-lm/
+
+# Python test/runtime cache artifacts.
+__pycache__/
+*.pyc

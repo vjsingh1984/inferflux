@@ -128,6 +128,39 @@ TEST_CASE("SelectModelForRequest falls back for default routing when primary "
   REQUIRE(selection.backend != nullptr);
 }
 
+TEST_CASE("SelectModelForRequest default fallback can switch model paths",
+          "[model_selection]") {
+  StubRouter router;
+
+  ModelInfo primary;
+  primary.id = "default-cuda";
+  primary.path = "/models/default.gguf";
+  primary.backend = "cuda";
+  primary.capabilities.supports_logprobs = false;
+  router.AddModel(primary, ReadyBackend());
+
+  ModelInfo fallback;
+  fallback.id = "json-cpu";
+  fallback.path = "/models/json.gguf";
+  fallback.backend = "cpu";
+  fallback.capabilities.supports_logprobs = true;
+  router.AddModel(fallback, ReadyBackend());
+
+  REQUIRE(router.SetDefaultModel(primary.id));
+
+  BackendFeatureRequirements req;
+  req.needs_logprobs = true;
+  auto selection = SelectModelForRequest(
+      &router, "", req,
+      ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,
+                            /*require_ready_backend=*/true});
+
+  REQUIRE(selection.status == ModelSelectionStatus::kSelected);
+  REQUIRE(selection.used_fallback);
+  REQUIRE(selection.info.id == fallback.id);
+  REQUIRE(selection.fallback_feature == "logprobs");
+}
+
 TEST_CASE("SelectModelForRequest keeps explicit model pinned",
           "[model_selection]") {
   StubRouter router;

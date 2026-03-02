@@ -63,9 +63,6 @@ PickFallbackCandidate(ModelRouter *router, const ModelInfo &primary,
     if (candidate_info.id.empty() || candidate_info.id == primary.id) {
       continue;
     }
-    if (!primary.path.empty() && candidate_info.path != primary.path) {
-      continue;
-    }
 
     auto candidate_check = CheckBackendCapabilities(
         EffectiveCapabilities(candidate_info), requirements);

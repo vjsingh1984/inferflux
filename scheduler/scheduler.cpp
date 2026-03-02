@@ -1032,7 +1032,11 @@ void Scheduler::ResolveBackends(
     requirements.needs_structured_output =
         pending->inference.has_response_format;
     requirements.needs_logprobs = pending->inference.collect_logprobs;
+    requirements.needs_streaming = pending->inference.stream;
     requirements.needs_vision = pending->inference.has_images;
+    requirements.needs_speculative_decoding =
+        speculative_decoder_ && speculative_decoder_->Enabled() &&
+        !pending->inference.has_response_format;
 
     auto selection = SelectModelForRequest(
         router_.get(), pending->inference.model, requirements,
