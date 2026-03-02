@@ -68,7 +68,7 @@
 | Completion | `inferctl completion --prompt "Hi" --model llama3 --stream` | SSE streaming |
 | Chat (scripted) | `inferctl chat --message "user:Hello" --stream` | One-shot chat |
 | Chat (interactive) | `inferctl chat --interactive --model tinyllama` | Maintains dialogue |
-| Admin ops | `inferctl admin models --load foo.gguf --id llama3 --default` | Model lifecycle |
+| Admin ops | `inferctl admin models --load foo.gguf --id llama3 --default` | Model lifecycle (`/v1/admin/routing` controls runtime capability fallback policy) |
 
 ---
 

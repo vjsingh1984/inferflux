@@ -39,6 +39,7 @@ struct ModelSelectionResult {
 };
 
 std::string CapabilityFallbackScopeToString(CapabilityFallbackScope scope);
+bool IsCapabilityFallbackScopeValue(const std::string &value);
 CapabilityFallbackScope
 ParseCapabilityFallbackScope(const std::string &value,
                              CapabilityFallbackScope default_scope =

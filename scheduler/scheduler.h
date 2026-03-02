@@ -60,6 +60,8 @@ public:
 
   // Update fairness policy at runtime.
   void UpdateFairnessConfig(const FairnessConfig &config);
+  void UpdateModelSelectionOptions(const ModelSelectionOptions &options);
+  ModelSelectionOptions ModelSelectionOptionsSnapshot() const;
 
   // Status accessors.
   int QueueDepth() const;
@@ -132,6 +134,7 @@ private:
   FairnessController fairness_controller_;
   FairnessConfig fairness_config_;
   DisaggregatedConfig disagg_config_;
+  mutable std::mutex model_selection_options_mutex_;
   ModelSelectionOptions model_selection_options_;
 
   // Sequence slot bookkeeping (§2.5).  Bitmask of 64 slots; 1 = free.

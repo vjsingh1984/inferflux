@@ -1718,6 +1718,123 @@ void HttpServer::HandleClient(ClientSession &session) {
     return;
   }
 
+  if (method == "GET" && path == "/v1/admin/routing") {
+    if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
+      return;
+    }
+    ModelSelectionOptions current;
+    {
+      std::lock_guard<std::mutex> lock(model_selection_mutex_);
+      current = model_selection_options_;
+    }
+    json payload{
+        {"allow_default_fallback",
+         current.allow_capability_fallback_for_default},
+        {"require_ready_backend", current.require_ready_backend},
+        {"fallback_scope",
+         CapabilityFallbackScopeToString(current.capability_fallback_scope)},
+    };
+    SendAll(session, BuildResponse(payload.dump()));
+    return;
+  }
+
+  if (method == "PUT" && path == "/v1/admin/routing") {
+    if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
+      return;
+    }
+    ModelSelectionOptions updated;
+    {
+      std::lock_guard<std::mutex> lock(model_selection_mutex_);
+      updated = model_selection_options_;
+    }
+    bool touched = false;
+    try {
+      auto j = json::parse(body);
+      if (j.contains("allow_default_fallback")) {
+        if (!j["allow_default_fallback"].is_boolean()) {
+          SendAll(session,
+                  BuildResponse(BuildErrorBody(
+                                    "allow_default_fallback must be a boolean"),
+                                400, "Bad Request"));
+          return;
+        }
+        updated.allow_capability_fallback_for_default =
+            j["allow_default_fallback"].get<bool>();
+        touched = true;
+      }
+      if (j.contains("require_ready_backend")) {
+        if (!j["require_ready_backend"].is_boolean()) {
+          SendAll(
+              session,
+              BuildResponse(
+                  BuildErrorBody("require_ready_backend must be a boolean"),
+                  400, "Bad Request"));
+          return;
+        }
+        updated.require_ready_backend = j["require_ready_backend"].get<bool>();
+        touched = true;
+      }
+      if (j.contains("fallback_scope")) {
+        if (!j["fallback_scope"].is_string()) {
+          SendAll(
+              session,
+              BuildResponse(BuildErrorBody("fallback_scope must be a string"),
+                            400, "Bad Request"));
+          return;
+        }
+        const std::string scope_value = j["fallback_scope"].get<std::string>();
+        if (!IsCapabilityFallbackScopeValue(scope_value)) {
+          SendAll(session,
+                  BuildResponse(
+                      BuildErrorBody(
+                          "fallback_scope must be any_compatible or "
+                          "same_path_only"),
+                      400, "Bad Request"));
+          return;
+        }
+        updated.capability_fallback_scope =
+            ParseCapabilityFallbackScope(scope_value);
+        touched = true;
+      }
+    } catch (const json::exception &) {
+      SendAll(session,
+              BuildResponse(BuildErrorBody("invalid JSON body"), 400,
+                            "Bad Request"));
+      return;
+    }
+    if (!touched) {
+      SendAll(session,
+              BuildResponse(
+                  BuildErrorBody("at least one routing policy field is "
+                                 "required"),
+                  400, "Bad Request"));
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(model_selection_mutex_);
+      model_selection_options_ = updated;
+    }
+    if (scheduler_) {
+      scheduler_->UpdateModelSelectionOptions(updated);
+    }
+
+    json payload{
+        {"status", "ok"},
+        {"allow_default_fallback",
+         updated.allow_capability_fallback_for_default},
+        {"require_ready_backend", updated.require_ready_backend},
+        {"fallback_scope",
+         CapabilityFallbackScopeToString(updated.capability_fallback_scope)},
+    };
+    SendAll(session, BuildResponse(payload.dump()));
+    if (audit_logger_) {
+      audit_logger_->Log(auth_ctx.subject, "", "routing_policy_update",
+                         payload.dump());
+    }
+    return;
+  }
+
   // ── Prefix cache admin endpoints (Workstream C) ──────────────────────────
   // GET  /v1/admin/cache       — live cache size/capacity + hit/miss metrics
   // POST /v1/admin/cache/warm  — pre-seed a cache entry with raw BPE token IDs
@@ -1888,7 +2005,11 @@ void HttpServer::HandleClient(ClientSession &session) {
     std::string resolved_model = embed_model.empty() ? "default" : embed_model;
     if (router) {
       BackendFeatureRequirements requirements = BuildEmbeddingFeatureRequirements();
-      ModelSelectionOptions embedding_options = model_selection_options_;
+      ModelSelectionOptions embedding_options;
+      {
+        std::lock_guard<std::mutex> lock(model_selection_mutex_);
+        embedding_options = model_selection_options_;
+      }
       embedding_options.require_ready_backend = true;
       auto selection = SelectModelForRequest(
           router, embed_model, requirements, embedding_options);
@@ -2120,7 +2241,11 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
 
     if (auto *router = scheduler_ ? scheduler_->Router() : nullptr) {
-      ModelSelectionOptions generation_options = model_selection_options_;
+      ModelSelectionOptions generation_options;
+      {
+        std::lock_guard<std::mutex> lock(model_selection_mutex_);
+        generation_options = model_selection_options_;
+      }
       generation_options.require_ready_backend = false;
       auto selection = SelectModelForRequest(
           router, parsed.model, BuildGenerationRequirements(parsed),

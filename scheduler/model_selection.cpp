@@ -118,6 +118,12 @@ std::string CapabilityFallbackScopeToString(CapabilityFallbackScope scope) {
   }
 }
 
+bool IsCapabilityFallbackScopeValue(const std::string &value) {
+  const std::string normalized = ToLower(value);
+  return normalized == "same_path" || normalized == "same_path_only" ||
+         normalized == "any" || normalized == "any_compatible";
+}
+
 CapabilityFallbackScope
 ParseCapabilityFallbackScope(const std::string &value,
                              CapabilityFallbackScope default_scope) {

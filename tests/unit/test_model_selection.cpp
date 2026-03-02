@@ -110,6 +110,9 @@ TEST_CASE("CapabilityFallbackScope parse and stringify are stable",
   REQUIRE(ParseCapabilityFallbackScope(
               "unknown", CapabilityFallbackScope::kSamePathOnly) ==
           CapabilityFallbackScope::kSamePathOnly);
+  REQUIRE(IsCapabilityFallbackScopeValue("any_compatible"));
+  REQUIRE(IsCapabilityFallbackScopeValue("same_path_only"));
+  REQUIRE_FALSE(IsCapabilityFallbackScopeValue("foo"));
 }
 
 TEST_CASE("SelectModelForRequest falls back for default routing when primary "

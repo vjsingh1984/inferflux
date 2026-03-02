@@ -322,6 +322,67 @@ TEST_CASE("Scheduler respects same-path fallback routing scope", "[scheduler]") 
   REQUIRE(resp.completion.find("logprobs") != std::string::npos);
 }
 
+TEST_CASE("Scheduler applies runtime routing policy updates", "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+
+  ModelInfo primary;
+  primary.id = "default-cuda";
+  primary.path = "/tmp/shared.gguf";
+  primary.backend = "cuda";
+  REQUIRE(router->RegisterModel(
+      primary, std::make_shared<ReadyStubBackend>("from-cuda")));
+
+  ModelInfo cross_path_fallback;
+  cross_path_fallback.id = "other-cpu";
+  cross_path_fallback.path = "/tmp/other.gguf";
+  cross_path_fallback.backend = "cpu";
+  REQUIRE(router->RegisterModel(
+      cross_path_fallback, std::make_shared<ReadyStubBackend>("from-cpu")));
+  REQUIRE(router->SetDefaultModel(primary.id));
+
+  auto *resolved_primary = router->Resolve(primary.id);
+  REQUIRE(resolved_primary != nullptr);
+  resolved_primary->capabilities.supports_logprobs = false;
+
+  ModelSelectionOptions selection_options;
+  selection_options.allow_capability_fallback_for_default = true;
+  selection_options.require_ready_backend = true;
+  selection_options.capability_fallback_scope =
+      CapabilityFallbackScope::kAnyCompatible;
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, DisaggregatedConfig{},
+                      selection_options);
+
+  InferenceRequest req_before;
+  req_before.prompt = "hello";
+  req_before.max_tokens = 4;
+  req_before.collect_logprobs = true;
+  auto resp_before = scheduler.Generate(req_before).get();
+  REQUIRE_FALSE(resp_before.no_backend);
+  REQUIRE(resp_before.model_id == "other-cpu");
+
+  ModelSelectionOptions tightened = selection_options;
+  tightened.capability_fallback_scope = CapabilityFallbackScope::kSamePathOnly;
+  scheduler.UpdateModelSelectionOptions(tightened);
+
+  auto snapshot = scheduler.ModelSelectionOptionsSnapshot();
+  REQUIRE(snapshot.capability_fallback_scope ==
+          CapabilityFallbackScope::kSamePathOnly);
+
+  InferenceRequest req_after;
+  req_after.prompt = "hello";
+  req_after.max_tokens = 4;
+  req_after.collect_logprobs = true;
+  auto resp_after = scheduler.Generate(req_after).get();
+  REQUIRE(resp_after.no_backend);
+  REQUIRE(resp_after.completion.find("logprobs") != std::string::npos);
+}
+
 TEST_CASE("Scheduler does not auto-fallback for explicit model requests",
           "[scheduler]") {
   SimpleTokenizer tokenizer;

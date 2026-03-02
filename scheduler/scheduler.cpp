@@ -112,6 +112,17 @@ int Scheduler::LiveDecodeWorkers() const {
   return live_decode_workers_.load(std::memory_order_relaxed);
 }
 
+void Scheduler::UpdateModelSelectionOptions(
+    const ModelSelectionOptions &options) {
+  std::lock_guard<std::mutex> lock(model_selection_options_mutex_);
+  model_selection_options_ = options;
+}
+
+ModelSelectionOptions Scheduler::ModelSelectionOptionsSnapshot() const {
+  std::lock_guard<std::mutex> lock(model_selection_options_mutex_);
+  return model_selection_options_;
+}
+
 void Scheduler::DecodeWorkerLoop() {
   // Register as a live worker; deregister on any exit path (stop signal or
   // uncaught exception), so HttpServer::LiveDecodeWorkers() accurately reflects
@@ -1024,6 +1035,7 @@ void Scheduler::ResolveBackends(
     }
     return;
   }
+  ModelSelectionOptions selection_options = ModelSelectionOptionsSnapshot();
   for (auto &pending : batch) {
     pending->resolved_backend.reset();
     pending->inference.resolved_model.clear();
@@ -1038,7 +1050,7 @@ void Scheduler::ResolveBackends(
 
     auto selection = SelectModelForRequest(
         router_.get(), pending->inference.model, requirements,
-        model_selection_options_);
+        selection_options);
 
     if (selection.status == ModelSelectionStatus::kNotFound) {
       GlobalMetrics().RecordModelRoute(pending->inference.model, "", false);

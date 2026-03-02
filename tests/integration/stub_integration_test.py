@@ -38,6 +38,24 @@ class StubIntegrationTests(unittest.TestCase):
         conn.close()
         return resp, body
 
+    def _put(self, path, data):
+        conn = http.client.HTTPConnection("localhost", 8080, timeout=10)
+        headers = {"Content-Type": "application/json", "Authorization": "Bearer dev-key-123"}
+        conn.request("PUT", path, body=json.dumps(data), headers=headers)
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        conn.close()
+        return resp, body
+
+    def _get(self, path):
+        conn = http.client.HTTPConnection("localhost", 8080, timeout=10)
+        headers = {"Authorization": "Bearer dev-key-123"}
+        conn.request("GET", path, headers=headers)
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        conn.close()
+        return resp, body
+
     def test_health(self):
         # /healthz might require auth depending on config
         conn = http.client.HTTPConnection("localhost", 8080, timeout=5)
@@ -54,6 +72,26 @@ class StubIntegrationTests(unittest.TestCase):
 
     def test_cache_warm(self):
         resp, body = self._post("/v1/admin/cache/warm", {"tokens": [1, 2, 3], "block_table": [100]})
+        self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
+
+    def test_admin_routing_policy(self):
+        resp, body = self._get("/v1/admin/routing")
+        self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
+        payload = json.loads(body)
+        self.assertIn("allow_default_fallback", payload)
+        self.assertIn("require_ready_backend", payload)
+        self.assertIn("fallback_scope", payload)
+
+        resp, body = self._put("/v1/admin/routing", {"fallback_scope": "same_path_only"})
+        self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
+
+        resp, body = self._get("/v1/admin/routing")
+        self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
+        payload = json.loads(body)
+        self.assertEqual(payload.get("fallback_scope"), "same_path_only")
+
+        # Restore default scope so this test does not affect other flows.
+        resp, body = self._put("/v1/admin/routing", {"fallback_scope": "any_compatible"})
         self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
 
 if __name__ == "__main__":
