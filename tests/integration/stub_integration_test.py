@@ -6,19 +6,49 @@ import subprocess
 import time
 import unittest
 import http.client
-import socket
+
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 18081
 
 class StubIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        env = os.environ.copy()
+        env["INFERFLUX_HOST_OVERRIDE"] = SERVER_HOST
+        env["INFERFLUX_PORT_OVERRIDE"] = str(SERVER_PORT)
         # We assume the binary is in the build directory and we are in the project root.
         cls.server_proc = subprocess.Popen(
             ["./build/inferfluxd", "--config", "config/server.yaml"],
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             preexec_fn=os.setsid
         )
-        time.sleep(2) # Initial wait
+        deadline = time.time() + 20.0
+        ready = False
+        while time.time() < deadline:
+            if cls.server_proc.poll() is not None:
+                break
+            try:
+                conn = http.client.HTTPConnection(SERVER_HOST, SERVER_PORT, timeout=1)
+                conn.request("GET", "/livez", headers={"Authorization": "Bearer dev-key-123"})
+                resp = conn.getresponse()
+                resp.read()
+                conn.close()
+                if resp.status in (200, 401):
+                    ready = True
+                    break
+            except Exception:
+                time.sleep(0.1)
+        if not ready:
+            try:
+                out, err = cls.server_proc.communicate(timeout=1)
+            except Exception:
+                out, err = ("", "")
+            raise RuntimeError(
+                "inferfluxd did not become ready in time; "
+                f"stdout={out[-400:] if out else ''} stderr={err[-400:] if err else ''}"
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -30,7 +60,7 @@ class StubIntegrationTests(unittest.TestCase):
                 pass
 
     def _post(self, path, data):
-        conn = http.client.HTTPConnection("localhost", 8080, timeout=10)
+        conn = http.client.HTTPConnection(SERVER_HOST, SERVER_PORT, timeout=10)
         headers = {"Content-Type": "application/json", "Authorization": "Bearer dev-key-123"}
         conn.request("POST", path, body=json.dumps(data), headers=headers)
         resp = conn.getresponse()
@@ -39,7 +69,7 @@ class StubIntegrationTests(unittest.TestCase):
         return resp, body
 
     def _put(self, path, data):
-        conn = http.client.HTTPConnection("localhost", 8080, timeout=10)
+        conn = http.client.HTTPConnection(SERVER_HOST, SERVER_PORT, timeout=10)
         headers = {"Content-Type": "application/json", "Authorization": "Bearer dev-key-123"}
         conn.request("PUT", path, body=json.dumps(data), headers=headers)
         resp = conn.getresponse()
@@ -48,7 +78,7 @@ class StubIntegrationTests(unittest.TestCase):
         return resp, body
 
     def _get(self, path):
-        conn = http.client.HTTPConnection("localhost", 8080, timeout=10)
+        conn = http.client.HTTPConnection(SERVER_HOST, SERVER_PORT, timeout=10)
         headers = {"Authorization": "Bearer dev-key-123"}
         conn.request("GET", path, headers=headers)
         resp = conn.getresponse()
@@ -58,7 +88,7 @@ class StubIntegrationTests(unittest.TestCase):
 
     def test_health(self):
         # /healthz might require auth depending on config
-        conn = http.client.HTTPConnection("localhost", 8080, timeout=5)
+        conn = http.client.HTTPConnection(SERVER_HOST, SERVER_PORT, timeout=5)
         headers = {"Authorization": "Bearer dev-key-123"}
         conn.request("GET", "/healthz", headers=headers)
         resp = conn.getresponse()
