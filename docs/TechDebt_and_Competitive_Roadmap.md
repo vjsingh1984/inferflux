@@ -24,7 +24,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | KV cache efficiency           |  B+  |   A+   |   A     |    N/A    |  N/A   |   **D**   | B (Q3) | Runtime |
 | Prefix Caching                |  A   |   A+   |   A     |     B     |   B    |   **B**   | A (Q3) | Runtime |
 | Speculative decoding          |  A   |   A    |   A     |    B+     |   B    |   **C**   | B (Q3) | Runtime |
-| Structured output / JSON mode |  A   |   A+   |   B+    |    B+     |   B    |   **B-**  | B+ (Q3) | Runtime |
+| Structured output / JSON mode |  A   |   A+   |   B+    |    B+     |   B    |   **B**   | B+ (Q3) | Runtime |
 | Multimodal / vision           |  A   |   A    |   B+    |    B+     |   B+   |   **D**   | C+ (Q3) | Runtime |
 | Tool / function calling       |  A   |   A    |   B     |    C      |   B    |   **B**   | B (Q3) | Server |
 | Quantization breadth          |  A+  |   B+   |   A     |    A+     |   A    |   **D**   | B (Q4) | Runtime |
@@ -33,8 +33,8 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | Model parallelism (TP/PP/EP)  |  A   |   A+   |   A     |    C      |   C    |   **D**   | C (Q4) | Distributed Runtime |
 | OpenAI API compatibility      |  A   |   A    |   B     |    B      |   A    |   **B**   | B (Q3) | Server |
 | Enterprise auth & RBAC        |  B   |   C    |   B     |    F      |   F    |   **B-**  | B+ (Q3) | Policy |
-| Observability                 |  A   |   B    |   A     |    D      |   D    |   **B**   | B (Q3) | Observability |
-| Ease of local setup           |  B+  |   B    |   C     |    C      |   A+   |   **B-**  | B (Q3) | CLI |
+| Observability                 |  A   |   B    |   A     |    D      |   D    |   **B+**  | B (Q3) | Observability |
+| Ease of local setup           |  B+  |   B    |   C     |    C      |   A+   |   **C**   | B (Q3) | CLI |
 | Model management UX           |  B   |   B    |   C     |    C      |   A+   |   **D**   | C+ (Q3) | CLI |
 | Test coverage & CI maturity   |  A   |   A    |   A     |    A      |   B    |   **B**   | B (Q3) | QA |
 
@@ -58,7 +58,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 - **KV cache efficiency: D** — `RadixPrefixCache` provides completion-level caching (trie over token IDs, LRU eviction, partial-match metrics). KV warm prefix store (`kv_prefix_store_`, capacity 4, LRU) allows `CopySequencePrefix`+`PrefillPartial` to skip re-evaluating shared prompt prefixes on the CPU path. No GPU KV page reuse (requires vLLM-style paged KV). D stays — warm store is CPU-only and covers O(1) copy within one llama_context.
 - **Prefix caching: B** — `RadixPrefixCache` (compressed trie, LRU eviction, partial-match Prometheus counters) for completion-level caching. KV warm prefix store (`kv_prefix_store_`, 4-slot LRU): `CopySequencePrefix`+`PrefillPartial` lets requests sharing a prompt prefix skip re-evaluating those tokens entirely. B-→B. Gap to A: GPU KV page reuse (vLLM-style paged attention + zero-copy across requests).
 - **Speculative decoding: C** — `SpeculativeDecoder` is wired through `BatchExecutor`; draft model runs via `draft_backend_->Generate()`, validator accepts/rejects chunks; `speculative.*` metrics on `InferenceResult`. Active when `config_.enabled=true` and `draft_backend_->IsReady()`. D→C.
-- **Structured output: B-** — HTTP parsing, schema→GBNF adapter (`StructuredOutputAdapter`), llama grammar sampling wired end-to-end (§2.1). Gap to B+: streaming grammar enforcement, nested `$defs` schemas.
+- **Structured output: B** — HTTP parsing, schema→GBNF adapter (`StructuredOutputAdapter`), llama grammar sampling wired end-to-end (§2.1); `$defs`/`$ref` resolution verified via `json_schema_to_grammar` + 13 `[structured]` unit tests (StructuredTests ctest target). Gap to B+: streaming grammar enforcement.
 - **Tool/function calling: B** — `tools[]`/`tool_choice` parsed; schema injected as system preamble; `tool_calls` array with `finish_reason=tool_calls`; streaming four-chunk OpenAI delta sequence; model-native chat templates via `llama_chat_apply_template(nullptr,...)`; multi-format detection (InferFlux, bare generic, Hermes XML, Mistral `[TOOL_CALLS]`) with `[/TOOL_CALLS]` sentinel fix. Gap to A: parallel tool calls (`tool_choice: required`).
 - **Multimodal/vision: D** — `ImagePreprocessor` (base64 + URL fetch + SHA-256 IDs + `<__media__>` markers); `LlamaCPUBackend::GenerateWithImages()` via libmtmd (`-DENABLE_MTMD=ON`); Prometheus counters. Actual vision inference requires compatible mmproj GGUF. Gap to C+: streaming multimodal, batch image inputs.
 - **Disaggregated prefill/decode: D** — Option A complete: phased `Prefill()`/`Decode()`/`FreeSequence()`, seq_slot free-list (now `atomic<uint64_t>` bitmask — lock-free, no WorkerLoop/DecodeWorkerLoop race), decode worker pool, ShmKVTransport (`INFERFLUX_KV_TRANSPORT=shm`), Helm overlays, SHM CI smoke test, KV warm prefix store (§2.5 Item 5 — `CopySequencePrefix`+`PrefillPartial`, 4-slot LRU, BPE-correct `n_kv_tokens`, BPE-token prefix matching via `TokenizeForCache` (INF-7), `weak_ptr` backend, eviction-safety guard, expired-entry purge). F→D. Remaining: cross-node RDMA, chaos tests.
@@ -78,16 +78,17 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
   - **Documentation & rollout**
     1. Update `docs/Architecture.md` with a “Model Parallelism” section once EP/TP MVP lands.
     2. Add operator guide (`docs/operators/tp_ep_setup.md`) plus Helm values for configuring TP/EP (per-stage GPU counts, process layout).
-- **OpenAI API compat: B** — Chat completions, completions, SSE streaming, structured output, image_url, tool calls, model-native chat templates, `/v1/models` + `/v1/models/{id}` (OpenAI list format, `read` scope, 4 integration tests) all done. Missing: logprobs on streaming, `n>1`, best_of.
+- **OpenAI API compat: B** — Chat completions, completions, SSE streaming, structured output, image_url, tool calls, model-native chat templates, `/v1/models` + `/v1/models/{id}` (OpenAI list format, `read` scope, 4 integration tests), `stop` sequences (string or array, up to 4, per-piece suffix match in Generate/Decode/GenerateWithImages) all done. Missing: logprobs on streaming, `n>1`, best_of.
 - **Enterprise auth/RBAC: B-** — OIDC RS256 (JWKS TTL cache), API-key SHA-256, rate-limiter, OPA client, encrypted policy store (AES-GCM), audit log (hash-by-default). Gap to B+: fine-grained per-model RBAC, key rotation UI.
-- **Observability: B** — 5 latency histograms, Prometheus `/metrics`, W3C traceparent, `Span` RAII, audit log, fairness/preemption metrics, KV-transfer histogram, MoE counter, flash-attention gauge. Gap to A: structured JSON logs, Grafana dashboard template, self-hosted GPU runner for live metric CI.
-- **Ease of local setup: B-** — Embedded litehtml WebUI and CLI quickstart are live. Remaining polish to hit B: packaged installers + Docker flow.
+- **Observability: B+** — 5 latency histograms, Prometheus `/metrics`, W3C traceparent, `Span` RAII, audit log, fairness/preemption metrics, KV-transfer histogram, MoE counter, flash-attention gauge; structured JSON logs (`server/logging/logger.h`, `INFERFLUX_LOG_FORMAT=json`); Grafana dashboard (`deploy/grafana/dashboard.json`, 9 panels); 7 Prometheus alert rules (`deploy/prometheus/alerts.yml`); Docker + docker-compose stack (`deploy/Dockerfile`, `deploy/docker-compose.yml`). Gap to A: self-hosted GPU runner for live metric CI.
+- **Ease of local setup: C** — CLI quickstart + the embedded WebUI help with day-zero config, but we still lack packaged installers, polished Docker images, and a production-ready SPA. The new deployment files are placeholders; until we ship signed installers (brew/winget/tarball) and the UI is feature-complete, the grade stays at C.
   - **Next steps**
-    1. Ship Homebrew/winget installers & publish official Docker image.
-    2. Expand `/ui` into a full SPA (chat history, model selection) with assets under `webui/static/`.
-    3. Extend docs (Quickstart) with UI screenshots + troubleshooting; include CLI `serve` workflow.
-- **Model management UX: D** — `inferctl pull` live, `inferctl admin models --list/--load` via `/v1/admin/models`, `/v1/models` + `/v1/models/{id}` OpenAI-standard endpoints live. Missing: `inferctl models list` CLI wrapper, hot reload.
-- **Test/CI: B** — 9 ctest targets (5 unit + 4 integration incl. SHM smoke), 5-job CI (build-test/MPS/CUDA-check/coverage/clang-format), SBOM artifact, Codecov (60% target). Gap to A: live GPU test runner, property-based tests.
+    1. Ship Homebrew/winget installers & publish an official Docker image with persisted config/model volumes.
+    2. Expand `/ui` into a full SPA (chat history, model selection, admin views) with assets under `webui/static/`.
+    3. Extend Quickstart/Troubleshooting with screenshots, diagnostics, and advanced workflows (cache warmers, persistence, multi-model hints).
+- **Model management UX: D→C** — `inferctl pull` live, `inferctl admin models --list/--load` via `/v1/admin/models`, `/v1/models` + `/v1/models/{id}` OpenAI-standard endpoints live, `inferctl models` top-level command (calls `GET /v1/models`, formats table of id/owned_by/created). Missing: hot reload.
+- **Test/CI: B** — 12 ctest targets (8 unit + 4 integration incl. SHM smoke, LoggerTests, StructuredTests), 5-job CI (build-test/MPS/CUDA-check/coverage/clang-format), SBOM artifact, Codecov (60% target). Gap to A: live GPU test runner, property-based tests.
+- **Hardware breadth: D** — CPUs + MPS ship today; CUDA/ROCm remain compile-only. A dedicated MLX backend design (`docs/design/mlx_backend.md`) plus `ENABLE_MLX`, CLI/config scaffolding, and a compile-check CI job are queued so we can bring MLX online first, then apply the same infrastructure to CUDA/ROCm when hardware is available.
 
 InferFlux has strong *architectural vision* (enterprise auth, policy store, multi-backend) but
 the implementation is at stub/MVP stage. The competitive gap is largest in the core inference
@@ -334,7 +335,7 @@ grouped by the system area and ordered by severity within each group.
 |----|-------|---------|-----|-------------|
 | DAT-1 | **[FIXED]** Adopted nlohmann/json v3.11.3 — replaced 4 hand-rolled parsers (~310 lines). CLI pending (CQ-1). | `external/nlohmann/json.hpp` | *(Fixed)* | — |
 | DAT-2 | **[FIXED]** Hand-rolled YAML parser was fragile and has been replaced. | `server/main.cpp` | Replaced with `yaml-cpp` library. | — |
-| DAT-3 | GGUF loader is a complete stub — returns dummy tensor with file size | `model/gguf/gguf_loader.cpp` | **Decision**: Delegate all GGUF parsing to the `llama.cpp` backend. This internal loader should not be implemented further and can be removed once the `LlamaBackend` is fully integrated. | `docs/Architecture.md` §Model |
+| DAT-3 | **[FIXED]** GGUF stub loader removed — all GGUF parsing delegated to `LlamaCPUBackend` via llama.cpp. `model/gguf/gguf_loader.{cpp,h}` deleted; `model/gguf/` directory removed; CMakeLists.txt cleaned up. | *(removed)* | *(Fixed)* | — |
 | DAT-4 | **[FIXED]** Added CORS headers (Access-Control-Allow-Origin: *) to all responses, OPTIONS preflight handling. | `server/http/http_server.cpp` | *(Fixed)* | — |
 
 ### 3.4 Thread Safety — MEDIUM
@@ -603,7 +604,7 @@ IDs (SEC-1, INF-2, etc.) in commit messages and PR descriptions for traceability
 | Fixing security | All SEC items done. Next: rotate API keys, add mutual TLS client cert validation. |
 | Adding Q3 features | All Q3 items done (§2.1–§2.4, §2.7–§2.9). |
 | Improving test coverage | CI SHM smoke test (cross-process `INFERFLUX_DECODE_POOL_SIZE=2 INFERFLUX_KV_TRANSPORT=shm` integration test). |
-| Improving observability | All OBS items done. Next: structured log format (JSON), alert rules for Prometheus. |
+| Improving observability | Structured JSON logs **Done** (`server/logging/logger.h/.cpp`; `INFERFLUX_LOG_FORMAT=json`). Next: Grafana dashboard template, alert rules for Prometheus. |
 | Improving core performance | True interleaved prefill/decode in BatchExecutor (INF-2 next phase — GPU hardware required). |
-| Refactoring code quality | DAT-3: remove GGUF stub loader (`model/gguf/gguf_loader.cpp`) — delegate all GGUF parsing to llama.cpp. |
+| Refactoring code quality | DAT-3: **Done** (GGUF stub loader removed). Next: structured JSON application logs. |
 | Updating docs | See §5 Doc Update Tracker — all checklist items complete. |

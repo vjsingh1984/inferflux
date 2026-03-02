@@ -1,0 +1,20 @@
+Id: Inferencial.InferFlux
+Name: InferFlux
+Publisher: Inferencial Labs
+PublisherUrl: https://inferencial.ai
+PackageUrl: https://github.com/inferencial/InferFlux
+License: Apache-2.0
+ShortDescription: C++ inference server and CLI with OpenAI-compatible APIs.
+Moniker: inferflux
+Version: 0.1.0
+InstallerType: wix
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/inferencial/InferFlux/releases/download/v0.1.0/inferflux-0.1.0-x64.msi
+    InstallerSha256: REPLACE_ME
+    ProductCode: "{00000000-0000-0000-0000-000000000000}"
+Commands:
+  - inferfluxd
+  - inferctl
+UpgradeBehavior: install
+ReleaseNotesUrl: https://github.com/inferencial/InferFlux/releases/v0.1.0

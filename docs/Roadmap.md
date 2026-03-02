@@ -42,7 +42,7 @@ Goal: close SEC/OBS debts required for enterprise pilots and comply with PRD sec
   - [x] PolicyStore hashes API keys on write/read (SEC-2) — SHA-256 hashing on write/read; `AddKeyHashed` for load-from-disk path; migration via CLI.
   - [x] Audit logger defaults to prompt hashing + configurable redaction (OBS-4) — SHA-256 by default; `debug_mode=true`/`INFERFLUX_AUDIT_DEBUG` for raw logging.
   - [x] OpenTelemetry traces cover tokenize→schedule→backend pipeline (OBS-2) — W3C traceparent propagation, `Span` RAII abstraction (`server/tracing/span.h`), prefill/decode duration histograms, 11 tracing unit tests.
-  - [ ] Guardrail verdict latency profiled and <500 ms P95 (NFR / KPI table).
+  - [ ] Guardrail verdict latency profiled and <500 ms P95 (NFR / KPI table) — **remaining debt before we can call Workstream B complete.**
   - **Exit KPIs**: Policy replication lag <30 s, zero plaintext secrets on disk, tracing coverage ≥90% of request path.
 
 ### Workstream C — Developer Experience & Multimodal (Q3 completion)
