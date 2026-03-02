@@ -13,8 +13,10 @@ env:
   BUILD_TYPE: Release
   RELEASE_REF: ${{ github.event.workflow_run.head_sha }}
   HEAD_BRANCH: ${{ github.event.workflow_run.head_branch || '' }}
-  SHOULD_PACKAGE: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || startsWith(github.event.workflow_run.head_branch, 'refs/tags/')) }}
-  IS_TAG_RELEASE: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'refs/tags/') }}
+  # workflow_run.head_branch for a tag push is the bare tag name (e.g. "v1.0.0"),
+  # NOT "refs/tags/v1.0.0" — so we match on the semver prefix instead.
+  IS_TAG_RELEASE: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/') }}
+  SHOULD_PACKAGE: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
 
 jobs:
   linux-packages:
@@ -241,19 +243,24 @@ jobs:
         run: |
           branch="${HEAD_BRANCH}"
           sha="${RELEASE_REF}"
-          if [[ "$branch" == refs/tags/* ]]; then
-            tag="${branch#refs/tags/}"
+          # workflow_run.head_branch for a tag push is the bare tag name
+          # (e.g. "v1.0.0"), not "refs/tags/v1.0.0".  Detect by semver prefix.
+          if [[ "$branch" =~ ^v[0-9]+\.[0-9]+ && "$branch" != */* ]]; then
+            tag="$branch"
             version="${tag#v}"
+            is_tag="true"
             src_url="https://github.com/inferencial/InferFlux/archive/refs/tags/${tag}.tar.gz"
           elif [[ "$branch" == "main" ]]; then
             short="${sha:0:7}"
             tag="nightly-${short}"
             version="0.0.0-dev-${short}"
+            is_tag="false"
             src_url="https://github.com/inferencial/InferFlux/archive/${sha}.tar.gz"
           else
             short="${sha:0:7}"
             tag="snapshot-${short}"
             version="0.0.0-dev-${short}"
+            is_tag="false"
             src_url="https://github.com/inferencial/InferFlux/archive/${sha}.tar.gz"
           fi
           curl -sSL "$src_url" -o source.tar.gz
@@ -263,6 +270,7 @@ jobs:
           msi_sha=$(sha256sum "$msi_path" | awk '{print $1}')
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "is_tag=$is_tag" >> "$GITHUB_OUTPUT"
           echo "src_url=$src_url" >> "$GITHUB_OUTPUT"
           echo "src_sha=$src_sha" >> "$GITHUB_OUTPUT"
           echo "msi_name=$msi_name" >> "$GITHUB_OUTPUT"
@@ -277,8 +285,12 @@ jobs:
           MSI_TAG: ${{ steps.meta.outputs.tag }}
           MSI_NAME: ${{ steps.meta.outputs.msi_name }}
           MSI_SHA: ${{ steps.meta.outputs.msi_sha }}
+          IS_TAG: ${{ steps.meta.outputs.is_tag }}
         run: |
-          mkdir -p artifacts/manifests/homebrew artifacts/manifests/winget
+          mkdir -p artifacts/manifests/homebrew
+
+          # Homebrew formula is valid for both tag and nightly builds because
+          # the source URL points to an existing commit/tag archive on GitHub.
           cat > artifacts/manifests/homebrew/inferflux.rb <<EOF
 class Inferflux < Formula
   desc "InferFlux inference server and CLI"
@@ -305,15 +317,21 @@ class Inferflux < Formula
 end
 EOF
 
-          installer_url="https://github.com/inferencial/InferFlux/releases/download/${MSI_TAG}/${MSI_NAME}"
-          cat > artifacts/manifests/winget/inferencial.inferflux.yaml <<EOF
+          # Winget manifests reference release download URLs that only exist
+          # once a GitHub Release is published.  Only generate for tagged builds;
+          # nightly/snapshot runs never produce a GitHub Release so those URLs
+          # would be permanently dead.
+          if [[ "${IS_TAG}" == "true" ]]; then
+            mkdir -p artifacts/manifests/winget
+            installer_url="https://github.com/inferencial/InferFlux/releases/download/${MSI_TAG}/${MSI_NAME}"
+            cat > artifacts/manifests/winget/inferencial.inferflux.yaml <<EOF
 Id: Inferencial.InferFlux
 Name: InferFlux
 Publisher: Inferencial Labs
 PublisherUrl: https://inferencial.ai
 PackageUrl: https://github.com/inferencial/InferFlux
 License: Apache-2.0
-ShortDescription: C++ inference server and CLI with OpenAI-compatible APIs.
+ShortDescription: C++ LLM inference server and CLI.
 Moniker: inferflux
 Version: ${VERSION}
 InstallerType: wix
@@ -327,6 +345,7 @@ Commands:
 UpgradeBehavior: install
 ReleaseNotesUrl: https://github.com/inferencial/InferFlux/releases/tag/${MSI_TAG}
 EOF
+          fi
 
       - name: Upload manifests
         uses: actions/upload-artifact@v4
