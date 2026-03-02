@@ -55,6 +55,9 @@ struct InferenceResult {
   // Per-token logprobs; empty when logprob_top_n == 0 in the request or when
   // the no_backend stub path is used.
   std::vector<TokenLogprob> logprobs;
+  // True when generation stopped because it reached max_tokens rather than
+  // hitting EOS or a stop sequence. Maps to OpenAI finish_reason="length".
+  bool finish_reason_length{false};
 };
 
 struct PendingRequest {
@@ -82,6 +85,10 @@ public:
 
   // Expose the router for use by the HTTP admin endpoint (/v1/models).
   ModelRouter *Router() const { return router_.get(); }
+
+  // Expose the prefix cache for use by the HTTP admin endpoint
+  // (/v1/admin/cache).
+  RadixPrefixCache *PrefixCache() const { return prefix_cache_.get(); }
 
   // Number of DecodeWorkerLoop threads currently running.  Zero means either
   // decode_pool_size=0 or all workers have exited (degraded/stopped state).

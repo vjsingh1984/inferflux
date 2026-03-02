@@ -63,6 +63,7 @@ class StubIntegrationTests(unittest.TestCase):
         env["INFERFLUX_API_KEYS"] = RATE_LIMIT_KEY  # separate key for rate-limit test
         env["INFERFLUX_RATE_LIMIT_PER_MINUTE"] = "30"
         env["INFERFLUX_GUARDRAIL_BLOCKLIST"] = "forbidden"
+        env["INFERFLUX_POLICY_STORE"] = os.path.join(cls.tmpdir.name, "policy_store.conf")
         env["INFERFLUX_AUDIT_LOG"] = os.path.join(cls.tmpdir.name, "audit.jsonl")
         env["INFERFLUX_OIDC_ISSUER"] = ""
         env["INFERFLUX_OIDC_AUDIENCE"] = ""
@@ -607,6 +608,76 @@ class StubIntegrationTests(unittest.TestCase):
             data = json.loads(body)
             self.assertIn("error", data)
             self.assertIn("logprobs_not_supported_with_streaming", data["error"])
+
+    # ── prefix cache admin (Workstream C) ────────────────────────────────────
+
+    def test_cache_status_unauthenticated(self):
+        """GET /v1/admin/cache without auth must return 401."""
+        conn = http.client.HTTPConnection("127.0.0.1", SERVER_PORT, timeout=5)
+        conn.request("GET", "/v1/admin/cache")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 401)
+
+    def test_cache_status(self):
+        """GET /v1/admin/cache with admin key returns 200 with cache metrics."""
+        resp, body = self._get("/v1/admin/cache")
+        self.assertEqual(resp.status, 200, msg=body)
+        data = json.loads(body)
+        for key in ("size", "capacity", "hits", "misses", "hit_rate"):
+            self.assertIn(key, data, msg=f"missing key '{key}' in {data}")
+        self.assertIsInstance(data["size"], int)
+        self.assertIsInstance(data["capacity"], int)
+        self.assertIsInstance(data["hit_rate"], float)
+
+    def test_cache_warm(self):
+        """POST /v1/admin/cache/warm seeds an entry and returns status=ok + size>=1."""
+        resp, body = self._post(
+            "/v1/admin/cache/warm",
+            {"tokens": [1, 2, 3], "completion": "hi"},
+        )
+        self.assertEqual(resp.status, 200, msg=body)
+        data = json.loads(body)
+        self.assertEqual(data.get("status"), "ok")
+        self.assertGreaterEqual(data.get("size", 0), 1)
+
+    def test_cache_warm_missing_fields(self):
+        """POST /v1/admin/cache/warm with empty body returns 400 with error key."""
+        resp, body = self._post("/v1/admin/cache/warm", {})
+        self.assertEqual(resp.status, 400, msg=body)
+        data = json.loads(body)
+        self.assertIn("error", data)
+
+
+    # ── /v1/embeddings ───────────────────────────────────────────────────────
+
+    def test_embeddings_unauthenticated(self):
+        """POST /v1/embeddings without auth must return 401."""
+        conn = http.client.HTTPConnection("127.0.0.1", SERVER_PORT, timeout=5)
+        conn.request(
+            "POST",
+            "/v1/embeddings",
+            json.dumps({"model": "default", "input": "hello"}),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 401)
+
+    def test_embeddings_no_model(self):
+        """POST /v1/embeddings with auth but no loaded model returns 503.
+
+        In stub mode no model is loaded so the router cannot resolve a backend.
+        The server should return 503 Service Unavailable.
+        """
+        resp, body = self._post(
+            "/v1/embeddings",
+            {"model": "default", "input": "hello world"},
+        )
+        # No backend loaded in stub mode → 503.
+        self.assertIn(resp.status, [503], msg=body)
 
 
 if __name__ == "__main__":

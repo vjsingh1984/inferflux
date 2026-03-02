@@ -15,25 +15,28 @@ namespace inferflux {
 
 namespace {
 
-class GrammarScope {
+// RAII guard that calls SetupSampler before execution and TeardownSampler on
+// scope exit.  Always sets up a sampler chain (grammar optional), so sampling
+// params (temperature, top_p, …) are always in effect.
+class SamplerScope {
 public:
-  GrammarScope(const StructuredConstraint &constraint,
+  SamplerScope(const InferenceRequest &req,
                const std::shared_ptr<LlamaCPUBackend> &backend)
-      : backend_(backend.get() ? backend.get() : nullptr) {
-    if (!backend_ || !constraint.has_grammar) {
-      backend_ = nullptr;
+      : backend_(backend ? backend.get() : nullptr) {
+    if (!backend_)
       return;
-    }
-    backend_->EnableGrammarConstraint(constraint.grammar, constraint.root);
+    const auto &c = req.response_constraint;
+    backend_->SetupSampler(c.has_grammar ? c.grammar : "",
+                           c.has_grammar ? c.root : "", req.sampling);
     active_ = true;
   }
 
-  GrammarScope(const GrammarScope &) = delete;
-  GrammarScope &operator=(const GrammarScope &) = delete;
+  SamplerScope(const SamplerScope &) = delete;
+  SamplerScope &operator=(const SamplerScope &) = delete;
 
-  ~GrammarScope() {
+  ~SamplerScope() {
     if (active_ && backend_) {
-      backend_->DisableGrammarConstraint();
+      backend_->TeardownSampler();
     }
   }
 
@@ -225,7 +228,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   inference.phase = RequestPhase::kDecode;
   auto decode_start = std::chrono::steady_clock::now();
 
-  GrammarScope grammar_scope(inference.response_constraint, backend);
+  SamplerScope sampler_scope(inference, backend);
 
   if (speculative_decoder_ && speculative_decoder_->Enabled() &&
       !inference.has_response_format &&
@@ -277,15 +280,27 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
         // decode only.  Pass first_token so Decode() starts from the
         // pre-sampled token rather than re-sampling from a potentially stale
         // logit buffer.
-        text = backend->Decode(inference.n_past, inference.sequence_id,
-                               decode_limit, chunk_cb, should_stop,
-                               logprob_top_n, lp_out, inference.first_token);
+        text =
+            backend->Decode(inference.n_past, inference.sequence_id,
+                            decode_limit, chunk_cb, should_stop, logprob_top_n,
+                            lp_out, inference.first_token, inference.stop);
       } else if (inference.has_images && backend->SupportsVision()) {
         text = backend->GenerateWithImages(inference.prompt, inference.images,
-                                           decode_limit, chunk_cb, should_stop);
+                                           decode_limit, chunk_cb, should_stop,
+                                           inference.stop);
       } else {
         text = backend->Generate(inference.prompt, decode_limit, chunk_cb,
-                                 should_stop, logprob_top_n, lp_out);
+                                 should_stop, logprob_top_n, lp_out,
+                                 inference.stop);
+      }
+      // Record GGML-native perf counters (P1b).
+      {
+        auto perf = backend->TakePerf();
+        if (perf.generated_tokens > 0) {
+          GlobalMetrics().RecordLlamaPerf(perf.prefill_ms, perf.decode_ms,
+                                          perf.prompt_tokens,
+                                          perf.generated_tokens);
+        }
       }
       response.completion =
           text.empty() ? "[backend returned empty response]" : text;
@@ -307,6 +322,15 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
     auto completion_tokens = tokenizer_->Encode(response.completion);
     response.completion_tokens = static_cast<int>(completion_tokens.size());
     inference.output_tokens = std::move(completion_tokens);
+  }
+  // finish_reason="length" when the full max_tokens budget is exhausted.
+  // inference.total_completion_tokens holds prior-slice counts; adding this
+  // slice's count gives the running total.  Fairness mid-slice yields will
+  // not trigger this because their partial total stays below max_tokens.
+  if (!response.no_backend && inference.max_tokens > 0 &&
+      inference.total_completion_tokens + response.completion_tokens >=
+          inference.max_tokens) {
+    response.finish_reason_length = true;
   }
   // Advance n_past so the next fairness slice continues from the right KV
   // position.

@@ -203,6 +203,21 @@ void MetricsRegistry::RecordKVTransfer(double transfer_ms) {
   kv_transfer_latency_.Record(transfer_ms);
 }
 
+void MetricsRegistry::RecordLlamaPerf(double prefill_ms, double decode_ms,
+                                      int32_t prompt_tokens,
+                                      int32_t generated_tokens) {
+  if (prefill_ms > 0)
+    llama_prefill_latency_.Record(prefill_ms);
+  if (decode_ms > 0)
+    llama_decode_latency_.Record(decode_ms);
+  if (prompt_tokens > 0)
+    llama_prompt_tokens_.fetch_add(static_cast<uint64_t>(prompt_tokens),
+                                   std::memory_order_relaxed);
+  if (generated_tokens > 0)
+    llama_gen_tokens_.fetch_add(static_cast<uint64_t>(generated_tokens),
+                                std::memory_order_relaxed);
+}
+
 void MetricsRegistry::RecordLatency(double request_ms) {
   request_latency_.Record(request_ms);
 }
@@ -233,6 +248,17 @@ void MetricsRegistry::SetPrefillQueueDepth(int depth) {
 
 void MetricsRegistry::SetDecodeQueueDepth(int depth) {
   decode_queue_depth_.store(depth, std::memory_order_relaxed);
+}
+
+MetricsRegistry::CacheMetrics MetricsRegistry::GetCacheMetrics() const {
+  CacheMetrics cm;
+  cm.hits = prefix_hits_.load(std::memory_order_relaxed);
+  cm.misses = prefix_misses_.load(std::memory_order_relaxed);
+  cm.partial_hits = prefix_partial_hits_.load(std::memory_order_relaxed);
+  cm.matched_tokens = prefix_matched_tokens_.load(std::memory_order_relaxed);
+  cm.kv_reuse_count = kv_prefix_reuse_count_.load(std::memory_order_relaxed);
+  cm.kv_reuse_tokens = kv_prefix_reuse_tokens_.load(std::memory_order_relaxed);
+  return cm;
 }
 
 std::string MetricsRegistry::RenderPrometheus() const {
@@ -557,6 +583,56 @@ std::string MetricsRegistry::RenderPrometheus() const {
       << kv_transfer_latency_.sum_ms.load() << "\n";
   out << "inferflux_kv_transfer_duration_ms_count{backend=\"" << backend
       << "\"} " << kv_transfer_latency_.total.load() << "\n";
+
+  // --- GGML-native perf (llama_perf_context) ---
+  out << "# HELP inferflux_llama_prefill_ms GGML-native prompt eval latency "
+         "(from llama_perf_context)\n";
+  out << "# TYPE inferflux_llama_prefill_ms histogram\n";
+  for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
+    out << "inferflux_llama_prefill_ms_bucket{backend=\"" << backend
+        << "\",le=\"" << std::fixed << std::setprecision(0)
+        << LatencyHistogram::kBuckets[i] << "\"} "
+        << llama_prefill_latency_.counts[i].load() << "\n";
+  }
+  out << "inferflux_llama_prefill_ms_bucket{backend=\"" << backend
+      << "\",le=\"+Inf\"} "
+      << llama_prefill_latency_.counts[LatencyHistogram::kBuckets.size()].load()
+      << "\n";
+  out << "inferflux_llama_prefill_ms_sum{backend=\"" << backend << "\"} "
+      << llama_prefill_latency_.sum_ms.load() << "\n";
+  out << "inferflux_llama_prefill_ms_count{backend=\"" << backend << "\"} "
+      << llama_prefill_latency_.total.load() << "\n";
+
+  out << "# HELP inferflux_llama_decode_ms GGML-native token generation "
+         "latency "
+         "(from llama_perf_context)\n";
+  out << "# TYPE inferflux_llama_decode_ms histogram\n";
+  for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
+    out << "inferflux_llama_decode_ms_bucket{backend=\"" << backend
+        << "\",le=\"" << std::fixed << std::setprecision(0)
+        << LatencyHistogram::kBuckets[i] << "\"} "
+        << llama_decode_latency_.counts[i].load() << "\n";
+  }
+  out << "inferflux_llama_decode_ms_bucket{backend=\"" << backend
+      << "\",le=\"+Inf\"} "
+      << llama_decode_latency_.counts[LatencyHistogram::kBuckets.size()].load()
+      << "\n";
+  out << "inferflux_llama_decode_ms_sum{backend=\"" << backend << "\"} "
+      << llama_decode_latency_.sum_ms.load() << "\n";
+  out << "inferflux_llama_decode_ms_count{backend=\"" << backend << "\"} "
+      << llama_decode_latency_.total.load() << "\n";
+
+  out << "# HELP inferflux_llama_prompt_tokens_total Prompt tokens processed "
+         "per llama_perf_context\n";
+  out << "# TYPE inferflux_llama_prompt_tokens_total counter\n";
+  out << "inferflux_llama_prompt_tokens_total{backend=\"" << backend << "\"} "
+      << llama_prompt_tokens_.load() << "\n";
+
+  out << "# HELP inferflux_llama_generated_tokens_total Tokens generated per "
+         "llama_perf_context\n";
+  out << "# TYPE inferflux_llama_generated_tokens_total counter\n";
+  out << "inferflux_llama_generated_tokens_total{backend=\"" << backend
+      << "\"} " << llama_gen_tokens_.load() << "\n";
 
   // --- Multimodal (§2.2) ---
   out << "# HELP inferflux_multimodal_images_total Total images preprocessed "

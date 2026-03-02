@@ -1,6 +1,8 @@
 #include "server/http/http_server.h"
 
+#include "runtime/backends/cpu/llama_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
+#include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 #include "server/tracing/span.h"
 
@@ -106,6 +108,10 @@ struct CompletionRequestPayload {
   std::string first_tool_name;
   bool has_tool_schema{false};
   std::string tool_choice{"auto"}; // "auto" | "none" | "required"
+  // When tool_choice is {"type":"function","function":{"name":"..."}} the
+  // target function name is stored here so the system prompt can enforce it
+  // explicitly.
+  std::string tool_choice_function;
   bool has_images{
       false}; // §2.2: true when any message contained image_url parts.
   std::vector<DecodedImage> images; // §2.2: decoded images in prompt order.
@@ -121,6 +127,21 @@ struct CompletionRequestPayload {
   // Completions: logprobs=N directly sets top-N (0 = selected token only).
   bool logprobs{false};
   int top_logprobs{0}; // number of alternatives per token (0-20)
+
+  // OpenAI sampling parameters.
+  float temperature{1.0f};
+  float top_p{1.0f};
+  int top_k{0};
+  float min_p{0.0f};
+  float frequency_penalty{0.0f};
+  float presence_penalty{0.0f};
+  float repetition_penalty{1.0f};
+  uint32_t seed{UINT32_MAX};
+
+  // OpenAI `stop` parameter: string or array of strings (up to 4).
+  std::vector<std::string> stop;
+  // stream_options.include_usage: emit a final SSE usage chunk before [DONE].
+  bool stream_include_usage{false};
 };
 
 CompletionRequestPayload ParseJsonPayload(const std::string &body) {
@@ -138,6 +159,11 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
     }
     if (j.contains("max_tokens") && j["max_tokens"].is_number_integer()) {
       payload.max_tokens = j["max_tokens"].get<int>();
+    }
+    // OpenAI newer API alias for max_tokens.
+    if (j.contains("max_completion_tokens") &&
+        j["max_completion_tokens"].is_number_integer()) {
+      payload.max_tokens = j["max_completion_tokens"].get<int>();
     }
     if (j.contains("stream") && j["stream"].is_boolean()) {
       payload.stream = j["stream"].get<bool>();
@@ -163,6 +189,31 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
       if (payload.top_logprobs > 0) {
         payload.logprobs = true;
       }
+    }
+    if (j.contains("temperature") && j["temperature"].is_number()) {
+      payload.temperature = j["temperature"].get<float>();
+    }
+    if (j.contains("top_p") && j["top_p"].is_number()) {
+      payload.top_p = j["top_p"].get<float>();
+    }
+    if (j.contains("top_k") && j["top_k"].is_number_integer()) {
+      payload.top_k = j["top_k"].get<int>();
+    }
+    if (j.contains("min_p") && j["min_p"].is_number()) {
+      payload.min_p = j["min_p"].get<float>();
+    }
+    if (j.contains("frequency_penalty") && j["frequency_penalty"].is_number()) {
+      payload.frequency_penalty = j["frequency_penalty"].get<float>();
+    }
+    if (j.contains("presence_penalty") && j["presence_penalty"].is_number()) {
+      payload.presence_penalty = j["presence_penalty"].get<float>();
+    }
+    if (j.contains("repetition_penalty") &&
+        j["repetition_penalty"].is_number()) {
+      payload.repetition_penalty = j["repetition_penalty"].get<float>();
+    }
+    if (j.contains("seed") && j["seed"].is_number_integer()) {
+      payload.seed = j["seed"].get<uint32_t>();
     }
     // OpenAI-compatible: response_format controls structured output.
     if (j.contains("response_format") && j["response_format"].is_object()) {
@@ -281,8 +332,37 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
       if (j["tool_choice"].is_string()) {
         payload.tool_choice = j["tool_choice"].get<std::string>();
       } else if (j["tool_choice"].is_object()) {
-        // {"type":"function","function":{"name":"..."}} — treat as "required".
+        // {"type":"function","function":{"name":"..."}} — required + specific
+        // fn.
         payload.tool_choice = "required";
+        const auto &tc = j["tool_choice"];
+        if (tc.contains("function") && tc["function"].is_object() &&
+            tc["function"].contains("name") &&
+            tc["function"]["name"].is_string()) {
+          payload.tool_choice_function =
+              tc["function"]["name"].get<std::string>();
+        }
+      }
+    }
+    // `stop`: string or array of strings (up to 4).
+    if (j.contains("stop")) {
+      if (j["stop"].is_string()) {
+        payload.stop.push_back(j["stop"].get<std::string>());
+      } else if (j["stop"].is_array()) {
+        for (const auto &s : j["stop"]) {
+          if (s.is_string() && !s.get<std::string>().empty()) {
+            payload.stop.push_back(s.get<std::string>());
+            if (payload.stop.size() >= 4)
+              break;
+          }
+        }
+      }
+    }
+    // stream_options.include_usage: emit token counts in a final SSE chunk.
+    if (j.contains("stream_options") && j["stream_options"].is_object()) {
+      const auto &so = j["stream_options"];
+      if (so.contains("include_usage") && so["include_usage"].is_boolean()) {
+        payload.stream_include_usage = so["include_usage"].get<bool>();
       }
     }
   } catch (const json::exception &) {
@@ -307,7 +387,8 @@ std::string FlattenMessages(const std::vector<ChatMessage> &messages) {
 
 // §2.3: builds a system-level preamble that teaches the model the tool-call
 // protocol.
-std::string BuildToolSystemPrompt(const std::vector<Tool> &tools) {
+std::string BuildToolSystemPrompt(const std::vector<Tool> &tools,
+                                  const std::string &required_function = {}) {
   std::string s = "You have access to the following tools:\n\n";
   for (const auto &t : tools) {
     s += "- " + t.function.name;
@@ -323,6 +404,11 @@ std::string BuildToolSystemPrompt(const std::vector<Tool> &tools) {
        "text):\n";
   s +=
       "{\"tool_call\":{\"name\":\"<function_name>\",\"arguments\":{<args>}}}\n";
+  if (!required_function.empty()) {
+    s +=
+        "\nYou MUST call the function named '" + required_function +
+        "'. Do not call any other function and do not respond with plain text.";
+  }
   return s;
 }
 
@@ -540,18 +626,20 @@ BuildCompletionBody(const InferenceResult &result,
                                    {"logprobs", logprobs_json},
                                    {"finish_reason", "tool_calls"}}});
     } else {
+      const std::string fr = result.finish_reason_length ? "length" : "stop";
       j["choices"] = json::array(
           {{{"index", 0},
             {"message",
              {{"role", "assistant"}, {"content", result.completion}}},
             {"logprobs", logprobs_json},
-            {"finish_reason", "stop"}}});
+            {"finish_reason", fr}}});
     }
   } else {
+    const std::string fr = result.finish_reason_length ? "length" : "stop";
     j["choices"] = json::array({{{"index", 0},
                                  {"text", result.completion},
                                  {"logprobs", logprobs_json},
-                                 {"finish_reason", "stop"}}});
+                                 {"finish_reason", fr}}});
   }
   return j.dump();
 }
@@ -581,7 +669,8 @@ std::vector<std::string> SplitForStreaming(const std::string &text) {
 
 std::string BuildStreamChunk(const std::string &id, const std::string &model,
                              std::time_t ts, const std::string &content,
-                             bool finish) {
+                             bool finish,
+                             const std::string &finish_reason = "stop") {
   json j;
   j["id"] = id;
   j["object"] = "chat.completion.chunk";
@@ -589,8 +678,9 @@ std::string BuildStreamChunk(const std::string &id, const std::string &model,
   j["model"] = model;
 
   if (finish) {
-    j["choices"] = json::array(
-        {{{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}});
+    j["choices"] = json::array({{{"index", 0},
+                                 {"delta", json::object()},
+                                 {"finish_reason", finish_reason}}});
   } else {
     j["choices"] = json::array({{{"index", 0},
                                  {"delta", {{"content", content}}},
@@ -692,27 +782,27 @@ HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
 #endif
   if (tls_config.enabled) {
     if (tls_config.cert_path.empty() || tls_config.key_path.empty()) {
-      std::cerr << "[http] TLS enabled without cert/key; falling back to HTTP"
-                << std::endl;
+      inferflux::log::Warn(
+          "http", "TLS enabled without cert/key; falling back to HTTP");
     } else {
       SSL_load_error_strings();
       OpenSSL_add_ssl_algorithms();
       ssl_ctx_ = SSL_CTX_new(TLS_server_method());
       if (!ssl_ctx_) {
-        std::cerr << "[http] Failed to initialize TLS context" << std::endl;
+        inferflux::log::Error("http", "Failed to initialize TLS context");
       } else {
         SSL_CTX_set_ecdh_auto(ssl_ctx_, 1);
         if (SSL_CTX_use_certificate_file(ssl_ctx_, tls_config.cert_path.c_str(),
                                          SSL_FILETYPE_PEM) <= 0) {
-          std::cerr << "[http] Failed to load TLS certificate: "
-                    << tls_config.cert_path << std::endl;
+          inferflux::log::Error("http", "Failed to load TLS certificate",
+                                tls_config.cert_path);
           SSL_CTX_free(ssl_ctx_);
           ssl_ctx_ = nullptr;
         } else if (SSL_CTX_use_PrivateKey_file(ssl_ctx_,
                                                tls_config.key_path.c_str(),
                                                SSL_FILETYPE_PEM) <= 0) {
-          std::cerr << "[http] Failed to load TLS key: " << tls_config.key_path
-                    << std::endl;
+          inferflux::log::Error("http", "Failed to load TLS key",
+                                tls_config.key_path);
           SSL_CTX_free(ssl_ctx_);
           ssl_ctx_ = nullptr;
         } else {
@@ -1039,15 +1129,13 @@ void HttpServer::HandleClient(ClientSession &session) {
 
 #if INFERFLUX_ENABLE_WEBUI
   if (method == "GET" && path == "/ui") {
-    std::string default_model = "unknown";
-    if (scheduler_ && scheduler_->Router()) {
-      auto id = scheduler_->Router()->DefaultModelId();
-      if (!id.empty()) {
-        default_model = id;
-      }
-    }
+    // Serve a static HTML shell. The browser's JavaScript fetches the model
+    // list via the authenticated /v1/models endpoint rather than embedding
+    // server-side state here — this keeps /ui unauthenticated (safe for
+    // browser navigation) while avoiding model ID disclosure to unauthenticated
+    // callers.
     std::string body = webui_renderer_
-                           ? webui_renderer_->RenderIndex(default_model)
+                           ? webui_renderer_->RenderIndex("")
                            : "<html><body><h1>InferFlux UI</h1></body></html>";
     std::string response = "HTTP/1.1 200 OK\r\n"
                            "Content-Type: text/html; charset=utf-8\r\n"
@@ -1520,6 +1608,76 @@ void HttpServer::HandleClient(ClientSession &session) {
     return;
   }
 
+  // ── Prefix cache admin endpoints (Workstream C) ──────────────────────────
+  // GET  /v1/admin/cache       — live cache size/capacity + hit/miss metrics
+  // POST /v1/admin/cache/warm  — pre-seed a cache entry with raw BPE token IDs
+
+  if (method == "GET" && path == "/v1/admin/cache") {
+    if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
+      return;
+    }
+    auto *cache = scheduler_ ? scheduler_->PrefixCache() : nullptr;
+    auto cm = GlobalMetrics().GetCacheMetrics();
+    double hit_rate = (cm.hits + cm.misses) > 0
+                          ? static_cast<double>(cm.hits) /
+                                static_cast<double>(cm.hits + cm.misses)
+                          : 0.0;
+    json payload{
+        {"size", cache ? static_cast<int64_t>(cache->Size()) : 0},
+        {"capacity", cache ? static_cast<int64_t>(cache->Capacity()) : 0},
+        {"hits", static_cast<int64_t>(cm.hits)},
+        {"misses", static_cast<int64_t>(cm.misses)},
+        {"hit_rate", hit_rate},
+        {"partial_hits", static_cast<int64_t>(cm.partial_hits)},
+        {"matched_tokens", static_cast<int64_t>(cm.matched_tokens)},
+        {"kv_reuse_count", static_cast<int64_t>(cm.kv_reuse_count)},
+        {"kv_reuse_tokens", static_cast<int64_t>(cm.kv_reuse_tokens)},
+    };
+    SendAll(session, BuildResponse(payload.dump()));
+    return;
+  }
+
+  if (method == "POST" && path == "/v1/admin/cache/warm") {
+    if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
+      return;
+    }
+    auto *cache = scheduler_ ? scheduler_->PrefixCache() : nullptr;
+    if (!cache) {
+      SendAll(session, BuildResponse(BuildErrorBody("cache_unavailable"), 503,
+                                     "Service Unavailable"));
+      return;
+    }
+    std::vector<int> tokens;
+    std::string completion;
+    int completion_tokens = 0;
+    try {
+      auto j = json::parse(body);
+      if (j.contains("tokens") && j["tokens"].is_array()) {
+        tokens = j["tokens"].get<std::vector<int>>();
+      }
+      if (j.contains("completion") && j["completion"].is_string()) {
+        completion = j["completion"].get<std::string>();
+      }
+      if (j.contains("completion_tokens") &&
+          j["completion_tokens"].is_number_integer()) {
+        completion_tokens = j["completion_tokens"].get<int>();
+      }
+    } catch (const json::exception &) {
+    }
+    if (tokens.empty() || completion.empty()) {
+      SendAll(session, BuildResponse(
+                           BuildErrorBody("tokens and completion are required"),
+                           400, "Bad Request"));
+      return;
+    }
+    cache->Insert(tokens, completion, completion_tokens);
+    SendAll(session,
+            BuildResponse(json({{"status", "ok"},
+                                {"size", static_cast<int64_t>(cache->Size())}})
+                              .dump()));
+    return;
+  }
+
   // ── OpenAI-standard /v1/models
   // ────────────────────────────────────────────── GET /v1/models          —
   // list all registered models (read scope) GET /v1/models/{id}     — describe
@@ -1548,7 +1706,8 @@ void HttpServer::HandleClient(ClientSession &session) {
         data.push_back({{"id", m.id},
                         {"object", "model"},
                         {"created", created_ts},
-                        {"owned_by", "inferflux"}});
+                        {"owned_by", "inferflux"},
+                        {"ready", m.ready}});
       }
       SendAll(session,
               BuildResponse(json({{"object", "list"}, {"data", data}}).dump()));
@@ -1562,13 +1721,91 @@ void HttpServer::HandleClient(ClientSession &session) {
         SendAll(session, BuildResponse(json({{"id", m.id},
                                              {"object", "model"},
                                              {"created", created_ts},
-                                             {"owned_by", "inferflux"}})
+                                             {"owned_by", "inferflux"},
+                                             {"ready", m.ready}})
                                            .dump()));
         return;
       }
     }
     SendAll(session,
             BuildResponse(BuildErrorBody("model_not_found"), 404, "Not Found"));
+    return;
+  }
+
+  // ── POST /v1/embeddings ──────────────────────────────────────────────────
+  // OpenAI-compatible embeddings endpoint.  Two llama_context instances share
+  // one llama_model* so weights are in RAM only once (structurally impossible
+  // across process boundaries).  Requires "read" scope.
+  if (method == "POST" && path == "/v1/embeddings") {
+    if (!RequireScope(auth_ctx, "read", session, "read scope required")) {
+      return;
+    }
+    std::string embed_model;
+    std::vector<std::string> inputs;
+    try {
+      auto j = json::parse(body);
+      if (j.contains("model") && j["model"].is_string()) {
+        embed_model = j["model"].get<std::string>();
+      }
+      if (j.contains("input")) {
+        if (j["input"].is_string()) {
+          inputs.push_back(j["input"].get<std::string>());
+        } else if (j["input"].is_array()) {
+          for (const auto &item : j["input"]) {
+            if (item.is_string()) {
+              inputs.push_back(item.get<std::string>());
+            }
+          }
+        }
+      }
+    } catch (const json::exception &) {
+    }
+    if (inputs.empty()) {
+      SendAll(session, BuildResponse(BuildErrorBody("input is required"), 400,
+                                     "Bad Request"));
+      return;
+    }
+
+    // Resolve backend.
+    auto *router = scheduler_ ? scheduler_->Router() : nullptr;
+    std::shared_ptr<LlamaCPUBackend> embed_backend;
+    if (router) {
+      auto *info = router->Resolve(embed_model);
+      if (info) {
+        embed_backend = router->GetBackend(info->id);
+      }
+    }
+    if (!embed_backend || !embed_backend->IsReady()) {
+      SendAll(session, BuildResponse(BuildErrorBody("no_backend"), 503,
+                                     "Service Unavailable"));
+      return;
+    }
+
+    // Generate embeddings for each input.
+    json data = json::array();
+    int total_tokens = 0;
+    for (std::size_t idx = 0; idx < inputs.size(); ++idx) {
+      auto emb = embed_backend->Embed(inputs[idx]);
+      if (emb.empty()) {
+        SendAll(session, BuildResponse(BuildErrorBody(
+                                           "model_does_not_support_embeddings"),
+                                       422, "Unprocessable Entity"));
+        return;
+      }
+      total_tokens += embed_backend->TokenCount(inputs[idx]);
+      json entry = {{"object", "embedding"},
+                    {"embedding", emb},
+                    {"index", static_cast<int>(idx)}};
+      data.push_back(std::move(entry));
+    }
+
+    json resp = {
+        {"object", "list"},
+        {"data", data},
+        {"model", embed_model.empty() ? "default" : embed_model},
+        {"usage",
+         {{"prompt_tokens", total_tokens}, {"total_tokens", total_tokens}}}};
+    SendAll(session, BuildResponse(resp.dump()));
     return;
   }
 
@@ -1629,6 +1866,20 @@ void HttpServer::HandleClient(ClientSession &session) {
       req.logprob_top_n = parsed.top_logprobs; // 0-20, already clamped above
     }
 
+    // Sampling parameters (temperature, top_p, top_k, etc.).
+    req.sampling = {parsed.temperature,
+                    parsed.top_p,
+                    parsed.top_k,
+                    parsed.min_p,
+                    parsed.frequency_penalty,
+                    parsed.presence_penalty,
+                    parsed.repetition_penalty,
+                    /*penalty_last_n=*/64,
+                    parsed.seed};
+
+    // Stop sequences.
+    req.stop = parsed.stop;
+
     // §2.2: attach decoded images (populated when messages contain image_url
     // parts).
     if (parsed.has_images) {
@@ -1681,7 +1932,9 @@ void HttpServer::HandleClient(ClientSession &session) {
             // needed.
             std::vector<std::pair<std::string, std::string>> msgs;
             if (use_tools && !parsed.tools.empty()) {
-              msgs.push_back({"system", BuildToolSystemPrompt(parsed.tools)});
+              msgs.push_back(
+                  {"system", BuildToolSystemPrompt(
+                                 parsed.tools, parsed.tool_choice_function)});
             }
             for (const auto &m : parsed.messages) {
               if (!m.role.empty() || !m.content.empty()) {
@@ -1710,7 +1963,8 @@ void HttpServer::HandleClient(ClientSession &session) {
         req.prompt = FlattenMessages(parsed.messages);
       }
       if (use_tools && !parsed.tools.empty()) {
-        std::string tool_prefix = BuildToolSystemPrompt(parsed.tools);
+        std::string tool_prefix =
+            BuildToolSystemPrompt(parsed.tools, parsed.tool_choice_function);
         req.prompt =
             req.prompt.empty() ? tool_prefix : tool_prefix + "\n" + req.prompt;
       }
@@ -1920,6 +2174,8 @@ void HttpServer::HandleClient(ClientSession &session) {
         {
           std::lock_guard<std::mutex> lock(*stream_mutex);
           if (stream_active->load()) {
+            const std::string stream_finish_reason =
+                result.finish_reason_length ? "length" : "stop";
             if (tool_call.detected) {
               // §2.3: emit structured tool_calls delta sequence (role → name →
               // args → finish).
@@ -1936,11 +2192,26 @@ void HttpServer::HandleClient(ClientSession &session) {
                                                     stream_ts, piece, false));
                 }
               }
-              SendAll(session, BuildStreamChunk(stream_id, parsed.model,
-                                                stream_ts, "", true));
+              SendAll(session,
+                      BuildStreamChunk(stream_id, parsed.model, stream_ts, "",
+                                       true, stream_finish_reason));
             } else {
-              SendAll(session, BuildStreamChunk(stream_id, parsed.model,
-                                                stream_ts, "", true));
+              SendAll(session,
+                      BuildStreamChunk(stream_id, parsed.model, stream_ts, "",
+                                       true, stream_finish_reason));
+            }
+            if (parsed.stream_include_usage) {
+              json uc;
+              uc["id"] = stream_id;
+              uc["object"] = "chat.completion.chunk";
+              uc["created"] = stream_ts;
+              uc["model"] = parsed.model;
+              uc["choices"] = json::array();
+              uc["usage"] = {{"prompt_tokens", result.prompt_tokens},
+                             {"completion_tokens", result.completion_tokens},
+                             {"total_tokens",
+                              result.prompt_tokens + result.completion_tokens}};
+              SendAll(session, "data: " + uc.dump() + "\n\n");
             }
             SendAll(session, "data: [DONE]\n\n");
           }

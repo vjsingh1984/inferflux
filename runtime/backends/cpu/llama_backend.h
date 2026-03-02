@@ -2,6 +2,7 @@
 
 #include "runtime/logprob.h"
 #include "runtime/multimodal/image_preprocessor.h"
+#include "scheduler/request_batch.h"
 
 #include <filesystem>
 #include <functional>
@@ -95,7 +96,7 @@ public:
          const std::function<bool(const std::string &)> &on_chunk = {},
          const std::function<bool()> &should_stop = {}, int logprob_top_n = 0,
          std::vector<TokenLogprob> *out_logprobs = nullptr,
-         int first_token = -1);
+         int first_token = -1, const std::vector<std::string> &stop_seqs = {});
 
   // Execute one shared decode step for N sequences simultaneously.
   // For each input, inserts feed_token at n_past, calls one llama_decode()
@@ -147,11 +148,12 @@ public:
   // TokenLogprob entry per generated token is appended to *out_logprobs
   // (logprob_top_n alternatives are stored in TokenLogprob::top_logprobs).
   // Pass nullptr to disable collection (default).
-  std::string
+  virtual std::string
   Generate(const std::string &prompt, int max_tokens,
            const std::function<bool(const std::string &)> &on_chunk = {},
            const std::function<bool()> &should_stop = {}, int logprob_top_n = 0,
-           std::vector<TokenLogprob> *out_logprobs = nullptr);
+           std::vector<TokenLogprob> *out_logprobs = nullptr,
+           const std::vector<std::string> &stop_seqs = {});
 
   // Vision-aware generation. Prompt must contain <__media__> markers matching
   // images. Falls back to Generate() when vision is not ready or images is
@@ -160,12 +162,22 @@ public:
       const std::string &prompt, const std::vector<DecodedImage> &images,
       int max_tokens,
       const std::function<bool(const std::string &)> &on_chunk = {},
-      const std::function<bool()> &should_stop = {});
+      const std::function<bool()> &should_stop = {},
+      const std::vector<std::string> &stop_seqs = {});
 
+  // Set up a unified sampler chain for grammar + sampling params.
+  // Must be called before Generate()/Decode(). TeardownSampler() is called
+  // automatically at the start (idempotent). Grammar string may be empty.
+  void SetupSampler(const std::string &grammar, const std::string &root,
+                    const SamplingParams &sp);
+  void TeardownSampler();
+
+  // Backward-compat wrappers (grammar-only, default SamplingParams).
   void EnableGrammarConstraint(const std::string &grammar,
                                const std::string &root);
   void DisableGrammarConstraint();
-  bool IsReady() const { return context_ != nullptr || test_ready_; }
+
+  virtual bool IsReady() const { return context_ != nullptr || test_ready_; }
 
   // Returns the effective context size (in tokens) for the loaded model.
   // Returns 0 when no model is loaded.
@@ -177,6 +189,20 @@ public:
   // LlamaBackendConfig and the context was successfully created with
   // LLAMA_FLASH_ATTN_TYPE_ENABLED.
   bool FlashAttentionEnabled() const { return config_.use_flash_attention; }
+
+  // GGML-native performance data captured after the last Generate()/Decode().
+  // Accumulated by the context's internal counters; reset after TakePerf() is
+  // called so values reflect exactly the most-recent call.
+  struct PerfSnapshot {
+    double prefill_ms{0};
+    double decode_ms{0};
+    int32_t prompt_tokens{0};
+    int32_t generated_tokens{0};
+  };
+
+  // Returns and clears the perf data from the most recent Generate/Decode.
+  // Not thread-safe — call from the same thread that called Generate/Decode.
+  PerfSnapshot TakePerf();
 
   // §2.3 — model-native chat template formatting.
   // Format a sequence of {role, content} message pairs using the model's
@@ -193,8 +219,15 @@ public:
       const std::vector<std::pair<std::string, std::string>> &messages,
       bool add_assistant_prefix = true);
 
-  int TokenCount(const std::string &text) const;
+  virtual int TokenCount(const std::string &text) const;
   void ForceReadyForTests() { test_ready_ = true; }
+
+  // Embeddings (§P1a): returns a MEAN-pooled embedding vector for text.
+  // Lazily initialises a separate llama_context sharing model_ weights (no
+  // second copy of weights in RAM). Returns an empty vector on error or when
+  // the model does not support embeddings.
+  std::vector<float> Embed(const std::string &text);
+  int EmbedDims() const;
 
   // Returns the BPE token ID vector for `prompt` (with BOS prepended).
   // Used by the scheduler's KV prefix store so that prefix matching is done
@@ -206,7 +239,6 @@ public:
 private:
   std::vector<int> Tokenize(const std::string &prompt, bool add_bos) const;
   std::string TokenToString(int token) const;
-  int SampleGreedy() const;
 
   // Build a TokenLogprob from the current context_ logits for `token_id`.
   // Computes log-softmax and optionally finds top-`top_n` alternatives.
@@ -220,7 +252,10 @@ private:
   int32_t n_vocab_{0};
   LlamaBackendConfig config_;
   bool test_ready_{false};
-  struct llama_sampler *grammar_sampler_{nullptr};
+  struct llama_sampler *active_sampler_{nullptr};
+  PerfSnapshot last_perf_{};
+  llama_context *embed_ctx_{nullptr};
+  bool EnsureEmbedCtx();
 
 #ifdef INFERFLUX_HAS_MTMD
   mtmd_context *mtmd_ctx_{nullptr};

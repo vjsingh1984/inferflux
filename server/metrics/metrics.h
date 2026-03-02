@@ -73,6 +73,11 @@ public:
   // ShmKVTransport.
   void RecordKVTransfer(double transfer_ms);
 
+  // GGML-native perf counters (from llama_perf_context). Exposes ground-truth
+  // kernel timings that subprocess wrappers cannot surface.
+  void RecordLlamaPerf(double prefill_ms, double decode_ms,
+                       int32_t prompt_tokens, int32_t generated_tokens);
+
   // Latency recording — call with full request duration in milliseconds.
   void RecordLatency(double request_ms);
 
@@ -88,6 +93,17 @@ public:
   void SetQueueDepth(int depth);
   void SetPrefillQueueDepth(int depth);
   void SetDecodeQueueDepth(int depth);
+
+  // Snapshot of prefix-cache metrics for the /v1/admin/cache endpoint.
+  struct CacheMetrics {
+    uint64_t hits{0};
+    uint64_t misses{0};
+    uint64_t partial_hits{0};
+    uint64_t matched_tokens{0};
+    uint64_t kv_reuse_count{0};
+    uint64_t kv_reuse_tokens{0};
+  };
+  CacheMetrics GetCacheMetrics() const;
 
   std::string RenderPrometheus() const;
 
@@ -137,6 +153,10 @@ private:
   LatencyHistogram decode_latency_;  // OBS-2: decode phase
   LatencyHistogram
       kv_transfer_latency_; // §2.5 item 12: prefill→decode KV hand-off
+  LatencyHistogram llama_prefill_latency_; // GGML-native prompt eval latency
+  LatencyHistogram llama_decode_latency_;  // GGML-native token gen latency
+  std::atomic<uint64_t> llama_prompt_tokens_{0};
+  std::atomic<uint64_t> llama_gen_tokens_{0};
 
   // Gauges.
   std::atomic<int> active_connections_{0};

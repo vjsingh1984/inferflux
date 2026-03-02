@@ -41,6 +41,31 @@ void BatchAddSeq(llama_batch &batch, llama_token id, llama_pos pos,
   batch.n_tokens++;
 }
 
+// Check whether output ends with any stop sequence.
+// If matched: output is trimmed to remove the stop suffix, and *emit_piece is
+// set to the portion of piece that precedes the stop (may be empty if the
+// entire piece was the stop sequence or part of it).
+// Returns true when a stop sequence was matched.
+bool ApplyStop(const std::string &piece, std::string &output,
+               const std::vector<std::string> &stops, std::string *emit_piece) {
+  *emit_piece = piece;
+  for (const auto &s : stops) {
+    if (s.empty())
+      continue;
+    if (output.size() >= s.size() &&
+        output.compare(output.size() - s.size(), s.size(), s) == 0) {
+      size_t pre_piece_len = output.size() - piece.size();
+      size_t stop_start = output.size() - s.size();
+      output.resize(stop_start);
+      *emit_piece = (stop_start > pre_piece_len)
+                        ? piece.substr(0, stop_start - pre_piece_len)
+                        : "";
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 namespace inferflux {
@@ -67,12 +92,17 @@ void LlamaBackendRelease() {
 LlamaCPUBackend::LlamaCPUBackend() { LlamaBackendAcquire(); }
 
 LlamaCPUBackend::~LlamaCPUBackend() {
+  TeardownSampler();
 #ifdef INFERFLUX_HAS_MTMD
   if (mtmd_ctx_) {
     mtmd_free(mtmd_ctx_);
     mtmd_ctx_ = nullptr;
   }
 #endif
+  if (embed_ctx_ != nullptr) {
+    llama_free(embed_ctx_);
+    embed_ctx_ = nullptr;
+  }
   if (context_ != nullptr) {
     llama_free(context_);
     context_ = nullptr;
@@ -172,13 +202,64 @@ std::vector<int> LlamaCPUBackend::Tokenize(const std::string &prompt,
   return {tokens.begin(), tokens.end()};
 }
 
-int LlamaCPUBackend::SampleGreedy() const {
-  const float *logits = llama_get_logits(context_);
-  if (!logits) {
-    return vocab_ ? llama_vocab_eos(vocab_) : 0;
+void LlamaCPUBackend::SetupSampler(const std::string &grammar,
+                                   const std::string &root,
+                                   const SamplingParams &sp) {
+  TeardownSampler();
+  if (!vocab_) {
+    return;
   }
-  auto max_it = std::max_element(logits, logits + n_vocab_);
-  return static_cast<int>(std::distance(logits, max_it));
+  auto params = llama_sampler_chain_default_params();
+  auto *chain = llama_sampler_chain_init(params);
+
+  // Grammar constraint (if provided).
+  if (!grammar.empty()) {
+    llama_sampler_chain_add(chain, llama_sampler_init_grammar(
+                                       vocab_, grammar.c_str(), root.c_str()));
+  }
+
+  // Repetition / frequency / presence penalties.
+  bool has_penalties =
+      (sp.frequency_penalty != 0.0f || sp.presence_penalty != 0.0f ||
+       sp.repetition_penalty != 1.0f);
+  if (has_penalties) {
+    llama_sampler_chain_add(chain,
+                            llama_sampler_init_penalties(
+                                sp.penalty_last_n, sp.repetition_penalty,
+                                sp.frequency_penalty, sp.presence_penalty));
+  }
+
+  // Top-K filtering.
+  if (sp.top_k > 0) {
+    llama_sampler_chain_add(chain, llama_sampler_init_top_k(sp.top_k));
+  }
+
+  // Min-P filtering.
+  if (sp.min_p > 0.0f) {
+    llama_sampler_chain_add(chain, llama_sampler_init_min_p(sp.min_p, 1));
+  }
+
+  // Top-P (nucleus) filtering.
+  if (sp.top_p < 1.0f) {
+    llama_sampler_chain_add(chain, llama_sampler_init_top_p(sp.top_p, 1));
+  }
+
+  // Terminal: greedy when temperature <= 0, stochastic otherwise.
+  if (sp.temperature <= 0.0f) {
+    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+  } else {
+    llama_sampler_chain_add(chain, llama_sampler_init_temp(sp.temperature));
+    llama_sampler_chain_add(chain, llama_sampler_init_dist(sp.seed));
+  }
+
+  active_sampler_ = chain;
+}
+
+void LlamaCPUBackend::TeardownSampler() {
+  if (active_sampler_) {
+    llama_sampler_free(active_sampler_);
+    active_sampler_ = nullptr;
+  }
 }
 
 std::string LlamaCPUBackend::TokenToString(int token) const {
@@ -205,7 +286,8 @@ std::string LlamaCPUBackend::Generate(
     const std::string &prompt, int max_tokens,
     const std::function<bool(const std::string &)> &on_chunk,
     const std::function<bool()> &should_stop, int logprob_top_n,
-    std::vector<TokenLogprob> *out_logprobs) {
+    std::vector<TokenLogprob> *out_logprobs,
+    const std::vector<std::string> &stop_seqs) {
   if (!IsReady()) {
     return {};
   }
@@ -235,20 +317,11 @@ std::string LlamaCPUBackend::Generate(
   llama_token eos = llama_vocab_eos(vocab_);
   int tokens_remaining = std::max(max_tokens, 1);
 
-  if (grammar_sampler_) {
-    llama_sampler_reset(grammar_sampler_);
-  }
-
   while (tokens_remaining-- > 0) {
     if (should_stop && should_stop()) {
       break;
     }
-    int token = 0;
-    if (grammar_sampler_) {
-      token = llama_sampler_sample(grammar_sampler_, context_, -1);
-    } else {
-      token = SampleGreedy();
-    }
+    int token = llama_sampler_sample(active_sampler_, context_, -1);
     if (token == eos) {
       break;
     }
@@ -258,10 +331,16 @@ std::string LlamaCPUBackend::Generate(
       out_logprobs->push_back(CollectLogprob(token, piece, logprob_top_n));
     }
     output += piece;
-    if (on_chunk) {
-      if (!on_chunk(piece)) {
+    // Check stop sequences: trim output and compute the streaming-safe portion.
+    std::string emit_piece;
+    bool stop_triggered = ApplyStop(piece, output, stop_seqs, &emit_piece);
+    if (on_chunk && !emit_piece.empty()) {
+      if (!on_chunk(emit_piece)) {
         break;
       }
+    }
+    if (stop_triggered) {
+      break;
     }
     if (should_stop && should_stop()) {
       break;
@@ -292,9 +371,14 @@ std::string LlamaCPUBackend::Generate(
   }
 
   llama_batch_free(batch);
-  if (grammar_sampler_) {
-    llama_sampler_reset(grammar_sampler_);
+
+  // Capture GGML-native timing (t_p_eval_ms = prefill, t_eval_ms = decode).
+  if (context_) {
+    auto raw = llama_perf_context(context_);
+    last_perf_ = {raw.t_p_eval_ms, raw.t_eval_ms, raw.n_p_eval, raw.n_eval};
+    llama_perf_context_reset(context_);
   }
+
   return output;
 }
 
@@ -336,10 +420,12 @@ bool LlamaCPUBackend::LoadMmproj(const std::filesystem::path &mmproj_path) {
 std::string LlamaCPUBackend::GenerateWithImages(
     const std::string &prompt, const std::vector<DecodedImage> &images,
     int max_tokens, const std::function<bool(const std::string &)> &on_chunk,
-    const std::function<bool()> &should_stop) {
+    const std::function<bool()> &should_stop,
+    const std::vector<std::string> &stop_seqs) {
 #ifdef INFERFLUX_HAS_MTMD
   if (!IsReady() || !vision_ready_ || !mtmd_ctx_ || images.empty()) {
-    return Generate(prompt, max_tokens, on_chunk, should_stop);
+    return Generate(prompt, max_tokens, on_chunk, should_stop, 0, nullptr,
+                    stop_seqs);
   }
 
   // Build bitmap list from raw image bytes.
@@ -355,7 +441,8 @@ std::string LlamaCPUBackend::GenerateWithImages(
                    "back to text-only\n";
       for (auto *b : bitmaps)
         mtmd_bitmap_free(b);
-      return Generate(prompt, max_tokens, on_chunk, should_stop);
+      return Generate(prompt, max_tokens, on_chunk, should_stop, 0, nullptr,
+                      stop_seqs);
     }
     if (!img.image_id.empty()) {
       mtmd_bitmap_set_id(bmp, img.image_id.c_str());
@@ -364,7 +451,8 @@ std::string LlamaCPUBackend::GenerateWithImages(
   }
 
   if (bitmaps.empty()) {
-    return Generate(prompt, max_tokens, on_chunk, should_stop);
+    return Generate(prompt, max_tokens, on_chunk, should_stop, 0, nullptr,
+                    stop_seqs);
   }
 
   // Tokenize prompt + image bitmaps into interleaved chunks.
@@ -383,7 +471,8 @@ std::string LlamaCPUBackend::GenerateWithImages(
     std::cerr << "[LlamaCPUBackend] mtmd_tokenize failed (rc=" << rc
               << "); falling back\n";
     mtmd_input_chunks_free(chunks);
-    return Generate(prompt, max_tokens, on_chunk, should_stop);
+    return Generate(prompt, max_tokens, on_chunk, should_stop, 0, nullptr,
+                    stop_seqs);
   }
 
   // Evaluate all chunks (text decode + image encode) through the model.
@@ -406,24 +495,19 @@ std::string LlamaCPUBackend::GenerateWithImages(
   llama_token eos = llama_vocab_eos(vocab_);
   int tokens_remaining = std::max(max_tokens, 1);
 
-  if (grammar_sampler_) {
-    llama_sampler_reset(grammar_sampler_);
-  }
-
   while (tokens_remaining-- > 0) {
     if (should_stop && should_stop())
       break;
-    int token = 0;
-    if (grammar_sampler_) {
-      token = llama_sampler_sample(grammar_sampler_, context_, -1);
-    } else {
-      token = SampleGreedy();
-    }
+    int token = llama_sampler_sample(active_sampler_, context_, -1);
     if (token == eos)
       break;
     std::string piece = TokenToString(token);
     output += piece;
-    if (on_chunk && !on_chunk(piece))
+    std::string emit_piece;
+    bool stop_triggered = ApplyStop(piece, output, stop_seqs, &emit_piece);
+    if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece))
+      break;
+    if (stop_triggered)
       break;
     if (should_stop && should_stop())
       break;
@@ -437,13 +521,11 @@ std::string LlamaCPUBackend::GenerateWithImages(
   }
 
   llama_batch_free(batch);
-  if (grammar_sampler_) {
-    llama_sampler_reset(grammar_sampler_);
-  }
   return output;
 #else
   (void)images;
-  return Generate(prompt, max_tokens, on_chunk, should_stop);
+  return Generate(prompt, max_tokens, on_chunk, should_stop, 0, nullptr,
+                  stop_seqs);
 #endif
 }
 
@@ -477,14 +559,24 @@ LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
   // Sample the first output token while the logit buffer is fresh.
   // This must happen before any subsequent Prefill() call, which would
   // overwrite the buffer and cause a logit-buffer race in multi-seq batches.
+  // Greedy sampling is used here (not per-request params) because
+  // active_sampler_ is set up by SamplerScope in batch_executor only for the
+  // Decode() phase.
   PrefillResult result;
   result.n_past = static_cast<int>(prompt_tokens.size());
   result.ok = true;
   llama_token eos = llama_vocab_eos(vocab_);
-  int first_tok = SampleGreedy();
-  if (first_tok >= 0 && first_tok != eos) {
-    result.first_token = first_tok;
-    result.first_piece = TokenToString(first_tok);
+  {
+    const float *logits = llama_get_logits(context_);
+    int first_tok = -1;
+    if (logits) {
+      auto max_it = std::max_element(logits, logits + n_vocab_);
+      first_tok = static_cast<int>(std::distance(logits, max_it));
+    }
+    if (first_tok >= 0 && first_tok != eos) {
+      result.first_token = first_tok;
+      result.first_piece = TokenToString(first_tok);
+    }
   }
   llama_batch_free(batch);
   return result;
@@ -539,10 +631,17 @@ LlamaCPUBackend::PrefillPartial(const std::string &prompt, int sequence_id,
   result.n_past = n_total;
   result.ok = true;
   llama_token eos = llama_vocab_eos(vocab_);
-  int first_tok = SampleGreedy();
-  if (first_tok >= 0 && first_tok != eos) {
-    result.first_token = first_tok;
-    result.first_piece = TokenToString(first_tok);
+  {
+    const float *logits = llama_get_logits(context_);
+    int first_tok = -1;
+    if (logits) {
+      auto max_it = std::max_element(logits, logits + n_vocab_);
+      first_tok = static_cast<int>(std::distance(logits, max_it));
+    }
+    if (first_tok >= 0 && first_tok != eos) {
+      result.first_token = first_tok;
+      result.first_piece = TokenToString(first_tok);
+    }
   }
   llama_batch_free(batch);
   return result;
@@ -552,7 +651,8 @@ std::string LlamaCPUBackend::Decode(
     int n_past, int sequence_id, int max_tokens,
     const std::function<bool(const std::string &)> &on_chunk,
     const std::function<bool()> &should_stop, int logprob_top_n,
-    std::vector<TokenLogprob> *out_logprobs, int first_token) {
+    std::vector<TokenLogprob> *out_logprobs, int first_token,
+    const std::vector<std::string> &stop_seqs) {
   if (!context_ || !vocab_ || n_past < 0) {
     return {};
   }
@@ -564,10 +664,6 @@ std::string LlamaCPUBackend::Decode(
   llama_token eos = llama_vocab_eos(vocab_);
   int tokens_remaining = std::max(max_tokens, 1);
 
-  if (grammar_sampler_) {
-    llama_sampler_reset(grammar_sampler_);
-  }
-
   // If a first token was pre-sampled by Prefill() (to avoid the logit-buffer
   // race in multi-sequence prefill), emit and feed it before the loop.
   if (first_token >= 0 && first_token != eos && tokens_remaining > 0) {
@@ -578,24 +674,24 @@ std::string LlamaCPUBackend::Decode(
     }
     output += piece;
     tokens_remaining--;
-    if (on_chunk && !on_chunk(piece)) {
+    std::string emit_ft;
+    bool ft_stop = ApplyStop(piece, output, stop_seqs, &emit_ft);
+    if (on_chunk && !emit_ft.empty() && !on_chunk(emit_ft)) {
       llama_batch_free(batch);
-      if (grammar_sampler_)
-        llama_sampler_reset(grammar_sampler_);
+      return output;
+    }
+    if (ft_stop) {
+      llama_batch_free(batch);
       return output;
     }
     if (should_stop && should_stop()) {
       llama_batch_free(batch);
-      if (grammar_sampler_)
-        llama_sampler_reset(grammar_sampler_);
       return output;
     }
     BatchAddSeq(batch, first_token, position++,
                 static_cast<llama_seq_id>(sequence_id), true);
     if (llama_decode(context_, batch) != 0) {
       llama_batch_free(batch);
-      if (grammar_sampler_)
-        llama_sampler_reset(grammar_sampler_);
       return output;
     }
     BatchClear(batch);
@@ -604,12 +700,7 @@ std::string LlamaCPUBackend::Decode(
   while (tokens_remaining-- > 0) {
     if (should_stop && should_stop())
       break;
-    int token = 0;
-    if (grammar_sampler_) {
-      token = llama_sampler_sample(grammar_sampler_, context_, -1);
-    } else {
-      token = SampleGreedy();
-    }
+    int token = llama_sampler_sample(active_sampler_, context_, -1);
     if (token == eos)
       break;
     std::string piece = TokenToString(token);
@@ -617,7 +708,11 @@ std::string LlamaCPUBackend::Decode(
       out_logprobs->push_back(CollectLogprob(token, piece, logprob_top_n));
     }
     output += piece;
-    if (on_chunk && !on_chunk(piece))
+    std::string emit_piece;
+    bool stop_triggered = ApplyStop(piece, output, stop_seqs, &emit_piece);
+    if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece))
+      break;
+    if (stop_triggered)
       break;
     if (should_stop && should_stop())
       break;
@@ -650,9 +745,14 @@ std::string LlamaCPUBackend::Decode(
   }
 
   llama_batch_free(batch);
-  if (grammar_sampler_) {
-    llama_sampler_reset(grammar_sampler_);
+
+  // Capture GGML-native timing for Decode phase.
+  if (context_) {
+    auto raw = llama_perf_context(context_);
+    last_perf_ = {raw.t_p_eval_ms, raw.t_eval_ms, raw.n_p_eval, raw.n_eval};
+    llama_perf_context_reset(context_);
   }
+
   return output;
 }
 
@@ -770,26 +870,18 @@ int LlamaCPUBackend::ActiveExperts() const {
   return std::atoi(buf);
 }
 
-void LlamaCPUBackend::EnableGrammarConstraint(const std::string &grammar,
-                                              const std::string &root) {
-  if (grammar.empty() || !context_ || !vocab_) {
-    return;
-  }
-  DisableGrammarConstraint();
-  auto params = llama_sampler_chain_default_params();
-  auto *chain = llama_sampler_chain_init(params);
-  llama_sampler_chain_add(
-      chain, llama_sampler_init_grammar(vocab_, grammar.c_str(), root.c_str()));
-  llama_sampler_chain_add(chain, llama_sampler_init_greedy());
-  grammar_sampler_ = chain;
+LlamaCPUBackend::PerfSnapshot LlamaCPUBackend::TakePerf() {
+  auto snap = last_perf_;
+  last_perf_ = {};
+  return snap;
 }
 
-void LlamaCPUBackend::DisableGrammarConstraint() {
-  if (grammar_sampler_) {
-    llama_sampler_free(grammar_sampler_);
-    grammar_sampler_ = nullptr;
-  }
+void LlamaCPUBackend::EnableGrammarConstraint(const std::string &grammar,
+                                              const std::string &root) {
+  SetupSampler(grammar, root, {});
 }
+
+void LlamaCPUBackend::DisableGrammarConstraint() { TeardownSampler(); }
 
 TokenLogprob LlamaCPUBackend::CollectLogprob(int token_id,
                                              const std::string &token_str,
@@ -895,6 +987,69 @@ LlamaCPUBackend::ChatTemplateResult LlamaCPUBackend::FormatChatMessages(
 
   result.prompt = std::string(buf.data(), static_cast<std::size_t>(n));
   result.valid = true;
+  return result;
+}
+
+bool LlamaCPUBackend::EnsureEmbedCtx() {
+  if (embed_ctx_)
+    return true;
+  if (!model_)
+    return false;
+  auto ep = llama_context_default_params();
+  ep.embeddings = true;
+  ep.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+  ep.n_ctx = 512;
+  embed_ctx_ = llama_init_from_model(model_, ep);
+  return embed_ctx_ != nullptr;
+}
+
+int LlamaCPUBackend::EmbedDims() const {
+  if (!model_)
+    return 0;
+  return llama_model_n_embd(model_);
+}
+
+std::vector<float> LlamaCPUBackend::Embed(const std::string &text) {
+  if (!EnsureEmbedCtx())
+    return {};
+  if (!vocab_)
+    return {};
+
+  // Tokenize without BOS — standard for embedding models.
+  auto tokens = Tokenize(text, /*add_bos=*/false);
+  if (tokens.empty())
+    return {};
+
+  int32_t batch_cap = std::max<int32_t>(
+      config_.batch_size, static_cast<int32_t>(tokens.size()) + 1);
+  llama_batch batch = llama_batch_init(batch_cap, 0, 1);
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    BatchAddSeq(batch, tokens[i], static_cast<llama_pos>(i),
+                /*seq_id=*/0,
+                /*logits=*/i == tokens.size() - 1);
+  }
+
+  if (llama_decode(embed_ctx_, batch) != 0) {
+    std::cerr << "[LlamaCPUBackend] Embed: llama_decode failed\n";
+    llama_batch_free(batch);
+    return {};
+  }
+  llama_batch_free(batch);
+
+  float *emb = llama_get_embeddings_seq(embed_ctx_, 0);
+  if (!emb) {
+    std::cerr
+        << "[LlamaCPUBackend] Embed: llama_get_embeddings_seq returned null\n";
+    // Reset context state for this sequence.
+    llama_memory_seq_rm(llama_get_memory(embed_ctx_), 0, -1, -1);
+    return {};
+  }
+
+  int n_embd = llama_model_n_embd(model_);
+  std::vector<float> result(emb, emb + n_embd);
+
+  // Clear KV state for the sequence so the context can be reused.
+  llama_memory_seq_rm(llama_get_memory(embed_ctx_), 0, -1, -1);
   return result;
 }
 

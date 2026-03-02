@@ -13,6 +13,22 @@
 
 namespace inferflux {
 
+// Per-request sampling parameters (OpenAI-compatible).
+// UINT32_MAX is used for seed because llama.cpp defines
+// LLAMA_DEFAULT_SEED == UINT32_MAX, avoiding a transitive llama.h dependency
+// in this scheduler-level header.
+struct SamplingParams {
+  float temperature{1.0f};        // 0 = greedy, >0 = stochastic
+  float top_p{1.0f};              // nucleus; 1.0 = disabled
+  int top_k{0};                   // 0 = disabled
+  float min_p{0.0f};              // 0.0 = disabled
+  float frequency_penalty{0.0f};  // OpenAI: penalise frequent tokens
+  float presence_penalty{0.0f};   // OpenAI: penalise any prior token
+  float repetition_penalty{1.0f}; // multiplicative; 1.0 = disabled
+  int penalty_last_n{64};         // lookback window for penalties
+  uint32_t seed{UINT32_MAX};      // UINT32_MAX = random per call
+};
+
 // Phase of an inference request in the continuous batching pipeline.
 enum class RequestPhase {
   kPending,  // Queued, not yet scheduled.
@@ -119,6 +135,14 @@ struct InferenceRequest {
   // the O(V log V) partial-sort for alternatives.
   bool collect_logprobs{false};
   int logprob_top_n{0};
+
+  // OpenAI-compatible sampling parameters. Applied by the backend on every
+  // Generate()/Decode() call via SamplerScope in batch_executor.cpp.
+  SamplingParams sampling{};
+
+  // OpenAI `stop` parameter: up to 4 strings at which generation halts.
+  // The matched stop sequence is NOT included in the completion text.
+  std::vector<std::string> stop;
 };
 
 // RequestBatch groups requests that will execute together in a single

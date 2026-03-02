@@ -2,13 +2,18 @@
 
 #include "server/metrics/metrics.h"
 
+#if INFERFLUX_HAS_MLX
+#include "runtime/backends/mlx/mlx_backend.h"
+#endif
+
 #include <filesystem>
+#include <iostream>
 
 namespace inferflux {
 
 namespace {
 
-LlamaBackendConfig ConfigForBackendHint(const std::string& hint) {
+LlamaBackendConfig ConfigForBackendHint(const std::string &hint) {
   LlamaBackendConfig cfg;
   if (hint == "mps" || hint == "cuda") {
     cfg.gpu_layers = 99;
@@ -16,14 +21,28 @@ LlamaBackendConfig ConfigForBackendHint(const std::string& hint) {
   return cfg;
 }
 
-std::string BackendLabelOrDefault(const std::string& hint) {
+std::string BackendLabelOrDefault(const std::string &hint) {
   if (hint.empty()) {
     return "cpu";
   }
   return hint;
 }
 
-}  // namespace
+std::shared_ptr<LlamaCPUBackend> CreateBackendForHint(const std::string &hint) {
+#if INFERFLUX_HAS_MLX
+  if (hint == "mlx") {
+    return std::make_shared<MlxBackend>();
+  }
+#else
+  if (hint == "mlx") {
+    std::cerr << "[router] MLX backend requested but binary was built without "
+                 "ENABLE_MLX. Falling back to CPU backend.\n";
+  }
+#endif
+  return std::make_shared<LlamaCPUBackend>();
+}
+
+} // namespace
 
 SingleModelRouter::SingleModelRouter(std::shared_ptr<LlamaCPUBackend> backend,
                                      ModelInfo info) {
@@ -32,8 +51,8 @@ SingleModelRouter::SingleModelRouter(std::shared_ptr<LlamaCPUBackend> backend,
 
 SingleModelRouter::SingleModelRouter() = default;
 
-bool SingleModelRouter::RegisterModel(const ModelInfo& info,
-                                      std::shared_ptr<LlamaCPUBackend> backend) {
+bool SingleModelRouter::RegisterModel(
+    const ModelInfo &info, std::shared_ptr<LlamaCPUBackend> backend) {
   if (!backend) {
     return false;
   }
@@ -49,9 +68,10 @@ bool SingleModelRouter::RegisterModel(const ModelInfo& info,
   entry.info.is_moe = backend->IsMoE();
   entry.info.n_experts = backend->ExpertCount();
   entry.info.n_active_experts = backend->ActiveExperts();
-  entry.info.id = info.id.empty()
-                      ? GenerateModelIdLocked(info.path.empty() ? "model" : info.path)
-                      : EnsureUniqueIdLocked(info.id);
+  entry.info.id =
+      info.id.empty()
+          ? GenerateModelIdLocked(info.path.empty() ? "model" : info.path)
+          : EnsureUniqueIdLocked(info.id);
   entry.info.ready = backend->IsReady();
   entry.backend = std::move(backend);
   entry.load_time = std::chrono::steady_clock::now();
@@ -68,7 +88,7 @@ std::vector<ModelInfo> SingleModelRouter::ListModels() const {
   std::vector<ModelInfo> out;
   std::lock_guard<std::mutex> lock(mutex_);
   out.reserve(models_.size());
-  for (const auto& [id, entry] : models_) {
+  for (const auto &[id, entry] : models_) {
     ModelInfo copy = entry.info;
     copy.ready = entry.backend && entry.backend->IsReady();
     out.push_back(copy);
@@ -76,10 +96,10 @@ std::vector<ModelInfo> SingleModelRouter::ListModels() const {
   return out;
 }
 
-std::string SingleModelRouter::LoadModel(const std::string& path,
-                                         const std::string& backend_hint,
-                                         const std::string& requested_id) {
-  auto new_backend = std::make_shared<LlamaCPUBackend>();
+std::string SingleModelRouter::LoadModel(const std::string &path,
+                                         const std::string &backend_hint,
+                                         const std::string &requested_id) {
+  auto new_backend = CreateBackendForHint(backend_hint);
   auto start = std::chrono::steady_clock::now();
   LlamaBackendConfig cfg = ConfigForBackendHint(backend_hint);
   if (!new_backend->LoadModel(path, cfg)) {
@@ -87,7 +107,8 @@ std::string SingleModelRouter::LoadModel(const std::string& path,
   }
 
   auto load_finished = std::chrono::steady_clock::now();
-  double load_seconds = std::chrono::duration<double>(load_finished - start).count();
+  double load_seconds =
+      std::chrono::duration<double>(load_finished - start).count();
 
   ModelInfo info;
   info.path = path;
@@ -117,7 +138,7 @@ std::string SingleModelRouter::LoadModel(const std::string& path,
   return info.id;
 }
 
-bool SingleModelRouter::UnloadModel(const std::string& id) {
+bool SingleModelRouter::UnloadModel(const std::string &id) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = models_.find(id);
   if (it == models_.end()) {
@@ -132,12 +153,13 @@ bool SingleModelRouter::UnloadModel(const std::string& id) {
   return true;
 }
 
-ModelInfo* SingleModelRouter::Resolve(const std::string& requested_model) {
+ModelInfo *SingleModelRouter::Resolve(const std::string &requested_model) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (models_.empty()) {
     return nullptr;
   }
-  std::string target = requested_model.empty() ? default_model_id_ : requested_model;
+  std::string target =
+      requested_model.empty() ? default_model_id_ : requested_model;
   auto it = models_.find(target);
   if (it == models_.end()) {
     if (!requested_model.empty() && !default_model_id_.empty()) {
@@ -155,7 +177,8 @@ ModelInfo* SingleModelRouter::Resolve(const std::string& requested_model) {
   return &it->second.info;
 }
 
-std::shared_ptr<LlamaCPUBackend> SingleModelRouter::GetBackend(const std::string& model_id) {
+std::shared_ptr<LlamaCPUBackend>
+SingleModelRouter::GetBackend(const std::string &model_id) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = models_.find(model_id);
   if (it == models_.end()) {
@@ -164,7 +187,7 @@ std::shared_ptr<LlamaCPUBackend> SingleModelRouter::GetBackend(const std::string
   return it->second.backend;
 }
 
-bool SingleModelRouter::SetDefaultModel(const std::string& model_id) {
+bool SingleModelRouter::SetDefaultModel(const std::string &model_id) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (models_.find(model_id) == models_.end()) {
     return false;
@@ -190,7 +213,8 @@ std::shared_ptr<LlamaCPUBackend> SingleModelRouter::Backend() const {
   return it->second.backend;
 }
 
-std::string SingleModelRouter::GenerateModelIdLocked(const std::string& path) const {
+std::string
+SingleModelRouter::GenerateModelIdLocked(const std::string &path) const {
   std::string base = std::filesystem::path(path).stem().string();
   if (base.empty()) {
     base = "model";
@@ -198,7 +222,8 @@ std::string SingleModelRouter::GenerateModelIdLocked(const std::string& path) co
   return EnsureUniqueIdLocked(base);
 }
 
-std::string SingleModelRouter::EnsureUniqueIdLocked(const std::string& preferred) const {
+std::string
+SingleModelRouter::EnsureUniqueIdLocked(const std::string &preferred) const {
   std::string base = preferred.empty() ? "model" : preferred;
   std::string candidate = base;
   int suffix = 1;
@@ -208,7 +233,8 @@ std::string SingleModelRouter::EnsureUniqueIdLocked(const std::string& preferred
   return candidate;
 }
 
-void SingleModelRouter::RecordModelReadyLocked(const Entry& entry, bool ready) const {
+void SingleModelRouter::RecordModelReadyLocked(const Entry &entry,
+                                               bool ready) const {
   GlobalMetrics().RecordModelReady(entry.info.id, entry.info.backend, ready);
 }
 
@@ -222,4 +248,4 @@ void SingleModelRouter::UpdateDefaultModelLocked() {
   default_model_id_ = models_.begin()->first;
 }
 
-}  // namespace inferflux
+} // namespace inferflux
