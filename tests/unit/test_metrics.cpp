@@ -114,3 +114,76 @@ TEST_CASE("MetricsRegistry prefill/decode queue gauges", "[metrics]") {
   REQUIRE(output.find("inferflux_prefill_queue_depth 3") != std::string::npos);
   REQUIRE(output.find("inferflux_decode_queue_depth 2") != std::string::npos);
 }
+
+TEST_CASE("MetricsRegistry records per-model token counters", "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordModelRoute("llama3-8b", "cuda", true);
+  registry.RecordModelTokens("llama3-8b", "cuda", 12, 34);
+  registry.RecordModelTokens("llama3-8b", "", 3, 6);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_model_prompt_tokens_total{model=\"llama3-8b\","
+                      "backend=\"cuda\"} 15") != std::string::npos);
+  REQUIRE(output.find("inferflux_model_completion_tokens_total{model=\"llama3-"
+                      "8b\",backend=\"cuda\"} 40") != std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry per-model counters fall back to instance backend",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.SetBackend("mps");
+  registry.RecordModelTokens("qwen2.5-7b", "", 5, 9);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_model_prompt_tokens_total{model=\"qwen2.5-"
+                      "7b\",backend=\"mps\"} 5") != std::string::npos);
+  REQUIRE(output.find("inferflux_model_completion_tokens_total{model=\"qwen2.5-"
+                      "7b\",backend=\"mps\"} 9") != std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry records capability rejection counters",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordCapabilityRejection("cuda", "vision");
+  registry.RecordCapabilityRejection("cuda", "vision");
+  registry.RecordCapabilityRejection("cpu", "structured_output");
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_capability_rejections_total{backend=\"cuda\","
+                      "feature=\"vision\"} 2") != std::string::npos);
+  REQUIRE(output.find("inferflux_capability_rejections_total{backend=\"cpu\","
+                      "feature=\"structured_output\"} 1") != std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry records backend exposure counters", "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordBackendExposure("cuda", "cuda", "universal", false);
+  registry.RecordBackendExposure("cuda", "cpu", "universal", true);
+  registry.RecordBackendExposure("cuda", "cpu", "universal", true);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_backend_exposures_total{requested_backend="
+                      "\"cuda\",exposed_backend=\"cuda\",provider="
+                      "\"universal\",fallback=\"false\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_backend_exposures_total{requested_backend="
+                      "\"cuda\",exposed_backend=\"cpu\",provider=\"universal\","
+                      "fallback=\"true\"} 2") != std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry records capability route fallback counters",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordCapabilityRouteFallback("cuda", "cpu", "logprobs");
+  registry.RecordCapabilityRouteFallback("cuda", "cpu", "logprobs");
+  registry.RecordCapabilityRouteFallback("rocm", "cpu", "backend_unavailable");
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_capability_route_fallbacks_total{"
+                      "from_backend=\"cuda\",to_backend=\"cpu\","
+                      "feature=\"logprobs\"} 2") != std::string::npos);
+  REQUIRE(output.find("inferflux_capability_route_fallbacks_total{"
+                      "from_backend=\"rocm\",to_backend=\"cpu\","
+                      "feature=\"backend_unavailable\"} 1") !=
+          std::string::npos);
+}

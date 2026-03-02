@@ -3,6 +3,7 @@
 #include <openssl/sha.h>
 
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 
 namespace inferflux {

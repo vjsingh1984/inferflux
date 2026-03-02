@@ -112,4 +112,39 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     REQUIRE(mock_backend->calls[0].inputs.size() == 2);
     REQUIRE(mock_backend->calls[1].inputs.size() == 2);
   }
+
+  SECTION("Groups phased unified execution by backend instance") {
+    auto mock_backend_a = std::make_shared<MockUnifiedBackend>();
+    auto mock_backend_b = std::make_shared<MockUnifiedBackend>();
+
+    InferenceRequest req_a;
+    req_a.model = "model-a";
+    req_a.phase = RequestPhase::kPrefill;
+    req_a.n_past = 0;
+    req_a.sequence_id = 3;
+    req_a.bpe_prompt_tokens = {1, 2, 3};
+    req_a.max_tokens = 2;
+    req_a.block_table = {10};
+
+    InferenceRequest req_b;
+    req_b.model = "model-b";
+    req_b.phase = RequestPhase::kPrefill;
+    req_b.n_past = 0;
+    req_b.sequence_id = 4;
+    req_b.bpe_prompt_tokens = {4, 5, 6};
+    req_b.max_tokens = 2;
+    req_b.block_table = {11};
+
+    RequestBatch batch;
+    batch.requests = {&req_a, &req_b};
+
+    executor->ExecuteBatch(batch, {mock_backend_a, mock_backend_b});
+
+    REQUIRE_FALSE(mock_backend_a->calls.empty());
+    REQUIRE_FALSE(mock_backend_b->calls.empty());
+    REQUIRE(mock_backend_a->calls.front().inputs.size() == 1);
+    REQUIRE(mock_backend_b->calls.front().inputs.size() == 1);
+    REQUIRE(req_a.phase == RequestPhase::kFinished);
+    REQUIRE(req_b.phase == RequestPhase::kFinished);
+  }
 }

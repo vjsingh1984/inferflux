@@ -1,5 +1,6 @@
 #include "model/tokenizer/simple_tokenizer.h"
 #include "policy/policy_store.h"
+#include "runtime/backends/backend_factory.h"
 #include "runtime/backends/backend_manager.h"
 #include "runtime/backends/cpu/cpu_backend.h"
 #include "runtime/backends/cpu/llama_backend.h"
@@ -109,6 +110,30 @@ std::vector<ModelConfig> ParseModelsEnv(const std::string &raw) {
   }
   return entries;
 }
+
+std::vector<std::string> ParseBackendPriorityList(const std::string &raw) {
+  std::vector<std::string> hints;
+  std::stringstream ss(raw);
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    token = ToLower(Trim(token));
+    if (!token.empty()) {
+      hints.push_back(token);
+    }
+  }
+  return hints;
+}
+
+std::string JoinList(const std::vector<std::string> &items) {
+  std::string out;
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (i > 0) {
+      out.append(",");
+    }
+    out.append(items[i]);
+  }
+  return out;
+}
 } // namespace
 
 static std::atomic<bool> g_running{true};
@@ -172,6 +197,9 @@ int main(int argc, char **argv) {
   bool cuda_enabled = false;
   bool cuda_flash_attention_enabled = false;
   int cuda_flash_attention_tile = 128;
+  bool backend_prefer_native = true;
+  bool backend_allow_universal_fallback = true;
+  std::vector<std::string> backend_priority;
   bool speculative_enabled = false;
   std::string speculative_draft_model;
   int speculative_max_prefill_tokens = 256;
@@ -249,6 +277,15 @@ int main(int argc, char **argv) {
 
       // Runtime config
       if (config["runtime"]) {
+        if (config["runtime"]["backend_priority"] &&
+            config["runtime"]["backend_priority"].IsSequence()) {
+          backend_priority.clear();
+          for (const auto &hint : config["runtime"]["backend_priority"]) {
+            if (hint.IsScalar()) {
+              backend_priority.push_back(ToLower(hint.as<std::string>()));
+            }
+          }
+        }
         if (config["runtime"]["mps_layers"])
           mps_layers = config["runtime"]["mps_layers"].as<int>();
         if (config["runtime"]["prefix_cache_capacity"])
@@ -270,6 +307,16 @@ int main(int argc, char **argv) {
           cuda_flash_attention_tile =
               config["runtime"]["cuda"]["flash_attention"]["tile_size"]
                   .as<int>();
+        }
+        if (config["runtime"]["backend_exposure"]) {
+          const auto &exposure = config["runtime"]["backend_exposure"];
+          if (exposure["prefer_native"]) {
+            backend_prefer_native = exposure["prefer_native"].as<bool>();
+          }
+          if (exposure["allow_universal_fallback"]) {
+            backend_allow_universal_fallback =
+                exposure["allow_universal_fallback"].as<bool>();
+          }
         }
         if (config["runtime"]["speculative_decoding"]) {
           if (config["runtime"]["speculative_decoding"]["enabled"])
@@ -522,6 +569,21 @@ int main(int argc, char **argv) {
       cuda_flash_attention_tile = static_cast<int>(tile);
     }
   }
+  if (const char *env_prefer_native =
+          std::getenv("INFERFLUX_BACKEND_PREFER_NATIVE")) {
+    backend_prefer_native = ParseBool(env_prefer_native);
+  }
+  if (const char *env_allow_fallback =
+          std::getenv("INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK")) {
+    backend_allow_universal_fallback = ParseBool(env_allow_fallback);
+  }
+  if (const char *env_backend_priority =
+          std::getenv("INFERFLUX_BACKEND_PRIORITY")) {
+    auto parsed_priority = ParseBackendPriorityList(env_backend_priority);
+    if (!parsed_priority.empty()) {
+      backend_priority = std::move(parsed_priority);
+    }
+  }
   inferflux::FairnessConfig fairness_config;
   fairness_config.enable_preemption = false;
   fairness_config.high_priority_threshold = 5;
@@ -613,6 +675,14 @@ int main(int argc, char **argv) {
   }
   std::cout << "Paged KV cache pages: " << cache_pages
             << " eviction=" << normalized_policy << std::endl;
+  inferflux::BackendFactory::SetExposurePolicy(
+      {backend_prefer_native, backend_allow_universal_fallback});
+  inferflux::log::Info(
+      "server",
+      "Backend exposure policy: prefer_native=" +
+          std::string(backend_prefer_native ? "true" : "false") +
+          ", allow_universal_fallback=" +
+          std::string(backend_allow_universal_fallback ? "true" : "false"));
   inferflux::BackendManager backend_manager;
   std::string backend_label = "stub";
   std::string primary_model_id;
@@ -661,7 +731,26 @@ int main(int argc, char **argv) {
   inferflux::GlobalMetrics().SetFlashAttentionEnabled(
       primary_cfg.use_flash_attention);
 
-  auto router = std::make_shared<inferflux::SingleModelRouter>();
+  inferflux::LlamaBackendConfig router_backend_config = primary_cfg;
+  if (cuda_enabled && router_backend_config.gpu_layers <= 0) {
+    router_backend_config.gpu_layers = 99;
+  }
+  std::string default_backend_hint = "cpu";
+  if (cuda_enabled) {
+    default_backend_hint = "cuda";
+  } else if (mps_layers > 0) {
+    default_backend_hint = "mps";
+  }
+  auto normalized_backend_priority =
+      inferflux::BackendFactory::NormalizeHintList(backend_priority,
+                                                   default_backend_hint);
+  if (!normalized_backend_priority.empty()) {
+    default_backend_hint = normalized_backend_priority.front();
+  }
+  inferflux::log::Info("server", "Backend priority order: " +
+                                     JoinList(normalized_backend_priority));
+  auto router = std::make_shared<inferflux::SingleModelRouter>(
+      router_backend_config, default_backend_hint, normalized_backend_priority);
   std::string resolved_default_model_id;
   std::string resolved_default_path = model_path;
   if (!configured_models.empty()) {
@@ -672,8 +761,18 @@ int main(int argc, char **argv) {
         continue;
       }
       cfg.id = assigned_id;
-      std::cout << "InferFlux loaded model: " << cfg.path
-                << " (backend=" << (cfg.backend.empty() ? "cpu" : cfg.backend)
+      std::string assigned_backend = cfg.backend;
+      for (const auto &loaded : router->ListModels()) {
+        if (loaded.id == assigned_id) {
+          assigned_backend = loaded.backend;
+          break;
+        }
+      }
+      if (assigned_backend.empty()) {
+        assigned_backend = default_backend_hint;
+      }
+      std::cout << "InferFlux loaded model: " << cfg.path << " (backend="
+                << (assigned_backend.empty() ? "cpu" : assigned_backend)
                 << ", id=" << assigned_id << ")" << std::endl;
       if (resolved_default_model_id.empty()) {
         resolved_default_model_id = assigned_id;

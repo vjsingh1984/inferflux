@@ -4,28 +4,31 @@ server:
   max_concurrent: 1024
   enable_metrics: true
   enable_tracing: false
+
 model:
-  repo: meta-llama/Meta-Llama-3-8B-Instruct
-  path: models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
+  repo: TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF
+  path: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
   format: gguf
   quantization: q4_k_m
   tokenizer: sentencepiece
+
 models:
-  - id: llama3-8b
-    path: models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
-    backend: cpu
+  - id: tinyllama
+    path: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+    backend: cuda
     default: true
+
 runtime:
-  backend_priority: [cpu]
+  backend_priority: [cuda, cpu]
   backend_exposure:
     prefer_native: true
     allow_universal_fallback: true
   tensor_parallel: 1
   mps_layers: 0
   fairness:
-    enable_preemption: false
+    enable_preemption: true
     high_priority_threshold: 5
-    max_timeslice_tokens: 0
+    max_timeslice_tokens: 64
   speculative_decoding:
     enabled: false
     draft_model: ""
@@ -38,23 +41,30 @@ runtime:
   paged_kv:
     cpu_pages: 4096
     eviction: lru
+
 adapters: []
+
 auth:
   api_keys:
     - key: dev-key-123
       scopes: [generate, read, admin]
+    - key: user-key-123
+      scopes: [generate, read]
   rate_limit_per_minute: 120
   oidc_issuer: https://issuer.example.com
   oidc_audience: inferflux
+
 guardrails:
   blocklist:
     - secret
     - confidential
   opa_endpoint: ""
+
 logging:
   level: info
   format: json
   audit_log: logs/audit.log
+
 registry:
-  path: ""                # Path to registry.yaml; empty = disabled (CQ-8)
-  poll_interval_ms: 5000  # How often to check for file changes
+  path: ""
+  poll_interval_ms: 5000

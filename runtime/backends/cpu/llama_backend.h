@@ -42,8 +42,8 @@ public:
   LlamaCPUBackend();
   virtual ~LlamaCPUBackend();
 
-  bool LoadModel(const std::filesystem::path &model_path,
-                 const LlamaBackendConfig &config = {});
+  virtual bool LoadModel(const std::filesystem::path &model_path,
+                         const LlamaBackendConfig &config = {});
 
   // Load a multimodal projector (mmproj) GGUF alongside the text model.
   // Must be called after LoadModel(). Returns false if ENABLE_MTMD is off.

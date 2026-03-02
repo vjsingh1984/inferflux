@@ -1,4 +1,5 @@
 #include "runtime/backends/backend_manager.h"
+#include "runtime/backends/backend_factory.h"
 #include "server/logging/logger.h"
 
 namespace inferflux {
@@ -12,23 +13,23 @@ BackendManager::LoadBackend(const std::string &name, const std::string &path,
   if (it != backends_.end() && it->second && it->second->IsReady()) {
     return it->second;
   }
-  if (prefer_cuda) {
-#ifdef INFERFLUX_HAS_CUDA
-    log::Info("backend_manager",
-              "CUDA support detected; GPU backend integration pending.");
-#else
+
+  auto selection = BackendFactory::Create(prefer_cuda ? "cuda" : "cpu");
+  if (!selection.backend) {
     log::Error("backend_manager",
-               "CUDA requested but binary was built without CUDA support.");
-#endif
+               "failed to create backend strategy for " + name);
+    return nullptr;
   }
-  auto backend = std::make_shared<LlamaCPUBackend>();
-  if (!backend->LoadModel(path, config)) {
+
+  auto merged_config = MergeBackendConfig(config, selection);
+  if (!selection.backend->LoadModel(path, merged_config)) {
     log::Error("backend_manager",
                "failed to load model " + path + " for " + name);
     return nullptr;
   }
-  backends_[name] = backend;
-  return backend;
+
+  backends_[name] = selection.backend;
+  return selection.backend;
 }
 
 std::shared_ptr<LlamaCPUBackend>

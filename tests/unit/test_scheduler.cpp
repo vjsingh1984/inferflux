@@ -12,6 +12,87 @@
 
 using namespace inferflux;
 
+namespace {
+
+class ReadyStubBackend : public LlamaCPUBackend {
+public:
+  explicit ReadyStubBackend(std::string output) : output_(std::move(output)) {}
+
+  bool LoadModel(const std::filesystem::path &,
+                 const LlamaBackendConfig &) override {
+    return true;
+  }
+
+  bool IsReady() const override { return true; }
+
+  PrefillResult Prefill(const std::string &, int) override {
+    PrefillResult out;
+    out.n_past = 1;
+    out.ok = true;
+    return out;
+  }
+
+  PrefillResult PrefillPartial(const std::string &, int,
+                               int n_past_start) override {
+    PrefillResult out;
+    out.n_past = n_past_start + 1;
+    out.ok = true;
+    return out;
+  }
+
+  std::string Decode(int, int, int,
+                     const std::function<bool(const std::string &,
+                                              const TokenLogprob *)> &on_chunk,
+                     const std::function<bool()> &, int,
+                     std::vector<TokenLogprob> *out_logprobs, int,
+                     const std::vector<std::string> &) override {
+    if (out_logprobs) {
+      TokenLogprob lp;
+      lp.token = output_;
+      lp.logprob = -0.1f;
+      out_logprobs->push_back(lp);
+    }
+    if (on_chunk && !on_chunk(output_, nullptr)) {
+      return {};
+    }
+    return output_;
+  }
+
+  std::string
+  Generate(const std::string &, int,
+           const std::function<bool(const std::string &, const TokenLogprob *)>
+               &on_chunk,
+           const std::function<bool()> &, int,
+           std::vector<TokenLogprob> *out_logprobs,
+           const std::vector<std::string> &) override {
+    if (out_logprobs) {
+      TokenLogprob lp;
+      lp.token = output_;
+      lp.logprob = -0.1f;
+      out_logprobs->push_back(lp);
+    }
+    if (on_chunk && !on_chunk(output_, nullptr)) {
+      return {};
+    }
+    return output_;
+  }
+
+  void FreeSequence(int) override {}
+
+  int TokenCount(const std::string &text) const override {
+    return static_cast<int>(text.size());
+  }
+
+  std::vector<int> TokenizeForCache(const std::string &) const override {
+    return {1, 2, 3};
+  }
+
+private:
+  std::string output_;
+};
+
+} // namespace
+
 TEST_CASE("Scheduler stub response with no backend", "[scheduler]") {
   SimpleTokenizer tokenizer;
   auto device = std::make_shared<CPUDeviceContext>();
@@ -111,4 +192,86 @@ TEST_CASE("FairnessController evaluation", "[fairness]") {
 
   auto decision = controller.Evaluate(batch, queue);
   REQUIRE(decision.swap);
+}
+
+TEST_CASE(
+    "Scheduler falls back to compatible backend for default model routing",
+    "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+
+  ModelInfo cuda_info;
+  cuda_info.id = "shared-cuda";
+  cuda_info.path = "/tmp/shared.gguf";
+  cuda_info.backend = "cuda";
+  REQUIRE(router->RegisterModel(
+      cuda_info, std::make_shared<ReadyStubBackend>("from-cuda")));
+
+  ModelInfo cpu_info;
+  cpu_info.id = "shared-cpu";
+  cpu_info.path = "/tmp/shared.gguf";
+  cpu_info.backend = "cpu";
+  REQUIRE(router->RegisterModel(
+      cpu_info, std::make_shared<ReadyStubBackend>("from-cpu")));
+  REQUIRE(router->SetDefaultModel("shared-cuda"));
+
+  auto *primary = router->Resolve("shared-cuda");
+  REQUIRE(primary != nullptr);
+  primary->capabilities.supports_logprobs = false;
+
+  Scheduler scheduler(tokenizer, device, cache, router);
+
+  InferenceRequest req;
+  req.prompt = "hello";
+  req.max_tokens = 4;
+  req.collect_logprobs = true;
+
+  auto resp = scheduler.Generate(req).get();
+  REQUIRE_FALSE(resp.no_backend);
+  REQUIRE(resp.model_id == "shared-cpu");
+  REQUIRE(resp.completion == "from-cpu");
+}
+
+TEST_CASE("Scheduler does not auto-fallback for explicit model requests",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+
+  ModelInfo cuda_info;
+  cuda_info.id = "shared-cuda";
+  cuda_info.path = "/tmp/shared.gguf";
+  cuda_info.backend = "cuda";
+  REQUIRE(router->RegisterModel(
+      cuda_info, std::make_shared<ReadyStubBackend>("from-cuda")));
+
+  ModelInfo cpu_info;
+  cpu_info.id = "shared-cpu";
+  cpu_info.path = "/tmp/shared.gguf";
+  cpu_info.backend = "cpu";
+  REQUIRE(router->RegisterModel(
+      cpu_info, std::make_shared<ReadyStubBackend>("from-cpu")));
+  REQUIRE(router->SetDefaultModel("shared-cuda"));
+
+  auto *primary = router->Resolve("shared-cuda");
+  REQUIRE(primary != nullptr);
+  primary->capabilities.supports_logprobs = false;
+
+  Scheduler scheduler(tokenizer, device, cache, router);
+
+  InferenceRequest req;
+  req.model = "shared-cuda";
+  req.prompt = "hello";
+  req.max_tokens = 4;
+  req.collect_logprobs = true;
+
+  auto resp = scheduler.Generate(req).get();
+  REQUIRE(resp.no_backend);
+  REQUIRE(resp.model_id.empty());
+  REQUIRE(resp.completion.find("logprobs") != std::string::npos);
 }

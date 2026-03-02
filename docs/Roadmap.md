@@ -38,14 +38,22 @@ Goal: reach competitive continuous batching throughput on CPU/MPS today while pa
 
 - **DoD**
   - [x] Continuous batching replaces global mutex; `RequestBatch` wired end-to-end (INF-2).
+  - [x] Unified phased batching now groups by backend instance so mixed-model batches keep backend-local coalescing (INF-2 follow-up).
+  - [x] Shared llama.cpp/CUDA backend traits shard (`runtime/backends/llama/llama_backend_traits.*`) centralizes target parsing + config tuning.
+  - [x] Backend exposure policy recorded in factory: native-preferred with universal llama fallback (`INFERFLUX_BACKEND_PREFER_NATIVE`, `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK`).
+  - [x] Backend priority chain + exposure provenance wired end-to-end (`runtime.backend_priority` / `INFERFLUX_BACKEND_PRIORITY`, per-model `backend_exposure` fields, `inferflux_backend_exposures_total` metric).
+  - [x] Request-time capability fallback for default model routing (same-path backend reroute, explicit model pinning preserved, `inferflux_capability_route_fallbacks_total` metric).
+  - [x] Backend capability contract + request-time feature gating shipped (`runtime/backends/backend_capabilities.*`, `/v1/models` capability metadata, 422 reject path + `inferflux_capability_rejections_total`).
   - [x] Prefix cache online with metrics + eviction policies (INF-6/§2.4) — `RadixPrefixCache` (compressed trie, partial-match tracking, LRU eviction, 12 unit tests).
-  - [ ] CUDA backend with FlashAttention-3 kernels validated on L40S (INF-2, §2.7 KPIs). Subtasks: enable llama.cpp CUDA build, add FlashAttention config knobs, implement BatchExecutor with prefill/decode overlap, wire GPU KV cache. **Hardware constraint:** hold execution until compatible CUDA hardware is available; keep design work ready.
+  - [ ] CUDA backend with FlashAttention-3 kernels validated on L40S (INF-2, §2.7 KPIs). **Progress:** backend strategy/factory wiring + CUDA default-route plumbing are complete. Remaining: FA3 kernels, prefill/decode overlap in BatchExecutor, GPU KV cache, and KPI sign-off.
 - [x] Priority-aware fairness scheduler on CPU/MPS (preemption + cancellation) — `FairnessController`, timeslice, preemption, per-priority metrics (§2.9).
   - [x] ModelRouter routes multi-model requests with hot load/unload (ARCH-4/5/6) — `SingleModelRouter`, `/v1/admin/models` CRUD, `/v1/models` OpenAI-standard list (4 integration tests).
   - [x] Priority fairness queue + preemption hooks (ARCH-5 follow-up); `runtime.fairness.*` knobs (`enable_preemption`, `high_priority_threshold`, `max_timeslice_tokens`) live in config/env.
   - [x] SSE cancellation regression tests (`SSECancel` ctest target) kept green.
   - [x] SimpleTokenizer metrics replaced with llama.cpp tokenizer (INF-7) — `TokenizeForCache` + BPE prefix matching in KV prefix store.
+  - [x] Per-model prompt/completion token counters exported (`inferflux_model_prompt_tokens_total`, `inferflux_model_completion_tokens_total`) so Prometheus `rate(...)` can track backend/model throughput.
   - [x] Latency histograms + queue-depth gauges emitted (OBS-1) to prove KPI gains; add fairness counters (preemptions, per-priority tokens).
+  - [ ] Record-only (macOS/MLX): add an MLX trait adapter + parity checklist so MLX capability reporting aligns with llama.cpp/CUDA without changing MLX runtime behavior yet.
   - [ ] Design scaffolding for Intel GPU + AMD ROCm backends (build flags, DeviceContext hooks) so hardware bring-up is unblocked once samples arrive.
   - **Exit KPIs**: ≥400 tok/s aggregate on L40S (future), prefix cache hit rate >60%, TTFT <250 ms with guardrails enabled, fairness tests demonstrate <5% variance across priorities on CPU/MPS.
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/backends/backend_capabilities.h"
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -10,17 +12,23 @@ class LlamaCPUBackend;
 
 // ModelInfo describes a loaded model for routing and management.
 struct ModelInfo {
-  std::string id;       // Unique model identifier (e.g., "llama3-8b-q4").
-  std::string path;     // Filesystem path to weights.
-  std::string backend;  // Backend type: "cpu", "cuda", "mps", "rocm".
-  bool ready{false};    // True when the model is loaded and serving.
+  std::string id;      // Unique model identifier (e.g., "llama3-8b-q4").
+  std::string path;    // Filesystem path to weights.
+  std::string backend; // Backend type: "cpu", "cuda", "mps", "rocm".
+  std::string requested_backend; // Requested backend hint ("cuda", "auto"...).
+  std::string backend_provider{"universal"}; // "native" or "universal".
+  bool backend_fallback{false};        // True when requested backend fell back.
+  std::string backend_fallback_reason; // Optional fallback explanation.
+  bool ready{false}; // True when the model is loaded and serving.
+  BackendCapabilities capabilities{};
+  // Legacy alias kept for compatibility with older checks/callers.
   bool supports_structured_output{false};
 
   // MoE metadata (§2.6).  Populated from GGUF metadata after model load.
   // is_moe is true when the GGUF "llm.expert_count" key is present and > 0.
   bool is_moe{false};
-  int n_experts{0};         // Total expert count (llm.expert_count).
-  int n_active_experts{0};  // Active experts per token (llm.expert_used_count).
+  int n_experts{0};        // Total expert count (llm.expert_count).
+  int n_active_experts{0}; // Active experts per token (llm.expert_used_count).
 };
 
 // ModelRouter is the plugin interface for multi-model serving.
@@ -32,7 +40,7 @@ struct ModelInfo {
 //
 // Thread safety: all methods must be safe to call concurrently.
 class ModelRouter {
- public:
+public:
   virtual ~ModelRouter() = default;
 
   // List all models known to the router (loaded and unloaded).
@@ -41,27 +49,28 @@ class ModelRouter {
   // Load a model from the given path, returning its assigned ID.
   // The optional requested_id is treated as a hint; routers may adjust it to
   // ensure uniqueness. Returns empty string on failure.
-  virtual std::string LoadModel(const std::string& path,
-                                const std::string& backend_hint = "",
-                                const std::string& requested_id = "") = 0;
+  virtual std::string LoadModel(const std::string &path,
+                                const std::string &backend_hint = "",
+                                const std::string &requested_id = "") = 0;
 
   // Unload a model by ID. Returns false if the model was not found.
-  virtual bool UnloadModel(const std::string& id) = 0;
+  virtual bool UnloadModel(const std::string &id) = 0;
 
   // Resolve which model should handle a request. The caller provides
   // the model ID from the API request (may be empty for default routing).
   // Returns nullptr if no suitable model is available.
-  virtual ModelInfo* Resolve(const std::string& requested_model) = 0;
+  virtual ModelInfo *Resolve(const std::string &requested_model) = 0;
 
   // Retrieve the backend instance associated with a resolved model ID.
-  virtual std::shared_ptr<LlamaCPUBackend> GetBackend(const std::string& model_id) = 0;
+  virtual std::shared_ptr<LlamaCPUBackend>
+  GetBackend(const std::string &model_id) = 0;
 
   // Set or query the default routing target.
-  virtual bool SetDefaultModel(const std::string& model_id) = 0;
+  virtual bool SetDefaultModel(const std::string &model_id) = 0;
   virtual std::string DefaultModelId() const = 0;
 
   // Identity — useful for logging and diagnostics.
   virtual std::string Name() const = 0;
 };
 
-}  // namespace inferflux
+} // namespace inferflux

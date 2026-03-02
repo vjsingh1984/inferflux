@@ -1,7 +1,9 @@
 #include "server/http/http_server.h"
 
+#include "runtime/backends/backend_capabilities.h"
 #include "runtime/backends/cpu/llama_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
+#include "scheduler/model_selection.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 #include "server/tracing/span.h"
@@ -149,6 +151,43 @@ struct CompletionRequestPayload {
   int n{1};
   int best_of{1};
 };
+
+json BuildCapabilitiesJson(const BackendCapabilities &capabilities) {
+  return json{
+      {"streaming", capabilities.supports_streaming},
+      {"logprobs", capabilities.supports_logprobs},
+      {"structured_output", capabilities.supports_structured_output},
+      {"embeddings", capabilities.supports_embeddings},
+      {"vision", capabilities.supports_vision},
+      {"speculative_decoding", capabilities.supports_speculative_decoding},
+      {"fairness_preemption", capabilities.supports_fairness_preemption},
+      {"kv_prefix_transfer", capabilities.supports_kv_prefix_transfer},
+  };
+}
+
+json BuildBackendExposureJson(const ModelInfo &info) {
+  const std::string requested =
+      info.requested_backend.empty() ? info.backend : info.requested_backend;
+  const std::string provider =
+      info.backend_provider.empty() ? "universal" : info.backend_provider;
+  return json{
+      {"requested_backend", requested},
+      {"exposed_backend", info.backend},
+      {"provider", provider},
+      {"fallback", info.backend_fallback},
+      {"fallback_reason", info.backend_fallback_reason},
+  };
+}
+
+BackendFeatureRequirements
+BuildGenerationRequirements(const CompletionRequestPayload &payload) {
+  BackendFeatureRequirements requirements;
+  requirements.needs_streaming = payload.stream;
+  requirements.needs_logprobs = payload.logprobs;
+  requirements.needs_structured_output = payload.has_response_format;
+  requirements.needs_vision = payload.has_images;
+  return requirements;
+}
 
 CompletionRequestPayload ParseJsonPayload(const std::string &body) {
   CompletionRequestPayload payload;
@@ -1532,11 +1571,18 @@ void HttpServer::HandleClient(ClientSession &session) {
     payload["default_model"] = default_id;
     payload["models"] = json::array();
     for (const auto &info : models) {
-      payload["models"].push_back({{"id", info.id},
-                                   {"path", info.path},
-                                   {"backend", info.backend},
-                                   {"ready", info.ready},
-                                   {"default", info.id == default_id}});
+      payload["models"].push_back(
+          {{"id", info.id},
+           {"path", info.path},
+           {"backend", info.backend},
+           {"requested_backend", info.requested_backend.empty()
+                                     ? info.backend
+                                     : info.requested_backend},
+           {"backend_provider", info.backend_provider},
+           {"backend_exposure", BuildBackendExposureJson(info)},
+           {"ready", info.ready},
+           {"capabilities", BuildCapabilitiesJson(info.capabilities)},
+           {"default", info.id == default_id}});
     }
     SendAll(session, BuildResponse(payload.dump()));
     return;
@@ -1764,11 +1810,15 @@ void HttpServer::HandleClient(ClientSession &session) {
     if (path == "/v1/models") {
       json data = json::array();
       for (const auto &m : models) {
-        data.push_back({{"id", m.id},
-                        {"object", "model"},
-                        {"created", created_ts},
-                        {"owned_by", "inferflux"},
-                        {"ready", m.ready}});
+        data.push_back(
+            {{"id", m.id},
+             {"object", "model"},
+             {"created", created_ts},
+             {"owned_by", "inferflux"},
+             {"backend", m.backend},
+             {"backend_exposure", BuildBackendExposureJson(m)},
+             {"ready", m.ready},
+             {"capabilities", BuildCapabilitiesJson(m.capabilities)}});
       }
       SendAll(session,
               BuildResponse(json({{"object", "list"}, {"data", data}}).dump()));
@@ -1779,12 +1829,18 @@ void HttpServer::HandleClient(ClientSession &session) {
     std::string model_id = path.substr(12); // strip "/v1/models/"
     for (const auto &m : models) {
       if (m.id == model_id) {
-        SendAll(session, BuildResponse(json({{"id", m.id},
-                                             {"object", "model"},
-                                             {"created", created_ts},
-                                             {"owned_by", "inferflux"},
-                                             {"ready", m.ready}})
-                                           .dump()));
+        SendAll(
+            session,
+            BuildResponse(
+                json({{"id", m.id},
+                      {"object", "model"},
+                      {"created", created_ts},
+                      {"owned_by", "inferflux"},
+                      {"backend", m.backend},
+                      {"backend_exposure", BuildBackendExposureJson(m)},
+                      {"ready", m.ready},
+                      {"capabilities", BuildCapabilitiesJson(m.capabilities)}})
+                    .dump()));
         return;
       }
     }
@@ -1827,13 +1883,50 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
 
-    // Resolve backend.
+    // Resolve backend with capability-aware fallback semantics.
     auto *router = scheduler_ ? scheduler_->Router() : nullptr;
     std::shared_ptr<LlamaCPUBackend> embed_backend;
+    std::string resolved_model = embed_model.empty() ? "default" : embed_model;
     if (router) {
-      auto *info = router->Resolve(embed_model);
-      if (info) {
-        embed_backend = router->GetBackend(info->id);
+      BackendFeatureRequirements requirements;
+      requirements.needs_embeddings = true;
+      auto selection = SelectModelForRequest(
+          router, embed_model, requirements,
+          ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,
+                                /*require_ready_backend=*/true});
+      if (selection.status == ModelSelectionStatus::kUnsupported) {
+        if (metrics_) {
+          metrics_->RecordCapabilityRejection(selection.info.backend,
+                                              selection.missing_feature);
+        }
+        SendAll(session,
+                BuildResponse(
+                    BuildErrorBody(selection.reason.empty()
+                                       ? "Selected model does not support "
+                                         "embeddings"
+                                       : selection.reason),
+                    422, "Unprocessable Entity"));
+        if (audit_logger_) {
+          audit_logger_->Log(auth_ctx.subject,
+                             selection.info.id.empty() ? resolved_model
+                                                       : selection.info.id,
+                             "capability_reject",
+                             selection.reason.empty() ? "embeddings unsupported"
+                                                      : selection.reason);
+        }
+        return;
+      }
+      if (selection.status == ModelSelectionStatus::kSelected) {
+        embed_backend = selection.backend;
+        if (!selection.info.id.empty()) {
+          resolved_model = selection.info.id;
+        }
+        if (selection.used_fallback && metrics_) {
+          metrics_->RecordCapabilityRouteFallback(
+              selection.fallback_from_backend, selection.info.backend,
+              selection.fallback_feature.empty() ? "unsupported_feature"
+                                                 : selection.fallback_feature);
+        }
       }
     }
     if (!embed_backend || !embed_backend->IsReady()) {
@@ -1863,7 +1956,7 @@ void HttpServer::HandleClient(ClientSession &session) {
     json resp = {
         {"object", "list"},
         {"data", data},
-        {"model", embed_model.empty() ? "default" : embed_model},
+        {"model", resolved_model},
         {"usage",
          {{"prompt_tokens", total_tokens}, {"total_tokens", total_tokens}}}};
     SendAll(session, BuildResponse(resp.dump()));
@@ -2027,6 +2120,36 @@ void HttpServer::HandleClient(ClientSession &session) {
       SendAll(session, payload);
       return;
     }
+
+    if (auto *router = scheduler_ ? scheduler_->Router() : nullptr) {
+      auto selection = SelectModelForRequest(
+          router, parsed.model, BuildGenerationRequirements(parsed),
+          ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,
+                                /*require_ready_backend=*/false});
+      if (selection.status == ModelSelectionStatus::kUnsupported) {
+        if (metrics_) {
+          metrics_->RecordCapabilityRejection(selection.info.backend,
+                                              selection.missing_feature);
+        }
+        auto payload = BuildResponse(
+            BuildErrorBody(selection.reason.empty()
+                               ? "Selected model does not support "
+                                 "requested features"
+                               : selection.reason),
+            422, "Unprocessable Entity");
+        SendAll(session, payload);
+        if (audit_logger_) {
+          audit_logger_->Log(
+              auth_ctx.subject,
+              selection.info.id.empty() ? parsed.model : selection.info.id,
+              "capability_reject",
+              selection.reason.empty() ? "requested feature unsupported"
+                                       : selection.reason);
+        }
+        return;
+      }
+    }
+
     bool chat_mode =
         (path == "/v1/chat/completions") || !parsed.messages.empty();
     std::string guard_reason;
@@ -2316,6 +2439,8 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
       if (metrics_) {
         metrics_->RecordSuccess(result.prompt_tokens, result.completion_tokens);
+        metrics_->RecordModelTokens(result.model_id, "", result.prompt_tokens,
+                                    result.completion_tokens);
         metrics_->RecordSpeculative(result.speculative.total_chunks,
                                     result.speculative.accepted_chunks,
                                     result.speculative.reused_tokens);

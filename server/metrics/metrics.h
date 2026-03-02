@@ -56,6 +56,19 @@ public:
                         bool ready);
   void RecordModelRoute(const std::string &model_id, const std::string &backend,
                         bool hit);
+  // Per-model token counters for throughput dashboards.
+  // Exported as counters so Prometheus can derive tokens/sec via rate().
+  void RecordModelTokens(const std::string &model_id,
+                         const std::string &backend, int prompt_tokens,
+                         int completion_tokens);
+  void RecordCapabilityRejection(const std::string &backend,
+                                 const std::string &feature);
+  void RecordBackendExposure(const std::string &requested_backend,
+                             const std::string &exposed_backend,
+                             const std::string &provider, bool used_fallback);
+  void RecordCapabilityRouteFallback(const std::string &from_backend,
+                                     const std::string &to_backend,
+                                     const std::string &feature);
 
   // Multimodal (§2.2): record image preprocessing events.
   // images: number of images decoded; decode_ms: preprocessing wall-clock time.
@@ -169,11 +182,19 @@ private:
     double load_seconds{0.0};
     uint64_t load_events{0};
     uint64_t routes{0};
+    uint64_t prompt_tokens{0};
+    uint64_t completion_tokens{0};
     bool ready{false};
   };
 
   mutable std::mutex model_metrics_mutex_;
   std::unordered_map<std::string, ModelStats> model_stats_;
+  mutable std::mutex capability_metrics_mutex_;
+  std::unordered_map<std::string, uint64_t> capability_rejections_;
+  mutable std::mutex backend_exposure_mutex_;
+  std::unordered_map<std::string, uint64_t> backend_exposure_counts_;
+  mutable std::mutex capability_route_fallback_mutex_;
+  std::unordered_map<std::string, uint64_t> capability_route_fallbacks_;
 };
 
 MetricsRegistry &GlobalMetrics();

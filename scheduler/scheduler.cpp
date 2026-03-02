@@ -3,6 +3,7 @@
 #include "runtime/execution/batch_executor.h"
 #include "runtime/execution/parallel_context.h"
 #include "runtime/structured_output/structured_output_adapter.h"
+#include "scheduler/model_selection.h"
 #include "scheduler/single_model_router.h"
 #include "server/metrics/metrics.h"
 #include "server/tracing/span.h"
@@ -194,13 +195,12 @@ void Scheduler::DecodeWorkerLoop() {
 
     for (auto &pending : batch) {
       auto *inference = &pending->inference;
-      if (inference->has_response_format &&
-          !inference->response_format_supported) {
+      if (!inference->response_format_supported) {
         InferenceResult error;
         error.no_backend = true;
         error.completion =
             inference->response_format_error.empty()
-                ? "Selected model does not support response_format"
+                ? "Selected model does not support requested features"
                 : inference->response_format_error;
         pending->promise.set_value(std::move(error));
         // Return the sequence slot and KV blocks so they are not leaked.
@@ -745,13 +745,13 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   exec_pending.reserve(selection.pending.size());
   for (auto &pending : selection.pending) {
     auto *inference = &pending->inference;
-    if (inference->has_response_format &&
-        !inference->response_format_supported) {
+    if (!inference->response_format_supported) {
       InferenceResult error;
       error.no_backend = true;
-      error.completion = inference->response_format_error.empty()
-                             ? "Selected model does not support response_format"
-                             : inference->response_format_error;
+      error.completion =
+          inference->response_format_error.empty()
+              ? "Selected model does not support requested features"
+              : inference->response_format_error;
       pending->promise.set_value(std::move(error));
       continue;
     }
@@ -1027,30 +1027,58 @@ void Scheduler::ResolveBackends(
     pending->inference.resolved_model.clear();
     pending->inference.response_format_supported = true;
     pending->inference.response_format_error.clear();
-    auto *info = router_->Resolve(pending->inference.model);
-    if (!info) {
+
+    BackendFeatureRequirements requirements;
+    requirements.needs_structured_output =
+        pending->inference.has_response_format;
+    requirements.needs_logprobs = pending->inference.collect_logprobs;
+    requirements.needs_vision = pending->inference.has_images;
+
+    auto selection = SelectModelForRequest(
+        router_.get(), pending->inference.model, requirements,
+        ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,
+                              /*require_ready_backend=*/true});
+
+    if (selection.status == ModelSelectionStatus::kNotFound) {
       GlobalMetrics().RecordModelRoute(pending->inference.model, "", false);
       continue;
     }
-    if (pending->inference.has_response_format &&
-        !info->supports_structured_output) {
+    if (selection.status == ModelSelectionStatus::kUnsupported) {
       pending->inference.response_format_supported = false;
       pending->inference.response_format_error =
-          "Selected model does not support response_format constraints";
-      GlobalMetrics().RecordModelRoute(info->id, info->backend, false);
+          selection.reason.empty()
+              ? "Selected model does not support requested features"
+              : selection.reason;
+      GlobalMetrics().RecordModelRoute(selection.info.id,
+                                       selection.info.backend, false);
       continue;
     }
-    auto backend = router_->GetBackend(info->id);
-    if (backend && backend->IsReady()) {
-      pending->resolved_backend = backend;
-      pending->inference.resolved_model = info->id;
-      GlobalMetrics().RecordModelRoute(info->id, info->backend, true);
-      if (info->is_moe) {
+    if (selection.status == ModelSelectionStatus::kBackendUnavailable) {
+      pending->inference.resolved_model = selection.info.id;
+      GlobalMetrics().RecordModelRoute(selection.info.id,
+                                       selection.info.backend, false);
+      continue;
+    }
+
+    if (selection.used_fallback) {
+      GlobalMetrics().RecordCapabilityRouteFallback(
+          selection.fallback_from_backend, selection.info.backend,
+          selection.fallback_feature.empty() ? "unsupported_feature"
+                                             : selection.fallback_feature);
+    }
+
+    if (selection.backend && selection.backend->IsReady()) {
+      pending->resolved_backend = selection.backend;
+      pending->inference.resolved_model = selection.info.id;
+      GlobalMetrics().RecordModelRoute(selection.info.id,
+                                       selection.info.backend, true);
+      if (selection.info.is_moe) {
         GlobalMetrics().RecordMoERequest();
       }
     } else {
-      pending->inference.resolved_model = info->id;
-      GlobalMetrics().RecordModelRoute(info->id, info->backend, false);
+      pending->inference.resolved_model = selection.info.id;
+      GlobalMetrics().RecordModelRoute(selection.info.id,
+                                       selection.info.backend, false);
     }
   }
 }

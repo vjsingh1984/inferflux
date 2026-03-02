@@ -117,6 +117,8 @@ struct InferenceRequest {
   std::string response_format_root{"root"};
   bool response_format_ready{
       false}; // True once grammar string compiled/resolved.
+  // Feature gate for backend/model capability checks. Historically used for
+  // response_format, now reused for all request-level feature compatibility.
   bool response_format_supported{true};
   std::string response_format_error;
   StructuredConstraint response_constraint;

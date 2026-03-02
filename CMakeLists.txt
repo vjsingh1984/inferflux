@@ -37,6 +37,12 @@ add_library(inferflux_core
   runtime/backends/cuda/cuda_device_context.h
   runtime/backends/cuda/cuda_backend.cpp
   runtime/backends/cuda/cuda_backend.h
+  runtime/backends/backend_capabilities.cpp
+  runtime/backends/backend_capabilities.h
+  runtime/backends/llama/llama_backend_traits.cpp
+  runtime/backends/llama/llama_backend_traits.h
+  runtime/backends/backend_factory.cpp
+  runtime/backends/backend_factory.h
   runtime/backends/backend_manager.cpp
   runtime/backends/backend_manager.h
   runtime/speculative/speculative_decoder.cpp
@@ -56,6 +62,8 @@ add_library(inferflux_core
   scheduler/scheduler.cpp
   scheduler/fairness_controller.cpp
   scheduler/scheduler.h
+  scheduler/model_selection.cpp
+  scheduler/model_selection.h
   scheduler/single_model_router.cpp
   scheduler/single_model_router.h
   scheduler/model_registry.cpp
@@ -90,10 +98,6 @@ add_library(inferflux_core
   runtime/disaggregated/shm_kv_transport.h
   runtime/multimodal/image_preprocessor.cpp
   runtime/multimodal/image_preprocessor.h
-  runtime/backends/mlx/mlx_backend.cpp
-  runtime/backends/mlx/mlx_loader.cpp
-  runtime/backends/mlx/mlx_execution.cpp
-  runtime/backends/mlx/mlx_tokenizer.cpp
   external/llama.cpp/common/json-schema-to-grammar.cpp
   io/async_file_writer.cpp
   io/async_file_writer.h
@@ -175,6 +179,12 @@ else()
 endif()
 
 if(ENABLE_MLX)
+  target_sources(inferflux_core PRIVATE
+    runtime/backends/mlx/mlx_backend.cpp
+    runtime/backends/mlx/mlx_loader.cpp
+    runtime/backends/mlx/mlx_execution.cpp
+    runtime/backends/mlx/mlx_tokenizer.cpp
+  )
   message(STATUS "ENABLE_MLX=ON — configuring mlx-c dependency")
   set(MLX_C_HINTS $ENV{MLX_C_ROOT} ${MLX_C_ROOT})
   if(MLX_C_HINTS)
@@ -326,20 +336,27 @@ add_executable(inferflux_tests
   tests/unit/test_sampling.cpp
   tests/unit/test_logger.cpp
   tests/unit/test_structured_output.cpp
-  tests/unit/test_mlx_loader.cpp
-  tests/unit/test_mlx_tokenizer.cpp
-  tests/unit/test_mlx_execution.cpp
-  tests/unit/test_mlx_backend.cpp
   tests/unit/test_paged_kv_cache.cpp
   tests/unit/test_unified_batching.cpp
   tests/unit/test_model_registry.cpp
+  tests/unit/test_model_selection.cpp
   tests/unit/test_stop_sequences.cpp
   tests/unit/test_parallel_context.cpp
   tests/unit/test_ep_dispatch.cpp
+  tests/unit/test_backend_factory.cpp
+  tests/unit/test_backend_capabilities.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
 target_link_libraries(inferflux_tests PRIVATE inferflux_core)
+if(ENABLE_MLX)
+  target_sources(inferflux_tests PRIVATE
+    tests/unit/test_mlx_loader.cpp
+    tests/unit/test_mlx_tokenizer.cpp
+    tests/unit/test_mlx_execution.cpp
+    tests/unit/test_mlx_backend.cpp
+  )
+endif()
 add_test(NAME UnitTests COMMAND inferflux_tests)
 add_test(NAME FairnessTests COMMAND inferflux_tests "[fairness]")
 set_tests_properties(FairnessTests PROPERTIES LABELS fairness)
@@ -351,6 +368,10 @@ add_test(NAME ParallelTests COMMAND inferflux_tests "[parallel]")
 set_tests_properties(ParallelTests PROPERTIES LABELS parallel)
 add_test(NAME EPTests COMMAND inferflux_tests "[ep]")
 set_tests_properties(EPTests PROPERTIES LABELS ep)
+add_test(NAME BackendFactoryTests COMMAND inferflux_tests "[backend_factory]")
+set_tests_properties(BackendFactoryTests PROPERTIES LABELS backend_factory)
+add_test(NAME BackendCapabilitiesTests COMMAND inferflux_tests "[backend_capabilities]")
+set_tests_properties(BackendCapabilitiesTests PROPERTIES LABELS backend_capabilities)
 add_test(NAME MoETests COMMAND inferflux_tests "[moe]")
 set_tests_properties(MoETests PROPERTIES LABELS moe)
 add_test(NAME FlashAttnTests COMMAND inferflux_tests "[flash_attn]")
@@ -369,20 +390,22 @@ add_test(NAME ModelRegistryTests COMMAND inferflux_tests "[model_registry]")
 set_tests_properties(ModelRegistryTests PROPERTIES LABELS model_registry)
 add_test(NAME StopSequenceTests COMMAND inferflux_tests "[stop_sequences]")
 set_tests_properties(StopSequenceTests PROPERTIES LABELS stop_sequences)
-add_test(NAME MlxLoaderTests COMMAND inferflux_tests "[mlx_loader]")
-set_tests_properties(MlxLoaderTests PROPERTIES LABELS mlx_loader)
-if(MLX_C_LIB_DIR)
-  # Provide the mlx-c and MLX dylib locations to the test runner on macOS.
-  set_tests_properties(MlxLoaderTests PROPERTIES
-    ENVIRONMENT "DYLD_LIBRARY_PATH=${MLX_C_LIB_DIR}:$ENV{DYLD_LIBRARY_PATH}")
-endif()
-add_test(NAME MlxTokenizerTests COMMAND inferflux_tests "[mlx_tokenizer]")
-set_tests_properties(MlxTokenizerTests PROPERTIES LABELS mlx_tokenizer)
-add_test(NAME MlxExecutionTests COMMAND inferflux_tests "[mlx_execution]")
-set_tests_properties(MlxExecutionTests PROPERTIES LABELS mlx_execution)
-if(MLX_C_LIB_DIR)
-  set_tests_properties(MlxExecutionTests PROPERTIES
-    ENVIRONMENT "DYLD_LIBRARY_PATH=${MLX_C_LIB_DIR}:$ENV{DYLD_LIBRARY_PATH}")
+if(ENABLE_MLX)
+  add_test(NAME MlxLoaderTests COMMAND inferflux_tests "[mlx_loader]")
+  set_tests_properties(MlxLoaderTests PROPERTIES LABELS mlx_loader)
+  if(MLX_C_LIB_DIR)
+    # Provide the mlx-c and MLX dylib locations to the test runner on macOS.
+    set_tests_properties(MlxLoaderTests PROPERTIES
+      ENVIRONMENT "DYLD_LIBRARY_PATH=${MLX_C_LIB_DIR}:$ENV{DYLD_LIBRARY_PATH}")
+  endif()
+  add_test(NAME MlxTokenizerTests COMMAND inferflux_tests "[mlx_tokenizer]")
+  set_tests_properties(MlxTokenizerTests PROPERTIES LABELS mlx_tokenizer)
+  add_test(NAME MlxExecutionTests COMMAND inferflux_tests "[mlx_execution]")
+  set_tests_properties(MlxExecutionTests PROPERTIES LABELS mlx_execution)
+  if(MLX_C_LIB_DIR)
+    set_tests_properties(MlxExecutionTests PROPERTIES
+      ENVIRONMENT "DYLD_LIBRARY_PATH=${MLX_C_LIB_DIR}:$ENV{DYLD_LIBRARY_PATH}")
+  endif()
 endif()
 
 set(CPACK_PACKAGE_NAME "inferflux")

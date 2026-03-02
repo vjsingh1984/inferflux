@@ -183,6 +183,72 @@ void MetricsRegistry::RecordModelRoute(const std::string &model_id,
   stats.routes += 1;
 }
 
+void MetricsRegistry::RecordModelTokens(const std::string &model_id,
+                                        const std::string &backend,
+                                        int prompt_tokens,
+                                        int completion_tokens) {
+  if (model_id.empty()) {
+    return;
+  }
+  if (prompt_tokens <= 0 && completion_tokens <= 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(model_metrics_mutex_);
+  auto &stats = model_stats_[model_id];
+  if (!backend.empty()) {
+    stats.backend = backend;
+  }
+  if (prompt_tokens > 0) {
+    stats.prompt_tokens += static_cast<uint64_t>(prompt_tokens);
+  }
+  if (completion_tokens > 0) {
+    stats.completion_tokens += static_cast<uint64_t>(completion_tokens);
+  }
+}
+
+void MetricsRegistry::RecordCapabilityRejection(const std::string &backend,
+                                                const std::string &feature) {
+  if (feature.empty()) {
+    return;
+  }
+  const std::string backend_label = backend.empty() ? "unknown" : backend;
+  const std::string key = backend_label + "|" + feature;
+  std::lock_guard<std::mutex> lock(capability_metrics_mutex_);
+  capability_rejections_[key] += 1;
+}
+
+void MetricsRegistry::RecordBackendExposure(
+    const std::string &requested_backend, const std::string &exposed_backend,
+    const std::string &provider, bool used_fallback) {
+  if (exposed_backend.empty()) {
+    return;
+  }
+  const std::string requested_label =
+      requested_backend.empty() ? "auto" : requested_backend;
+  const std::string exposed_label =
+      exposed_backend.empty() ? "unknown" : exposed_backend;
+  const std::string provider_label = provider.empty() ? "unknown" : provider;
+  const std::string fallback_label = used_fallback ? "true" : "false";
+  const std::string key = requested_label + "|" + exposed_label + "|" +
+                          provider_label + "|" + fallback_label;
+  std::lock_guard<std::mutex> lock(backend_exposure_mutex_);
+  backend_exposure_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordCapabilityRouteFallback(
+    const std::string &from_backend, const std::string &to_backend,
+    const std::string &feature) {
+  if (feature.empty()) {
+    return;
+  }
+  const std::string from_label =
+      from_backend.empty() ? "unknown" : from_backend;
+  const std::string to_label = to_backend.empty() ? "unknown" : to_backend;
+  const std::string key = from_label + "|" + to_label + "|" + feature;
+  std::lock_guard<std::mutex> lock(capability_route_fallback_mutex_);
+  capability_route_fallbacks_[key] += 1;
+}
+
 void MetricsRegistry::RecordImagePreprocess(int images, double /*decode_ms*/) {
   if (images > 0) {
     multimodal_images_.fetch_add(static_cast<uint64_t>(images),
@@ -435,6 +501,70 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_stream_cache_hits_total{backend=\"" << backend << "\"} "
       << stream_cache_hits_.load() << "\n";
 
+  out << "# HELP inferflux_capability_rejections_total Requests rejected due "
+         "to unsupported backend/model features\n";
+  out << "# TYPE inferflux_capability_rejections_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(capability_metrics_mutex_);
+    for (const auto &[key, count] : capability_rejections_) {
+      auto split = key.find('|');
+      std::string label_backend =
+          split == std::string::npos ? backend : key.substr(0, split);
+      std::string label_feature =
+          split == std::string::npos ? key : key.substr(split + 1);
+      out << "inferflux_capability_rejections_total{backend=\"" << label_backend
+          << "\",feature=\"" << label_feature << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_backend_exposures_total Model backend exposure "
+         "decisions by requested/selected provider path\n";
+  out << "# TYPE inferflux_backend_exposures_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(backend_exposure_mutex_);
+    for (const auto &[key, count] : backend_exposure_counts_) {
+      auto p1 = key.find('|');
+      auto p2 =
+          (p1 == std::string::npos) ? std::string::npos : key.find('|', p1 + 1);
+      auto p3 =
+          (p2 == std::string::npos) ? std::string::npos : key.find('|', p2 + 1);
+      if (p1 == std::string::npos || p2 == std::string::npos ||
+          p3 == std::string::npos) {
+        continue;
+      }
+      const std::string requested = key.substr(0, p1);
+      const std::string exposed = key.substr(p1 + 1, p2 - p1 - 1);
+      const std::string provider = key.substr(p2 + 1, p3 - p2 - 1);
+      const std::string fallback = key.substr(p3 + 1);
+      out << "inferflux_backend_exposures_total{requested_backend=\""
+          << requested << "\",exposed_backend=\"" << exposed << "\",provider=\""
+          << provider << "\",fallback=\"" << fallback << "\"} " << count
+          << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_capability_route_fallbacks_total Requests rerouted "
+         "to another backend due to unsupported features or backend "
+         "unavailability\n";
+  out << "# TYPE inferflux_capability_route_fallbacks_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(capability_route_fallback_mutex_);
+    for (const auto &[key, count] : capability_route_fallbacks_) {
+      auto p1 = key.find('|');
+      auto p2 =
+          (p1 == std::string::npos) ? std::string::npos : key.find('|', p1 + 1);
+      if (p1 == std::string::npos || p2 == std::string::npos) {
+        continue;
+      }
+      const std::string from = key.substr(0, p1);
+      const std::string to = key.substr(p1 + 1, p2 - p1 - 1);
+      const std::string feature = key.substr(p2 + 1);
+      out << "inferflux_capability_route_fallbacks_total{from_backend=\""
+          << from << "\",to_backend=\"" << to << "\",feature=\"" << feature
+          << "\"} " << count << "\n";
+    }
+  }
+
   out << "# HELP inferflux_fairness_preemptions_total Number of fairness "
          "preemptions performed\n";
   out << "# TYPE inferflux_fairness_preemptions_total counter\n";
@@ -506,6 +636,33 @@ std::string MetricsRegistry::RenderPrometheus() const {
           stats.backend.empty() ? backend : stats.backend;
       out << "inferflux_model_ready{model=\"" << model << "\",backend=\""
           << label << "\"} " << (stats.ready ? 1 : 0) << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_model_prompt_tokens_total Prompt tokens processed "
+         "per model (use rate(...) for prompt throughput)\n";
+  out << "# TYPE inferflux_model_prompt_tokens_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(model_metrics_mutex_);
+    for (const auto &[model, stats] : model_stats_) {
+      const std::string &label =
+          stats.backend.empty() ? backend : stats.backend;
+      out << "inferflux_model_prompt_tokens_total{model=\"" << model
+          << "\",backend=\"" << label << "\"} " << stats.prompt_tokens << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_model_completion_tokens_total Completion tokens "
+         "produced per model (use rate(...) for generation throughput)\n";
+  out << "# TYPE inferflux_model_completion_tokens_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(model_metrics_mutex_);
+    for (const auto &[model, stats] : model_stats_) {
+      const std::string &label =
+          stats.backend.empty() ? backend : stats.backend;
+      out << "inferflux_model_completion_tokens_total{model=\"" << model
+          << "\",backend=\"" << label << "\"} " << stats.completion_tokens
+          << "\n";
     }
   }
 

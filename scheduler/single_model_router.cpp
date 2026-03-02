@@ -1,45 +1,24 @@
 #include "scheduler/single_model_router.h"
 
+#include "runtime/backends/backend_factory.h"
+#include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 
-#if INFERFLUX_HAS_MLX
-#include "runtime/backends/mlx/mlx_backend.h"
-#endif
-
 #include <filesystem>
-#include <iostream>
+#include <vector>
 
 namespace inferflux {
 
 namespace {
 
-LlamaBackendConfig ConfigForBackendHint(const std::string &hint) {
-  LlamaBackendConfig cfg;
-  if (hint == "mps" || hint == "cuda") {
-    cfg.gpu_layers = 99;
+std::string ProviderLabel(BackendProvider provider) {
+  switch (provider) {
+  case BackendProvider::kNative:
+    return "native";
+  case BackendProvider::kUniversalLlama:
+  default:
+    return "universal";
   }
-  return cfg;
-}
-
-std::string BackendLabelOrDefault(const std::string &hint) {
-  if (hint.empty()) {
-    return "cpu";
-  }
-  return hint;
-}
-
-std::shared_ptr<LlamaCPUBackend> CreateBackendForHint(const std::string &hint) {
-#if INFERFLUX_HAS_MLX
-  if (hint == "mlx") {
-    return std::make_shared<MlxBackend>();
-  }
-#else
-  if (hint == "mlx") {
-    std::cerr << "[router] MLX backend requested but binary was built without "
-                 "ENABLE_MLX. Falling back to CPU backend.\n";
-  }
-#endif
-  return std::make_shared<LlamaCPUBackend>();
 }
 
 } // namespace
@@ -50,6 +29,16 @@ SingleModelRouter::SingleModelRouter(std::shared_ptr<LlamaCPUBackend> backend,
 }
 
 SingleModelRouter::SingleModelRouter() = default;
+
+SingleModelRouter::SingleModelRouter(
+    const LlamaBackendConfig &default_backend_config,
+    const std::string &default_backend_hint,
+    const std::vector<std::string> &backend_priority)
+    : default_backend_config_(default_backend_config),
+      default_backend_hint_(BackendFactory::NormalizeHint(
+          default_backend_hint.empty() ? "cpu" : default_backend_hint)),
+      backend_priority_(BackendFactory::NormalizeHintList(
+          backend_priority, default_backend_hint_)) {}
 
 bool SingleModelRouter::RegisterModel(
     const ModelInfo &info, std::shared_ptr<LlamaCPUBackend> backend) {
@@ -63,8 +52,22 @@ bool SingleModelRouter::RegisterModel(
   Entry entry;
   entry.info = info;
   entry.info.path = info.path;
-  entry.info.backend = info.backend.empty() ? "cpu" : info.backend;
-  entry.info.supports_structured_output = true;
+  entry.info.backend = BackendFactory::NormalizeHint(
+      info.backend.empty() ? "cpu" : info.backend);
+  entry.info.requested_backend =
+      info.requested_backend.empty()
+          ? entry.info.backend
+          : BackendFactory::NormalizeHint(info.requested_backend);
+  entry.info.backend_provider =
+      info.backend_provider.empty() ? "universal" : info.backend_provider;
+  entry.info.backend_fallback = info.backend_fallback;
+  entry.info.backend_fallback_reason = info.backend_fallback_reason;
+  auto register_target = ParseLlamaBackendTarget(entry.info.backend);
+  entry.info.capabilities =
+      DescribeLlamaBackendTarget(register_target).capabilities;
+  entry.info.capabilities.supports_vision = backend->SupportsVision();
+  entry.info.supports_structured_output =
+      entry.info.capabilities.supports_structured_output;
   entry.info.is_moe = backend->IsMoE();
   entry.info.n_experts = backend->ExpertCount();
   entry.info.n_active_experts = backend->ActiveExperts();
@@ -80,6 +83,9 @@ bool SingleModelRouter::RegisterModel(
     default_model_id_ = entry.info.id;
   }
   GlobalMetrics().RecordModelLoad(entry.info.id, entry.info.backend, 0.0);
+  GlobalMetrics().RecordBackendExposure(
+      entry.info.requested_backend, entry.info.backend,
+      entry.info.backend_provider, entry.info.backend_fallback);
   RecordModelReadyLocked(entry, entry.info.ready);
   return true;
 }
@@ -99,10 +105,39 @@ std::vector<ModelInfo> SingleModelRouter::ListModels() const {
 std::string SingleModelRouter::LoadModel(const std::string &path,
                                          const std::string &backend_hint,
                                          const std::string &requested_id) {
-  auto new_backend = CreateBackendForHint(backend_hint);
+  const auto backend_candidates = BuildBackendCandidates(backend_hint);
+  BackendFactoryResult selection;
+  std::string selected_requested_backend;
+  std::string failure_reason;
+
   auto start = std::chrono::steady_clock::now();
-  LlamaBackendConfig cfg = ConfigForBackendHint(backend_hint);
-  if (!new_backend->LoadModel(path, cfg)) {
+  for (const auto &candidate : backend_candidates) {
+    auto candidate_selection = BackendFactory::Create(candidate);
+    selected_requested_backend = candidate;
+    if (!candidate_selection.backend) {
+      if (!candidate_selection.fallback_reason.empty()) {
+        failure_reason = candidate_selection.fallback_reason;
+      } else {
+        failure_reason =
+            "backend candidate '" + candidate + "' was not available";
+      }
+      continue;
+    }
+
+    auto cfg = MergeBackendConfig(default_backend_config_, candidate_selection);
+    if (!candidate_selection.backend->LoadModel(path, cfg)) {
+      failure_reason =
+          "backend candidate '" + candidate + "' failed to load model";
+      continue;
+    }
+    selection = std::move(candidate_selection);
+    break;
+  }
+
+  if (!selection.backend) {
+    if (!failure_reason.empty()) {
+      log::Error("single_model_router", failure_reason);
+    }
     return "";
   }
 
@@ -112,12 +147,29 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
 
   ModelInfo info;
   info.path = path;
-  info.backend = BackendLabelOrDefault(backend_hint);
-  info.ready = new_backend->IsReady();
-  info.supports_structured_output = true;
-  info.is_moe = new_backend->IsMoE();
-  info.n_experts = new_backend->ExpertCount();
-  info.n_active_experts = new_backend->ActiveExperts();
+  info.backend = selection.backend_label;
+  info.requested_backend = selected_requested_backend.empty()
+                               ? selection.backend_label
+                               : selected_requested_backend;
+  info.backend_provider = ProviderLabel(selection.provider);
+  info.backend_fallback = selection.used_fallback;
+  info.backend_fallback_reason = selection.fallback_reason;
+  info.ready = selection.backend->IsReady();
+  info.capabilities = selection.capabilities;
+  info.capabilities.supports_vision = selection.backend->SupportsVision();
+  info.supports_structured_output =
+      info.capabilities.supports_structured_output;
+  info.is_moe = selection.backend->IsMoE();
+  info.n_experts = selection.backend->ExpertCount();
+  info.n_active_experts = selection.backend->ActiveExperts();
+  if (info.backend_fallback) {
+    log::Warn("single_model_router",
+              "Backend fallback for model '" + path + "': requested=" +
+                  info.requested_backend + ", selected=" + info.backend +
+                  (info.backend_fallback_reason.empty()
+                       ? ""
+                       : ", reason=" + info.backend_fallback_reason));
+  }
 
   std::lock_guard<std::mutex> lock(mutex_);
   std::string preferred = !requested_id.empty()
@@ -127,13 +179,16 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
 
   Entry entry;
   entry.info = info;
-  entry.backend = std::move(new_backend);
+  entry.backend = std::move(selection.backend);
   entry.load_time = load_finished;
   models_[info.id] = entry;
   if (default_model_id_.empty()) {
     default_model_id_ = info.id;
   }
   GlobalMetrics().RecordModelLoad(info.id, info.backend, load_seconds);
+  GlobalMetrics().RecordBackendExposure(info.requested_backend, info.backend,
+                                        info.backend_provider,
+                                        info.backend_fallback);
   RecordModelReadyLocked(entry, entry.info.ready);
   return info.id;
 }
@@ -246,6 +301,20 @@ void SingleModelRouter::UpdateDefaultModelLocked() {
     return;
   }
   default_model_id_ = models_.begin()->first;
+}
+
+std::vector<std::string> SingleModelRouter::BuildBackendCandidates(
+    const std::string &backend_hint) const {
+  if (!backend_hint.empty()) {
+    const std::string normalized = BackendFactory::NormalizeHint(backend_hint);
+    if (normalized != "auto") {
+      return {normalized};
+    }
+  }
+  if (!backend_priority_.empty()) {
+    return backend_priority_;
+  }
+  return {default_backend_hint_};
 }
 
 } // namespace inferflux

@@ -13,7 +13,7 @@ public:
   ~MlxBackend() override;
 
   bool LoadModel(const std::filesystem::path &model_path,
-                 const LlamaBackendConfig &config = {});
+                 const LlamaBackendConfig &config = {}) override;
 
   // Evaluate all prompt tokens for sequence_id and populate the KV cache.
   PrefillResult Prefill(const std::string &prompt, int sequence_id) override;

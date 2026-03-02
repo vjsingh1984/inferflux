@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
+#include <unordered_map>
 
 using json = nlohmann::json;
 
@@ -75,13 +76,20 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
   double total_prefill_ms = 0.0;
   double total_decode_ms = 0.0;
 
-  // Identify requests eligible for multi-sequence batch decode.
-  // Eligibility: phased decode (n_past >= 0, seq_id >= 0), same backend,
-  // no grammar constraints, no logprob collection, no response format.
-  // Grammar uses per-backend grammar_sampler_ — not safe to interleave.
-  std::vector<std::size_t> eligible_indices;
-  std::shared_ptr<LlamaCPUBackend> shared_be;
-  bool homogeneous_backend = true;
+  // Identify requests eligible for multi-sequence batch decode and group them
+  // by backend instance so mixed-model/multi-hardware batches still benefit
+  // from unified phased execution per backend.
+  // Eligibility: phased decode (n_past >= 0, seq_id >= 0), no grammar
+  // constraints, no logprob collection, no response format.
+  // Grammar uses per-backend grammar_sampler_ — not safe to interleave across
+  // backends.
+  struct EligibleGroup {
+    std::shared_ptr<LlamaCPUBackend> backend;
+    std::vector<std::size_t> indices;
+  };
+  std::vector<EligibleGroup> eligible_groups;
+  std::unordered_map<LlamaCPUBackend *, std::size_t> group_index_by_backend;
+
   for (std::size_t i = 0; i < n; ++i) {
     auto *req = batch.requests[i];
     auto be = (i < backend_overrides.size()) ? backend_overrides[i] : nullptr;
@@ -91,28 +99,30 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
     if (req->n_past >= 0 && req->sequence_id >= 0 &&
         !req->response_constraint.has_grammar && !req->collect_logprobs &&
         !req->has_response_format && be && be->IsReady()) {
-      if (!shared_be) {
-        shared_be = be;
-      } else if (be.get() != shared_be.get()) {
-        homogeneous_backend = false;
+      auto *key = be.get();
+      auto it = group_index_by_backend.find(key);
+      if (it == group_index_by_backend.end()) {
+        group_index_by_backend.emplace(key, eligible_groups.size());
+        eligible_groups.push_back({be, {}});
+        it = group_index_by_backend.find(key);
       }
-      eligible_indices.push_back(i);
+      eligible_groups[it->second].indices.push_back(i);
     }
   }
 
-  if (!eligible_indices.empty() && homogeneous_backend && shared_be) {
+  for (const auto &group : eligible_groups) {
     std::vector<InferenceRequest *> eligible_reqs;
-    eligible_reqs.reserve(eligible_indices.size());
-    for (auto idx : eligible_indices) {
+    eligible_reqs.reserve(group.indices.size());
+    for (auto idx : group.indices) {
       eligible_reqs.push_back(batch.requests[idx]);
     }
     // Use the unified execution path (§P1b) to interleave prefill and decode
     // tokens.
-    auto outcomes = ExecuteUnifiedBatchPhased(eligible_reqs, shared_be);
-    for (std::size_t j = 0; j < eligible_indices.size(); ++j) {
-      results[eligible_indices[j]] = std::move(outcomes[j].result);
+    auto outcomes = ExecuteUnifiedBatchPhased(eligible_reqs, group.backend);
+    for (std::size_t j = 0; j < group.indices.size(); ++j) {
+      results[group.indices[j]] = std::move(outcomes[j].result);
       total_decode_ms += outcomes[j].decode_ms;
-      handled[eligible_indices[j]] = true;
+      handled[group.indices[j]] = true;
     }
   }
 
