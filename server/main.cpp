@@ -1,3 +1,4 @@
+#include "model/model_format.h"
 #include "model/tokenizer/simple_tokenizer.h"
 #include "policy/policy_store.h"
 #include "runtime/backends/backend_factory.h"
@@ -12,8 +13,8 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "runtime/speculative/speculative_decoder.h"
 #include "scheduler/model_registry.h"
-#include "scheduler/model_selection.h"
 #include "scheduler/model_router.h"
+#include "scheduler/model_selection.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/single_model_router.h"
 #include "server/auth/api_key_auth.h"
@@ -43,6 +44,7 @@
 struct ModelConfig {
   std::string id;
   std::string path;
+  std::string format{"auto"};
   std::string backend;
   bool make_default{false};
 };
@@ -99,6 +101,17 @@ std::vector<ModelConfig> ParseModelsEnv(const std::string &raw) {
         cfg.id = value;
       } else if (key == "path") {
         cfg.path = value;
+      } else if (key == "format") {
+        auto normalized = inferflux::NormalizeModelFormat(value);
+        if (!normalized.empty()) {
+          cfg.format = normalized;
+        } else {
+          cfg.format = "auto";
+          inferflux::log::Warn("server",
+                               "Invalid model format in INFERFLUX_MODELS "
+                               "entry; defaulting to auto",
+                               value);
+        }
       } else if (key == "backend") {
         cfg.backend = ToLower(value);
       } else if (key == "default") {
@@ -186,6 +199,7 @@ int main(int argc, char **argv) {
   int port = 8080;
   auto auth = std::make_shared<inferflux::ApiKeyAuth>();
   std::string model_path;
+  std::string legacy_model_format{"auto"};
   int mps_layers = 0;
   int rate_limit_per_minute = 0;
   std::string audit_log_path;
@@ -198,6 +212,10 @@ int main(int argc, char **argv) {
   bool cuda_enabled = false;
   bool cuda_flash_attention_enabled = false;
   int cuda_flash_attention_tile = 128;
+  std::string cuda_attention_kernel = "auto";
+  bool cuda_phase_overlap_scaffold = false;
+  int cuda_phase_overlap_min_prefill_tokens = 256;
+  bool cuda_phase_overlap_prefill_replica = false;
   bool backend_prefer_native = true;
   bool backend_allow_universal_fallback = true;
   std::vector<std::string> backend_priority;
@@ -217,6 +235,7 @@ int main(int argc, char **argv) {
       0; // 0 = decode on WorkerLoop thread (no separate pool)
   std::size_t kv_channel_capacity = 64;
   std::string kv_transport_type = "channel"; // "channel" | "shm"
+  inferflux::Scheduler::Config scheduler_config;
   std::vector<ModelConfig> configured_models;
   std::string default_model_override;
   inferflux::ModelSelectionOptions routing_selection_options{};
@@ -251,6 +270,13 @@ int main(int argc, char **argv) {
       if (config["model"] && config["model"]["path"]) {
         model_path = config["model"]["path"].as<std::string>();
       }
+      if (config["model"] && config["model"]["format"]) {
+        auto normalized = inferflux::NormalizeModelFormat(
+            config["model"]["format"].as<std::string>());
+        if (!normalized.empty()) {
+          legacy_model_format = normalized;
+        }
+      }
       if (config["model"] && config["model"]["mmproj_path"]) {
         mmproj_path = config["model"]["mmproj_path"].as<std::string>();
       }
@@ -263,6 +289,17 @@ int main(int argc, char **argv) {
             mc.id = model_node["id"].as<std::string>();
           if (model_node["path"])
             mc.path = model_node["path"].as<std::string>();
+          if (model_node["format"]) {
+            auto normalized = inferflux::NormalizeModelFormat(
+                model_node["format"].as<std::string>());
+            if (!normalized.empty()) {
+              mc.format = normalized;
+            } else {
+              inferflux::log::Warn("server",
+                                   "Invalid model format; defaulting to auto",
+                                   model_node["format"].as<std::string>());
+            }
+          }
           if (model_node["backend"])
             mc.backend = ToLower(model_node["backend"].as<std::string>());
           if (model_node["default"])
@@ -313,6 +350,34 @@ int main(int argc, char **argv) {
           cuda_flash_attention_tile =
               config["runtime"]["cuda"]["flash_attention"]["tile_size"]
                   .as<int>();
+        }
+        if (config["runtime"]["cuda"] &&
+            config["runtime"]["cuda"]["attention"] &&
+            config["runtime"]["cuda"]["attention"]["kernel"]) {
+          cuda_attention_kernel =
+              ToLower(config["runtime"]["cuda"]["attention"]["kernel"]
+                          .as<std::string>());
+        }
+        if (config["runtime"]["cuda"] &&
+            config["runtime"]["cuda"]["phase_overlap"] &&
+            config["runtime"]["cuda"]["phase_overlap"]["enabled"]) {
+          cuda_phase_overlap_scaffold =
+              config["runtime"]["cuda"]["phase_overlap"]["enabled"].as<bool>();
+        }
+        if (config["runtime"]["cuda"] &&
+            config["runtime"]["cuda"]["phase_overlap"] &&
+            config["runtime"]["cuda"]["phase_overlap"]["min_prefill_tokens"]) {
+          cuda_phase_overlap_min_prefill_tokens = std::max(
+              1,
+              config["runtime"]["cuda"]["phase_overlap"]["min_prefill_tokens"]
+                  .as<int>());
+        }
+        if (config["runtime"]["cuda"] &&
+            config["runtime"]["cuda"]["phase_overlap"] &&
+            config["runtime"]["cuda"]["phase_overlap"]["prefill_replica"]) {
+          cuda_phase_overlap_prefill_replica =
+              config["runtime"]["cuda"]["phase_overlap"]["prefill_replica"]
+                  .as<bool>();
         }
         if (config["runtime"]["backend_exposure"]) {
           const auto &exposure = config["runtime"]["backend_exposure"];
@@ -390,6 +455,25 @@ int main(int argc, char **argv) {
           if (disagg["kv_channel_capacity"])
             kv_channel_capacity =
                 disagg["kv_channel_capacity"].as<std::size_t>();
+        }
+        if (config["runtime"]["scheduler"]) {
+          const auto &scheduler_node = config["runtime"]["scheduler"];
+          if (scheduler_node["max_batch_size"]) {
+            scheduler_config.max_batch_size =
+                std::max(1, scheduler_node["max_batch_size"].as<int>());
+          }
+          if (scheduler_node["max_batch_tokens"]) {
+            scheduler_config.max_batch_tokens =
+                std::max(1, scheduler_node["max_batch_tokens"].as<int>());
+          }
+          if (scheduler_node["min_batch_size"]) {
+            scheduler_config.min_batch_size =
+                std::max(1, scheduler_node["min_batch_size"].as<int>());
+          }
+          if (scheduler_node["batch_accumulation_ms"]) {
+            scheduler_config.batch_accumulation_ms =
+                std::max(0, scheduler_node["batch_accumulation_ms"].as<int>());
+          }
         }
       }
 
@@ -481,6 +565,16 @@ int main(int argc, char **argv) {
 
   if (const char *env_model = std::getenv("INFERFLUX_MODEL_PATH")) {
     model_path = env_model;
+  }
+  if (const char *env_model_format = std::getenv("INFERFLUX_MODEL_FORMAT")) {
+    auto normalized = inferflux::NormalizeModelFormat(env_model_format);
+    if (!normalized.empty()) {
+      legacy_model_format = normalized;
+    } else {
+      inferflux::log::Warn("server",
+                           "Ignoring invalid INFERFLUX_MODEL_FORMAT value",
+                           env_model_format);
+    }
   }
   if (const char *env_reg = std::getenv("INFERFLUX_REGISTRY_PATH")) {
     registry_path = env_reg;
@@ -593,6 +687,26 @@ int main(int argc, char **argv) {
       cuda_flash_attention_tile = static_cast<int>(tile);
     }
   }
+  if (const char *env_cuda_attention_kernel =
+          std::getenv("INFERFLUX_CUDA_ATTENTION_KERNEL")) {
+    cuda_attention_kernel = ToLower(env_cuda_attention_kernel);
+  }
+  if (const char *env_cuda_overlap =
+          std::getenv("INFERFLUX_CUDA_PHASE_OVERLAP")) {
+    cuda_phase_overlap_scaffold = ParseBool(env_cuda_overlap);
+  }
+  if (const char *env_cuda_overlap_prefill =
+          std::getenv("INFERFLUX_CUDA_PHASE_OVERLAP_MIN_PREFILL_TOKENS")) {
+    auto v = ParsePositiveSize(env_cuda_overlap_prefill);
+    if (v > 0) {
+      cuda_phase_overlap_min_prefill_tokens = static_cast<int>(v);
+    }
+  }
+  if (const char *env_cuda_overlap_prefill_replica =
+          std::getenv("INFERFLUX_CUDA_PHASE_OVERLAP_PREFILL_REPLICA")) {
+    cuda_phase_overlap_prefill_replica =
+        ParseBool(env_cuda_overlap_prefill_replica);
+  }
   if (const char *env_prefer_native =
           std::getenv("INFERFLUX_BACKEND_PREFER_NATIVE")) {
     backend_prefer_native = ParseBool(env_prefer_native);
@@ -608,8 +722,8 @@ int main(int argc, char **argv) {
       backend_priority = std::move(parsed_priority);
     }
   }
-  if (const char *env_allow_default_cap_fallback = std::getenv(
-          "INFERFLUX_ROUTING_ALLOW_DEFAULT_CAPABILITY_FALLBACK")) {
+  if (const char *env_allow_default_cap_fallback =
+          std::getenv("INFERFLUX_ROUTING_ALLOW_DEFAULT_CAPABILITY_FALLBACK")) {
     routing_selection_options.allow_capability_fallback_for_default =
         ParseBool(env_allow_default_cap_fallback);
   }
@@ -659,6 +773,34 @@ int main(int argc, char **argv) {
       decode_pool_size = static_cast<int>(pool);
     }
   }
+  if (const char *env_batch_size =
+          std::getenv("INFERFLUX_SCHED_MAX_BATCH_SIZE")) {
+    auto batch_size = ParsePositiveSize(env_batch_size);
+    if (batch_size > 0) {
+      scheduler_config.max_batch_size = static_cast<int>(batch_size);
+    }
+  }
+  if (const char *env_batch_tokens =
+          std::getenv("INFERFLUX_SCHED_MAX_BATCH_TOKENS")) {
+    auto batch_tokens = ParsePositiveSize(env_batch_tokens);
+    if (batch_tokens > 0) {
+      scheduler_config.max_batch_tokens = static_cast<int>(batch_tokens);
+    }
+  }
+  if (const char *env_min_batch =
+          std::getenv("INFERFLUX_SCHED_MIN_BATCH_SIZE")) {
+    auto min_batch = ParsePositiveSize(env_min_batch);
+    if (min_batch > 0) {
+      scheduler_config.min_batch_size = static_cast<int>(min_batch);
+    }
+  }
+  if (const char *env_accumulation =
+          std::getenv("INFERFLUX_SCHED_BATCH_ACCUMULATION_MS")) {
+    auto accumulation = ParsePositiveSize(env_accumulation);
+    if (accumulation >= 0) {
+      scheduler_config.batch_accumulation_ms = static_cast<int>(accumulation);
+    }
+  }
   if (const char *env_kv_channel_cap =
           std::getenv("INFERFLUX_KV_CHANNEL_CAPACITY")) {
     auto cap = ParsePositiveSize(env_kv_channel_cap);
@@ -683,6 +825,7 @@ int main(int argc, char **argv) {
   if (configured_models.empty() && !model_path.empty()) {
     ModelConfig cfg;
     cfg.path = model_path;
+    cfg.format = legacy_model_format;
     cfg.make_default = true;
     configured_models.push_back(cfg);
   }
@@ -727,10 +870,10 @@ int main(int argc, char **argv) {
   inferflux::log::Info(
       "server",
       "Capability routing policy: allow_default_fallback=" +
-          std::string(routing_selection_options
-                          .allow_capability_fallback_for_default
-                      ? "true"
-                      : "false") +
+          std::string(
+              routing_selection_options.allow_capability_fallback_for_default
+                  ? "true"
+                  : "false") +
           ", require_ready_backend=" +
           std::string(routing_selection_options.require_ready_backend
                           ? "true"
@@ -738,6 +881,15 @@ int main(int argc, char **argv) {
           ", fallback_scope=" +
           inferflux::CapabilityFallbackScopeToString(
               routing_selection_options.capability_fallback_scope));
+  inferflux::log::Info("server",
+                       "Scheduler batch policy: max_batch_size=" +
+                           std::to_string(scheduler_config.max_batch_size) +
+                           ", max_batch_tokens=" +
+                           std::to_string(scheduler_config.max_batch_tokens) +
+                           ", min_batch_size=" +
+                           std::to_string(scheduler_config.min_batch_size) +
+                           ", batch_accumulation_ms=" +
+                           std::to_string(scheduler_config.batch_accumulation_ms));
   inferflux::BackendManager backend_manager;
   std::string backend_label = "stub";
   std::string primary_model_id;
@@ -746,6 +898,13 @@ int main(int argc, char **argv) {
   primary_cfg.use_flash_attention =
       cuda_enabled && cuda_flash_attention_enabled;
   primary_cfg.flash_attention_tile = cuda_flash_attention_tile;
+  primary_cfg.cuda_attention_kernel = cuda_attention_kernel;
+  primary_cfg.cuda_phase_overlap_scaffold =
+      cuda_enabled && cuda_phase_overlap_scaffold;
+  primary_cfg.cuda_phase_overlap_min_prefill_tokens =
+      cuda_phase_overlap_min_prefill_tokens;
+  primary_cfg.cuda_phase_overlap_prefill_replica =
+      cuda_enabled && cuda_phase_overlap_prefill_replica;
 
 #ifndef INFERFLUX_HAS_CUDA
   if (cuda_enabled) {
@@ -773,16 +932,42 @@ int main(int argc, char **argv) {
         "FlashAttention requires CUDA. Disable or build with CUDA support.");
     cuda_flash_attention_enabled = false;
   }
+  if (cuda_phase_overlap_scaffold && !cuda_enabled) {
+    inferflux::log::Warn(
+        "server",
+        "CUDA phase-overlap scaffold requires CUDA. Disabling overlap mode.");
+    cuda_phase_overlap_scaffold = false;
+  }
+  if (cuda_phase_overlap_prefill_replica && !cuda_phase_overlap_scaffold) {
+    inferflux::log::Warn(
+        "server",
+        "CUDA prefill replica requires phase-overlap scaffold. Disabling "
+        "prefill replica mode.");
+    cuda_phase_overlap_prefill_replica = false;
+  }
 #ifdef INFERFLUX_HAS_CUDA
   if (cuda_flash_attention_enabled) {
-    std::cout << "[server] FlashAttention toggled on (tile_size="
-              << cuda_flash_attention_tile << ").\n";
+    std::cout << "[server] FlashAttention toggled on (kernel="
+              << cuda_attention_kernel
+              << ", tile_size=" << cuda_flash_attention_tile << ").\n";
+  }
+  if (cuda_phase_overlap_scaffold) {
+    std::cout << "[server] CUDA phase-overlap scaffold enabled "
+                 "(min_prefill_tokens="
+              << cuda_phase_overlap_min_prefill_tokens << ").\n";
+    if (cuda_phase_overlap_prefill_replica) {
+      std::cout << "[server] CUDA prefill replica enabled (dual-context "
+                   "overlap).\n";
+    }
   }
 #endif
 
   // Sync primary_cfg with effective post-guard FA state; record Prometheus
   // gauge (§2.7).
   primary_cfg.use_flash_attention = cuda_flash_attention_enabled;
+  primary_cfg.cuda_phase_overlap_scaffold = cuda_phase_overlap_scaffold;
+  primary_cfg.cuda_phase_overlap_prefill_replica =
+      cuda_phase_overlap_prefill_replica;
   inferflux::GlobalMetrics().SetFlashAttentionEnabled(
       primary_cfg.use_flash_attention);
 
@@ -810,24 +995,34 @@ int main(int argc, char **argv) {
   std::string resolved_default_path = model_path;
   if (!configured_models.empty()) {
     for (auto &cfg : configured_models) {
-      auto assigned_id = router->LoadModel(cfg.path, cfg.backend, cfg.id);
+      auto assigned_id =
+          router->LoadModel(cfg.path, cfg.backend, cfg.id, cfg.format);
       if (assigned_id.empty()) {
         inferflux::log::Error("server", "Failed to load model", cfg.path);
         continue;
       }
       cfg.id = assigned_id;
       std::string assigned_backend = cfg.backend;
+      std::string assigned_format = cfg.format;
+      std::string assigned_effective_path = cfg.path;
       for (const auto &loaded : router->ListModels()) {
         if (loaded.id == assigned_id) {
           assigned_backend = loaded.backend;
+          assigned_format = loaded.format;
+          if (!loaded.effective_load_path.empty()) {
+            assigned_effective_path = loaded.effective_load_path;
+          }
           break;
         }
       }
       if (assigned_backend.empty()) {
         assigned_backend = default_backend_hint;
       }
-      std::cout << "InferFlux loaded model: " << cfg.path << " (backend="
+      std::cout << "InferFlux loaded model: " << cfg.path << " (format="
+                << (assigned_format.empty() ? "auto" : assigned_format)
+                << ", backend="
                 << (assigned_backend.empty() ? "cpu" : assigned_backend)
+                << ", effective_path=" << assigned_effective_path
                 << ", id=" << assigned_id << ")" << std::endl;
       if (resolved_default_model_id.empty()) {
         resolved_default_model_id = assigned_id;
@@ -933,7 +1128,47 @@ int main(int argc, char **argv) {
   } else if (!guard_blocklist.empty()) {
     policy_store.SetGuardrailBlocklist(guard_blocklist);
   }
-  policy_store.Save();
+  auto store_routing = policy_store.RoutingPolicy();
+  if (store_routing.has_value()) {
+    routing_selection_options.allow_capability_fallback_for_default =
+        store_routing->allow_default_fallback;
+    routing_selection_options.require_ready_backend =
+        store_routing->require_ready_backend;
+    routing_selection_options.capability_fallback_scope =
+        inferflux::ParseCapabilityFallbackScope(
+            store_routing->fallback_scope,
+            routing_selection_options.capability_fallback_scope);
+  } else {
+    inferflux::RoutingPolicyEntry initial_routing_policy;
+    initial_routing_policy.allow_default_fallback =
+        routing_selection_options.allow_capability_fallback_for_default;
+    initial_routing_policy.require_ready_backend =
+        routing_selection_options.require_ready_backend;
+    initial_routing_policy.fallback_scope =
+        inferflux::CapabilityFallbackScopeToString(
+            routing_selection_options.capability_fallback_scope);
+    policy_store.SetRoutingPolicy(initial_routing_policy);
+  }
+  if (!policy_store.Save()) {
+    inferflux::log::Warn(
+        "server",
+        "Failed to persist policy store; runtime policy updates may be "
+        "non-durable");
+  }
+  inferflux::log::Info(
+      "server",
+      "Effective capability routing policy: allow_default_fallback=" +
+          std::string(
+              routing_selection_options.allow_capability_fallback_for_default
+                  ? "true"
+                  : "false") +
+          ", require_ready_backend=" +
+          std::string(routing_selection_options.require_ready_backend
+                          ? "true"
+                          : "false") +
+          ", fallback_scope=" +
+          inferflux::CapabilityFallbackScopeToString(
+              routing_selection_options.capability_fallback_scope));
 
   if (speculative_chunk_size <= 0) {
     speculative_chunk_size = 1;
@@ -991,7 +1226,7 @@ int main(int argc, char **argv) {
   inferflux::Scheduler scheduler(tokenizer, device, cache, router,
                                  speculative_decoder, prefix_cache,
                                  fairness_config, disagg_config,
-                                 routing_selection_options);
+                                 routing_selection_options, scheduler_config);
   sched_ptr = &scheduler;
   auto &metrics = inferflux::GlobalMetrics();
   metrics.SetBackend(backend_label);
@@ -1021,7 +1256,10 @@ int main(int argc, char **argv) {
             << disagg_config.prefill_pool_size << "/"
             << disagg_config.decode_pool_size
             << " kv_transport=" << kv_transport_type
-            << " capacity=" << kv_channel_capacity << std::endl;
+            << " capacity=" << kv_channel_capacity
+            << " max_batch_size=" << scheduler_config.max_batch_size
+            << " max_batch_tokens=" << scheduler_config.max_batch_tokens
+            << std::endl;
   if (!opa_endpoint.empty()) {
     std::cout << "OPA guardrail endpoint: " << opa_endpoint << std::endl;
   }
@@ -1050,8 +1288,7 @@ int main(int argc, char **argv) {
       rate_limit_per_minute > 0 ? &rate_limiter : nullptr,
       guardrail.Enabled() ? &guardrail : nullptr,
       audit_logger.Enabled() ? &audit_logger : nullptr, &policy_store,
-      speculative_decoder, tls_config, http_workers,
-      routing_selection_options);
+      speculative_decoder, tls_config, http_workers, routing_selection_options);
 
   // §2.5 item 12: disaggregated deployment role.
   inferflux::HttpServer::PoolRole server_role =

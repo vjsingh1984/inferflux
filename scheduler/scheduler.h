@@ -38,8 +38,12 @@ struct DisaggregatedConfig {
 class Scheduler {
 public:
   struct Config {
-    int max_batch_size{4};
-    int max_batch_tokens{2048};
+    Config() : max_batch_size(4), max_batch_tokens(8192),
+               min_batch_size(1), batch_accumulation_ms(0) {}
+    int max_batch_size;
+    int max_batch_tokens;
+    int min_batch_size;              // Minimum batch to wait for
+    int batch_accumulation_ms;       // Max wait time (0 = no waiting)
   };
 
   explicit Scheduler(
@@ -52,7 +56,8 @@ public:
       const ModelSelectionOptions &model_selection_options =
           ModelSelectionOptions{
               /*allow_capability_fallback_for_default=*/true,
-              /*require_ready_backend=*/true});
+              /*require_ready_backend=*/true},
+      Config config = Config());
   ~Scheduler();
 
   // Non-blocking admission: adds request to queue and returns a future result.
@@ -134,6 +139,7 @@ private:
   FairnessController fairness_controller_;
   FairnessConfig fairness_config_;
   DisaggregatedConfig disagg_config_;
+  Config config_;
   mutable std::mutex model_selection_options_mutex_;
   ModelSelectionOptions model_selection_options_;
 

@@ -15,8 +15,6 @@
 namespace inferflux {
 
 namespace {
-constexpr std::size_t kMaxBatchSize = 4;
-constexpr std::size_t kMaxBatchTokens = 8192;
 constexpr double kFairnessAgingDivisorMs =
     2000.0; // every 2s of wait adds +1 to effective priority
 // Number of distinct KV sequence slots available for phased prefill/decode.
@@ -37,6 +35,90 @@ std::vector<uint8_t> SerializeTokens(const std::vector<int> &tokens) {
   }
   return payload;
 }
+
+bool WaitForUnifiedBatchAsync(
+    LlamaCPUBackend *backend, LlamaCPUBackend::UnifiedBatchHandle handle,
+    std::vector<LlamaCPUBackend::UnifiedBatchOutput> *outputs,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+  if (!backend || !outputs || handle == 0) {
+    return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (backend->TryCollectUnifiedBatchAsync(handle, outputs)) {
+      return true;
+    }
+    std::this_thread::yield();
+  }
+  return backend->TryCollectUnifiedBatchAsync(handle, outputs);
+}
+
+bool ExecutePhasedPrefillStep(LlamaCPUBackend *backend,
+                              const InferenceRequest &inference,
+                              int sequence_id, int n_past_start,
+                              LlamaCPUBackend::PrefillResult *result) {
+  if (!backend || !result || sequence_id < 0) {
+    return false;
+  }
+  const auto &prompt_tokens = inference.bpe_prompt_tokens;
+  if (prompt_tokens.empty()) {
+    return false;
+  }
+  int bounded_start =
+      std::clamp(n_past_start, 0, static_cast<int>(prompt_tokens.size()));
+  if (bounded_start >= static_cast<int>(prompt_tokens.size())) {
+    // Full-prefix hits must replay at least one token so logits are refreshed
+    // for this sequence and first_token sampling remains valid.
+    bounded_start = std::max(0, static_cast<int>(prompt_tokens.size()) - 1);
+  }
+
+  std::vector<int> suffix(prompt_tokens.begin() + bounded_start,
+                          prompt_tokens.end());
+  std::vector<LlamaCPUBackend::UnifiedBatchInput> inputs;
+  inputs.push_back({sequence_id, bounded_start, std::move(suffix),
+                    /*request_logits=*/true, inference.sampling});
+
+  std::vector<LlamaCPUBackend::UnifiedBatchOutput> outputs;
+  if (backend->SupportsAsyncUnifiedBatch()) {
+    const auto handle = backend->SubmitUnifiedBatchAsync(
+        inputs, LlamaCPUBackend::UnifiedBatchLane::kPrefill);
+    if (handle == 0 || !WaitForUnifiedBatchAsync(backend, handle, &outputs) ||
+        outputs.size() != 1) {
+      return false;
+    }
+  } else {
+    outputs = backend->ExecuteUnifiedBatch(inputs);
+    if (outputs.size() != 1) {
+      return false;
+    }
+  }
+
+  if (!outputs[0].ok) {
+    return false;
+  }
+  result->ok = true;
+  result->n_past = static_cast<int>(prompt_tokens.size());
+  result->first_token = outputs[0].token;
+  result->first_piece = (outputs[0].token >= 0) ? outputs[0].piece : "";
+  return true;
+}
+
+Scheduler::Config NormalizeSchedulerConfig(const Scheduler::Config &raw) {
+  Scheduler::Config normalized = raw;
+  if (normalized.max_batch_size <= 0) {
+    normalized.max_batch_size = 1;
+  }
+  if (normalized.max_batch_size > 64) {
+    normalized.max_batch_size = 64;
+  }
+  if (normalized.max_batch_tokens <= 0) {
+    normalized.max_batch_tokens = 1;
+  }
+  if (normalized.max_batch_tokens > 131072) {
+    normalized.max_batch_tokens = 131072;
+  }
+  return normalized;
+}
 } // namespace
 
 Scheduler::Scheduler(SimpleTokenizer &tokenizer,
@@ -47,13 +129,14 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
                      std::shared_ptr<RadixPrefixCache> prefix_cache,
                      const FairnessConfig &fairness_config,
                      const DisaggregatedConfig &disagg_config,
-                     const ModelSelectionOptions &model_selection_options)
+                     const ModelSelectionOptions &model_selection_options,
+                     Scheduler::Config config)
     : tokenizer_(tokenizer), device_(std::move(device)),
       cache_(std::move(cache)), router_(std::move(router)),
       speculative_decoder_(std::move(speculative_decoder)),
       prefix_cache_(std::move(prefix_cache)),
       fairness_controller_(fairness_config), fairness_config_(fairness_config),
-      disagg_config_(disagg_config),
+      disagg_config_(disagg_config), config_(NormalizeSchedulerConfig(config)),
       model_selection_options_(model_selection_options),
       seq_slots_free_((1ULL << kMaxSequenceSlots) - 1) {
   static_assert(kMaxSequenceSlots <= 64,
@@ -68,6 +151,8 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
   if (use_decode_workers_) {
     StartDecodeWorkers();
   }
+  GlobalMetrics().SetSchedulerBatchLimits(config_.max_batch_size,
+                                          config_.max_batch_tokens);
 }
 
 Scheduler::~Scheduler() {
@@ -137,12 +222,33 @@ void Scheduler::DecodeWorkerLoop() {
     std::vector<std::shared_ptr<PendingRequest>> batch;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
-      queue_cv_.wait(lock, [&] { return stop_ || !pending_decode_.empty(); });
+
+      // Batch accumulation for decode workers
+      auto has_work = [&] { return stop_ || !pending_decode_.empty(); };
+      auto has_min_batch = [&] {
+        if (stop_) {
+          return true;
+        }
+        return pending_decode_.size() >= static_cast<std::size_t>(config_.min_batch_size);
+      };
+
+      if (config_.batch_accumulation_ms > 0 && config_.min_batch_size > 1) {
+        auto deadline = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(config_.batch_accumulation_ms);
+        queue_cv_.wait_until(lock, deadline, [&] {
+          return has_work() && has_min_batch();
+        });
+      } else {
+        queue_cv_.wait(lock, has_work);
+      }
+
       if (stop_ && pending_decode_.empty())
         break;
 
       // Drain up to kMaxBatchSize requests from the decode queue.
-      std::size_t n = std::min(pending_decode_.size(), kMaxBatchSize);
+      std::size_t n =
+          std::min(pending_decode_.size(),
+                   static_cast<std::size_t>(config_.max_batch_size));
       batch.assign(pending_decode_.begin(),
                    pending_decode_.begin() + static_cast<std::ptrdiff_t>(n));
       pending_decode_.erase(pending_decode_.begin(),
@@ -399,10 +505,38 @@ void Scheduler::WorkerLoop() {
     } else {
       {
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        queue_cv_.wait(lock, [&] {
+
+        // Batch accumulation: wait for minimum batch size or timeout
+        // to improve GPU utilization. Trade-off: slightly higher latency
+        // for significantly better throughput.
+        auto has_work = [&] {
           return stop_ || !pending_prefill_.empty() ||
                  (!use_decode_workers_ && !pending_decode_.empty());
-        });
+        };
+
+        auto has_min_batch = [&] {
+          if (stop_) {
+            return true;
+          }
+          std::size_t total_pending = pending_prefill_.size();
+          if (!use_decode_workers_) {
+            total_pending += pending_decode_.size();
+          }
+          return total_pending >= static_cast<std::size_t>(config_.min_batch_size);
+        };
+
+        if (config_.batch_accumulation_ms > 0 && config_.min_batch_size > 1) {
+          // Wait for minimum batch OR timeout
+          auto deadline = std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(config_.batch_accumulation_ms);
+          queue_cv_.wait_until(lock, deadline, [&] {
+            return has_work() && has_min_batch();
+          });
+        } else {
+          // No batch accumulation: wait for any work immediately
+          queue_cv_.wait(lock, has_work);
+        }
+
         if (stop_ && pending_prefill_.empty() && pending_decode_.empty()) {
           break;
         }
@@ -480,7 +614,10 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
   for (std::size_t i = 0; i < queue_items.size(); ++i) {
     auto &item = queue_items[i].pending;
     std::size_t tokens = item->inference.prompt_tokens.size();
-    if (!selection.pending.empty() && token_budget + tokens > kMaxBatchTokens) {
+    if (!selection.pending.empty() &&
+        token_budget + tokens >
+            static_cast<std::size_t>(config_.max_batch_tokens)) {
+      GlobalMetrics().RecordBatchTokenBudgetSkip();
       continue;
     }
 
@@ -503,7 +640,8 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
     } else {
       to_remove_prefill.push_back(queue_items[i].index);
     }
-    if (selection.pending.size() >= kMaxBatchSize) {
+    if (selection.pending.size() >=
+        static_cast<std::size_t>(config_.max_batch_size)) {
       break;
     }
   }
@@ -613,6 +751,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // (no paged cache configured OR new blocks were successfully reserved).
         bool can_admit = (seq_id >= 0) && (!cache_ || new_blocks_needed == 0 ||
                                            !new_blocks.empty());
+        bool queued_via_unified_prefill = false;
 
         if (can_admit) {
           if (cache_) {
@@ -623,43 +762,109 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                                    new_blocks.end());
           }
 
-          LlamaCPUBackend::PrefillResult pr;
-          if (prefix_hit && matched_tokens > 0) {
-            // Correctness Fix (§ Item 3): must copy KV state into new slot!
-            // Only attempt partial prefill if we have a valid sequence to copy
-            // from.
-            if (cached_seq_id >= 0) {
+          const bool can_defer_to_unified_prefill =
+              !use_decode_workers_ && pending->resolved_backend &&
+              pending->resolved_backend->SupportsAsyncUnifiedBatch() &&
+              !inf.collect_logprobs && !inf.has_response_format &&
+              !inf.has_images && !inf.bpe_prompt_tokens.empty();
+          if (can_defer_to_unified_prefill) {
+            int prefill_start = 0;
+            bool copied_prefix = false;
+            if (prefix_hit && matched_tokens > 0 && cached_seq_id >= 0) {
+              // Correctness Fix (§ Item 3): must copy KV state into new slot!
+              // matched_tokens is clamped to the current prompt length before
+              // use.
+              prefill_start =
+                  std::clamp(matched_tokens, 0,
+                             static_cast<int>(inf.bpe_prompt_tokens.size()));
+              if (!inf.bpe_prompt_tokens.empty() &&
+                  prefill_start >=
+                      static_cast<int>(inf.bpe_prompt_tokens.size())) {
+                // Replay one suffix token on exact hits to refresh logits and
+                // avoid zero-token decode continuations.
+                prefill_start =
+                    static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
+              }
               pending->resolved_backend->CopySequencePrefix(
-                  cached_seq_id, seq_id, matched_tokens);
-              pr = pending->resolved_backend->PrefillPartial(inf.prompt, seq_id,
-                                                             matched_tokens);
-            } else {
-              // Hit but sequence was evicted; fallback to full prefill.
-              pr = pending->resolved_backend->Prefill(inf.prompt, seq_id);
+                  cached_seq_id, seq_id, prefill_start);
+              copied_prefix = true;
             }
-            if (pr.ok && cached_seq_id >= 0) {
-              GlobalMetrics().RecordKVPrefixReuse(matched_tokens);
-            }
-          } else {
-            pr = pending->resolved_backend->Prefill(inf.prompt, seq_id);
-          }
 
-          if (pr.ok) {
-            inf.n_past = pr.n_past;
-            inf.prompt_bpe_tokens = pr.n_past;
+            // Defer prefill compute into ExecuteUnifiedBatchPhased so decode
+            // steps can overlap with in-flight prefill chunks in the same
+            // batch.
+            inf.prefill_offset = prefill_start;
+            inf.n_past = prefill_start;
+            inf.prompt_bpe_tokens =
+                static_cast<int>(inf.bpe_prompt_tokens.size());
             inf.sequence_id = seq_id;
-            inf.first_token = pr.first_token;
-            inf.first_piece = pr.first_piece;
+            inf.first_token = -1;
+            inf.first_piece.clear();
+            if (copied_prefix && prefill_start > 0) {
+              GlobalMetrics().RecordKVPrefixReuse(prefill_start);
+            }
+            staged_decode.push_back(pending);
+            queued_via_unified_prefill = true;
           } else {
-            // Prefill failed: release only the NEW blocks (warm blocks belong
-            // to the cache).
-            if (cache_)
-              cache_->ReleaseBlocks(new_blocks);
-            inf.block_table.clear();
-            FreeSeqSlot(seq_id);
+            LlamaCPUBackend::PrefillResult pr;
+            bool copied_prefix = false;
+            int prefill_start = 0;
+            if (prefix_hit && matched_tokens > 0 && cached_seq_id >= 0) {
+              // Correctness Fix (§ Item 3): must copy KV state into new slot!
+              // matched_tokens is clamped to the current prompt length before
+              // use.
+              prefill_start =
+                  std::clamp(matched_tokens, 0,
+                             static_cast<int>(inf.bpe_prompt_tokens.size()));
+              if (!inf.bpe_prompt_tokens.empty() &&
+                  prefill_start >=
+                      static_cast<int>(inf.bpe_prompt_tokens.size())) {
+                // Replay one suffix token on exact hits to refresh logits and
+                // avoid zero-token decode continuations.
+                prefill_start =
+                    static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
+              }
+              pending->resolved_backend->CopySequencePrefix(
+                  cached_seq_id, seq_id, prefill_start);
+              copied_prefix = true;
+            }
+
+            bool prefill_ok =
+                ExecutePhasedPrefillStep(pending->resolved_backend.get(), inf,
+                                         seq_id, prefill_start, &pr);
+            if (!prefill_ok) {
+              if (copied_prefix) {
+                pr = pending->resolved_backend->PrefillPartial(
+                    inf.prompt, seq_id, prefill_start);
+              } else {
+                // Misses and stale-prefix hits both fall back to full prefill.
+                pr = pending->resolved_backend->Prefill(inf.prompt, seq_id);
+              }
+            }
+            if (pr.ok && copied_prefix) {
+              GlobalMetrics().RecordKVPrefixReuse(prefill_start);
+            }
+
+            if (pr.ok) {
+              inf.n_past = pr.n_past;
+              inf.prompt_bpe_tokens = pr.n_past;
+              inf.sequence_id = seq_id;
+              inf.first_token = pr.first_token;
+              inf.first_piece = pr.first_piece;
+            } else {
+              // Prefill failed: release only the NEW blocks (warm blocks belong
+              // to the cache).
+              if (cache_)
+                cache_->ReleaseBlocks(new_blocks);
+              inf.block_table.clear();
+              FreeSeqSlot(seq_id);
+            }
           }
         } else if (seq_id >= 0) {
           FreeSeqSlot(seq_id);
+        }
+        if (queued_via_unified_prefill) {
+          continue;
         }
       }
       bool enqueued = false;
@@ -1042,15 +1247,17 @@ void Scheduler::ResolveBackends(
     pending->inference.response_format_supported = true;
     pending->inference.response_format_error.clear();
 
-    BackendFeatureRequirements requirements = BuildGenerationFeatureRequirements(
-        pending->inference.stream, pending->inference.collect_logprobs,
-        pending->inference.has_response_format, pending->inference.has_images,
-        speculative_decoder_ && speculative_decoder_->Enabled() &&
-            !pending->inference.has_response_format);
+    BackendFeatureRequirements requirements =
+        BuildGenerationFeatureRequirements(
+            pending->inference.stream, pending->inference.collect_logprobs,
+            pending->inference.has_response_format,
+            pending->inference.has_images,
+            speculative_decoder_ && speculative_decoder_->Enabled() &&
+                !pending->inference.has_response_format);
 
-    auto selection = SelectModelForRequest(
-        router_.get(), pending->inference.model, requirements,
-        selection_options);
+    auto selection =
+        SelectModelForRequest(router_.get(), pending->inference.model,
+                              requirements, selection_options);
 
     if (selection.status == ModelSelectionStatus::kNotFound) {
       GlobalMetrics().RecordModelRoute(pending->inference.model, "", false);
