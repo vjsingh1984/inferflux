@@ -817,6 +817,36 @@ LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
   return results;
 }
 
+bool LlamaCPUBackend::SupportsAsyncUnifiedBatch() const { return false; }
+
+int LlamaCPUBackend::UnifiedBatchTokenCapacity() const {
+  return std::max(1, config_.batch_size);
+}
+
+LlamaCPUBackend::UnifiedBatchHandle LlamaCPUBackend::SubmitUnifiedBatchAsync(
+    const std::vector<UnifiedBatchInput> &inputs, UnifiedBatchLane /*lane*/) {
+  auto outputs = ExecuteUnifiedBatch(inputs);
+  std::lock_guard<std::mutex> lock(async_results_mutex_);
+  const UnifiedBatchHandle handle = next_async_handle_++;
+  async_results_[handle] = std::move(outputs);
+  return handle;
+}
+
+bool LlamaCPUBackend::TryCollectUnifiedBatchAsync(
+    UnifiedBatchHandle handle, std::vector<UnifiedBatchOutput> *outputs) {
+  if (!outputs || handle == 0) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(async_results_mutex_);
+  auto it = async_results_.find(handle);
+  if (it == async_results_.end()) {
+    return false;
+  }
+  *outputs = std::move(it->second);
+  async_results_.erase(it);
+  return true;
+}
+
 std::vector<LlamaCPUBackend::UnifiedBatchOutput>
 LlamaCPUBackend::ExecuteUnifiedBatch(
     const std::vector<UnifiedBatchInput> &inputs) {
@@ -841,7 +871,6 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
   llama_batch batch = llama_batch_init(total_tokens, 0, 1);
   std::vector<int> logit_indices(inputs.size(), -1);
   int token_offset = 0;
-  int logit_counter = 0;
 
   for (std::size_t i = 0; i < inputs.size(); ++i) {
     const auto &inp = inputs[i];
@@ -856,7 +885,10 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
                   static_cast<llama_seq_id>(inp.sequence_id), should_request);
 
       if (should_request) {
-        logit_indices[i] = logit_counter++;
+        // llama_get_logits_ith() / llama_sampler_sample(..., ith) expects the
+        // token index within the submitted batch, not the ordinal index among
+        // logits-enabled requests.
+        logit_indices[i] = token_offset;
       }
       token_offset++;
     }
@@ -1116,5 +1148,11 @@ std::vector<float> LlamaCPUBackend::Embed(const std::string &text) {
   llama_memory_seq_rm(llama_get_memory(embed_ctx_), 0, -1, -1);
   return result;
 }
+
+#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
+std::string LlamaCPUBackend::Name() const {
+  return "llama_cpu";
+}
+#endif
 
 } // namespace inferflux

@@ -23,6 +23,11 @@ set(MLX_C_TAG "v0.5.0" CACHE STRING "mlx-c git tag to use when building from sou
 
 option(ENABLE_CPU "Enable CPU runtime" ON)
 option(ENABLE_MTMD "Enable multimodal (vision) support via libmtmd" OFF)
+option(INFERFLUX_USE_COMMON_BACKEND_TYPES "Use common backend types from runtime/backends/common (Phase 2 migration)" OFF)
+
+if(INFERFLUX_USE_COMMON_BACKEND_TYPES)
+  add_compile_definitions(INFERFLUX_USE_COMMON_BACKEND_TYPES)
+endif()
 
 add_library(inferflux_core
   runtime/device_context.h
@@ -37,8 +42,17 @@ add_library(inferflux_core
   runtime/backends/cuda/cuda_device_context.h
   runtime/backends/cuda/cuda_backend.cpp
   runtime/backends/cuda/cuda_backend.h
+  runtime/backends/cuda/native_cuda_executor.cpp
+  runtime/backends/cuda/native_cuda_executor.h
+  runtime/backends/cuda/native_cuda_backend.cpp
+  runtime/backends/cuda/native_cuda_backend.h
+  runtime/backends/cuda/native_kernel_executor.cpp
+  runtime/backends/cuda/native_kernel_executor.h
   runtime/backends/backend_capabilities.cpp
   runtime/backends/backend_capabilities.h
+  runtime/backends/common/backend_types.h
+  runtime/backends/common/backend_interface.h
+  runtime/backends/common/batching_utils.h
   runtime/backends/llama/llama_backend_traits.cpp
   runtime/backends/llama/llama_backend_traits.h
   runtime/backends/backend_factory.cpp
@@ -59,6 +73,8 @@ add_library(inferflux_core
   runtime/prefix_cache/radix_prefix_cache.h
   model/tokenizer/simple_tokenizer.cpp
   model/tokenizer/simple_tokenizer.h
+  model/model_format.cpp
+  model/model_format.h
   scheduler/scheduler.cpp
   scheduler/fairness_controller.cpp
   scheduler/scheduler.h
@@ -118,6 +134,12 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   set(LLAMA_CUDA ON CACHE BOOL "" FORCE)
   target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_CUDA=1)
   target_link_libraries(inferflux_core PUBLIC CUDA::cudart)
+
+  # Note: Native CUDA kernels (.cu files) require CUDA language to be enabled
+  # For now, we build the NativeKernelExecutor without custom kernels
+  # The executor will fall back to llama.cpp's CUDA backend for benchmarking
+  message(STATUS "Native CUDA backend infrastructure enabled (uses llama.cpp kernels)")
+
 else()
   if(ENABLE_CUDA)
     message(WARNING "ENABLE_CUDA=ON but CUDA toolkit not found; building without GPU support")
@@ -161,6 +183,27 @@ if(ENABLE_VULKAN)
   endif()
 else()
   set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+endif()
+
+if(ENABLE_ROCM)
+  find_package(hip 6.1 QUIET)
+  if(hip_FOUND)
+    message(STATUS "ROCm/HIP found: enabling ROCm build path")
+    set(LLAMA_HIP ON CACHE BOOL "" FORCE)
+    target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_ROCM=1)
+    target_link_libraries(inferflux_core PUBLIC hip::host roc::rocblas roc::hipblas)
+
+    # Add ROCm backend sources
+    target_sources(inferflux_core PRIVATE
+      runtime/backends/rocm/rocm_backend.cpp
+      runtime/backends/rocm/rocm_backend.h
+    )
+  else()
+    if(ENABLE_ROCM)
+      message(WARNING "ENABLE_ROCM=ON but ROCm toolkit not found; building without ROCm support")
+    endif()
+    set(LLAMA_HIP OFF CACHE BOOL "" FORCE)
+  endif()
 endif()
 
 if(ENABLE_WEBUI)
@@ -345,6 +388,11 @@ add_executable(inferflux_tests
   tests/unit/test_ep_dispatch.cpp
   tests/unit/test_backend_factory.cpp
   tests/unit/test_backend_capabilities.cpp
+  tests/unit/test_model_format.cpp
+  tests/unit/test_model_info_paths.cpp
+  tests/unit/test_backend_types.cpp
+  tests/unit/test_batch_analyzer.cpp
+  tests/unit/test_backend_interface.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -388,6 +436,10 @@ add_test(NAME StructuredTests COMMAND inferflux_tests "[structured]")
 set_tests_properties(StructuredTests PROPERTIES LABELS structured)
 add_test(NAME ModelRegistryTests COMMAND inferflux_tests "[model_registry]")
 set_tests_properties(ModelRegistryTests PROPERTIES LABELS model_registry)
+add_test(NAME ModelFormatTests COMMAND inferflux_tests "[model_format]")
+set_tests_properties(ModelFormatTests PROPERTIES LABELS model_format)
+add_test(NAME ModelPathTests COMMAND inferflux_tests "[model_paths]")
+set_tests_properties(ModelPathTests PROPERTIES LABELS model_paths)
 add_test(NAME StopSequenceTests COMMAND inferflux_tests "[stop_sequences]")
 set_tests_properties(StopSequenceTests PROPERTIES LABELS stop_sequences)
 if(ENABLE_MLX)

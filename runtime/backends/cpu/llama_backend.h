@@ -1,14 +1,18 @@
 #pragma once
 
+#include "runtime/backends/common/backend_interface.h"
 #include "runtime/backends/ep_dispatch.h"
 #include "runtime/logprob.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "scheduler/request_batch.h"
 
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <llama.h>
@@ -26,6 +30,20 @@ struct LlamaBackendConfig {
   int gpu_layers = 0;
   bool use_flash_attention = false;
   int flash_attention_tile = 128;
+  // CUDA attention kernel policy:
+  // auto | fa3 | fa2 | standard
+  std::string cuda_attention_kernel{"auto"};
+  // CUDA phase-overlap scaffold (foundation for native async overlap).
+  // When enabled, CUDA backend can split mixed unified batches into decode-
+  // first and prefill lanes to reduce decode head-of-line blocking.
+  bool cuda_phase_overlap_scaffold{false};
+  // Minimum count of prefill tokens in a mixed batch before split kicks in.
+  int cuda_phase_overlap_min_prefill_tokens{256};
+  // Optional dual-context overlap mode: run prefill lane on a separate CUDA
+  // context and hand off KV to decode lane via
+  // SerializeSequence/HydrateSequence. Disabled by default because it increases
+  // memory footprint.
+  bool cuda_phase_overlap_prefill_replica{false};
   std::string
       mmproj_path; // Path to multimodal projector; empty = vision disabled.
   // Maximum number of KV-cache sequences that can be live simultaneously.
@@ -37,13 +55,35 @@ struct LlamaBackendConfig {
   int pp_degree{1}; // Pipeline Parallel degree
 };
 
+// When INFERFLUX_USE_COMMON_BACKEND_TYPES is enabled, LlamaCPUBackend
+// inherits from BackendInterface and uses common types. When disabled,
+// it maintains backward compatibility with nested types.
+#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
+class LlamaCPUBackend : public BackendInterface {
+#else
 class LlamaCPUBackend {
+#endif
 public:
   LlamaCPUBackend();
   virtual ~LlamaCPUBackend();
 
+#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
+  // Type aliases for backward compatibility with code that references
+  // LlamaCPUBackend::UnifiedBatchInput, etc.
+  using UnifiedBatchInput = ::inferflux::UnifiedBatchInput;
+  using UnifiedBatchOutput = ::inferflux::UnifiedBatchOutput;
+  using UnifiedBatchLane = ::inferflux::UnifiedBatchLane;
+  using UnifiedBatchHandle = ::inferflux::UnifiedBatchHandle;
+  using PrefillResult = ::inferflux::PrefillResult;
+#endif
+
+#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
+  bool LoadModel(const std::filesystem::path &model_path,
+                 const LlamaBackendConfig &config = {}) override;
+#else
   virtual bool LoadModel(const std::filesystem::path &model_path,
                          const LlamaBackendConfig &config = {});
+#endif
 
   // Load a multimodal projector (mmproj) GGUF alongside the text model.
   // Must be called after LoadModel(). Returns false if ENABLE_MTMD is off.
@@ -52,6 +92,7 @@ public:
   // True when a mmproj has been loaded and supports vision input.
   bool SupportsVision() const { return vision_ready_; }
 
+#ifndef INFERFLUX_USE_COMMON_BACKEND_TYPES
   // Result of a phased prefill pass (§2.5 Option A).
   struct PrefillResult {
     int n_past{
@@ -66,6 +107,7 @@ public:
     int first_token{-1};
     std::string first_piece; // text of first_token; empty when first_token==-1
   };
+#endif // INFERFLUX_USE_COMMON_BACKEND_TYPES
 
   // Input/output for one step of multi-sequence batch decode.
   // BatchDecodeStep() feeds feed_token at n_past for each sequence, runs one
@@ -81,6 +123,7 @@ public:
     std::string piece; // text of token; empty when token == -1
   };
 
+#ifndef INFERFLUX_USE_COMMON_BACKEND_TYPES
   // Input/output for one step of unified batch execution (§P1b).
   // A single ExecuteUnifiedBatch() call can mix prefill (multiple tokens,
   // n_past=0) and decode (one token, n_past>0) sequences in the same
@@ -98,10 +141,52 @@ public:
     bool ok{false};
   };
 
+  // Execution lane hint for async unified-batch submission.
+  // kDecode should be favored for lower token latency.
+  enum class UnifiedBatchLane {
+    kAuto,
+    kDecode,
+    kPrefill,
+  };
+  using UnifiedBatchHandle = uint64_t;
+#endif // INFERFLUX_USE_COMMON_BACKEND_TYPES
+
   // Execute a mixed batch of prefill and decode sequences.
   // Returns results for all inputs where request_logits=true.
+#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
+  std::vector<UnifiedBatchOutput>
+  ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override;
+#else
   virtual std::vector<UnifiedBatchOutput>
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs);
+#endif
+
+  // Backend-agnostic async unified batch contract.
+  // Base implementation executes synchronously and stores the result for
+  // later collection through TryCollectUnifiedBatchAsync().
+#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
+  bool SupportsAsyncUnifiedBatch() const override;
+  UnifiedBatchHandle
+  SubmitUnifiedBatchAsync(const std::vector<UnifiedBatchInput> &inputs,
+                          UnifiedBatchLane lane = UnifiedBatchLane::kAuto) override;
+  bool
+  TryCollectUnifiedBatchAsync(UnifiedBatchHandle handle,
+                              std::vector<UnifiedBatchOutput> *outputs) override;
+  // Maximum number of tokens the backend can safely accept in one unified
+  // batch step. Used by scheduler/executor-side chunking guards.
+  int UnifiedBatchTokenCapacity() const override;
+#else
+  virtual bool SupportsAsyncUnifiedBatch() const;
+  virtual UnifiedBatchHandle
+  SubmitUnifiedBatchAsync(const std::vector<UnifiedBatchInput> &inputs,
+                          UnifiedBatchLane lane = UnifiedBatchLane::kAuto);
+  virtual bool
+  TryCollectUnifiedBatchAsync(UnifiedBatchHandle handle,
+                              std::vector<UnifiedBatchOutput> *outputs);
+  // Maximum number of tokens the backend can safely accept in one unified
+  // batch step. Used by scheduler/executor-side chunking guards.
+  virtual int UnifiedBatchTokenCapacity() const;
+#endif
 
   // Evaluate all prompt tokens for sequence_id and populate the KV cache.
   virtual PrefillResult Prefill(const std::string &prompt, int sequence_id);
@@ -133,11 +218,12 @@ public:
   virtual void FreeSequence(int sequence_id);
 
   // Serialize the KV cache state for sequence_id to a byte buffer.
-  std::vector<uint8_t> SerializeSequence(int sequence_id);
+  virtual std::vector<uint8_t> SerializeSequence(int sequence_id);
 
   // Restore KV cache state for dest_sequence_id from a previously serialized
   // buffer.
-  bool HydrateSequence(int dest_sequence_id, const std::vector<uint8_t> &blob);
+  virtual bool HydrateSequence(int dest_sequence_id,
+                               const std::vector<uint8_t> &blob);
 
   bool IsMoE() const;
   int ExpertCount() const;
@@ -208,6 +294,16 @@ public:
   // Rank within the Tensor Parallel group.
   int TPRank() const { return tp_rank_; }
 
+#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
+  // BackendInterface implementation
+  std::string Name() const override;
+  bool IsFallback() const override { return false; }
+  const std::string &FallbackReason() const override {
+    static const std::string empty_reason;
+    return empty_reason;
+  }
+#endif
+
 protected:
   struct llama_sampler *active_sampler_{nullptr};
   std::shared_ptr<EPDispatch> ep_dispatch_;
@@ -229,6 +325,10 @@ private:
   PerfSnapshot last_perf_{};
   llama_context *embed_ctx_{nullptr};
   bool EnsureEmbedCtx();
+  mutable std::mutex async_results_mutex_;
+  UnifiedBatchHandle next_async_handle_{1};
+  std::unordered_map<UnifiedBatchHandle, std::vector<UnifiedBatchOutput>>
+      async_results_;
 
 #ifdef INFERFLUX_HAS_MTMD
   mtmd_context *mtmd_ctx_{nullptr};
