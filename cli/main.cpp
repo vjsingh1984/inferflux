@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -90,6 +91,43 @@ bool ParseStrictBoolValue(const std::string &raw, bool *value_out) {
   if (raw == "false") {
     *value_out = false;
     return true;
+  }
+  return false;
+}
+
+bool ParsePrometheusMetricValue(const std::string &metrics_body,
+                                const std::string &metric_name,
+                                double *value_out) {
+  if (!value_out || metric_name.empty()) {
+    return false;
+  }
+  std::stringstream ss(metrics_body);
+  std::string line;
+  while (std::getline(ss, line)) {
+    line = Trim(line);
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+    if (line.rfind(metric_name, 0) != 0) {
+      continue;
+    }
+    if (line.size() > metric_name.size()) {
+      char next = line[metric_name.size()];
+      if (next != ' ' && next != '\t' && next != '{') {
+        continue;
+      }
+    }
+    std::size_t sep = line.find_last_of(" \t");
+    if (sep == std::string::npos || sep + 1 >= line.size()) {
+      continue;
+    }
+    std::string value_str = Trim(line.substr(sep + 1));
+    try {
+      *value_out = std::stod(value_str);
+      return true;
+    } catch (...) {
+      continue;
+    }
   }
   return false;
 }
@@ -265,6 +303,7 @@ void PrintUsage() {
          "                         [--fallback-scope any_compatible|"
          "same_path_only]]\n"
          "                        [--host ... --port ... --api-key KEY]\n"
+      << "  inferctl admin pools --get [--host ... --port ... --api-key KEY]\n"
       << "  inferctl admin models --list | --load PATH [--backend TYPE] [--id "
          "NAME] [--default] [--json]\n"
          "                       | --unload ID | --set-default ID [--host ... "
@@ -1499,6 +1538,87 @@ int main(int argc, char **argv) {
         auto resp = client.Put(BuildUrl(host, port, "/v1/admin/routing"),
                                body_j.dump(), headers);
         return PrintJsonResponseAndReturn(resp, "inferctl admin routing --set");
+      }
+      if (target == "pools") {
+        bool get = false;
+        for (int i = 3; i < argc; ++i) {
+          std::string arg = argv[i];
+          if (arg == "--get") {
+            get = true;
+          }
+        }
+        if (!get) {
+          std::cerr << "inferctl admin pools: --get is required" << std::endl;
+          return 1;
+        }
+
+        auto ready_resp = client.Get(BuildUrl(host, port, "/readyz"), headers);
+        if (ready_resp.status == 401 || ready_resp.status == 403) {
+          std::cerr << "inferctl admin pools --get: authentication required "
+                       "(set --api-key or INFERCTL_API_KEY)\n";
+          return 1;
+        }
+        if (!(ready_resp.status == 200 || ready_resp.status == 503)) {
+          std::cout << ready_resp.body << std::endl;
+          return 1;
+        }
+
+        auto metrics_resp =
+            client.Get(BuildUrl(host, port, "/metrics"), headers);
+        if (metrics_resp.status == 401 || metrics_resp.status == 403) {
+          std::cerr << "inferctl admin pools --get: authentication required "
+                       "(set --api-key or INFERCTL_API_KEY)\n";
+          return 1;
+        }
+        if (!IsHttpSuccess(metrics_resp.status)) {
+          std::cout << metrics_resp.body << std::endl;
+          return 1;
+        }
+
+        json ready_payload;
+        try {
+          ready_payload = json::parse(ready_resp.body);
+        } catch (const json::exception &) {
+          std::cout << ready_resp.body << std::endl;
+          return 1;
+        }
+
+        auto metric_or_null = [&](const std::string &name) -> json {
+          double value = 0.0;
+          if (!ParsePrometheusMetricValue(metrics_resp.body, name, &value)) {
+            return json(nullptr);
+          }
+          double rounded = std::round(value);
+          if (std::fabs(value - rounded) < 1e-9) {
+            return json(static_cast<int64_t>(rounded));
+          }
+          return json(value);
+        };
+
+        json scheduler_metrics{
+            {"queue_depth",
+             metric_or_null("inferflux_scheduler_queue_depth")},
+            {"prefill_queue_depth",
+             metric_or_null("inferflux_prefill_queue_depth")},
+            {"decode_queue_depth",
+             metric_or_null("inferflux_decode_queue_depth")},
+            {"batch_limit_size",
+             metric_or_null("inferflux_scheduler_batch_limit_size")},
+            {"batch_limit_tokens",
+             metric_or_null("inferflux_scheduler_batch_limit_tokens")},
+        };
+
+        json payload{
+            {"status", "ok"},
+            {"pool_health",
+             {{"ready", ready_payload.value("status", "") == "ready"},
+              {"http_status", ready_resp.status},
+              {"role", ready_payload.value("role", "unknown")},
+              {"reason", ready_payload.value("reason", "")}}},
+            {"scheduler", scheduler_metrics},
+        };
+        std::cout << payload.dump() << std::endl;
+        return 0;
       }
       if (target == "models") {
         bool list = false;

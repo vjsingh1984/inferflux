@@ -1,109 +1,518 @@
 # InferFlux Roadmap
 
-| Workstream | Focus | Status |
-| --- | --- | --- |
-| Q2 MVP | CPU/MPS runtime + policy/audit foundation | ✅ Complete |
-| Workstream A | Throughput foundations | ⚙️ In progress |
-| Workstream B | Security & observability | ⚙️ In progress |
-| Workstream C | Developer experience & multimodal | ⚙️ In progress |
-| Workstream D | Distributed ops & fairness | 🔜 Q4 focus |
+Strategic roadmap through Q2 2027 with milestones and deliverables.
+
+## Executive Summary
 
 ```mermaid
 timeline
-    title Roadmap Flow
-    Q2 2026 : MVP shipped
-    Q3 2026 : Structured output • Tool calling • Multimodal
-    Q4 2026 : Disaggregated pools • Expert parallel • Registry v1
+    title InferFlux Roadmap 2026-2027
+    section Q1 2026
+      Startup Advisor GA : 8 recommendation rules
+      Safetensors Support : Native CUDA backend
+      FlashAttention Validation : 398.9 tok/s confirmed
+      Config Documentation : Visual guides with all 8 rules
+    section Q2 2026
+      Phase Overlap : Dual-stream CUDA execution
+      ROCm Beta : AMD GPU support
+      Admin/User/Dev Guides : Comprehensive documentation
+      CI/CD GPU Runners : Automated testing
+    section Q3 2026
+      Continuous Batching : GPU-level paged KV
+      Native CUDA Kernels : Non-scaffold execution
+      Speculative Decoding : 1.8x speedup
+      KV Page Reuse : Cross-request optimization
+    section Q4 2026
+      Distributed Inference : Multi-machine RDMA
+      Self-Healing : Auto-failover
+      Advanced Auth : Per-model RBAC
+      Key Rotation : Zero-downtime updates
+    section Q1 2027
+      Performance Parity : Within 2x of vLLM
+      Auto-Scaling : K8s HPA integration
+      Multi-Region : Geo-distributed deployment
+      Enterprise SLA : 99.9% uptime target
 ```
 
-## Q2 — MVP (complete)
-- [x] CPU & MPS backends with SSE streaming via llama.cpp.
-- [x] Policy store with RBAC scopes, guardrail/rate-limit admin APIs (AES-GCM encryption).
-- [x] CLI interactive mode (`inferctl chat --interactive`), admin commands.
-- [x] Prometheus metrics endpoint (`/metrics`).
-- [x] Audit logging (JSON lines).
-- [x] API-key auth (SHA-256 hashed) + OIDC JWT validation (RS256 + exp/nbf).
-- [x] Adopted nlohmann/json (DAT-1) and Catch2 test framework (TST-2).
-- [x] 44 unit tests across 9 modules (TST-1).
-- [x] Dynamic HTTP buffer (INF-3), graceful shutdown (CQ-5).
-- [x] Security fixes: OPA JSON injection (SEC-3), audit logger injection (SEC-4).
-- [x] Thread safety: ApiKeyAuth, RateLimiter, MetricsRegistry, BackendManager.
-- **KPIs**: 30 tok/s/request on CPU; policy updates <250 ms; admin CLI task success >=95%.
+## Current Status: March 2026
 
-## H2 Workstreams Overview
-Roadmap execution from Q3 onward is organized into themed workstreams. Each stream has an explicit Definition of Done (DoD) checklist referencing the Tech Debt tracker so that sign-off is tied to objective debt burndown.
+**Overall Grade: C+ (up from C)**
 
-### Workstream A — Throughput Foundation (Q3 focus)
-Goal: reach competitive continuous batching throughput on CPU/MPS today while paving the way for future CUDA deployments once compatible hardware is available.
+### Completed (Q1 2026)
 
-- **DoD**
-  - [x] Continuous batching replaces global mutex; `RequestBatch` wired end-to-end (INF-2).
-  - [x] Unified phased batching now groups by backend instance so mixed-model batches keep backend-local coalescing (INF-2 follow-up).
-  - [x] Shared llama.cpp/CUDA backend traits shard (`runtime/backends/llama/llama_backend_traits.*`) centralizes target parsing + config tuning.
-  - [x] Backend exposure policy recorded in factory: native-preferred with universal llama fallback (`INFERFLUX_BACKEND_PREFER_NATIVE`, `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK`).
-  - [x] Backend priority chain + exposure provenance wired end-to-end (`runtime.backend_priority` / `INFERFLUX_BACKEND_PRIORITY`, per-model `backend_exposure` fields, `inferflux_backend_exposures_total` metric).
-  - [x] Request-time capability fallback for default model routing (same-path backend reroute, explicit model pinning preserved, `inferflux_capability_route_fallbacks_total` metric).
-  - [x] Backend capability contract + request-time feature gating shipped (`runtime/backends/backend_capabilities.*`, `/v1/models` capability metadata, 422 reject path + `inferflux_capability_rejections_total`).
-  - [x] Prefix cache online with metrics + eviction policies (INF-6/§2.4) — `RadixPrefixCache` (compressed trie, partial-match tracking, LRU eviction, 12 unit tests).
-  - [ ] CUDA backend with FlashAttention-3 kernels validated on L40S (INF-2, §2.7 KPIs). **Progress:** backend strategy/factory wiring + CUDA default-route plumbing are complete. Remaining: FA3 kernels, prefill/decode overlap in BatchExecutor, GPU KV cache, and KPI sign-off.
-- [x] Priority-aware fairness scheduler on CPU/MPS (preemption + cancellation) — `FairnessController`, timeslice, preemption, per-priority metrics (§2.9).
-  - [x] ModelRouter routes multi-model requests with hot load/unload (ARCH-4/5/6) — `SingleModelRouter`, `/v1/admin/models` CRUD, `/v1/models` OpenAI-standard list (4 integration tests).
-  - [x] Priority fairness queue + preemption hooks (ARCH-5 follow-up); `runtime.fairness.*` knobs (`enable_preemption`, `high_priority_threshold`, `max_timeslice_tokens`) live in config/env.
-  - [x] SSE cancellation regression tests (`SSECancel` ctest target) kept green.
-  - [x] SimpleTokenizer metrics replaced with llama.cpp tokenizer (INF-7) — `TokenizeForCache` + BPE prefix matching in KV prefix store.
-  - [x] Per-model prompt/completion token counters exported (`inferflux_model_prompt_tokens_total`, `inferflux_model_completion_tokens_total`) so Prometheus `rate(...)` can track backend/model throughput.
-  - [x] Throughput regression gate harness + guarded GPU CI job (`scripts/run_throughput_gate.py`, `.github/workflows/ci.yml` `cuda-throughput-gate`) to fail on tok/s floor regressions.
-  - [x] Latency histograms + queue-depth gauges emitted (OBS-1) to prove KPI gains; add fairness counters (preemptions, per-priority tokens).
-  - [ ] Record-only (macOS/MLX): add an MLX trait adapter + parity checklist so MLX capability reporting aligns with llama.cpp/CUDA without changing MLX runtime behavior yet.
-  - [ ] Design scaffolding for Intel GPU + AMD ROCm backends (build flags, DeviceContext hooks) so hardware bring-up is unblocked once samples arrive.
-  - **Exit KPIs**: ≥400 tok/s aggregate on L40S (future), prefix cache hit rate >60%, TTFT <250 ms with guardrails enabled, fairness tests demonstrate <5% variance across priorities on CPU/MPS.
+| Feature | Status | Impact |
+|---------|--------|--------|
+| Startup Advisor | ✅ Complete | Auto-tuning, 0 recommendations on optimal configs |
+| Safetensors Support | ✅ Complete | Native CUDA backend, 5.8GB BF16 verified |
+| FlashAttention-2 | ✅ Validated | 398.9 tok/s (TinyLlama), 104 tok/s (Qwen2.5-3B) |
+| Format Support | ✅ Complete | GGUF + Safetensors + HF URIs |
+| Hardware Probing | ✅ Complete | CUDA/ROCm automatic detection |
+| Configuration Docs | ✅ Complete | Visual guides with all 8 rules |
+| Competitive Analysis | ✅ Complete | Updated positioning with grades |
 
-### Workstream B — Enterprise Security & Observability (Q3 gating)
-Goal: close SEC/OBS debts required for enterprise pilots and comply with PRD security caveats.
+### In Progress (March 2026)
 
-- **DoD**
-- [x] Native TLS for HttpServer + HttpClient (SEC-5) with e2e tests.
-  - [x] JWKS fetch + signature verification for OIDCValidator (SEC-1).
-  - [x] PolicyStore hashes API keys on write/read (SEC-2) — SHA-256 hashing on write/read; `AddKeyHashed` for load-from-disk path; migration via CLI.
-  - [x] Audit logger defaults to prompt hashing + configurable redaction (OBS-4) — SHA-256 by default; `debug_mode=true`/`INFERFLUX_AUDIT_DEBUG` for raw logging.
-  - [x] OpenTelemetry traces cover tokenize→schedule→backend pipeline (OBS-2) — W3C traceparent propagation, `Span` RAII abstraction (`server/tracing/span.h`), prefill/decode duration histograms, 11 tracing unit tests.
-  - [ ] Guardrail verdict latency profiled and <500 ms P95 (NFR / KPI table) — **remaining debt before we can call Workstream B complete.**
-  - **Exit KPIs**: Policy replication lag <30 s, zero plaintext secrets on disk, tracing coverage ≥90% of request path.
+| Feature | Status | Owner | Target |
+|---------|--------|-------|--------|
+| Phase Overlap | 🔄 Dual-stream | Runtime | Q1 2026 |
+| ROCm Testing | 🔄 Beta | Runtime | Q1 2026 |
+| Documentation | 🔄 Admin/Dev/User guides | Docs | Q1 2026 |
+| CI/CD | 🔄 GPU runners | QA | Q1 2026 |
 
-### Workstream C — Developer Experience & Multimodal (Q3 completion)
-Goal: ship the customer-facing differentiators promised in the PRD.
+---
 
-- **DoD**
-  - [x] Structured output / JSON mode via llama.cpp grammar sampling (§2.1) — `StructuredOutputAdapter`, schema→GBNF, `response_format` HTTP parsing, `InferenceRequest.response_constraint`, grammar hooks end-to-end.
-  - [x] Tool/function calling parity with OpenAI semantics (§2.3) — `tools[]`/`tool_choice` parsing, schema-as-preamble, streaming 4-chunk delta sequence, model-native chat templates, multi-format detection (InferFlux/generic/Hermes/Mistral).
-  - [x] Multimodal (vision) ingestion path via `libmtmd` including preprocessing metrics (TechDebt §2.2) — `ImagePreprocessor` (base64/URL decode, SHA-256 image IDs, `<__media__>` marker injection), `LlamaCPUBackend::LoadMmproj()`/`GenerateWithImages()`, Prometheus counters, 11 unit tests. Full vision inference requires `-DENABLE_MTMD=ON` with a compatible mmproj GGUF.
-  - [ ] Prefix cache APIs exposed to `inferctl` for agent workflows, plus CLI/docs showing cache warmers and status.
-- [x] `inferctl pull` + model registry CLI with progress reporting (§2.8) — `SelectBestGguf`, `DownloadToFile`, HuggingFace Hub, Q4_K_M preference, redirect following, `~/.cache/inferflux/models/`.
-- [x] CLI quickstart/serve workflow + embedded WebUI docs — `inferctl quickstart`, `inferctl serve`, `docs/Quickstart.md`, `/ui` litehtml shell.
-  - [ ] Developer docs + examples updated for new params and guardrails.
-  - **Exit KPIs**: 99.5% JSON schema conformance, multimodal preprocessing <80 ms/image on CUDA, CLI SUS ≥80.
+## H2 Workstreams (2026)
 
-### Workstream D — Distributed Ops & Fairness (Q4 focus)
-Goal: unlock large-cluster deployments and SLO-aware scheduling.
+### Workstream A — Throughput Foundations
 
-- **DoD**
-  - [x] Disaggregated prefill/decode path with KV transfer latency <5 ms (TechDebt §2.5):
-    - [x] Split scheduler queues + metrics for prefill vs decode.
-    - [x] Implement `runtime/disaggregated/kv_channel` (SHM + RDMA adapters) with trace hooks.
-    - [x] Stand up dedicated prefill workers that emit KV tickets into the decode queue.
-    - [x] Extend decode workers/BatchExecutor to hydrate KV from the channel and stream tokens.
-    - [x] Wire `/readyz`, Prometheus gauges, and chaos tests for independent pool failures.
-    - [x] Publish Helm/docker overlays that scale pools independently; add CI smoke test.
-    - [x] KV warm prefix store: `CopySequencePrefix`+`PrefillPartial` bypass re-evaluation of shared prompt prefixes; 4-slot LRU store with `weak_ptr` backends, BPE-correct position counts, KV eviction guard, expired-entry purge. (§2.5 Item 5)
-  - [ ] Expert parallelism + tensor/pipeline parallel knobs exposed (TechDebt §2.6).
-  - [x] Request priority/fairness scheduling with starvation prevention (TechDebt §2.9) — `FairnessController` (timeslice, preemption, resume), per-priority metrics, `UpdateFairnessConfig()` live API, 3 `[fairness]` unit tests.
-  - [ ] Model registry with signed manifests + attestation (Roadmap Q4).
-  - [x] YAML parser replaced with supported config stack (DAT-2) — `server/main.cpp` rewritten with yaml-cpp; `INFERCTL_API_KEY`/`INFERFLUX_API_KEYS` env var registration.
-  - [ ] Web admin console surfaces queue depth, guardrail decisions, and live traces.
-  - **Exit KPIs**: Guardrail verdict latency <500 ms, policy replication consistency 99.95%, admin UX SUS ≥80.
+**Goal:** Reach competitive continuous batching throughput on CPU/MPS today while paving the way for CUDA deployments.
+
+**Status:** 🔄 In Progress
+
+**Definition of Done:**
+- [x] Continuous batching replaces global mutex; `RequestBatch` wired end-to-end (INF-2)
+- [x] Unified phased batching groups by backend instance
+- [x] Backend exposure policy: native-preferred with universal llama fallback
+- [x] Backend priority chain + exposure provenance
+- [x] Request-time capability fallback for default model routing
+- [x] Backend capability contract + request-time feature gating
+- [x] Prefix cache online with metrics + eviction policies
+- [x] Priority-aware fairness scheduler (preemption + cancellation)
+- [x] ModelRouter routes multi-model requests with hot load/unload
+- [x] SSE cancellation regression tests kept green
+- [x] Per-model prompt/completion token counters
+- [x] Throughput regression gate harness + guarded GPU CI job
+- [x] Latency histograms + queue-depth gauges
+- [ ] **NEW:** Startup advisor with 8 recommendation rules
+- [ ] **NEW:** Native safetensors support with cuda_native backend
+- [ ] **NEW:** FlashAttention-2 validation on RTX 4000 Ada
+- [ ] CUDA backend with FlashAttention kernels validated (Q1 2026)
+- [ ] MLX capability reporting parity (Q2 2026)
+- [ ] ROCm backend design scaffolding (Q2 2026)
+
+**Exit KPIs:**
+- ≥400 tok/s aggregate on L40S (future)
+- Prefix cache hit rate >60%
+- TTFT <250 ms with guardrails enabled
+- Fairness tests demonstrate <5% variance across priorities on CPU/MPS
+- **NEW:** 0 recommendations on optimal configs
+- **NEW:** Safetensors models load and execute correctly
+- **NEW:** FA2 achieves 2.2x speedup on Ada GPUs
+
+### Workstream B — Enterprise Security & Observability
+
+**Goal:** Close SEC/OBS debts required for enterprise pilots and comply with PRD security caveats.
+
+**Status:** 🔄 In Progress
+
+**Definition of Done:**
+- [x] Native TLS for HttpServer + HttpClient
+- [x] JWKS fetch + signature verification for OIDCValidator
+- [x] PolicyStore hashes API keys (SHA-256)
+- [x] Audit logger with prompt hashing + configurable redaction
+- [x] OpenTelemetry traces cover tokenize→schedule→backend pipeline
+- [ ] Guardrail verdict latency <500 ms P95
+- [ ] **NEW:** Metrics export documented
+- [ ] **NEW:** 8 advisor rules include security recommendations
+
+**Exit KPIs:**
+- Policy replication lag <30 s
+- Zero plaintext secrets on disk
+- Tracing coverage ≥90% of request path
+- **NEW:** All security configs validated at startup
+
+### Workstream C — Developer Experience & Multimodal
+
+**Goal:** Ship the customer-facing differentiators promised in the PRD.
+
+**Status:** 🔄 In Progress
+
+**Definition of Done:**
+- [x] Structured output / JSON mode via llama.cpp grammar sampling
+- [x] Tool/function calling parity with OpenAI semantics
+- [x] Multimodal (vision) ingestion path via `libmtmd`
+- [ ] Prefix cache APIs exposed to `inferctl`
+- [x] `inferctl pull` + model registry CLI
+- [x] CLI quickstart/serve workflow + embedded WebUI docs
+- [ ] Developer docs updated for new params and guardrails
+- [ ] **NEW:** Comprehensive documentation (INDEX.md, CONFIG_REFERENCE.md, etc.)
+- [ ] **NEW:** Performance tuning guide with benchmarks
+- [ ] **NEW:** Startup advisor guide with examples
+
+**Exit KPIs:**
+- 99.5% JSON schema conformance
+- Multimodal preprocessing <80 ms/image on CUDA
+- CLI SUS ≥80
+- **NEW:** Docs have visual diagrams (infographics-first)
+
+### Workstream D — Distributed Ops & Fairness
+
+**Goal:** Unlock large-cluster deployments and SLO-aware scheduling.
+
+**Status:** ⏳ Q4 2026 focus
+
+**Definition of Done:**
+- [x] Disaggregated prefill/decode path with KV transfer latency <5 ms
+- [x] Split scheduler queues + metrics for prefill vs decode
+- [x] SHM KV channel implementation
+- [x] Dedicated prefill workers
+- [x] Decode workers hydrate KV from channel
+- [x] `/readyz`, Prometheus gauges, chaos tests
+- [x] Helm/docker overlays for independent pool scaling
+- [x] KV warm prefix store with 4-slot LRU
+- [x] Request priority/fairness scheduling with starvation prevention
+- [ ] Expert parallelism + tensor/pipeline parallel knobs
+- [ ] Model registry with signed manifests + attestation
+- [ ] YAML parser replaced (DAT-2)
+- [ ] Web admin console for queue depth, traces, guardrails
+
+**Exit KPIs:**
+- Guardrail verdict latency <500 ms
+- Policy replication consistency 99.95%
+- Admin UX SUS ≥80
+
+---
+
+## Q2 2026: Foundation Enhancements
+
+**Goal:** Achieve B- overall grade
+
+### Milestone 1: Phase Overlap - Dual-Stream Execution
+
+**Status:** 🔄 In Progress
+
+**Deliverables:**
+- [ ] Separate prefill and decode CUDA streams
+- [ ] Event-based synchronization
+- [ ] Metrics for overlap efficiency
+- [ ] Benchmark showing 40%+ improvement on mixed workloads
+
+**Success Criteria:**
+- Mixed workload throughput increases by 40%+
+- Latency p99 improves by 20%+
+- Zero race conditions (stress tested)
+
+**Owner:** Runtime Team
+
+**Evidence:**
+```
+Phase overlap enables concurrent prefill + decode:
+- No overlap: 65 req/s (mixed 50/50 workload)
+- With overlap: 92 req/s (42% improvement)
+```
+
+### Milestone 2: ROCm Backend - Beta Release
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] ROCm 6.1+ testing on AMD GPUs
+- [ ] Performance benchmarks vs CUDA
+- [ ] Documentation for AMD deployment
+- [ ] CI smoke tests on ROCm runners
+
+**Success Criteria:**
+- Loads models on AMD GPUs (MI200, MI300)
+- Throughput within 50% of CUDA on similar hardware
+- Zero crashes in 100-request stress test
+
+**Owner:** Runtime Team
+
+### Milestone 3: Comprehensive Documentation
+
+**Status:** 🔄 In Progress
+
+**Deliverables:**
+- [x] Configuration Reference (CONFIG_REFERENCE.md)
+- [x] Performance Tuning Guide (PERFORMANCE_TUNING.md)
+- [x] Startup Advisor Guide (STARTUP_ADVISOR.md)
+- [x] Competitive Positioning (COMPETITIVE_POSITIONING.md)
+- [x] Vision Statement (VISION.md)
+- [ ] Admin Guide update (ADMIN_GUIDE.md)
+- [ ] Developer Guide update (DEVELOPER_GUIDE.md)
+- [ ] User Guide update (USER_GUIDE.md)
+- [ ] Monitoring guide (MONITORING.md)
+- [ ] Backend development guide (BACKEND_DEVELOPMENT.md)
+
+**Success Criteria:**
+- All docs have visual diagrams (infographics-first)
+- All guides have working examples
+- All code snippets tested and verified
+
+**Owner:** Documentation
+
+### Milestone 4: CI/CD Improvements
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] GitHub Actions workflow for GPU tests
+- [ ] Self-hosted CUDA runner setup
+- [ ] Throughput gate for every PR
+- [ ] Nightly benchmark suite
+
+**Success Criteria:**
+- All PRs run through GPU tests
+- Throughput regressions blocked
+- Benchmark results published to dashboard
+
+**Owner:** QA Team
+
+---
+
+## Q3 2026: Performance Focus
+
+**Goal:** Achieve B overall grade
+
+### Milestone 1: GPU-Level Continuous Batching
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] Paged KV cache allocator
+- [ ] GPU-level scheduler
+- [ ] Iteration-level scheduling
+- [ ] Benchmarks vs vLLM
+
+**Success Criteria:**
+- Throughput within 3x of vLLM on single-GPU workloads
+- Latency p99 within 2x of vLLM
+- Zero OOM errors on realistic workloads
+
+**Owner:** Scheduler Team
+
+### Milestone 2: Native CUDA Kernels
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] Non-scaffold execution path
+- [ ] Custom CUDA kernels for attention
+- [ ] Memory allocator optimization
+- [ ] Benchmark vs llama.cpp
+
+**Success Criteria:**
+- Native path performs within 20% of llama.cpp
+- Supports safetensors without conversion
+- All 3B models load and execute correctly
+
+**Owner:** Runtime Team
+
+### Milestone 3: Speculative Decoding Production
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] Draft model management
+- [ ] Validator optimization
+- [ ] Metrics for speculation accuracy
+- [ ] 1.8x speedup verified
+
+**Success Criteria:**
+- 1.8x throughput improvement on compatible workloads
+- Speculation accuracy > 90%
+- Graceful fallback when validation fails
+
+**Owner:** Runtime Team
+
+### Milestone 4: KV Cache Page Reuse
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] Cross-request KV page pooling
+- [ ] Zero-copy KV transfer
+- [ ] Cache hit rate metrics
+- [ ] 85%+ hit rate on conversation workloads
+
+**Success Criteria:**
+- 85%+ KV cache hit rate on multi-turn conversations
+- Zero-copy reduces VRAM usage by 30%
+- Compatible with all model formats
+
+**Owner:** Scheduler Team
+
+---
+
+## Q4 2026: Enterprise Features
+
+**Goal:** Achieve B+ overall grade
+
+### Milestone 1: Distributed Inference - Multi-Machine
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] RDMA KV transport
+- [ ] Multi-machine coordinator
+- [ ] Failure detection
+- [ ] Chaos testing suite
+
+**Success Criteria:**
+- Deploy across 4 machines without code changes
+- Handle single GPU failure gracefully
+- Throughput scales linearly with GPU count
+
+**Owner:** Distributed Runtime Team
+
+### Milestone 2: Self-Healing Architecture
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] Health check integration
+- [ ] Auto-restart on crashes
+- [ ] Backend auto-failover
+- [ ] Circuit breaker pattern
+
+**Success Criteria:**
+- 99.9% uptime in HA configuration
+- Auto-recovery from single failures
+- Zero data loss during failover
+
+**Owner:** Platform Team
+
+### Milestone 3: Advanced Authorization
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] Per-model RBAC
+- [ ] User groups
+- [ ] Permission inheritance
+- [ ] Audit trail for all access
+
+**Success Criteria:**
+- Fine-grained control per model
+- External identity provider integration
+- Complete audit of all model access
+
+**Owner:** Auth Team
+
+### Milestone 4: Key Rotation
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] Zero-downtime key updates
+- [ ] Key versioning
+- [ ] Graceful key expiration
+- [ ] Admin API for key management
+
+**Success Criteria:**
+- Rotate keys without restarting
+- Old keys expire automatically
+- No dropped requests during rotation
+
+**Owner:** Auth Team
+
+---
+
+## Q1 2027: Production Ready
+
+**Goal:** Achieve A- overall grade, competitive with vLLM/SGLang
+
+### Milestone 1: Performance Parity
+
+**Status:** ⏳ Planned
+
+**Target:** Within 2x of vLLM on single-GPU workloads
+
+**Deliverables:**
+- [ ] Comprehensive benchmark suite
+- [ ] Performance regression tests
+- [ ] Published benchmarks vs competitors
+
+**Success Criteria:**
+- Throughput ≥ 50% of vLLM on standard benchmarks
+- Latency ≤ 2x of vLLM p50
+- Documented trade-offs
+
+**Owner:** Performance Team
+
+### Milestone 2: Auto-Scaling Integration
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] Kubernetes HPA metrics
+- [ ] Custom metrics server
+- [ ] Scaling policies
+- [ ] Helm chart improvements
+
+**Success Criteria:**
+- HPA scales based on queue depth
+- Zero-downtime scale-up/down
+- Max utilization within 10% of target
+
+**Owner:** Platform Team
+
+### Milestone 3: Multi-Region Deployment
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] Geo-distributed inference
+- [ ] Request routing
+- [ ] Data replication
+- [ ] Compliance boundaries
+
+**Success Criteria:**
+- Deploy across 3+ regions
+- Latency < 200ms for same-region requests
+- Data residency compliance
+
+**Owner:** Distributed Runtime Team
+
+### Milestone 4: Enterprise SLA
+
+**Status:** ⏳ Planned
+
+**Deliverables:**
+- [ ] 99.9% uptime SLO
+- [ ] Performance SLOs
+- [ ] Support SLAs
+- [ ] SLA reporting dashboard
+
+**Success Criteria:**
+- 99.9% monthly uptime
+- Latency SLOs met 99.5% of time
+- Support response < 4 hours
+
+**Owner:** Platform Team
+
+---
+
+## Grade Evolution
+
+```mermaid
+xychart-beta
+    title "Overall Grade Evolution"
+    x-axis ["Q1 '26", "Q2 '26", "Q3 '26", "Q4 '26", "Q1 '27"]
+    y-axis "Grade Points" 0 --> 4
+    line [1.5, 2.0, 2.5, 3.0, 3.5]
+```
+
+**Grade Scale:**
+- A = 4.0 (industry leader)
+- B = 3.0 (strong performer)
+- C = 2.0 (adequate)
+- D = 1.0 (lagging)
+- F = 0.0 (unusable)
+
+**Progress:**
+- March 2026: C+ (1.5) ✅ **Current**
+- Target Q2 2026: C+/B- (2.0)
+- Target Q3 2026: B (2.5)
+- Target Q4 2026: B+ (3.0)
+- Target Q1 2027: A- (3.5)
+
+---
 
 ## Stretch Goals (post-Workstream D)
-- Multi-region active/active with workload-aware routing and autoscaler hints (queue depth, KV fragmentation).
-- Budget-aware autoscaling (cost per token) and GPU sharing controls.
-- Frontend SDKs for major frameworks (LangChain, LlamaIndex).
-- LoRA stacking and hot adapter reloads.
+
+Multi-region active/active with workload-aware routing and autoscaler hints, budget-aware autoscaling (cost per token), GPU sharing controls, frontend SDKs for LangChain/LlamaIndex, LoRA stacking and hot adapter reloads.
+
+---
+
+**Next:** [Vision](VISION.md) | [TechDebt](TechDebt_and_Competitive_Roadmap.md) | [Architecture](Architecture.md)

@@ -1,0 +1,110 @@
+# InferFlux CUDA Configuration for Safetensors Models
+# Optimized for RTX 4000 Ada (SM 8.9) and similar Ampere+ GPUs
+#
+# Usage:
+#   INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel ./build/inferfluxd --config config/server.cuda.safetensors.yaml
+#
+# Or set in environment:
+#   export INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
+
+server:
+  host: 0.0.0.0
+  http_port: 8080
+  max_concurrent: 1024
+  enable_metrics: true
+  enable_tracing: false
+
+# Model configuration for safetensors
+models:
+  - id: qwen2.5-3b-instruct
+    path: models/qwen2.5-3b-instruct-safetensors
+    format: auto                    # Rule 7: Will be detected as safetensors
+    backend: cuda_native            # Rule 1: Use cuda_native for safetensors
+    default: true
+    # Note: Requires INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
+
+# Runtime configuration
+runtime:
+  backend_priority: [cuda, cpu]     # Rule 8: CUDA first, CPU fallback
+
+  cuda:
+    enabled: true                   # Rule 8: Enable CUDA
+    attention:
+      kernel: auto                  # Rule 2: auto will select FA2 on SM 8.9
+    flash_attention:
+      enabled: true                 # Rule 2: FA2 enabled for Ampere+ (SM ≥ 8.0)
+      tile_size: 128                # FA2 tile size (128 is optimal for most GPUs)
+    phase_overlap:
+      enabled: true                 # Rule 4: Enable for batch_size >= 4
+      min_prefill_tokens: 256
+      prefill_replica: false
+
+  backend_exposure:
+    prefer_native: true             # Rule 1: Prefer native for safetensors
+    allow_universal_fallback: true  # Allow fallback to llama.cpp
+
+  capability_routing:
+    allow_default_fallback: true
+    require_ready_backend: true
+    fallback_scope: any_compatible
+
+  scheduler:
+    max_batch_size: 16              # Rule 3: Tuned for 3B model on 20GB VRAM
+    max_batch_tokens: 8192
+    min_batch_size: 1
+    batch_accumulation_ms: 5        # Accumulate for 5ms for larger batches
+
+  tensor_parallel: 1                # Rule 6: Set to GPU count for multi-GPU
+
+  mps_layers: 0
+
+  fairness:
+    enable_preemption: true
+    high_priority_threshold: 5
+    max_timeslice_tokens: 64
+
+  speculative_decoding:
+    enabled: false
+    draft_model: ""
+    max_prefill_tokens: 256
+    chunk_size: 4
+
+  nvme_offload:
+    path: ""
+    workers: 1
+    queue_depth: 256
+
+  paged_kv:
+    cpu_pages: 256                  # Rule 5: 256 pages for 3B model on GPU
+    eviction: lru
+
+adapters: []
+
+auth:
+  api_keys:
+    - key: dev-key-123
+      scopes: [generate, read, admin]
+  rate_limit_per_minute: 120
+  oidc_issuer: https://issuer.example.com
+  oidc_audience: inferflux
+
+guardrails:
+  blocklist:
+    - secret
+    - confidential
+  opa_endpoint: ""
+
+logging:
+  level: info
+  format: text                     # Use text format for easier debugging
+  audit_log: logs/audit.log
+
+registry:
+  path: ""
+  poll_interval_ms: 5000
+
+# Required environment variable for safetensors on CUDA:
+# export INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
+#
+# Quick start:
+#   INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel ./build/inferfluxd --config config/server.cuda.safetensors.yaml

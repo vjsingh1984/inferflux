@@ -1,79 +1,133 @@
+# InferFlux Server Configuration
+# This is the default configuration for CPU-only inference.
+# For CUDA GPUs, use server.cuda.yaml instead.
+#
+# For best performance, the startup advisor will log recommendations at startup.
+# Suppress with: INFERFLUX_DISABLE_STARTUP_ADVISOR=true
+
 server:
   host: 0.0.0.0
   http_port: 8080
   max_concurrent: 1024
   enable_metrics: true
   enable_tracing: false
+
+# Legacy model config (deprecated, use 'models' array below)
 model:
   repo: meta-llama/Meta-Llama-3-8B-Instruct
   path: models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
   format: gguf
   quantization: q4_k_m
   tokenizer: sentencepiece
+
+# Model configurations (multi-model serving)
 models:
   - id: llama3-8b
     path: models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
-    format: auto
-    backend: cpu
+    format: gguf                    # Rule 7: Set format explicitly (gguf, safetensors, hf)
+    backend: cpu                    # Rule 8: Use 'cuda' for GPU inference
     default: true
+
+# Runtime configuration
 runtime:
-  backend_priority: [cpu]
+  # Backend priority for auto-selection
+  backend_priority: [cpu]           # Rule 8: Add 'cuda' first for GPU: [cuda, cpu]
+
+  # CUDA configuration (only used when CUDA is available)
   cuda:
-    enabled: false
+    enabled: false                  # Rule 8: Set to true for GPU inference
     attention:
-      kernel: auto # auto | fa3 | fa2 | standard
+      kernel: auto                  # Rule 2: 'fa2' for SM ≥ 8.0 (Ampere+), 'auto' for auto-detect
     flash_attention:
-      enabled: false
+      enabled: false                # Rule 2: Set to true on GPUs with SM ≥ 8.0
       tile_size: 128
     phase_overlap:
-      enabled: false
+      enabled: false                # Rule 4: Set to true when batch_size >= 4
       min_prefill_tokens: 256
       prefill_replica: false
+
+  # Backend exposure policy
   backend_exposure:
-    prefer_native: true
-    allow_universal_fallback: true
+    prefer_native: true             # Prefer native implementations (native CUDA, MLX)
+    allow_universal_fallback: true  # Allow fallback to llama.cpp backends
+
+  # Capability routing for graceful degradation
   capability_routing:
     allow_default_fallback: true
     require_ready_backend: true
-    fallback_scope: any_compatible # any_compatible | same_path_only
+    fallback_scope: any_compatible
+
+  # Scheduler batch configuration
   scheduler:
-    max_batch_size: 4
-    max_batch_tokens: 8192
-  tensor_parallel: 1
+    max_batch_size: 4               # Rule 3: Increase for high VRAM (32-64 for 3B models on 20GB)
+    max_batch_tokens: 8192          # Max tokens per batch
+    min_batch_size: 1               # Minimum batch size before flushing
+    batch_accumulation_ms: 0        # Wait time to accumulate larger batches
+
+  # Tensor parallelism (multi-GPU inference)
+  tensor_parallel: 1                # Rule 6: Set to GPU count for large models
+
+  # Metal/MPS layers (macOS only)
   mps_layers: 0
+
+  # Fairness controller
   fairness:
     enable_preemption: false
     high_priority_threshold: 5
     max_timeslice_tokens: 0
+
+  # Speculative decoding (draft + validation)
   speculative_decoding:
     enabled: false
     draft_model: ""
     max_prefill_tokens: 256
     chunk_size: 4
+
+  # NVMe offload for KV cache
   nvme_offload:
     path: ""
     workers: 1
     queue_depth: 256
+
+  # Paged KV cache configuration
   paged_kv:
-    cpu_pages: 4096
-    eviction: lru
+    cpu_pages: 4096                 # Rule 5: Increase for large VRAM (256-512 for 3B models on GPU)
+    eviction: lru                   # Cache eviction policy: lru or clock
+
 adapters: []
+
+# Authentication
 auth:
   api_keys:
-    - key: dev-key-123
+    - key: dev-key-123              # Development API key (all permissions)
       scopes: [generate, read, admin]
-  rate_limit_per_minute: 120
+    - key: user-key-123             # User API key (no admin)
+      scopes: [generate, read]
+  rate_limit_per_minute: 120        # Per-API-key rate limit
   oidc_issuer: https://issuer.example.com
   oidc_audience: inferflux
+
+# Content guardrails
 guardrails:
   blocklist:
     - secret
     - confidential
   opa_endpoint: ""
+
+# Logging configuration
 logging:
-  level: info
-  format: json
+  level: info                       # debug, info, warn, error
+  format: json                      # json or text
   audit_log: logs/audit.log
+
+# Hot-reload model registry
 registry:
-  path: ""                # Path to registry.yaml; empty = disabled (CQ-8)
-  poll_interval_ms: 5000  # How often to check for file changes
+  path: ""                          # Path to registry.yaml; empty = disabled
+  poll_interval_ms: 5000            # How often to check for file changes
+
+# Environment variable overrides:
+# INFERFLUX_MODEL_PATH              - Override default model path
+# INFERFLUX_MODELS                  - Multi-model config string
+# INFERFLUX_NATIVE_CUDA_EXECUTOR    - native_kernel for safetensors on CUDA
+# INFERFLUX_BACKEND_PRIORITY        - Override backend selection order
+# INFERFLUX_DISABLE_STARTUP_ADVISOR - Disable recommendation logging

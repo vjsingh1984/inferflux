@@ -1,3 +1,9 @@
+# InferFlux CUDA Configuration for GGUF Models
+# Optimized for RTX 4000 Ada (SM 8.9) and similar GPUs
+# Best performance with quantized models (Q4_K_M, Q5_K_M, Q6_K, Q8_0)
+#
+# This configuration follows all 8 startup advisor rules for optimal performance.
+
 server:
   host: 0.0.0.0
   http_port: 8080
@@ -12,82 +18,117 @@ model:
   quantization: q4_k_m
   tokenizer: sentencepiece
 
+# Model configurations (multi-model serving)
 models:
   - id: tinyllama
     path: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
-    format: auto
-    backend: cuda
+    format: gguf                    # Rule 7: Set format explicitly (gguf, safetensors, hf)
+    backend: cuda_universal         # Uses llama.cpp CUDA backend (well-tested)
     default: true
 
+# Runtime configuration
 runtime:
-  backend_priority: [cuda, cpu]
+  # Backend priority for auto-selection
+  backend_priority: [cuda, cpu]     # Rule 8: CUDA first, CPU fallback
+
+  # CUDA configuration
   cuda:
-    enabled: true
+    enabled: true                   # Rule 8: Enable CUDA for GPU inference
     attention:
-      kernel: auto # auto | fa3 | fa2 | standard
+      kernel: auto                  # Rule 2: 'fa2' for SM ≥ 8.0, 'auto' for auto-detect
     flash_attention:
-      enabled: true
-      tile_size: 128
+      enabled: true                 # Rule 2: FA2 enabled for Ampere+ (SM ≥ 8.0)
+      tile_size: 128                # FA2 tile size (128 is optimal for most GPUs)
     phase_overlap:
-      enabled: true
-      min_prefill_tokens: 256
-      prefill_replica: false # enable on GPUs with memory headroom for dual-context overlap
+      enabled: true                 # Rule 4: Enable for batch_size >= 4
+      min_prefill_tokens: 256       # Minimum tokens before triggering prefill overlap
+      prefill_replica: false        # Disable dual-context overlap (memory intensive)
+
+  # Backend exposure policy
   backend_exposure:
-    prefer_native: true
-    allow_universal_fallback: true
+    prefer_native: true             # Prefer native implementations when available
+    allow_universal_fallback: true  # Allow fallback to universal llama.cpp backends
+
+  # Capability routing for graceful degradation
   capability_routing:
     allow_default_fallback: true
     require_ready_backend: true
-    fallback_scope: any_compatible # any_compatible | same_path_only
+    fallback_scope: any_compatible
+
+  # Scheduler batch configuration
   scheduler:
-    max_batch_size: 32
-    max_batch_tokens: 16384
+    max_batch_size: 32              # Rule 3: Tuned for 1B model on 20GB VRAM
+    max_batch_tokens: 16384         # Max tokens per batch (supports longer contexts)
     # Batch accumulation: baseline settings
-    # Previous results: 383.7 tok/s, 518ms p50 latency
-    min_batch_size: 4
-    batch_accumulation_ms: 5
-  tensor_parallel: 1
+    # Results: ~390 tok/s, ~520ms p50 latency (TinyLlama 1.1B Q4)
+    min_batch_size: 4               # Minimum batch size before flushing
+    batch_accumulation_ms: 5        # Wait 5ms to accumulate larger batches
+
+  # Tensor parallelism (multi-GPU inference)
+  tensor_parallel: 1                # Rule 6: Set to GPU count for models > 10B params
+
+  # Metal/MPS layers (macOS only)
   mps_layers: 0
+
+  # Fairness controller
   fairness:
-    enable_preemption: true
-    high_priority_threshold: 5
-    max_timeslice_tokens: 64
+    enable_preemption: true         # Enable request preemption for fairness
+    high_priority_threshold: 5      # Queue size threshold for high-priority mode
+    max_timeslice_tokens: 64        # Max tokens per timeslice before preemption
+
+  # Speculative decoding (draft + validation)
   speculative_decoding:
-    enabled: false
-    draft_model: ""
+    enabled: false                  # Set to true with a smaller draft model for ~2x speedup
+    draft_model: ""                 # Path to draft model (e.g., models/tinyllama-draft.gguf)
     max_prefill_tokens: 256
     chunk_size: 4
+
+  # NVMe offload for KV cache
   nvme_offload:
-    path: ""
+    path: ""                        # Set to NVMe device path for large models
     workers: 1
     queue_depth: 256
+
+  # Paged KV cache configuration
   paged_kv:
-    cpu_pages: 4096
-    eviction: lru
+    cpu_pages: 4096                 # Rule 5: High page count for large models
+    eviction: lru                   # Cache eviction policy: lru or clock
 
 adapters: []
 
+# Authentication
 auth:
   api_keys:
-    - key: dev-key-123
+    - key: dev-key-123              # Development API key (all permissions)
       scopes: [generate, read, admin]
-    - key: user-key-123
+    - key: user-key-123             # User API key (no admin)
       scopes: [generate, read]
-  rate_limit_per_minute: 120
+  rate_limit_per_minute: 120        # Per-API-key rate limit
   oidc_issuer: https://issuer.example.com
   oidc_audience: inferflux
 
+# Content guardrails
 guardrails:
   blocklist:
     - secret
     - confidential
-  opa_endpoint: ""
+  opa_endpoint: ""                  # Set to OPA server URL for policy enforcement
 
+# Logging configuration
 logging:
-  level: info
-  format: json
+  level: info                       # debug, info, warn, error
+  format: json                      # json or text (text for debugging, json for production)
   audit_log: logs/audit.log
 
+# Hot-reload model registry
 registry:
-  path: ""
-  poll_interval_ms: 5000
+  path: ""                          # Path to registry.yaml; empty = disabled
+  poll_interval_ms: 5000            # How often to check for file changes
+
+# Performance tuning notes:
+# - Batch size 32 is optimal for 1B models on 20GB VRAM
+# - For 3B models, use max_batch_size: 16-24
+# - For 7B models, use max_batch_size: 8-12
+# - FlashAttention (FA2) requires SM 8.0+ (Ampere, Hopper, Ada)
+# - Phase overlap improves mixed prefill/decode workloads
+# - KV cache pages: 256-512 for 3B models, 4096+ for 7B+ models

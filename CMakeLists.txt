@@ -104,6 +104,8 @@ add_library(inferflux_core
   server/logging/logger.h
   server/policy/guardrail.cpp
   server/policy/guardrail.h
+  server/startup_advisor.cpp
+  server/startup_advisor.h
   policy/policy_store.cpp
   policy/policy_store.h
   policy/opa_client.cpp
@@ -431,6 +433,7 @@ add_executable(inferflux_tests
   tests/unit/test_gpu_kv_cache.cpp
   tests/unit/test_gpu_sampler.cpp
   tests/unit/test_native_batching.cpp
+  tests/unit/test_startup_advisor.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -494,6 +497,8 @@ add_test(NAME GpuSamplerTests COMMAND inferflux_tests "[gpu_sampler]")
 set_tests_properties(GpuSamplerTests PROPERTIES LABELS gpu_sampler)
 add_test(NAME NativeBatchTests COMMAND inferflux_tests "[native_batch]")
 set_tests_properties(NativeBatchTests PROPERTIES LABELS native_batch)
+add_test(NAME StartupAdvisorTests COMMAND inferflux_tests "[startup_advisor]")
+set_tests_properties(StartupAdvisorTests PROPERTIES LABELS startup_advisor)
 if(ENABLE_MLX)
   add_test(NAME MlxLoaderTests COMMAND inferflux_tests "[mlx_loader]")
   set_tests_properties(MlxLoaderTests PROPERTIES LABELS mlx_loader)
@@ -711,6 +716,9 @@ if(Python3_Interpreter_FOUND)
             StubIntegrationTests.test_inferctl_admin_rate_limit_set_requires_value
             StubIntegrationTests.test_inferctl_admin_rate_limit_set_requires_integer
             StubIntegrationTests.test_inferctl_admin_rate_limit_get_auth_failure
+            StubIntegrationTests.test_inferctl_admin_pools_requires_get
+            StubIntegrationTests.test_inferctl_admin_pools_get_auth_failure
+            StubIntegrationTests.test_inferctl_admin_pools_get
             StubIntegrationTests.test_inferctl_admin_routing_rejects_multiple_operations
             StubIntegrationTests.test_inferctl_admin_routing_set_requires_fields
             StubIntegrationTests.test_inferctl_admin_routing_allow_default_requires_set
@@ -720,7 +728,9 @@ if(Python3_Interpreter_FOUND)
             StubIntegrationTests.test_inferctl_admin_routing_fallback_scope_requires_value
             StubIntegrationTests.test_inferctl_admin_routing_fallback_scope_validates_value
             StubIntegrationTests.test_inferctl_admin_routing_get_auth_failure
-            StubIntegrationTests.test_inferctl_admin_routing_get)
+            StubIntegrationTests.test_inferctl_admin_routing_get
+            StubIntegrationTests.test_inferctl_admin_routing_set_scope_success
+            StubIntegrationTests.test_inferctl_admin_routing_set_booleans_success)
   set_tests_properties(IntegrationCLIAdminArgContract PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60

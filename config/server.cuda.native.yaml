@@ -1,3 +1,7 @@
+# InferFlux Native CUDA Configuration for Safetensors
+# DEPRECATED: Use server.cuda.safetensors.yaml instead
+# This file is kept for backwards compatibility
+
 server:
   host: 0.0.0.0
   http_port: 8080
@@ -17,45 +21,55 @@ models:
     default: true
 
 runtime:
-  backend_priority: [cuda_native, cuda, cpu]
+  backend_priority: [cuda, cpu]
   cuda:
     enabled: true
     attention:
-      kernel: fa2
+      kernel: auto                  # Rule 2: auto selects FA2 on SM 8.9
     flash_attention:
-      enabled: true
+      enabled: true                 # Rule 2: FA2 enabled
       tile_size: 128
     phase_overlap:
-      enabled: false
+      enabled: true                 # Rule 4: Enable for batch_size >= 4
+      min_prefill_tokens: 256
+      prefill_replica: false
+
   backend_exposure:
     prefer_native: true
-    allow_universal_fallback: false
+    allow_universal_fallback: true  # Changed from false to allow fallback
+
   capability_routing:
     allow_default_fallback: true
     require_ready_backend: true
     fallback_scope: any_compatible
+
   scheduler:
-    max_batch_size: 8
-    max_batch_tokens: 4096
+    max_batch_size: 16              # Rule 3: Increased from 8
+    max_batch_tokens: 8192          # Increased from 4096
     min_batch_size: 1
-    batch_accumulation_ms: 2
+    batch_accumulation_ms: 5
+
   tensor_parallel: 1
   mps_layers: 0
+
   fairness:
     enable_preemption: true
     high_priority_threshold: 5
     max_timeslice_tokens: 64
+
   speculative_decoding:
     enabled: false
     draft_model: ""
     max_prefill_tokens: 256
     chunk_size: 4
+
   nvme_offload:
     path: ""
     workers: 1
     queue_depth: 256
+
   paged_kv:
-    cpu_pages: 4096
+    cpu_pages: 256                  # Rule 5: Reduced from 4096 to 256 for GPU
     eviction: lru
 
 adapters: []
@@ -78,3 +92,8 @@ logging:
 registry:
   path: ""
   poll_interval_ms: 5000
+
+# NOTE: This config requires:
+#   INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
+#
+# For a better-documented version, see server.cuda.safetensors.yaml

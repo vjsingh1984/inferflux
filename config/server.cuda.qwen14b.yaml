@@ -1,3 +1,7 @@
+# InferFlux CUDA Configuration for Qwen2.5-Coder-14B
+# Optimized for RTX 4000 Ada (20GB VRAM) and similar GPUs
+# Large model (14B params) requires moderate batch sizes and KV pages
+
 server:
   host: 0.0.0.0
   http_port: 8080
@@ -8,52 +12,62 @@ server:
 models:
   - id: qwen2.5-coder-14b
     path: models/qwen2.5-coder-14b-instruct-q4_k_m.gguf
-    format: gguf
-    backend: cuda
+    format: gguf                    # Rule 7: Explicit format
+    backend: cuda_universal         # Uses llama.cpp CUDA backend
     default: true
 
 runtime:
-  backend_priority: [cuda, cpu]
+  backend_priority: [cuda, cpu]     # Rule 8: CUDA first, CPU fallback
+
   cuda:
-    enabled: true
+    enabled: true                   # Rule 8: Enable CUDA
     attention:
-      kernel: auto # auto | fa2 | fa3 | standard
+      kernel: auto                  # Rule 2: auto selects FA2 on SM 8.9
     flash_attention:
-      enabled: true
+      enabled: true                 # Rule 2: FA2 enabled for Ampere+ GPUs
       tile_size: 128
     phase_overlap:
-      enabled: true
+      enabled: true                 # Rule 4: Enable for batch_size >= 4
       min_prefill_tokens: 256
       prefill_replica: false
+
   backend_exposure:
     prefer_native: true
     allow_universal_fallback: true
+
   capability_routing:
     allow_default_fallback: true
     require_ready_backend: true
     fallback_scope: any_compatible
+
   scheduler:
-    max_batch_size: 16  # Suitable for 14B model
-    max_batch_tokens: 16384
+    max_batch_size: 16              # Rule 3: Suitable for 14B model on 20GB VRAM
+    max_batch_tokens: 16384         # Larger context for coding tasks
     min_batch_size: 4
     batch_accumulation_ms: 5
-  tensor_parallel: 1
+
+  tensor_parallel: 1                # Rule 6: Set to GPU count for multi-GPU
+
   mps_layers: 0
+
   fairness:
     enable_preemption: true
     high_priority_threshold: 5
     max_timeslice_tokens: 64
+
   speculative_decoding:
     enabled: false
     draft_model: ""
     max_prefill_tokens: 256
     chunk_size: 4
+
   nvme_offload:
     path: ""
     workers: 1
     queue_depth: 256
+
   paged_kv:
-    cpu_pages: 2048  # Reduced from 4096 for 14B model
+    cpu_pages: 2048                 # Rule 5: Moderate for 14B model
     eviction: lru
 
 adapters: []
@@ -82,3 +96,9 @@ logging:
 registry:
   path: ""
   poll_interval_ms: 5000
+
+# Performance notes for 14B models on 20GB VRAM:
+# - batch_size 12-20 is optimal (vs 32-64 for 3B models)
+# - cpu_pages 1536-2048 (vs 256-512 for 3B models)
+# - FA2 enabled by default for SM 8.0+ GPUs
+# - Phase overlap helps with mixed prefill/decode workloads

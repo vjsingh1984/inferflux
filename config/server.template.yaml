@@ -1,0 +1,211 @@
+# InferFlux Server Configuration Template
+# Copy this file and customize for your deployment.
+#
+# All 8 Startup Advisor Rules are documented below with recommended values.
+#
+# Startup advisor will log recommendations at startup if config is suboptimal.
+# Suppress with: INFERFLUX_DISABLE_STARTUP_ADVISOR=true
+
+server:
+  host: 0.0.0.0
+  http_port: 8080
+  max_concurrent: 1024
+  enable_metrics: true
+  enable_tracing: false
+
+# ============================================================================
+# MODEL CONFIGURATION
+# ============================================================================
+
+models:
+  # Example GGUF model configuration
+  - id: model-name
+    path: /path/to/model.gguf
+    format: gguf                    # Rule 7: Set explicitly (gguf, safetensors, hf, auto)
+    backend: cuda                   # Rule 8: cuda, cpu, mps, rocm, cuda_native, cuda_universal
+    default: true
+
+  # Example safetensors model configuration
+  # - id: safetensors-model
+  #   path: /path/to/safetensors-model
+  #   format: safetensors           # Rule 7: Explicit format
+  #   backend: cuda_native          # Rule 1: Use cuda_native for safetensors
+  #   default: false
+
+# ============================================================================
+# RUNTIME CONFIGURATION
+# ============================================================================
+
+runtime:
+  # Backend priority order for auto-selection
+  backend_priority: [cuda, cpu]     # Rule 8: Try CUDA first, fallback to CPU
+
+  # CUDA GPU configuration
+  cuda:
+    enabled: true                   # Rule 8: Set to true for GPU inference
+
+    # Attention kernel configuration
+    attention:
+      kernel: auto                  # Rule 2: auto (selects FA2 on SM≥8.0), fa2, standard
+
+    # FlashAttention configuration (requires SM 8.0+)
+    flash_attention:
+      enabled: true                 # Rule 2: Enable on Ampere+ GPUs (RTX 3090, 4090, Ada, Hopper)
+      tile_size: 128                # FA2 tile size (64-256, 128 is optimal)
+
+    # Phase overlap for mixed prefill/decode batches
+    phase_overlap:
+      enabled: true                 # Rule 4: Enable when batch_size >= 4
+      min_prefill_tokens: 256       # Min prefill tokens before triggering overlap
+      prefill_replica: false        # Dual-context overlap (memory intensive)
+
+  # Backend exposure policy
+  backend_exposure:
+    prefer_native: true             # Prefer native implementations
+    allow_universal_fallback: true  # Allow fallback to llama.cpp backends
+
+  # Capability routing for graceful degradation
+  capability_routing:
+    allow_default_fallback: true    # Allow backend fallback when capabilities mismatch
+    require_ready_backend: true     # Wait for backend ready before serving
+    fallback_scope: any_compatible  # Fallback scope (any_compatible, same_path_only)
+
+  # Scheduler batch configuration
+  scheduler:
+    max_batch_size: 16              # Rule 3: Tune based on VRAM and model size
+    max_batch_tokens: 8192          # Max tokens per batch (affects memory)
+    min_batch_size: 1               # Minimum batch size before flushing
+    batch_accumulation_ms: 5        # Wait time to accumulate larger batches
+
+    # Recommended max_batch_size by model size (20GB VRAM):
+    # - 1B-3B models: 24-32
+    # - 7B models: 12-16
+    # - 13B-14B models: 6-8
+    # - 30B+ models: 2-4
+
+  # Tensor parallelism (multi-GPU inference)
+  tensor_parallel: 1                # Rule 6: Set to GPU count for large models
+
+  # Metal/MPS layers (Apple Silicon only)
+  mps_layers: 0                     # Number of layers to offload to MPS GPU
+
+  # Fairness controller (multi-tenant request scheduling)
+  fairness:
+    enable_preemption: false        # Enable request preemption for fairness
+    high_priority_threshold: 5      # Queue size for high-priority mode
+    max_timeslice_tokens: 0         # Max tokens per timeslice
+
+  # Speculative decoding (draft model + validator)
+  speculative_decoding:
+    enabled: false                  # Set to true for ~2x speedup with draft model
+    draft_model: ""                 # Path to smaller draft model
+    max_prefill_tokens: 256
+    chunk_size: 4
+
+  # NVMe offload for KV cache (large models)
+  nvme_offload:
+    path: ""                        # Set to NVMe mount point
+    workers: 1
+    queue_depth: 256
+
+  # Paged KV cache configuration
+  paged_kv:
+    cpu_pages: 256                  # Rule 5: Increase for large VRAM (256-512 for 3B on GPU)
+    eviction: lru                   # Cache eviction: lru or clock
+
+    # Recommended cpu_pages by model size:
+    # - 1B-3B models (GPU): 128-256
+    # - 7B models (GPU): 256-512
+    # - 13B-14B models (GPU): 512-1024
+    # - 30B+ models (GPU): 1024-2048
+    # - CPU inference: 4096-8192
+
+# ============================================================================
+# 8 STARTUP ADVISOR RULES SUMMARY
+# ============================================================================
+#
+# Rule 1: Backend mismatch
+#   Trigger: safetensors + CUDA + universal provider
+#   Fix: Use backend: cuda_native with INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
+#
+# Rule 2: Attention kernel
+#   Trigger: GPU SM ≥ 8.0, FlashAttention disabled
+#   Fix: Set cuda.flash_attention.enabled: true
+#
+# Rule 3: Batch size vs VRAM
+#   Trigger: Large free VRAM, small max_batch_size
+#   Fix: Increase runtime.scheduler.max_batch_size
+#
+# Rule 4: Phase overlap
+#   Trigger: CUDA enabled, batch_size ≥ 4, phase_overlap disabled
+#   Fix: Set cuda.phase_overlap.enabled: true
+#
+# Rule 5: KV cache pages
+#   Trigger: Large VRAM, low cpu_pages count
+#   Fix: Increase runtime.paged_kv.cpu_pages
+#
+# Rule 6: Tensor parallelism
+#   Trigger: Multi-GPU, TP=1, large model
+#   Fix: Set runtime.tensor_parallel to GPU count
+#
+# Rule 7: Unknown format
+#   Trigger: Model format not detected (format == "unknown")
+#   Fix: Set models[*].format explicitly (gguf, safetensors, hf)
+#
+# Rule 8: GPU unused
+#   Trigger: GPU available, all models on CPU
+#   Fix: Set models[*].backend to cuda/cuda_universal/cuda_native
+
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
+
+adapters: []
+
+auth:
+  api_keys:
+    - key: dev-key-123              # Development key (all permissions)
+      scopes: [generate, read, admin]
+  rate_limit_per_minute: 120        # Per-key request rate limit
+  oidc_issuer: https://issuer.example.com
+  oidc_audience: inferflux
+
+# ============================================================================
+# CONTENT GUARDRAILS
+# ============================================================================
+
+guardrails:
+  blocklist:
+    - secret
+    - confidential
+  opa_endpoint: ""                  # OPA policy agent endpoint
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+logging:
+  level: info                       # debug, info, warn, error
+  format: json                      # json (production) or text (development)
+  audit_log: logs/audit.log
+
+# ============================================================================
+# HOT-RELOAD MODEL REGISTRY
+# ============================================================================
+
+registry:
+  path: ""                          # Path to registry.yaml; empty = disabled
+  poll_interval_ms: 5000
+
+# ============================================================================
+# ENVIRONMENT VARIABLE OVERRIDES
+# ============================================================================
+#
+# INFERFLUX_MODEL_PATH              - Override default model path
+# INFERFLUX_MODELS                  - Multi-model config string
+# INFERFLUX_NATIVE_CUDA_EXECUTOR    - native_kernel for safetensors (Rule 1)
+# INFERFLUX_BACKEND_PRIORITY        - Override backend selection (Rule 8)
+# INFERFLUX_DISABLE_STARTUP_ADVISOR - Disable recommendation logging
+#
+# Example for safetensors on CUDA:
+#   INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel ./build/inferfluxd --config config/server.yaml

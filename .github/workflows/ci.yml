@@ -128,7 +128,15 @@ jobs:
       # non-2xx exit semantics for automation-facing admin commands.
       # ------------------------------------------------------------------
       - name: Assert inferctl admin argument contract
-        run: ctest --test-dir build -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
+        run: |
+          EXPECTED_ADMIN_ARG_METHODS=40
+          ACTUAL_ADMIN_ARG_METHODS=$(sed -n '/NAME IntegrationCLIAdminArgContract/,/set_tests_properties/p' CMakeLists.txt | grep -o 'StubIntegrationTests\.[A-Za-z0-9_]*' | wc -l | tr -d ' ')
+          echo "IntegrationCLIAdminArgContract method count: expected=${EXPECTED_ADMIN_ARG_METHODS} actual=${ACTUAL_ADMIN_ARG_METHODS}"
+          if [ "${ACTUAL_ADMIN_ARG_METHODS}" -ne "${EXPECTED_ADMIN_ARG_METHODS}" ]; then
+            echo "::error::IntegrationCLIAdminArgContract method count drifted; update EXPECTED_ADMIN_ARG_METHODS in .github/workflows/ci.yml"
+            exit 1
+          fi
+          ctest --test-dir build -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
 
       # ------------------------------------------------------------------
       # SBOM — CycloneDX 1.5 JSON + SPDX 2.3 tag-value
@@ -490,7 +498,15 @@ jobs:
       # Focused assertion: inferctl admin argument contract
       # ------------------------------------------------------------------
       - name: Assert inferctl admin argument contract
-        run: ctest --test-dir build-cov -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
+        run: |
+          EXPECTED_ADMIN_ARG_METHODS=40
+          ACTUAL_ADMIN_ARG_METHODS=$(sed -n '/NAME IntegrationCLIAdminArgContract/,/set_tests_properties/p' CMakeLists.txt | grep -o 'StubIntegrationTests\.[A-Za-z0-9_]*' | wc -l | tr -d ' ')
+          echo "IntegrationCLIAdminArgContract method count: expected=${EXPECTED_ADMIN_ARG_METHODS} actual=${ACTUAL_ADMIN_ARG_METHODS}"
+          if [ "${ACTUAL_ADMIN_ARG_METHODS}" -ne "${EXPECTED_ADMIN_ARG_METHODS}" ]; then
+            echo "::error::IntegrationCLIAdminArgContract method count drifted; update EXPECTED_ADMIN_ARG_METHODS in .github/workflows/ci.yml"
+            exit 1
+          fi
+          ctest --test-dir build-cov -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
 
       # ------------------------------------------------------------------
       # Run tests + collect coverage in one CMake target

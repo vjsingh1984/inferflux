@@ -111,6 +111,15 @@ class StubIntegrationTests(unittest.TestCase):
         ]
         return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
+    def _get_routing_policy_via_inferctl(self):
+        result = self._run_inferctl(["admin", "routing", "--get"])
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
+        )
+        return json.loads(result.stdout)
+
     def test_health(self):
         # /healthz might require auth depending on config
         conn = http.client.HTTPConnection(SERVER_HOST, SERVER_PORT, timeout=5)
@@ -487,6 +496,41 @@ class StubIntegrationTests(unittest.TestCase):
         )
         self.assertIn("authentication required", result.stderr)
 
+    def test_inferctl_admin_pools_requires_get(self):
+        result = self._run_inferctl(["admin", "pools"])
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
+        )
+        self.assertIn("--get is required", result.stderr)
+
+    def test_inferctl_admin_pools_get_auth_failure(self):
+        result = self._run_inferctl(
+            ["admin", "pools", "--get"], api_key="invalid-key"
+        )
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
+        )
+        self.assertIn("authentication required", result.stderr)
+
+    def test_inferctl_admin_pools_get(self):
+        result = self._run_inferctl(["admin", "pools", "--get"])
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload.get("status"), "ok")
+        self.assertIn("pool_health", payload)
+        self.assertIn("scheduler", payload)
+        self.assertIn("queue_depth", payload["scheduler"])
+        self.assertIn("prefill_queue_depth", payload["scheduler"])
+        self.assertIn("decode_queue_depth", payload["scheduler"])
+
     def test_inferctl_admin_routing_rejects_multiple_operations(self):
         result = self._run_inferctl(["admin", "routing", "--get", "--set"])
         self.assertNotEqual(
@@ -597,6 +641,76 @@ class StubIntegrationTests(unittest.TestCase):
         self.assertIn("allow_default_fallback", payload)
         self.assertIn("require_ready_backend", payload)
         self.assertIn("fallback_scope", payload)
+
+    def test_inferctl_admin_routing_set_scope_success(self):
+        before = self._get_routing_policy_via_inferctl()
+        original_scope = before.get("fallback_scope", "any_compatible")
+        target_scope = (
+            "same_path_only" if original_scope != "same_path_only" else "any_compatible"
+        )
+        try:
+            result = self._run_inferctl(
+                ["admin", "routing", "--set", "--fallback-scope", target_scope]
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
+            )
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload.get("status"), "ok")
+            self.assertEqual(payload.get("fallback_scope"), target_scope)
+
+            after = self._get_routing_policy_via_inferctl()
+            self.assertEqual(after.get("fallback_scope"), target_scope)
+        finally:
+            self._run_inferctl(
+                ["admin", "routing", "--set", "--fallback-scope", original_scope]
+            )
+
+    def test_inferctl_admin_routing_set_booleans_success(self):
+        before = self._get_routing_policy_via_inferctl()
+        original_allow = bool(before.get("allow_default_fallback", True))
+        original_ready = bool(before.get("require_ready_backend", True))
+        target_allow = not original_allow
+        target_ready = not original_ready
+        try:
+            result = self._run_inferctl(
+                [
+                    "admin",
+                    "routing",
+                    "--set",
+                    "--allow-default-fallback",
+                    "true" if target_allow else "false",
+                    "--require-ready-backend",
+                    "true" if target_ready else "false",
+                ]
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
+            )
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload.get("status"), "ok")
+            self.assertEqual(payload.get("allow_default_fallback"), target_allow)
+            self.assertEqual(payload.get("require_ready_backend"), target_ready)
+
+            after = self._get_routing_policy_via_inferctl()
+            self.assertEqual(after.get("allow_default_fallback"), target_allow)
+            self.assertEqual(after.get("require_ready_backend"), target_ready)
+        finally:
+            self._run_inferctl(
+                [
+                    "admin",
+                    "routing",
+                    "--set",
+                    "--allow-default-fallback",
+                    "true" if original_allow else "false",
+                    "--require-ready-backend",
+                    "true" if original_ready else "false",
+                ]
+            )
 
     def test_inferctl_models_default_output(self):
         result = self._run_inferctl(["models"])

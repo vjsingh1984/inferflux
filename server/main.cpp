@@ -25,6 +25,7 @@
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 #include "server/policy/guardrail.h"
+#include "server/startup_advisor.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1263,6 +1264,52 @@ int main(int argc, char **argv) {
   if (!opa_endpoint.empty()) {
     std::cout << "OPA guardrail endpoint: " << opa_endpoint << std::endl;
   }
+
+  // --- Startup Advisor: log-only recommendations ---
+  {
+    inferflux::StartupAdvisorContext advisor_ctx;
+    // Snapshot loaded models.
+    for (const auto &mi : router->ListModels()) {
+      inferflux::AdvisorModelInfo am;
+      am.id = mi.id;
+      am.path = mi.path;
+      am.format = mi.format;
+      am.backend = mi.backend;
+      am.backend_provider = mi.backend_provider;
+      am.backend_fallback = mi.backend_fallback;
+      am.backend_fallback_reason = mi.backend_fallback_reason;
+      am.is_moe = mi.is_moe;
+      am.n_experts = mi.n_experts;
+      std::error_code ec;
+      auto fsize = std::filesystem::file_size(mi.path, ec);
+      if (!ec) am.file_size_bytes = static_cast<std::uint64_t>(fsize);
+      advisor_ctx.models.push_back(am);
+    }
+    // Probe GPU (post-model-load to get real free VRAM).
+    advisor_ctx.gpu = inferflux::ProbeCudaGpu();
+    if (!advisor_ctx.gpu.available) {
+      advisor_ctx.gpu = inferflux::ProbeRocmGpu();
+    }
+    // Snapshot config.
+    advisor_ctx.config.cuda_enabled = cuda_enabled;
+    advisor_ctx.config.flash_attention_enabled = cuda_flash_attention_enabled;
+    advisor_ctx.config.cuda_attention_kernel = cuda_attention_kernel;
+    advisor_ctx.config.phase_overlap_enabled = cuda_phase_overlap_scaffold;
+    advisor_ctx.config.max_batch_size = scheduler_config.max_batch_size;
+    advisor_ctx.config.max_batch_tokens = scheduler_config.max_batch_tokens;
+    advisor_ctx.config.kv_cpu_pages = paged_kv_pages;
+    advisor_ctx.config.prefer_native = backend_prefer_native;
+    advisor_ctx.config.allow_universal_fallback =
+        backend_allow_universal_fallback;
+    advisor_ctx.config.backend_priority =
+        normalized_backend_priority.empty()
+            ? ""
+            : normalized_backend_priority.front();
+    advisor_ctx.config.tp_degree = dist_world_size;
+    advisor_ctx.config.speculative_enabled = speculative_enabled;
+    inferflux::RunStartupAdvisor(advisor_ctx);
+  }
+
   int http_workers = 4;
   if (const char *env_workers = std::getenv("INFERFLUX_HTTP_WORKERS")) {
     try {

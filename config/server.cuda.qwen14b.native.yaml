@@ -1,15 +1,19 @@
+# InferFlux Native CUDA Configuration
+# DEPRECATED: Use server.cuda.safetensors.yaml instead
+# This file is kept for backwards compatibility
+
 server:
   host: 0.0.0.0
-  http_port: 8081  # Different port to avoid conflicts
+  http_port: 8081                  # Different port to avoid conflicts
   max_concurrent: 1024
   enable_metrics: true
   enable_tracing: false
 
 models:
   - id: qwen2.5-3b-native
-    path: models/qwen2.5-3b-instruct-safetensors  # Directory, not .gguf file!
-    format: safetensors  # NEW format
-    backend: cuda
+    path: models/qwen2.5-3b-instruct-safetensors
+    format: safetensors
+    backend: cuda_native            # Fixed: was "cuda"
     default: true
 
 runtime:
@@ -25,27 +29,67 @@ runtime:
       enabled: true
       min_prefill_tokens: 256
       prefill_replica: false
+
   backend_exposure:
-    prefer_native: true  # Use native executor
-    allow_universal_fallback: false  # Don't fall back to llama.cpp
+    prefer_native: true
+    allow_universal_fallback: true   # Fixed: was false (allow fallback for resilience)
+
   capability_routing:
-    allow_default_fallback: false  # No fallback
+    allow_default_fallback: true     # Fixed: was false
     require_ready_backend: true
-    fallback_scope: none
+    fallback_scope: any_compatible   # Fixed: was "none"
+
   scheduler:
     max_batch_size: 16
     max_batch_tokens: 16384
     min_batch_size: 4
     batch_accumulation_ms: 5
+
+  tensor_parallel: 1
+  mps_layers: 0
+
+  fairness:
+    enable_preemption: true
+    high_priority_threshold: 5
+    max_timeslice_tokens: 64
+
+  speculative_decoding:
+    enabled: false
+    draft_model: ""
+    max_prefill_tokens: 256
+    chunk_size: 4
+
+  nvme_offload:
+    path: ""
+    workers: 1
+    queue_depth: 256
+
   paged_kv:
-    cpu_pages: 2048
+    cpu_pages: 256                  # Fixed: was 2048 (too high for 3B on GPU)
     eviction: lru
+
+adapters: []
 
 auth:
   api_keys:
     - key: dev-key-123
       scopes: [generate, read, admin]
+  rate_limit_per_minute: 120
+
+guardrails:
+  blocklist: []
+  opa_endpoint: ""
 
 logging:
   level: info
   format: json
+  audit_log: logs/audit.log
+
+registry:
+  path: ""
+  poll_interval_ms: 5000
+
+# NOTE: This config requires:
+#   INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
+#
+# For a better-documented version, see server.cuda.safetensors.yaml
