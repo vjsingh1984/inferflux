@@ -1,6 +1,7 @@
 #include "runtime/backends/cuda/native_cuda_backend.h"
 
 #include "runtime/backends/cuda/native_cuda_executor.h"
+#include "model/model_format.h"
 #include "server/logging/logger.h"
 
 #include <algorithm>
@@ -34,9 +35,28 @@ NativeCudaBackend::~NativeCudaBackend() = default;
 bool NativeCudaBackend::LoadModel(const std::filesystem::path &model_path,
                                   const LlamaBackendConfig &config) {
 #ifdef INFERFLUX_HAS_CUDA
+  // Default executor kind
   executor_kind_ = "delegate";
-  if (const char *raw = std::getenv("INFERFLUX_NATIVE_CUDA_EXECUTOR")) {
-    executor_kind_ = raw;
+
+  // Check environment variable override
+  const char *executor_hint = std::getenv("INFERFLUX_NATIVE_CUDA_EXECUTOR");
+  if (executor_hint) {
+    executor_kind_ = executor_hint;
+    log::Info("native_cuda_backend",
+              "Executor hint from env: INFERFLUX_NATIVE_CUDA_EXECUTOR=" +
+                  std::string(executor_hint));
+  } else {
+    // Auto-detect: use native kernels for safetensors models
+    std::string detected_format = DetectModelFormat(model_path.string());
+    if (detected_format == "safetensors") {
+      executor_kind_ = "native_kernel";
+      log::Info("native_cuda_backend",
+                "Auto-detected safetensors format, using native CUDA kernels");
+    } else {
+      log::Info("native_cuda_backend",
+                "Model format '" + detected_format +
+                    "', using llama.cpp CUDA backend (delegate mode)");
+    }
   }
 
   if (ParseBoolEnv("INFERFLUX_NATIVE_CUDA_STRICT", false) &&

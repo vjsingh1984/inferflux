@@ -174,6 +174,115 @@ flowchart TD
 | `mps` | Metal Performance Shaders | gguf | Apple Silicon |
 | `rocm` | AMD HIP | gguf | AMD GPUs |
 
+#### Native CUDA Kernels
+
+**When Native Kernels Are Used:**
+
+Native CUDA kernels are automatically enabled for safetensors models when using `cuda_native` backend.
+
+```mermaid
+graph TB
+    A[Load Model] --> B{Format?}
+
+    B -->|Safetensors| C[Use Native Kernels]
+    B -->|GGUF| D[Use llama.cpp]
+    B -->|Auto| E{Detect Format}
+
+    E -->|Safetensors| C
+    E -->|GGUF| D
+
+    C --> F[Custom CUDA Kernels]
+    C --> G[FlashAttention-2]
+    C --> H[cuBLAS GEMM]
+    C --> I[GPU KV Cache]
+
+    style C fill:#4ecdc4
+    style F fill:#feca57
+    style G fill:#ff9ff3
+```
+
+**Automatic Detection:**
+
+When `INFERFLUX_NATIVE_CUDA_EXECUTOR` is not set, InferFlux auto-detects safetensors models and uses native kernels:
+
+```yaml
+models:
+  - id: qwen2.5-3b
+    path: models/qwen2.5-3b-safetensors/
+    format: auto  # Detected as safetensors → native kernels
+    backend: cuda_native
+```
+
+**Manual Override:**
+
+```bash
+# Force native kernels (for safetensors)
+export INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
+
+# Force llama.cpp delegate
+export INFERFLUX_NATIVE_CUDA_EXECUTOR=delegate
+```
+
+**Native Kernel Components:**
+
+| Component | Description | Performance |
+|-----------|-------------|-------------|
+| **FlashAttention-2** | Optimized attention kernel | 2.2x speedup (SM 8.0+) |
+| **cuBLAS GEMM** | NVIDIA optimized matrix multiply | Peak throughput |
+| **GPU KV Cache** | On-GPU KV cache storage | Zero-copy access |
+| **Custom CUDA kernels** | RMSNorm, RoPE, FFN | End-to-end optimization |
+| **NVTX annotations** | Profiling support | Nsight Systems compatible |
+
+**Metrics:**
+
+Native kernels report Prometheus metrics:
+
+```prometheus
+# Forward pass timing
+inferflux_native_forward_passes_total{phase="prefill|decode"}
+inferflux_native_forward_duration_ms{phase="prefill|decode"}
+
+# Sampling
+inferflux_native_sampling_duration_ms
+
+# KV cache
+inferflux_native_kv_active_sequences
+inferflux_native_kv_max_sequences
+
+# Throughput
+inferflux_native_forward_batch_tokens_total
+```
+
+**When to Use Native Kernels:**
+
+✅ **Use native kernels for:**
+- Safetensors models (BF16, FP16)
+- Maximum performance on NVIDIA GPUs
+- Models trained with FlashAttention
+- Production deployments
+
+❌ **Use llama.cpp (cuda_universal) for:**
+- GGUF quantized models (Q4, Q8, etc.)
+- Models with custom llama.cpp optimizations
+- Compatibility testing
+
+**Example Configuration:**
+
+```yaml
+models:
+  # Native kernels for safetensors
+  - id: qwen2.5-3b-bf16
+    path: models/qwen2.5-3b-safetensors/
+    backend: cuda_native
+    format: auto
+
+  # llama.cpp for GGUF
+  - id: tinyllama-quantized
+    path: models/tinyllama-1.1b.gguf
+    backend: cuda
+    format: gguf
+```
+
 ## Runtime Configuration
 
 ### Backend Priority
