@@ -35,6 +35,7 @@ public:
   void RecordSpeculative(std::size_t total_chunks, std::size_t accepted_chunks,
                          std::size_t reused_tokens);
   void RecordBatch(std::size_t request_count, std::size_t token_count);
+  void RecordBatchTokenBudgetSkip();
   void RecordPrefixLookup(bool hit);
   void RecordPrefixMatchedTokens(int tokens);
   void RecordPartialPrefixHit();
@@ -81,6 +82,27 @@ public:
   // Called once at server startup after LlamaBackendConfig is applied.
   void SetFlashAttentionEnabled(bool enabled);
 
+  // Flash Attention execution metrics - record per-request FA2 usage.
+  // kernel: one of "fa2", "fa3", "standard"
+  // duration_ms: execution time in milliseconds
+  // prompt_tokens: number of tokens processed
+  void RecordFlashAttentionExecution(const std::string &kernel,
+                                     double duration_ms, int prompt_tokens);
+
+  // Flash Attention memory usage - update VRAM consumption gauge.
+  // memory_mb: memory used in megabytes
+  void SetFlashAttentionMemoryMB(double memory_mb);
+
+  // Flash Attention request counter - track total requests using FA.
+  // kernel: one of "fa2", "fa3", "standard"
+  void RecordFlashAttentionRequest(const std::string &kernel);
+
+  // ROCm backend metrics - track AMD GPU usage
+  void RecordRocmKernelSelection(const std::string &kernel);
+  void RecordRocmFlashAttentionExecution(double duration_ms, int tokens);
+  void SetRocmMemoryUsageMB(double memory_mb);
+  void RecordRocmDeviceProperties(int device_id, const std::string &arch);
+
   // KV transfer latency (§2.5 item 12): elapsed time from
   // KVPacket::enqueue_time to when a decode worker dequeues it from KVChannel /
   // ShmKVTransport.
@@ -106,6 +128,26 @@ public:
   void SetQueueDepth(int depth);
   void SetPrefillQueueDepth(int depth);
   void SetDecodeQueueDepth(int depth);
+  void SetSchedulerBatchLimits(int max_batch_size, int max_batch_tokens);
+  void RecordCudaLaneSubmission(bool decode_lane);
+  void RecordCudaLaneCompletion(bool decode_lane);
+  void RecordCudaLaneExecutionStart(bool decode_lane);
+  void RecordCudaLaneExecutionStop(bool decode_lane);
+  void RecordCudaLaneOverlap(double duration_ms);
+  void SetCudaLaneQueueDepth(bool decode_lane, int depth);
+  void SetCudaAttentionKernel(const std::string &kernel);
+  void RecordCudaAttentionKernelFallback(const std::string &requested_kernel,
+                                         const std::string &selected_kernel,
+                                         const std::string &reason);
+  void RecordCudaAttentionKernelSwitch(const std::string &from_kernel,
+                                       const std::string &to_kernel);
+
+  // Native CUDA backend metrics
+  void RecordNativeForwardPass(bool is_decode, int batch_size,
+                               double forward_ms);
+  void RecordNativeSampling(int batch_size, double sampling_ms);
+  void RecordNativeBatchDecode(int batch_size, double total_ms);
+  void SetNativeKvCacheOccupancy(int active_sequences, int max_sequences);
 
   // Snapshot of prefix-cache metrics for the /v1/admin/cache endpoint.
   struct CacheMetrics {
@@ -135,6 +177,7 @@ private:
   std::atomic<uint64_t> total_batches_{0};
   std::atomic<uint64_t> total_batch_tokens_{0};
   std::atomic<uint64_t> max_batch_size_{0};
+  std::atomic<uint64_t> scheduler_batch_token_budget_skips_{0};
   std::atomic<uint64_t> prefix_hits_{0};
   std::atomic<uint64_t> prefix_misses_{0};
   std::atomic<uint64_t> prefix_matched_tokens_{0};
@@ -158,6 +201,20 @@ private:
   std::atomic<uint64_t> flash_attention_enabled_{
       0}; // §2.7: gauge — 0=disabled, 1=enabled.
 
+  // Flash Attention execution metrics (§2.7).
+  std::atomic<uint64_t> flash_attention_requests_fa2_{0};
+  std::atomic<uint64_t> flash_attention_requests_fa3_{0};
+  std::atomic<uint64_t> flash_attention_requests_standard_{0};
+  mutable std::mutex flash_attention_exec_mutex_;
+  LatencyHistogram flash_attention_exec_latency_;
+  std::atomic<double> flash_attention_memory_mb_{0.0};
+
+  // ROCm backend metrics (AMD GPU support)
+  std::atomic<uint64_t> rocm_requests_total_{0};
+  std::atomic<uint64_t> rocm_flash_attention_requests_{0};
+  std::atomic<double> rocm_memory_mb_{0.0};
+  std::string rocm_device_arch_{"unknown"};
+
   // Latency histograms.
   LatencyHistogram request_latency_;
   LatencyHistogram queue_latency_;
@@ -176,6 +233,36 @@ private:
   std::atomic<int> queue_depth_{0};
   std::atomic<int> prefill_queue_depth_{0};
   std::atomic<int> decode_queue_depth_{0};
+  std::atomic<int> scheduler_batch_limit_size_{0};
+  std::atomic<int> scheduler_batch_limit_tokens_{0};
+  std::atomic<uint64_t> cuda_decode_lane_submissions_{0};
+  std::atomic<uint64_t> cuda_prefill_lane_submissions_{0};
+  std::atomic<uint64_t> cuda_decode_lane_completions_{0};
+  std::atomic<uint64_t> cuda_prefill_lane_completions_{0};
+  std::atomic<uint64_t> cuda_lane_overlap_events_{0};
+  std::atomic<uint64_t> cuda_lane_overlap_duration_us_{0};
+  std::atomic<int> cuda_decode_lane_inflight_{0};
+  std::atomic<int> cuda_prefill_lane_inflight_{0};
+  std::atomic<int> cuda_decode_lane_queue_depth_{0};
+  std::atomic<int> cuda_prefill_lane_queue_depth_{0};
+  mutable std::mutex cuda_attention_kernel_mutex_;
+  std::string cuda_attention_kernel_{"standard"};
+  mutable std::mutex cuda_overlap_timing_mutex_;
+  bool cuda_overlap_active_{false};
+  std::chrono::steady_clock::time_point cuda_overlap_started_at_{};
+  mutable std::mutex cuda_attention_fallback_mutex_;
+  std::unordered_map<std::string, uint64_t> cuda_attention_fallback_counts_;
+  mutable std::mutex cuda_attention_switch_mutex_;
+  std::unordered_map<std::string, uint64_t> cuda_attention_switch_counts_;
+
+  // Native CUDA backend metrics
+  std::atomic<uint64_t> native_forward_prefill_total_{0};
+  std::atomic<uint64_t> native_forward_decode_total_{0};
+  std::atomic<uint64_t> native_forward_batch_tokens_total_{0};
+  LatencyHistogram native_forward_latency_;
+  LatencyHistogram native_sampling_latency_;
+  std::atomic<int> native_kv_active_sequences_{0};
+  std::atomic<int> native_kv_max_sequences_{0};
 
   struct ModelStats {
     std::string backend;

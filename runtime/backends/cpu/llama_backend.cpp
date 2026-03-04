@@ -1150,9 +1150,7 @@ std::vector<float> LlamaCPUBackend::Embed(const std::string &text) {
 }
 
 #ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
-std::string LlamaCPUBackend::Name() const {
-  return "llama_cpu";
-}
+std::string LlamaCPUBackend::Name() const { return "llama_cpu"; }
 #endif
 
 } // namespace inferflux

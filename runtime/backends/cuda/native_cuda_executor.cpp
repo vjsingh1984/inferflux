@@ -1,6 +1,6 @@
 #include "runtime/backends/cuda/native_cuda_executor.h"
-#include "runtime/backends/cuda/native_kernel_executor.h"
 #include "runtime/backends/common/batching_utils.h"
+#include "runtime/backends/cuda/native_kernel_executor.h"
 
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"

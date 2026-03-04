@@ -353,6 +353,14 @@ class LocalEPDispatch : public EPDispatch { ... }; // single-process default
 
 Flash Attention is controlled through `LlamaBackendConfig::use_flash_attention` (bool) and
 `flash_attention_tile` (int, default 128 — reserved for future FA3 CUDA tile tuning).
+CUDA attention policy now supports a safe runtime ladder (`fa3 -> fa2 -> standard`)
+via `LlamaBackendConfig::cuda_attention_kernel` (`auto|fa3|fa2|standard`).
+CUDA now also exposes a phase-overlap scaffold for mixed unified batches:
+`cuda_phase_overlap_scaffold` (bool),
+`cuda_phase_overlap_min_prefill_tokens` (int), and
+`cuda_phase_overlap_prefill_replica` (bool).
+When enabled, CUDA backend applies decode-first arbitration in mixed prefill/decode steps to
+reduce decode head-of-line blocking while keeping the existing scheduler interface unchanged.
 
 The setting maps directly to the llama.cpp context parameter:
 ```cpp
@@ -368,6 +376,10 @@ stays forward-compatible.
 |-----------|--------|-------|
 | `LlamaBackendConfig::use_flash_attention` | Done | Config field; wired through YAML + env var `INFERFLUX_CUDA_FLASH_ATTENTION` |
 | `LlamaBackendConfig::flash_attention_tile` | Done | Stored config; reserved for FA3 CUDA tile tuning |
+| `LlamaBackendConfig::cuda_attention_kernel` | Done | Runtime policy (`auto|fa3|fa2|standard`) with safe fallback ladder |
+| `LlamaBackendConfig::cuda_phase_overlap_scaffold` | Done | Decode-first mixed-batch arbitration scaffold for CUDA |
+| `LlamaBackendConfig::cuda_phase_overlap_min_prefill_tokens` | Done | Split threshold to avoid over-fragmenting small batches |
+| `LlamaBackendConfig::cuda_phase_overlap_prefill_replica` | Done | Optional dual-context overlap (prefill replica + KV handoff) |
 | `ctx_params.flash_attn_type` wired in `LoadModel()` | Done | `LLAMA_FLASH_ATTN_TYPE_ENABLED` / `DISABLED` |
 | `LlamaCPUBackend::FlashAttentionEnabled()` | Done | Accessor returning `config_.use_flash_attention` |
 | `inferflux_flash_attention_enabled` Prometheus gauge | Done | 0=disabled, 1=enabled; set at server startup |
@@ -380,30 +392,139 @@ YAML (`config/server.yaml`):
 runtime:
   cuda:
     enabled: true
+    attention:
+      kernel: auto
     flash_attention:
       enabled: true
       tile_size: 128   # reserved; passed through to future FA3 tile planner
+    phase_overlap:
+      enabled: true
+      min_prefill_tokens: 256
+      prefill_replica: false
 ```
 
 Environment overrides:
 - `INFERFLUX_CUDA_FLASH_ATTENTION=true` — enable FA
 - `INFERFLUX_CUDA_FLASH_TILE=256` — override tile size
+- `INFERFLUX_CUDA_ATTENTION_KERNEL=fa3|fa2|standard|auto` — attention kernel policy override
+- `INFERFLUX_CUDA_PHASE_OVERLAP=true` — enable decode-first mixed-batch arbitration scaffold
+- `INFERFLUX_CUDA_PHASE_OVERLAP_MIN_PREFILL_TOKENS=256` — minimum prefill-token pressure before split
+- `INFERFLUX_CUDA_PHASE_OVERLAP_PREFILL_REPLICA=true` — enable optional dual-context prefill overlap (higher memory use)
+
+### Throughput Guardrail
+
+CUDA throughput regression checks are now standardized via
+`scripts/run_throughput_gate.py`:
+- runs concurrent completion load (`/v1/completions` or `/v1/chat/completions`)
+- measures completion tok/s from Prometheus counters
+- enforces pass/fail floors (`--min-completion-tok-per-sec`,
+  `--min-success-rate`, optional lane-activity, lane-overlap, and
+  attention-kernel checks; optional `--min-cuda-overlap-duration-ms` and
+  `--max-cuda-attention-fallbacks`)
+- can assert runtime provider path (`--require-backend-provider native`) so
+  CUDA throughput tests fail fast when the server is on universal llama
+  fallback instead of native runtime
+- can require zero backend fallback (`--require-no-backend-fallback`) to block
+  native-scaffold delegate paths from counting as true native throughput
+- includes GPU profile presets (for example `--gpu-profile ada_rtx_4000`)
+  that apply conservative overlap/fallback defaults with user overrides
+- leaves attention-kernel expectation unset by default so heterogeneous runners
+  can pass with `auto` kernel selection (`fa2` or `standard`); pin with
+  `--expect-cuda-attention-kernel` only on homogeneous fleets
+- supports mixed-prompt pressure mode (`--mixed-prompt-workload`) to force
+  concurrent long-prefill and short-decode traffic in one gate run
+- supports explicit mixed-workload prefill pressure control
+  (`--target-total-prefill-tokens`) so overlap validation can be tuned without
+  modifying gate code
+- supports managed server launch (`--server-bin`, `--config`, `--server-env`)
+  for reproducible CI runs
+
+CI wiring (`.github/workflows/ci.yml`) includes a guarded self-hosted job
+`cuda-throughput-gate` that turns this into a merge gate on GPU runners.
+It now drives mixed-prompt overlap pressure by default and can be tuned via
+`INFERFLUX_TP_TARGET_PREFILL_TOKENS`.
 
 ### Implementation Checklist
 1. [x] `LlamaBackendConfig::use_flash_attention` / `flash_attention_tile` fields
-2. [x] YAML + env-var parsing in `server/main.cpp`
-3. [x] `ctx_params.flash_attn_type` wired in `LlamaCPUBackend::LoadModel()`
-4. [x] `LlamaCPUBackend::FlashAttentionEnabled()` accessor
-5. [x] `MetricsRegistry::SetFlashAttentionEnabled()` + `inferflux_flash_attention_enabled` gauge
-6. [x] `GlobalMetrics().SetFlashAttentionEnabled()` called in `server/main.cpp` post-guard
-7. [x] 9 `[flash_attn]` unit tests (`tests/unit/test_flash_attn.cpp`)
-8. [ ] FA3 CUDA kernels on Hopper / link against cutlass or flash-attention library
-9. [ ] Per-layer kernel selection metrics (FA vs standard attention switch count)
+2. [x] `LlamaBackendConfig::cuda_phase_overlap_scaffold` / `cuda_phase_overlap_min_prefill_tokens` fields
+3. [x] `LlamaBackendConfig::cuda_phase_overlap_prefill_replica` field
+4. [x] `LlamaBackendConfig::cuda_attention_kernel` policy field
+5. [x] YAML + env-var parsing in `server/main.cpp`
+6. [x] `ctx_params.flash_attn_type` wired in `LlamaCPUBackend::LoadModel()`
+7. [x] `LlamaCPUBackend::FlashAttentionEnabled()` accessor
+8. [x] `MetricsRegistry::SetFlashAttentionEnabled()` + `inferflux_flash_attention_enabled` gauge
+9. [x] `GlobalMetrics().SetFlashAttentionEnabled()` called in `server/main.cpp` post-guard
+10. [x] CUDA mixed-batch decode-first scaffold in `CudaBackend::ExecuteUnifiedBatch()`
+11. [x] Runtime attention policy fallback + `inferflux_cuda_attention_kernel_selected` gauge
+12. [x] Optional dual-context prefill overlap with KV handoff in `CudaBackend` async runtime
+13. [x] 9 `[flash_attn]` unit tests (`tests/unit/test_flash_attn.cpp`)
+14. [ ] FA3 CUDA kernels on Hopper / link against cutlass or flash-attention library
+15. [x] Throughput guardrail harness + CI job (`scripts/run_throughput_gate.py`, `cuda-throughput-gate`)
+16. [x] Runtime kernel fallback/switch counters (`inferflux_cuda_attention_kernel_fallbacks_total`, `inferflux_cuda_attention_kernel_switches_total`)
+17. [ ] Per-layer attention-kernel telemetry (requires upstream llama.cpp layer-level kernel hooks)
 
 ### Adapter Pattern & Backend Capabilities
 - **StructuredOutputAdapter** — Maintain OpenAI’s `response_format` as the public contract but introduce an internal adapter interface that validates payloads, enforces size limits, and emits backend-native constraints (e.g., llama.cpp GBNF via `json_schema_to_grammar`, regex/DSL for future engines).
 - **Backend capability flags** — Extend `ModelRouter`/`BackendManager` to advertise whether a backend supports structured output and which adapter type it requires. Scheduler consults these flags so unsupported combinations fail fast.
 - **Pluggable sampler hooks** — Wrap llama.cpp grammar sampler creation in a small `StructuredConstraint::Attach(BackendContext&)` helper so CUDA/ROCm/MPS backends (or entirely new runtimes) can implement constraint enforcement without touching HTTP or scheduler code.
+
+## Native CUDA Batched Decode Pipeline
+
+The native CUDA backend (`runtime/backends/cuda/native_kernel_executor.cpp`) implements a
+direct safetensors-to-GPU inference path with no llama.cpp dependency. It supports batched
+decode, async lane overlap, NVTX profiling, and Prometheus metrics.
+
+### Batched Decode
+
+`ExecuteUnifiedBatch()` partitions incoming requests into two groups:
+
+1. **Decode group** — requests with `tokens.size() == 1` (single-token decode steps).
+   These are batched into a single `BatchForward(B)` call where all GEMMs use `M=B`.
+   Per-sequence operations (RoPE with varying `n_past`, KV cache append, FlashAttention2
+   with different KV lengths) remain per-sequence within the batched forward pass.
+   After the batched forward, `SampleBatch(B)` produces one token per sequence.
+
+2. **Prefill group** — requests with `tokens.size() > 1` (variable-length prompts).
+   These are processed sequentially with individual `Forward()` + `Sample()` calls.
+
+### Async Lane Support
+
+When `SupportsAsyncUnifiedBatch()` returns true, the executor uses separate CUDA streams
+for decode and prefill lanes:
+- `SubmitUnifiedBatchAsync()` selects the lane-specific stream, locks the pipeline,
+  switches the model forward pass and cuBLAS handle to that stream, executes the batch,
+  and records a `cudaEvent` completion marker.
+- `TryCollectUnifiedBatchAsync()` checks `cudaEventQuery()` and returns outputs when ready.
+
+This enables decode+prefill phase overlap when `runtime.cuda.phase_overlap.enabled` is set.
+
+### NVTX Profiling
+
+All pipeline stages are annotated with NVTX ranges (`runtime/backends/cuda/native/nvtx_scoped.h`)
+for Nsight Systems timeline views: `Forward`, `Embedding`, `Layer`, `QKV_Projection`, `RoPE`,
+`KV_Append`, `FlashAttention2`, `O_Projection`, `FFN`, `LM_Head`, `Sampling`.
+
+### Prometheus Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `inferflux_native_forward_passes_total{phase}` | counter | Forward passes by phase (prefill/decode) |
+| `inferflux_native_forward_batch_tokens_total` | counter | Total tokens processed in batched forwards |
+| `inferflux_native_forward_duration_ms` | histogram | Forward pass latency distribution |
+| `inferflux_native_sampling_duration_ms` | histogram | Sampling latency distribution |
+| `inferflux_native_kv_active_sequences` | gauge | Active KV cache sequences |
+| `inferflux_native_kv_max_sequences` | gauge | Maximum KV cache capacity |
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `runtime/backends/cuda/native_kernel_executor.{h,cpp}` | Executor: batched dispatch, async lanes, metrics timing |
+| `runtime/backends/cuda/native/transformer_forward.cu` | `Forward()` and `BatchForward()` implementations |
+| `runtime/backends/cuda/native/model_forward.h` | Abstract forward pass interface |
+| `runtime/backends/cuda/native/gpu_sampler.{h,cu}` | `Sample()` and `SampleBatch()` |
+| `runtime/backends/cuda/native/nvtx_scoped.h` | RAII NVTX range utility |
+| `runtime/backends/cuda/native/cublas_gemm.{h,cpp}` | cuBLAS GEMM wrapper with stream switching |
 
 ## Parallelism Strategies (§2.6 / §2.7)
 
@@ -460,16 +581,18 @@ are the remaining steps.
 - **Scheduler** (`scheduler/`): `Scheduler` with global mutex (continuous batching rewrite in progress via `RequestBatch`). `ModelRouter` interface for multi-model routing. Requests flow through `InferenceRequest`/`RequestBatch`, and results are returned as `InferenceResult` for HTTP compatibility.
 - **Scheduler** (`scheduler/`): Request queue is priority-aware with aging (older requests automatically boost priority) to prevent starvation; batches capture queue wait time + execution time metrics.
 - **Server** (`server/`): Multi-threaded `HttpServer` (accept loop + worker thread pool), SSE streaming via `InferenceRequest.on_token` callbacks, `ApiKeyAuth` (SHA-256 hashed), `OIDCValidator` (RS256 verification), `RateLimiter` (per-key sliding window), `Guardrail` (blocklist + OPA), `AuditLogger` (JSON lines), `MetricsRegistry` (Prometheus counters + batch histograms), and `server/tracing` for W3C trace propagation.
-- **Policy** (`policy/`): `PolicyBackend` abstract interface, `PolicyStore` concrete implementation (encrypted INI with AES-GCM via OpenSSL). Admin APIs for CRUD on API keys, guardrails, and rate limits.
+- **Policy** (`policy/`): `PolicyBackend` abstract interface, `PolicyStore` concrete implementation (encrypted INI with AES-GCM via OpenSSL, atomic temp-file writes, `.bak` fallback on load). Admin APIs for CRUD on API keys, guardrails, rate limits, and persisted capability-routing policy.
 - **CLI** (`cli/`): `inferctl` with subcommands: `status`, `completion`, `chat` (interactive + streaming), `admin` (guardrails, rate-limit, api-keys).
 - **Net** (`net/`): Shared `HttpClient` used by both CLI and OPA client.
 
 ### Scheduler & Continuous Batching
 - HTTP handlers translate each request into an `InferenceRequest` (priority, enqueue timestamp, prompt tokens) and push it onto the scheduler queue.
-- A background scheduler thread repeatedly builds `RequestBatch` objects by priority/age, bounded by token budget (`kMaxBatchTokens`) and max batch size. Each batch records timing/metrics and emits OpenTelemetry + Prometheus data (queue depth, batch size).
+- A background scheduler thread repeatedly builds `RequestBatch` objects by priority/age, bounded by configurable token/size budgets (`runtime.scheduler.max_batch_tokens`, `runtime.scheduler.max_batch_size`). Each batch records timing/metrics and emits OpenTelemetry + Prometheus data (queue depth, batch size, token-budget pressure).
 - Before executing, the scheduler reserves KV cache pages for the batch, resolves the target backend via `ModelRouter`, and transitions requests through `prefill`/`decode` phases.
 - After generation, KV pages are released, metrics updated, and futures fulfilled so HTTP threads can stream completions. The batch structure keeps the door open for future prefill/decode overlap and fairness/preemption without touching HTTP code.
 - **Upcoming GPU path**: The same batch abstraction will dispatch to CUDA/FlashAttention executors once the CUDA backend and FlashAttention kernels are in place (Workstream A). The scheduler already tags requests by phase and priority so GPU streams can overlap prefill/decode.
+- **Async backend contract (foundation)**: `LlamaCPUBackend` now exposes backend-agnostic async unified-batch submission/collection. CUDA backend consumes this contract via decode-priority lane queues, while CPU keeps a synchronous fallback implementation, so scheduler/executor code stays backend-agnostic.
+- **CUDA lane telemetry**: async runtime exports lane submissions/completions/queue-depth plus overlap/inflight visibility (`inferflux_cuda_lane_*`, including overlap duration) so operators can verify true decode-vs-prefill overlap instead of just queue activity.
 
 ## Data Flow
 1. Client sends HTTP request with prompt + parameters (optionally including base64/URL media descriptors).

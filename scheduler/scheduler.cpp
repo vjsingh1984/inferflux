@@ -229,15 +229,16 @@ void Scheduler::DecodeWorkerLoop() {
         if (stop_) {
           return true;
         }
-        return pending_decode_.size() >= static_cast<std::size_t>(config_.min_batch_size);
+        return pending_decode_.size() >=
+               static_cast<std::size_t>(config_.min_batch_size);
       };
 
       if (config_.batch_accumulation_ms > 0 && config_.min_batch_size > 1) {
-        auto deadline = std::chrono::steady_clock::now() +
-                       std::chrono::milliseconds(config_.batch_accumulation_ms);
-        queue_cv_.wait_until(lock, deadline, [&] {
-          return has_work() && has_min_batch();
-        });
+        auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(config_.batch_accumulation_ms);
+        queue_cv_.wait_until(lock, deadline,
+                             [&] { return has_work() && has_min_batch(); });
       } else {
         queue_cv_.wait(lock, has_work);
       }
@@ -522,16 +523,17 @@ void Scheduler::WorkerLoop() {
           if (!use_decode_workers_) {
             total_pending += pending_decode_.size();
           }
-          return total_pending >= static_cast<std::size_t>(config_.min_batch_size);
+          return total_pending >=
+                 static_cast<std::size_t>(config_.min_batch_size);
         };
 
         if (config_.batch_accumulation_ms > 0 && config_.min_batch_size > 1) {
           // Wait for minimum batch OR timeout
-          auto deadline = std::chrono::steady_clock::now() +
-                         std::chrono::milliseconds(config_.batch_accumulation_ms);
-          queue_cv_.wait_until(lock, deadline, [&] {
-            return has_work() && has_min_batch();
-          });
+          auto deadline =
+              std::chrono::steady_clock::now() +
+              std::chrono::milliseconds(config_.batch_accumulation_ms);
+          queue_cv_.wait_until(lock, deadline,
+                               [&] { return has_work() && has_min_batch(); });
         } else {
           // No batch accumulation: wait for any work immediately
           queue_cv_.wait(lock, has_work);

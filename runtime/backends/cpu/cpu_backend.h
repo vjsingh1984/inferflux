@@ -8,7 +8,7 @@
 namespace inferflux {
 
 class CPUDeviceContext : public DeviceContext {
- public:
+public:
   CPUDeviceContext() = default;
   ~CPUDeviceContext() override;
 
@@ -18,11 +18,11 @@ class CPUDeviceContext : public DeviceContext {
   void Free(std::unique_ptr<DeviceBuffer> buffer) override;
 
   // Simple demo inference that echoes tokens with annotation.
-  std::vector<int> RunGreedyDecode(const std::vector<int>& tokens);
+  std::vector<int> RunGreedyDecode(const std::vector<int> &tokens);
 
- private:
-  std::mutex alloc_mutex_;  // protects allocations vector
-  std::vector<void*> allocations_;
+private:
+  std::mutex alloc_mutex_; // protects allocations vector
+  std::vector<void *> allocations_;
 };
 
-}  // namespace inferflux
+} // namespace inferflux

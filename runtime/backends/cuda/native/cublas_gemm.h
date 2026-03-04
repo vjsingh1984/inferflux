@@ -1,0 +1,69 @@
+#pragma once
+
+#include <cublas_v2.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+namespace inferflux {
+
+/**
+ * CublasGemm: cuBLAS handle manager + typed GEMM with FP32 accumulation.
+ *
+ * Wraps cublasGemmEx for y = x * W^T (safetensors row-major convention).
+ */
+class CublasGemm {
+public:
+  CublasGemm() = default;
+  ~CublasGemm();
+
+  CublasGemm(const CublasGemm &) = delete;
+  CublasGemm &operator=(const CublasGemm &) = delete;
+
+  /**
+   * Create cuBLAS handle and bind to stream.
+   */
+  bool Initialize(cudaStream_t stream);
+
+  /**
+   * Switch cuBLAS handle to a different stream.
+   */
+  void SetStream(cudaStream_t stream);
+
+  /**
+   * FP16 GEMM with FP32 accumulation: C = A * B^T
+   *
+   * A: [M, K] row-major (half)
+   * B: [N, K] row-major (half) — transposed during multiply
+   * C: [M, N] row-major (half)
+   */
+  bool Gemm(int M, int N, int K, const half *A, const half *B, half *C);
+
+  /**
+   * Typed GEMM with FP32 accumulation: C = A * B^T
+   * Supports half (FP16) and __nv_bfloat16 (BF16) via DtypeTraits.
+   */
+  template <typename T>
+  bool GemmTyped(int M, int N, int K, const T *A, const T *B, T *C);
+
+  /**
+   * Strided batched GEMM for GQA attention.
+   * Each batch: C_i = A_i * B_i^T
+   */
+  bool GemmBatched(int M, int N, int K, const half *A, const half *B, half *C,
+                   long long stride_A, long long stride_B, long long stride_C,
+                   int batch_count);
+
+  /**
+   * Typed strided batched GEMM.
+   */
+  template <typename T>
+  bool GemmBatchedTyped(int M, int N, int K, const T *A, const T *B, T *C,
+                        long long stride_A, long long stride_B,
+                        long long stride_C, int batch_count);
+
+private:
+  cublasHandle_t handle_{nullptr};
+};
+
+} // namespace inferflux

@@ -12,10 +12,20 @@ class LlamaCPUBackend;
 
 // ModelInfo describes a loaded model for routing and management.
 struct ModelInfo {
-  std::string id;      // Unique model identifier (e.g., "llama3-8b-q4").
-  std::string path;    // Filesystem path to weights.
-  std::string backend; // Backend type: "cpu", "cuda", "mps", "rocm".
-  std::string requested_backend; // Requested backend hint ("cuda", "auto"...).
+  std::string id; // Unique model identifier (e.g., "llama3-8b-q4").
+  // Requested source path from config/admin API/registry.
+  // Kept as legacy field for compatibility with existing callers.
+  std::string path;
+  // Explicit source path alias (same semantics as path).
+  std::string source_path;
+  // Effective path used by the backend loader (may differ from source_path
+  // when resolving hf:// references or GGUF sidecar fallbacks).
+  std::string effective_load_path;
+  std::string format{"unknown"}; // Resolved model format (gguf/safetensors/hf).
+  std::string requested_format{"auto"}; // Requested format hint (or auto).
+  std::string backend;           // Backend type: "cpu", "cuda", "mps", "rocm".
+  std::string requested_backend; // Requested backend hint ("cuda",
+                                 // "cuda_native", "cuda_universal", "auto"...).
   std::string backend_provider{"universal"}; // "native" or "universal".
   bool backend_fallback{false};        // True when requested backend fell back.
   std::string backend_fallback_reason; // Optional fallback explanation.
@@ -51,7 +61,8 @@ public:
   // ensure uniqueness. Returns empty string on failure.
   virtual std::string LoadModel(const std::string &path,
                                 const std::string &backend_hint = "",
-                                const std::string &requested_id = "") = 0;
+                                const std::string &requested_id = "",
+                                const std::string &model_format = "auto") = 0;
 
   // Unload a model by ID. Returns false if the model was not found.
   virtual bool UnloadModel(const std::string &id) = 0;
@@ -60,6 +71,10 @@ public:
   // the model ID from the API request (may be empty for default routing).
   // Returns nullptr if no suitable model is available.
   virtual ModelInfo *Resolve(const std::string &requested_model) = 0;
+
+  // Resolve an explicit model ID without applying default fallback behavior.
+  // Returns nullptr when the exact model ID is unknown.
+  virtual ModelInfo *ResolveExact(const std::string &model_id) = 0;
 
   // Retrieve the backend instance associated with a resolved model ID.
   virtual std::shared_ptr<LlamaCPUBackend>

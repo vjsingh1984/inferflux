@@ -1,0 +1,83 @@
+#pragma once
+
+#include <cstdint>
+#include <cuda_runtime.h>
+#include <curand.h>
+#include <vector>
+
+namespace inferflux {
+
+/**
+ * GPU-side sampling: temperature, top-k, top-p, multinomial.
+ *
+ * For greedy (temperature=0): argmax via parallel reduction.
+ * For stochastic: softmax -> top-k -> top-p -> multinomial sample.
+ */
+class GpuSampler {
+public:
+  GpuSampler() = default;
+  ~GpuSampler();
+
+  GpuSampler(const GpuSampler &) = delete;
+  GpuSampler &operator=(const GpuSampler &) = delete;
+
+  /**
+   * Initialize with vocab size and CUDA stream.
+   */
+  bool Initialize(int vocab_size, cudaStream_t stream);
+
+  /**
+   * Sample a token from logits.
+   *
+   * @param d_logits    [vocab_size] FP32 logits on device
+   * @param temperature Temperature (0 = greedy)
+   * @param top_k       Top-k filtering (0 = disabled)
+   * @param top_p       Top-p / nucleus filtering (1.0 = disabled)
+   * @param seed        Random seed (UINT32_MAX = auto)
+   * @return Sampled token ID
+   */
+  int Sample(const float *d_logits, float temperature, int top_k, float top_p,
+             uint32_t seed = UINT32_MAX);
+
+  /**
+   * Sample tokens from batched logits.
+   *
+   * @param d_logits      [batch_size * vocab_size] FP32 logits on device
+   * @param batch_size    Number of sequences in batch
+   * @param temperatures  Per-sequence temperature
+   * @param top_ks        Per-sequence top-k
+   * @param top_ps        Per-sequence top-p
+   * @param out_tokens    Output: sampled token IDs
+   */
+  void SampleBatch(const float *d_logits, int batch_size,
+                   const std::vector<float> &temperatures,
+                   const std::vector<int> &top_ks,
+                   const std::vector<float> &top_ps,
+                   std::vector<int> *out_tokens);
+
+private:
+  int GreedyArgmax(const float *d_logits);
+  int StochasticSample(const float *d_logits, float temperature, int top_k,
+                       float top_p);
+
+  cudaStream_t stream_{nullptr};
+  int vocab_size_{0};
+
+  // Scratch buffers
+  float *d_probs_{nullptr}; // [vocab_size] probabilities
+  int *d_indices_{nullptr}; // [vocab_size] sorted indices
+  float *d_temp_{nullptr};  // [vocab_size] temp storage
+  int *d_result_{nullptr};  // [1] sampled token ID (device)
+  int h_result_{0};         // sampled token ID (host)
+
+  // For argmax
+  float *d_max_val_{nullptr}; // [1] max value
+  int *d_max_idx_{nullptr};   // [1] max index
+
+  // cuRAND
+  curandGenerator_t rng_{nullptr};
+  float *d_uniform_{nullptr}; // [1] random uniform
+  bool rng_initialized_{false};
+};
+
+} // namespace inferflux

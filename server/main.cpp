@@ -881,15 +881,15 @@ int main(int argc, char **argv) {
           ", fallback_scope=" +
           inferflux::CapabilityFallbackScopeToString(
               routing_selection_options.capability_fallback_scope));
-  inferflux::log::Info("server",
-                       "Scheduler batch policy: max_batch_size=" +
-                           std::to_string(scheduler_config.max_batch_size) +
-                           ", max_batch_tokens=" +
-                           std::to_string(scheduler_config.max_batch_tokens) +
-                           ", min_batch_size=" +
-                           std::to_string(scheduler_config.min_batch_size) +
-                           ", batch_accumulation_ms=" +
-                           std::to_string(scheduler_config.batch_accumulation_ms));
+  inferflux::log::Info(
+      "server", "Scheduler batch policy: max_batch_size=" +
+                    std::to_string(scheduler_config.max_batch_size) +
+                    ", max_batch_tokens=" +
+                    std::to_string(scheduler_config.max_batch_tokens) +
+                    ", min_batch_size=" +
+                    std::to_string(scheduler_config.min_batch_size) +
+                    ", batch_accumulation_ms=" +
+                    std::to_string(scheduler_config.batch_accumulation_ms));
   inferflux::BackendManager backend_manager;
   std::string backend_label = "stub";
   std::string primary_model_id;

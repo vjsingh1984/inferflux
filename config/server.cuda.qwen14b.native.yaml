@@ -1,0 +1,51 @@
+server:
+  host: 0.0.0.0
+  http_port: 8081  # Different port to avoid conflicts
+  max_concurrent: 1024
+  enable_metrics: true
+  enable_tracing: false
+
+models:
+  - id: qwen2.5-3b-native
+    path: models/qwen2.5-3b-instruct-safetensors  # Directory, not .gguf file!
+    format: safetensors  # NEW format
+    backend: cuda
+    default: true
+
+runtime:
+  backend_priority: [cuda, cpu]
+  cuda:
+    enabled: true
+    attention:
+      kernel: auto
+    flash_attention:
+      enabled: true
+      tile_size: 128
+    phase_overlap:
+      enabled: true
+      min_prefill_tokens: 256
+      prefill_replica: false
+  backend_exposure:
+    prefer_native: true  # Use native executor
+    allow_universal_fallback: false  # Don't fall back to llama.cpp
+  capability_routing:
+    allow_default_fallback: false  # No fallback
+    require_ready_backend: true
+    fallback_scope: none
+  scheduler:
+    max_batch_size: 16
+    max_batch_tokens: 16384
+    min_batch_size: 4
+    batch_accumulation_ms: 5
+  paged_kv:
+    cpu_pages: 2048
+    eviction: lru
+
+auth:
+  api_keys:
+    - key: dev-key-123
+      scopes: [generate, read, admin]
+
+logging:
+  level: info
+  format: json

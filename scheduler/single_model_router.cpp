@@ -1,9 +1,11 @@
 #include "scheduler/single_model_router.h"
 
+#include "model/model_format.h"
 #include "runtime/backends/backend_factory.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <vector>
 
@@ -19,6 +21,55 @@ std::string ProviderLabel(BackendProvider provider) {
   default:
     return "universal";
   }
+}
+
+bool IsMlxBackendLabel(const std::string &label) {
+  return BackendFactory::NormalizeHint(label) == "mlx";
+}
+
+bool BackendSupportsModelFormat(const BackendFactoryResult &selection,
+                                const std::string &format) {
+  const std::string normalized = NormalizeModelFormat(format);
+  if (normalized == "gguf") {
+    return true;
+  }
+  if (normalized == "hf" || normalized == "safetensors") {
+    // MLX backend supports HF/safetensors natively
+    if (IsMlxBackendLabel(selection.backend_label)) {
+      return true;
+    }
+    // Native CUDA backend supports safetensors
+    if (selection.provider == BackendProvider::kNative) {
+      return normalized == "safetensors";
+    }
+  }
+  return false;
+}
+
+void MaybePrependMlxCandidate(std::vector<std::string> *candidates,
+                              const std::string &backend_hint,
+                              const std::string &resolved_format) {
+#if INFERFLUX_HAS_MLX
+  const std::string normalized_format = NormalizeModelFormat(resolved_format);
+  if (normalized_format != "hf" && normalized_format != "safetensors") {
+    return;
+  }
+  std::string normalized_hint =
+      backend_hint.empty() ? "auto"
+                           : BackendFactory::NormalizeHint(backend_hint);
+  if (normalized_hint != "auto" && normalized_hint != "mps" &&
+      normalized_hint != "mlx") {
+    return;
+  }
+  if (std::find(candidates->begin(), candidates->end(), "mlx") ==
+      candidates->end()) {
+    candidates->insert(candidates->begin(), "mlx");
+  }
+#else
+  (void)candidates;
+  (void)backend_hint;
+  (void)resolved_format;
+#endif
 }
 
 } // namespace
@@ -52,6 +103,24 @@ bool SingleModelRouter::RegisterModel(
   Entry entry;
   entry.info = info;
   entry.info.path = info.path;
+  entry.info.source_path =
+      info.source_path.empty() ? info.path : info.source_path;
+  if (entry.info.source_path.empty()) {
+    entry.info.source_path = entry.info.path;
+  }
+  entry.info.path = entry.info.source_path;
+  entry.info.effective_load_path = info.effective_load_path.empty()
+                                       ? entry.info.path
+                                       : info.effective_load_path;
+  entry.info.requested_format = NormalizeModelFormat(info.requested_format);
+  if (entry.info.requested_format.empty()) {
+    entry.info.requested_format = "auto";
+  }
+  entry.info.format = NormalizeModelFormat(info.format);
+  if (entry.info.format.empty() || entry.info.format == "auto") {
+    entry.info.format =
+        ResolveModelFormat(entry.info.source_path, entry.info.requested_format);
+  }
   entry.info.backend = BackendFactory::NormalizeHint(
       info.backend.empty() ? "cpu" : info.backend);
   entry.info.requested_backend =
@@ -71,10 +140,11 @@ bool SingleModelRouter::RegisterModel(
   entry.info.is_moe = backend->IsMoE();
   entry.info.n_experts = backend->ExpertCount();
   entry.info.n_active_experts = backend->ActiveExperts();
-  entry.info.id =
-      info.id.empty()
-          ? GenerateModelIdLocked(info.path.empty() ? "model" : info.path)
-          : EnsureUniqueIdLocked(info.id);
+  entry.info.id = info.id.empty()
+                      ? GenerateModelIdLocked(entry.info.source_path.empty()
+                                                  ? "model"
+                                                  : entry.info.source_path)
+                      : EnsureUniqueIdLocked(info.id);
   entry.info.ready = backend->IsReady();
   entry.backend = std::move(backend);
   entry.load_time = std::chrono::steady_clock::now();
@@ -104,10 +174,31 @@ std::vector<ModelInfo> SingleModelRouter::ListModels() const {
 
 std::string SingleModelRouter::LoadModel(const std::string &path,
                                          const std::string &backend_hint,
-                                         const std::string &requested_id) {
-  const auto backend_candidates = BuildBackendCandidates(backend_hint);
+                                         const std::string &requested_id,
+                                         const std::string &model_format) {
+  std::string normalized_requested_format = NormalizeModelFormat(model_format);
+  if (normalized_requested_format.empty()) {
+    normalized_requested_format = model_format.empty() ? "auto" : "";
+  }
+  if (normalized_requested_format.empty()) {
+    log::Error("single_model_router", "invalid model format '" + model_format +
+                                          "' for path '" + path + "'");
+    return "";
+  }
+  const std::string resolved_format =
+      ResolveModelFormat(path, normalized_requested_format);
+  if (resolved_format == "unknown") {
+    log::Error("single_model_router",
+               "failed to resolve model format for path '" + path + "'");
+    return "";
+  }
+
+  auto backend_candidates = BuildBackendCandidates(backend_hint);
+  MaybePrependMlxCandidate(&backend_candidates, backend_hint, resolved_format);
   BackendFactoryResult selection;
   std::string selected_requested_backend;
+  std::string selected_path = path;
+  std::string selected_format = resolved_format;
   std::string failure_reason;
 
   auto start = std::chrono::steady_clock::now();
@@ -124,10 +215,59 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
       continue;
     }
 
+    std::string candidate_path = path;
+    std::string candidate_format = resolved_format;
+
+    struct LoadAttempt {
+      std::string path;
+      std::string format;
+    };
+    std::vector<LoadAttempt> load_attempts;
+    load_attempts.push_back({candidate_path, candidate_format});
+
+    if (candidate_format == "hf" || candidate_format == "safetensors") {
+      if (IsMlxBackendLabel(candidate_selection.backend_label)) {
+        load_attempts[0].path = ResolveMlxLoadPath(path, candidate_format);
+        const auto gguf_fallback = ResolveLlamaLoadPath(path, candidate_format);
+        if (!gguf_fallback.empty() && gguf_fallback != load_attempts[0].path) {
+          load_attempts.push_back({gguf_fallback, "gguf"});
+        }
+      } else if (candidate_selection.provider == BackendProvider::kNative &&
+                 candidate_format == "safetensors") {
+        // Native CUDA backend uses safetensors directly
+        load_attempts[0].path = ResolveHfReferenceToCachePath(path);
+      } else {
+        const auto gguf_fallback = ResolveLlamaLoadPath(path, candidate_format);
+        if (!gguf_fallback.empty()) {
+          load_attempts.clear();
+          load_attempts.push_back({gguf_fallback, "gguf"});
+        }
+      }
+    }
+
     auto cfg = MergeBackendConfig(default_backend_config_, candidate_selection);
-    if (!candidate_selection.backend->LoadModel(path, cfg)) {
-      failure_reason =
-          "backend candidate '" + candidate + "' failed to load model";
+    bool loaded = false;
+    for (const auto &attempt : load_attempts) {
+      if (!BackendSupportsModelFormat(candidate_selection, attempt.format)) {
+        failure_reason = "backend candidate '" + candidate +
+                         "' does not support "
+                         "model format '" +
+                         attempt.format + "' for path '" + path +
+                         "'. Configure backend=mlx or provide a GGUF artifact.";
+        continue;
+      }
+      if (!candidate_selection.backend->LoadModel(attempt.path, cfg)) {
+        failure_reason = "backend candidate '" + candidate +
+                         "' failed to load model from path '" + attempt.path +
+                         "'";
+        continue;
+      }
+      selected_path = attempt.path;
+      selected_format = attempt.format;
+      loaded = true;
+      break;
+    }
+    if (!loaded) {
       continue;
     }
     selection = std::move(candidate_selection);
@@ -147,6 +287,10 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
 
   ModelInfo info;
   info.path = path;
+  info.source_path = path;
+  info.effective_load_path = selected_path;
+  info.requested_format = normalized_requested_format;
+  info.format = selected_format;
   info.backend = selection.backend_label;
   info.requested_backend = selected_requested_backend.empty()
                                ? selection.backend_label
@@ -162,6 +306,12 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
   info.is_moe = selection.backend->IsMoE();
   info.n_experts = selection.backend->ExpertCount();
   info.n_active_experts = selection.backend->ActiveExperts();
+  if (selected_path != path || selected_format != resolved_format) {
+    log::Info("single_model_router", "Resolved model source for '" + path +
+                                         "': effective_path='" + selected_path +
+                                         "', effective_format='" +
+                                         selected_format + "'");
+  }
   if (info.backend_fallback) {
     log::Warn("single_model_router",
               "Backend fallback for model '" + path + "': requested=" +
@@ -225,6 +375,21 @@ ModelInfo *SingleModelRouter::Resolve(const std::string &requested_model) {
     } else {
       return nullptr;
     }
+  }
+  bool ready = it->second.backend && it->second.backend->IsReady();
+  it->second.info.ready = ready;
+  RecordModelReadyLocked(it->second, ready);
+  return &it->second.info;
+}
+
+ModelInfo *SingleModelRouter::ResolveExact(const std::string &model_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (model_id.empty()) {
+    return nullptr;
+  }
+  auto it = models_.find(model_id);
+  if (it == models_.end()) {
+    return nullptr;
   }
   bool ready = it->second.backend && it->second.backend->IsReady();
   it->second.info.ready = ready;

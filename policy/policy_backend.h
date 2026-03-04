@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,12 @@ namespace inferflux {
 struct PolicyKeyEntry {
   std::string key;
   std::vector<std::string> scopes;
+};
+
+struct RoutingPolicyEntry {
+  bool allow_default_fallback{true};
+  bool require_ready_backend{false};
+  std::string fallback_scope{"any_compatible"};
 };
 
 class PolicyBackend {
@@ -44,6 +51,11 @@ public:
   // Rate limiting
   virtual int RateLimitPerMinute() const = 0;
   virtual void SetRateLimitPerMinute(int limit) = 0;
+
+  // Capability-aware model routing policy
+  virtual std::optional<RoutingPolicyEntry> RoutingPolicy() const = 0;
+  virtual void SetRoutingPolicy(const RoutingPolicyEntry &policy) = 0;
+  virtual void ClearRoutingPolicy() = 0;
 
   // Identity — useful for logging and diagnostics.
   virtual std::string Name() const = 0;

@@ -25,7 +25,7 @@ namespace disaggregated {
 // and call shm_open with the segment name embedded in packet.metadata.
 // Leaked segments (e.g. after a crash) can be cleaned with shm_unlink(3).
 class ShmKVTransport : public IKVTransport {
- public:
+public:
   explicit ShmKVTransport(std::size_t capacity = 64);
   ~ShmKVTransport() override;
 
@@ -41,19 +41,19 @@ class ShmKVTransport : public IKVTransport {
   std::size_t Capacity() const override;
   std::size_t Size() const override;
 
- private:
+private:
   // Generate a unique SHM segment name embedding request_id and a process-
   // level counter to avoid collisions on rapid reuse of the same request_id.
   static std::string MakeShmName(uint64_t request_id);
 
   // Extract "shm=<name>" from the pipe-delimited metadata string.
-  static std::string ExtractShmName(const std::string& metadata);
+  static std::string ExtractShmName(const std::string &metadata);
 
   // Extract "|size=<N>" from the pipe-delimited metadata string.
-  static std::size_t ExtractShmSize(const std::string& metadata);
+  static std::size_t ExtractShmSize(const std::string &metadata);
 
   KVChannel control_queue_;
 };
 
-}  // namespace disaggregated
-}  // namespace inferflux
+} // namespace disaggregated
+} // namespace inferflux

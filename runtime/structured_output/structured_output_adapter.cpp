@@ -7,9 +7,8 @@
 namespace inferflux {
 namespace {
 
-bool ParseSchema(const std::string& schema,
-                 nlohmann::ordered_json* out,
-                 std::string* error) {
+bool ParseSchema(const std::string &schema, nlohmann::ordered_json *out,
+                 std::string *error) {
   if (!out) {
     if (error) {
       *error = "internal error: null schema target";
@@ -25,7 +24,7 @@ bool ParseSchema(const std::string& schema,
   try {
     *out = nlohmann::ordered_json::parse(schema);
     return true;
-  } catch (const nlohmann::json::exception& ex) {
+  } catch (const nlohmann::json::exception &ex) {
     if (error) {
       *error = std::string("invalid response_format schema: ") + ex.what();
     }
@@ -33,9 +32,8 @@ bool ParseSchema(const std::string& schema,
   }
 }
 
-bool ConvertSchemaToGrammar(const nlohmann::ordered_json& schema,
-                            StructuredConstraint* out,
-                            std::string* error) {
+bool ConvertSchemaToGrammar(const nlohmann::ordered_json &schema,
+                            StructuredConstraint *out, std::string *error) {
   if (!out) {
     if (error) {
       *error = "internal error: null constraint";
@@ -54,21 +52,22 @@ bool ConvertSchemaToGrammar(const nlohmann::ordered_json& schema,
     out->grammar = std::move(grammar);
     out->root = "root";
     return true;
-  } catch (const std::exception& ex) {
+  } catch (const std::exception &ex) {
     if (error) {
-      *error = std::string("response_format schema conversion failed: ") + ex.what();
+      *error =
+          std::string("response_format schema conversion failed: ") + ex.what();
     }
   }
   return false;
 }
 
-bool BuildJsonObjectConstraint(const std::string& schema_text,
-                               StructuredConstraint* out,
-                               std::string* error) {
+bool BuildJsonObjectConstraint(const std::string &schema_text,
+                               StructuredConstraint *out, std::string *error) {
   out->require_json_object = true;
   if (schema_text.empty()) {
-    static const char* kDefaultObjectSchema = R"({"type":"object"})";
-    nlohmann::ordered_json parsed = nlohmann::ordered_json::parse(kDefaultObjectSchema);
+    static const char *kDefaultObjectSchema = R"({"type":"object"})";
+    nlohmann::ordered_json parsed =
+        nlohmann::ordered_json::parse(kDefaultObjectSchema);
     out->has_schema = true;
     out->schema = parsed.dump();
     return ConvertSchemaToGrammar(parsed, out, error);
@@ -82,14 +81,14 @@ bool BuildJsonObjectConstraint(const std::string& schema_text,
   return ConvertSchemaToGrammar(parsed, out, error);
 }
 
-}  // namespace
+} // namespace
 
-bool StructuredOutputAdapter::BuildConstraint(const std::string& type,
-                                              const std::string& schema,
-                                              const std::string& grammar,
-                                              const std::string& root,
-                                              StructuredConstraint* out,
-                                              std::string* error) {
+bool StructuredOutputAdapter::BuildConstraint(const std::string &type,
+                                              const std::string &schema,
+                                              const std::string &grammar,
+                                              const std::string &root,
+                                              StructuredConstraint *out,
+                                              std::string *error) {
   if (!out) {
     if (error) {
       *error = "internal error: null constraint";
@@ -145,4 +144,4 @@ bool StructuredOutputAdapter::BuildConstraint(const std::string& type,
   return false;
 }
 
-}  // namespace inferflux
+} // namespace inferflux

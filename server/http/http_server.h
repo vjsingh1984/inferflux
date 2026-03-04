@@ -95,6 +95,7 @@ private:
   AuditLogger *audit_logger_;
   PolicyBackend *policy_store_;
   std::shared_ptr<SpeculativeDecoder> speculative_decoder_;
+  mutable std::mutex policy_update_mutex_;
   mutable std::mutex model_selection_mutex_;
   ModelSelectionOptions model_selection_options_;
   bool tls_enabled_{false};

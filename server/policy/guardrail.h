@@ -9,23 +9,24 @@
 namespace inferflux {
 
 class Guardrail {
- public:
+public:
   Guardrail() = default;
 
-  void SetBlocklist(const std::vector<std::string>& words);
-  void UpdateBlocklist(const std::vector<std::string>& words);
+  void SetBlocklist(const std::vector<std::string> &words);
+  void UpdateBlocklist(const std::vector<std::string> &words);
   std::vector<std::string> Blocklist() const;
-  bool Check(const std::string& text, std::string* reason) const;
+  bool Check(const std::string &text, std::string *reason) const;
   bool Enabled() const;
-  void SetOPAEndpoint(const std::string& endpoint);
+  void SetOPAEndpoint(const std::string &endpoint);
   std::string OPAEndpoint() const;
 
- private:
+private:
   std::vector<std::string> blocklist_;
   std::string opa_endpoint_;
   mutable std::mutex mutex_;
   OPAClient opa_client_;
-  static std::vector<std::string> Normalize(const std::vector<std::string>& words);
+  static std::vector<std::string>
+  Normalize(const std::vector<std::string> &words);
 };
 
-}  // namespace inferflux
+} // namespace inferflux

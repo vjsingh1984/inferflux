@@ -40,13 +40,12 @@ runtime:
     require_ready_backend: true
     fallback_scope: any_compatible # any_compatible | same_path_only
   scheduler:
-    max_batch_size: 32  # Increased from 8 for better GPU utilization
-    max_batch_tokens: 32768  # Increased from 16384 for larger batches
-    # Batch accumulation: wait for minimum batch size before processing
-    # to improve GPU utilization. Optimal settings from benchmark: 5ms delay, min_batch=4
-    # Result: +23.2% throughput, -16.3% p50 latency (see docs/NATIVE_BACKEND_PROFILING_ANALYSIS.md)
-    min_batch_size: 4  # Minimum batch size for accumulation (override via INFERFLUX_SCHED_MIN_BATCH_SIZE)
-    batch_accumulation_ms: 5  # Max wait time to accumulate batch (override via INFERFLUX_SCHED_BATCH_ACCUMULATION_MS)
+    max_batch_size: 32
+    max_batch_tokens: 16384
+    # Batch accumulation: baseline settings
+    # Previous results: 383.7 tok/s, 518ms p50 latency
+    min_batch_size: 4
+    batch_accumulation_ms: 5
   tensor_parallel: 1
   mps_layers: 0
   fairness:

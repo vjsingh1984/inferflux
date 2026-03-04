@@ -52,6 +52,7 @@ Goal: reach competitive continuous batching throughput on CPU/MPS today while pa
   - [x] SSE cancellation regression tests (`SSECancel` ctest target) kept green.
   - [x] SimpleTokenizer metrics replaced with llama.cpp tokenizer (INF-7) — `TokenizeForCache` + BPE prefix matching in KV prefix store.
   - [x] Per-model prompt/completion token counters exported (`inferflux_model_prompt_tokens_total`, `inferflux_model_completion_tokens_total`) so Prometheus `rate(...)` can track backend/model throughput.
+  - [x] Throughput regression gate harness + guarded GPU CI job (`scripts/run_throughput_gate.py`, `.github/workflows/ci.yml` `cuda-throughput-gate`) to fail on tok/s floor regressions.
   - [x] Latency histograms + queue-depth gauges emitted (OBS-1) to prove KPI gains; add fairness counters (preemptions, per-priority tokens).
   - [ ] Record-only (macOS/MLX): add an MLX trait adapter + parity checklist so MLX capability reporting aligns with llama.cpp/CUDA without changing MLX runtime behavior yet.
   - [ ] Design scaffolding for Intel GPU + AMD ROCm backends (build flags, DeviceContext hooks) so hardware bring-up is unblocked once samples arrive.

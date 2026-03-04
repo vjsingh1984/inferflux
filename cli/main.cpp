@@ -2,22 +2,35 @@
 
 #include <nlohmann/json.hpp>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using json = nlohmann::json;
 
 namespace {
+
+// PATH_MAX is not defined on some systems by default
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 std::string Trim(const std::string &input) {
   auto start = input.find_first_not_of(" \t");
@@ -44,6 +57,57 @@ std::map<std::string, std::string> AuthHeaders(const std::string &api_key) {
     headers["Authorization"] = "Bearer " + api_key;
   }
   return headers;
+}
+
+bool IsHttpSuccess(int status) { return status >= 200 && status < 300; }
+
+bool ParseRequiredFlagValue(int argc, char **argv, int *index,
+                            const std::string &command_context,
+                            const std::string &flag,
+                            const std::string &value_name,
+                            std::string *value_out) {
+  if (*index + 1 >= argc) {
+    std::cerr << "inferctl " << command_context << ": " << flag << " requires "
+              << value_name << std::endl;
+    return false;
+  }
+  std::string candidate = argv[*index + 1];
+  if (!candidate.empty() && candidate.front() == '-') {
+    std::cerr << "inferctl " << command_context << ": " << flag << " requires "
+              << value_name << std::endl;
+    return false;
+  }
+  *value_out = candidate;
+  ++(*index);
+  return true;
+}
+
+bool ParseStrictBoolValue(const std::string &raw, bool *value_out) {
+  if (raw == "true") {
+    *value_out = true;
+    return true;
+  }
+  if (raw == "false") {
+    *value_out = false;
+    return true;
+  }
+  return false;
+}
+
+int PrintJsonResponseAndReturn(const inferflux::HttpResponse &resp,
+                               const std::string &auth_command_hint = "") {
+  if (resp.status == 401 || resp.status == 403) {
+    if (!auth_command_hint.empty()) {
+      std::cerr << auth_command_hint
+                << ": authentication required (set --api-key or "
+                   "INFERCTL_API_KEY)\n";
+    } else {
+      std::cout << resp.body << std::endl;
+    }
+    return 1;
+  }
+  std::cout << resp.body << std::endl;
+  return IsHttpSuccess(resp.status) ? 0 : 1;
 }
 
 std::filesystem::path InferfluxHome() {
@@ -89,9 +153,88 @@ json BuildCompletionPayload(const std::string &prompt, const std::string &model,
   return j;
 }
 
+std::string TruncateCell(const std::string &value, std::size_t max_width) {
+  if (value.size() <= max_width) {
+    return value;
+  }
+  if (max_width <= 3) {
+    return value.substr(0, max_width);
+  }
+  return value.substr(0, max_width - 3) + "...";
+}
+
+void PrintAdminModelsTable(const json &payload) {
+  if (!payload.contains("models") || !payload["models"].is_array()) {
+    std::cout << payload.dump() << std::endl;
+    return;
+  }
+  const auto &models = payload["models"];
+  if (models.empty()) {
+    std::cout << "(no models loaded)\n";
+    return;
+  }
+
+  const std::string default_id = payload.value("default_model", "");
+
+  constexpr int kDefaultW = 4;
+  constexpr int kIdW = 24;
+  constexpr int kBackendW = 10;
+  constexpr int kFormatW = 14;
+  constexpr int kReadyW = 8;
+  constexpr int kSourceW = 44;
+  constexpr int kEffectiveW = 44;
+
+  std::cout << std::left << std::setw(kDefaultW) << "DEF" << std::setw(kIdW)
+            << "ID" << std::setw(kBackendW) << "BACKEND" << std::setw(kFormatW)
+            << "FORMAT" << std::setw(kReadyW) << "READY" << std::setw(kSourceW)
+            << "SOURCE-PATH" << "EFFECTIVE-LOAD-PATH\n";
+  std::cout << std::string(kDefaultW + kIdW + kBackendW + kFormatW + kReadyW +
+                               kSourceW + kEffectiveW,
+                           '-')
+            << "\n";
+
+  for (const auto &model : models) {
+    const std::string id = model.value("id", "");
+    const std::string backend = model.value("backend", "");
+    const std::string format = model.value("format", "");
+    const std::string source_path =
+        model.value("source_path", model.value("path", ""));
+    const std::string effective_load_path =
+        model.value("effective_load_path", source_path);
+    const bool ready = model.value("ready", false);
+    bool is_default = model.value("default", false);
+    if (!is_default && !default_id.empty()) {
+      is_default = (id == default_id);
+    }
+
+    std::cout << std::left << std::setw(kDefaultW) << (is_default ? "*" : "")
+              << std::setw(kIdW) << TruncateCell(id, kIdW - 1)
+              << std::setw(kBackendW) << TruncateCell(backend, kBackendW - 1)
+              << std::setw(kFormatW) << TruncateCell(format, kFormatW - 1)
+              << std::setw(kReadyW) << (ready ? "yes" : "no")
+              << std::setw(kSourceW) << TruncateCell(source_path, kSourceW - 1)
+              << TruncateCell(effective_load_path, kEffectiveW - 1) << "\n";
+  }
+}
+
 void PrintUsage() {
   std::cout
       << "Usage:\n"
+      << "  inferctl server start [--config PATH] [--no-wait]\n"
+      << "      Start InferFlux server in background with PID tracking.\n"
+      << "      --config: Server config file (default: "
+         "~/.inferflux/config.yaml)\n"
+      << "      --no-wait: Don't wait for server to be ready\n"
+      << "  inferctl server stop [--force]\n"
+      << "      Stop running InferFlux server gracefully (or with SIGKILL if "
+         "--force).\n"
+      << "  inferctl server status [--verbose]\n"
+      << "      Show server status, PID, and health information.\n"
+      << "  inferctl server restart [--config PATH] [--no-wait]\n"
+      << "      Restart the server (stop + start).\n"
+      << "  inferctl server logs [--tail N]\n"
+      << "      Show server logs (default: tail -f with last 100 lines).\n"
+      << "      --tail N: Show last N lines without following.\n"
       << "  inferctl pull <owner/model-name>\n"
       << "      Download the best GGUF from HuggingFace Hub "
          "(~/.cache/inferflux/models/).\n"
@@ -116,8 +259,14 @@ void PrintUsage() {
          "--port ... --api-key KEY]\n"
       << "  inferctl admin rate-limit [--get | --set N] [--host ... --port ... "
          "--api-key KEY]\n"
+      << "  inferctl admin routing [--get | --set [--allow-default-fallback "
+         "true|false]\n"
+         "                         [--require-ready-backend true|false]\n"
+         "                         [--fallback-scope any_compatible|"
+         "same_path_only]]\n"
+         "                        [--host ... --port ... --api-key KEY]\n"
       << "  inferctl admin models --list | --load PATH [--backend TYPE] [--id "
-         "NAME] [--default]\n"
+         "NAME] [--default] [--json]\n"
          "                       | --unload ID | --set-default ID [--host ... "
          "--port ... --api-key KEY]\n"
       << "  inferctl admin cache [--status] [--host ... --port ... --api-key "
@@ -127,9 +276,10 @@ void PrintUsage() {
          "... --api-key KEY]\n"
       << "  inferctl admin api-keys [--list | --add KEY --scopes read,admin | "
          "--remove KEY]\n"
-      << "  inferctl models [--host 127.0.0.1] [--port 8080] [--api-key KEY]\n"
-         "      List loaded models (calls GET /v1/models; requires 'read' "
-         "scope).\n";
+      << "  inferctl models [--id MODEL_ID] [--host 127.0.0.1] [--port 8080] "
+         "[--api-key KEY] [--json]\n"
+         "      List loaded models (GET /v1/models) or fetch one model "
+         "(GET /v1/models/{id}); requires 'read' scope.\n";
 }
 
 bool ProcessStreamChunks(std::string &buffer, std::string *accumulated) {
@@ -469,7 +619,9 @@ int DownloadToFile(inferflux::HttpClient &client, const std::string &url,
 
     // Extend recv timeout to 5 minutes for large file downloads.
     if (conn.sock >= 0) {
-      struct timeval tv{300, 0};
+      struct timeval tv {
+        300, 0
+      };
       setsockopt(conn.sock, SOL_SOCKET, SO_RCVTIMEO,
                  reinterpret_cast<const char *>(&tv), sizeof(tv));
     }
@@ -600,6 +752,332 @@ int CmdPull(const std::string &repo) {
   return 0;
 }
 
+// -----------------------------------------------------------------------------
+// Server Management Commands
+// -----------------------------------------------------------------------------
+
+std::filesystem::path ServerPidFile() { return InferfluxHome() / "server.pid"; }
+
+std::filesystem::path ServerLogFile() {
+  return InferfluxHome() / "logs" / "server.log";
+}
+
+bool IsServerRunning() {
+  auto pid_file = ServerPidFile();
+  if (!std::filesystem::exists(pid_file)) {
+    return false;
+  }
+
+  std::ifstream pid_file_stream(pid_file);
+  if (!pid_file_stream.is_open()) {
+    return false;
+  }
+
+  pid_t pid;
+  pid_file_stream >> pid;
+
+  // Check if process is running by sending signal 0
+  if (kill(pid, 0) == 0) {
+    return true; // Process exists
+  }
+  return false; // Process doesn't exist
+}
+
+int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
+                   int timeout_sec = 30) {
+  if (IsServerRunning()) {
+    std::cerr << "Error: Server is already running (PID file: "
+              << ServerPidFile() << ")\n";
+    std::cerr << "Use 'inferctl server stop' to stop it first.\n";
+    return 1;
+  }
+
+  // Create logs directory
+  auto log_file = ServerLogFile();
+  std::filesystem::create_directories(log_file.parent_path());
+
+  // Build server binary path
+  std::string server_bin = "./build/inferfluxd";
+  if (!std::filesystem::exists(server_bin)) {
+    // Try relative path from inferctl
+    char exe_path[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len != -1) {
+      exe_path[len] = '\0';
+      std::filesystem::path exe_dir =
+          std::filesystem::path(exe_path).parent_path();
+      server_bin = exe_dir / "inferfluxd";
+      if (!std::filesystem::exists(server_bin)) {
+        server_bin = exe_dir / "../inferfluxd";
+      }
+    }
+  }
+
+  if (!std::filesystem::exists(server_bin)) {
+    std::cerr << "Error: Server binary not found at " << server_bin << "\n";
+    std::cerr
+        << "Build the server with: cmake --build build --target inferfluxd\n";
+    return 1;
+  }
+
+  // Start server in background
+  pid_t pid = fork();
+  if (pid < 0) {
+    std::cerr << "Error: Failed to fork server process: " << strerror(errno)
+              << "\n";
+    return 1;
+  }
+
+  if (pid == 0) {
+    // Child process - start server
+    // Close stdin/stdout/stderr
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+
+    // Redirect output to log file
+    int log_fd = open(log_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (log_fd < 0) {
+      _exit(1);
+    }
+    dup2(log_fd, STDOUT_FILENO);
+    dup2(log_fd, STDERR_FILENO);
+    close(log_fd);
+
+    // Start server
+    execl(server_bin.c_str(), server_bin.c_str(), "--config",
+          config_path.c_str(), (char *)nullptr);
+    _exit(1); // If exec returns
+  }
+
+  // Parent process - write PID file
+  {
+    std::ofstream pid_file_stream(ServerPidFile());
+    pid_file_stream << pid << "\n";
+  }
+
+  std::cout << "Starting InferFlux server (PID: " << pid << ")...\n";
+  std::cout << "Config: " << config_path << "\n";
+  std::cout << "Logs: " << log_file << "\n";
+
+  if (wait_for_ready) {
+    std::cout << "Waiting for server to be ready...";
+    std::cout.flush();
+
+    auto start = std::chrono::steady_clock::now();
+    bool ready = false;
+
+    while (std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now() - start)
+               .count() < timeout_sec) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      std::cout << ".";
+      std::cout.flush();
+
+      // Check if process is still running
+      if (kill(pid, 0) != 0) {
+        std::cout << "\n";
+        std::cerr << "Error: Server process died unexpectedly\n";
+        std::filesystem::remove(ServerPidFile());
+        return 1;
+      }
+
+      // Try health endpoint
+      try {
+        inferflux::HttpClient client;
+        auto headers = AuthHeaders(""); // Health endpoint doesn't need auth
+        auto resp =
+            client.Get(BuildUrl("127.0.0.1", 8080, "/healthz"), headers);
+        if (resp.status == 200) {
+          ready = true;
+          break;
+        }
+      } catch (...) {
+        // Server not ready yet
+      }
+    }
+
+    std::cout << "\n";
+
+    if (ready) {
+      std::cout << "✓ Server is ready!\n";
+      std::cout << "  API: http://127.0.0.1:8080\n";
+      std::cout << "  Health: http://127.0.0.1:8080/healthz\n";
+      std::cout << "  Metrics: http://127.0.0.1:8080/metrics\n";
+      return 0;
+    } else {
+      std::cerr << "Error: Server failed to become ready after " << timeout_sec
+                << " seconds\n";
+      std::cerr << "Check logs at: " << log_file << "\n";
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+int CmdServerStop(bool wait = true, int timeout_sec = 10) {
+  auto pid_file = ServerPidFile();
+  if (!std::filesystem::exists(pid_file)) {
+    std::cerr << "Error: Server is not running (no PID file found)\n";
+    return 1;
+  }
+
+  std::ifstream pid_file_stream(pid_file);
+  if (!pid_file_stream.is_open()) {
+    std::cerr << "Error: Cannot read PID file\n";
+    return 1;
+  }
+
+  pid_t pid;
+  pid_file_stream >> pid;
+
+  // Check if process is running
+  if (kill(pid, 0) != 0) {
+    std::cerr << "Server process (PID " << pid << ") is not running\n";
+    std::filesystem::remove(pid_file);
+    return 0;
+  }
+
+  std::cout << "Stopping server (PID: " << pid << ")...";
+  std::cout.flush();
+
+  // Send SIGTERM
+  if (kill(pid, SIGTERM) != 0) {
+    std::cerr << "\nError: Failed to send SIGTERM: " << strerror(errno) << "\n";
+    return 1;
+  }
+
+  if (wait) {
+    auto start = std::chrono::steady_clock::now();
+    bool stopped = false;
+
+    while (std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now() - start)
+               .count() < timeout_sec) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      std::cout << ".";
+      std::cout.flush();
+
+      if (kill(pid, 0) != 0) {
+        stopped = true;
+        break;
+      }
+    }
+
+    if (!stopped) {
+      std::cout << "\nServer did not stop gracefully, forcing...";
+      std::cout.flush();
+      kill(pid, SIGKILL);
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+  }
+
+  std::cout << "\n✓ Server stopped\n";
+
+  // Clean up PID file
+  std::filesystem::remove(pid_file);
+
+  return 0;
+}
+
+int CmdServerStatus(bool verbose = false) {
+  auto pid_file = ServerPidFile();
+  bool pid_exists = std::filesystem::exists(pid_file);
+
+  if (!pid_exists) {
+    std::cout << "Server: " << "\033[31m" << "STOPPED" << "\033[0m" << "\n";
+    return 1;
+  }
+
+  std::ifstream pid_file_stream(pid_file);
+  if (!pid_file_stream.is_open()) {
+    std::cerr << "Error: Cannot read PID file\n";
+    return 1;
+  }
+
+  pid_t pid;
+  pid_file_stream >> pid;
+
+  if (kill(pid, 0) != 0) {
+    std::cout << "Server: " << "\033[31m" << "CRASHED" << "\033[0m"
+              << " (PID file exists but process not running)\n";
+    std::cout << "Cleaning up stale PID file...\n";
+    std::filesystem::remove(pid_file);
+    return 1;
+  }
+
+  std::cout << "Server: " << "\033[32m" << "RUNNING" << "\033[0m" << "\n";
+  std::cout << "PID: " << pid << "\n";
+  std::cout << "Config: "
+            << (std::filesystem::exists(DefaultConfigPath())
+                    ? DefaultConfigPath().string()
+                    : "not found")
+            << "\n";
+  std::cout << "Logs: " << ServerLogFile() << "\n";
+
+  if (verbose) {
+    std::cout << "\nChecking server health...\n";
+    try {
+      inferflux::HttpClient client;
+      auto headers = AuthHeaders("");
+
+      auto health_resp =
+          client.Get(BuildUrl("127.0.0.1", 8080, "/healthz"), headers);
+      if (health_resp.status == 200) {
+        auto health = json::parse(health_resp.body);
+        bool model_ready = health.value("model_ready", false);
+        std::cout << "Health: " << "\033[32m" << "OK" << "\033[0m" << "\n";
+        std::cout << "Model Ready: " << (model_ready ? "yes" : "no") << "\n";
+      }
+
+      auto models_resp =
+          client.Get(BuildUrl("127.0.0.1", 8080, "/v1/models"), headers);
+      if (models_resp.status == 200) {
+        auto models = json::parse(models_resp.body);
+        if (models.contains("data") && models["data"].is_array()) {
+          std::cout << "\nLoaded Models:\n";
+          for (const auto &model : models["data"]) {
+            std::string id = model.value("id", "unknown");
+            std::string backend = model.value("backend", "unknown");
+            bool ready = model.value("ready", false);
+            std::cout << "  - " << id << " [" << backend << "] "
+                      << (ready ? "✓" : "loading...") << "\n";
+          }
+        }
+      }
+    } catch (const std::exception &e) {
+      std::cout << "Warning: Could not fetch server status: " << e.what()
+                << "\n";
+    }
+  }
+
+  return 0;
+}
+
+int CmdServerRestart(const std::string &config_path,
+                     bool wait_for_ready = true) {
+  std::cout << "Restarting server...\n";
+  CmdServerStop(true, 10);
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  return CmdServerStart(config_path, wait_for_ready);
+}
+
+int CmdServerLogs(int tail_lines = 100) {
+  auto log_file = ServerLogFile();
+  if (!std::filesystem::exists(log_file)) {
+    std::cerr << "Error: Log file not found at " << log_file << "\n";
+    std::cerr << "Server may not have been started yet.\n";
+    return 1;
+  }
+
+  std::string command =
+      "tail -n " + std::to_string(tail_lines) + " -f " + log_file.string();
+  int result = std::system(command.c_str());
+
+  return (result == 0) ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -692,6 +1170,85 @@ int main(int argc, char **argv) {
                     !serve_no_ui);
   }
 
+  // Server management commands (don't require running server)
+  if (command == "server") {
+    if (argc < 3) {
+      std::cerr
+          << "Usage: inferctl server {start|stop|status|restart|logs} [...]\n";
+      return 1;
+    }
+    std::string server_cmd = argv[2];
+
+    if (server_cmd == "start") {
+      std::string config = serve_config_override.empty()
+                               ? DefaultConfigPath().string()
+                               : serve_config_override;
+      bool wait_for_ready = true;
+      for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--config" && i + 1 < argc) {
+          config = argv[++i];
+        } else if (arg == "--no-wait") {
+          wait_for_ready = false;
+        }
+      }
+      return CmdServerStart(config, wait_for_ready);
+    }
+
+    if (server_cmd == "stop") {
+      bool force = false;
+      for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--force") {
+          force = true;
+        }
+      }
+      return CmdServerStop(!force, force ? 2 : 10);
+    }
+
+    if (server_cmd == "status") {
+      bool verbose = false;
+      for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--verbose" || arg == "-v") {
+          verbose = true;
+        }
+      }
+      return CmdServerStatus(verbose);
+    }
+
+    if (server_cmd == "restart") {
+      std::string config = serve_config_override.empty()
+                               ? DefaultConfigPath().string()
+                               : serve_config_override;
+      bool wait_for_ready = true;
+      for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--config" && i + 1 < argc) {
+          config = argv[++i];
+        } else if (arg == "--no-wait") {
+          wait_for_ready = false;
+        }
+      }
+      return CmdServerRestart(config, wait_for_ready);
+    }
+
+    if (server_cmd == "logs") {
+      int tail_lines = 0; // 0 means follow mode
+      for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--tail" && i + 1 < argc) {
+          tail_lines = std::stoi(argv[++i]);
+        }
+      }
+      return CmdServerLogs(tail_lines);
+    }
+
+    std::cerr << "Unknown server command: " << server_cmd << "\n";
+    std::cerr << "Valid commands: start, stop, status, restart, logs\n";
+    return 1;
+  }
+
   try {
     inferflux::HttpClient client;
     auto headers = AuthHeaders(api_key);
@@ -708,21 +1265,38 @@ int main(int argc, char **argv) {
       std::string target = argv[2];
       if (target == "guardrails") {
         bool list = false;
+        bool set = false;
         std::string set_values;
         for (int i = 3; i < argc; ++i) {
           std::string arg = argv[i];
-          if (arg == "--list")
+          if (arg == "--list") {
             list = true;
-          else if (arg == "--set" && i + 1 < argc)
-            set_values = argv[++i];
+          } else if (arg == "--set") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin guardrails",
+                                        "--set", "word1,word2", &set_values)) {
+              return 1;
+            }
+            set = true;
+          }
+        }
+        const int op_count = (list ? 1 : 0) + (set ? 1 : 0);
+        if (op_count == 0) {
+          PrintUsage();
+          return 1;
+        }
+        if (op_count > 1) {
+          std::cerr << "inferctl admin guardrails: choose exactly one of "
+                       "--list, --set"
+                    << std::endl;
+          return 1;
         }
         if (list) {
           auto resp =
               client.Get(BuildUrl(host, port, "/v1/admin/guardrails"), headers);
-          std::cout << resp.body << std::endl;
-          return 0;
+          return PrintJsonResponseAndReturn(resp,
+                                            "inferctl admin guardrails --list");
         }
-        if (!set_values.empty()) {
+        if (set) {
           std::vector<std::string> words;
           std::stringstream ss(set_values);
           std::string token;
@@ -733,8 +1307,8 @@ int main(int argc, char **argv) {
           }
           auto resp = client.Put(BuildUrl(host, port, "/v1/admin/guardrails"),
                                  json({{"blocklist", words}}).dump(), headers);
-          std::cout << resp.body << std::endl;
-          return 0;
+          return PrintJsonResponseAndReturn(resp,
+                                            "inferctl admin guardrails --set");
         }
         PrintUsage();
         return 1;
@@ -742,34 +1316,193 @@ int main(int argc, char **argv) {
       if (target == "rate-limit") {
         bool get = false;
         bool set_flag = false;
+        std::string set_value_raw;
         int new_limit = 0;
         for (int i = 3; i < argc; ++i) {
           std::string arg = argv[i];
-          if (arg == "--get")
+          if (arg == "--get") {
             get = true;
-          else if (arg == "--set" && i + 1 < argc) {
-            new_limit = std::stoi(argv[++i]);
+          } else if (arg == "--set") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin rate-limit",
+                                        "--set", "N", &set_value_raw)) {
+              return 1;
+            }
             set_flag = true;
           }
+        }
+        const int op_count = (get ? 1 : 0) + (set_flag ? 1 : 0);
+        if (op_count == 0) {
+          PrintUsage();
+          return 1;
+        }
+        if (op_count > 1) {
+          std::cerr << "inferctl admin rate-limit: choose exactly one of "
+                       "--get, --set"
+                    << std::endl;
+          return 1;
         }
         if (get) {
           auto resp =
               client.Get(BuildUrl(host, port, "/v1/admin/rate_limit"), headers);
-          std::cout << resp.body << std::endl;
-          return 0;
+          return PrintJsonResponseAndReturn(resp,
+                                            "inferctl admin rate-limit --get");
         }
         if (set_flag) {
+          try {
+            std::size_t consumed = 0;
+            new_limit = std::stoi(set_value_raw, &consumed);
+            if (consumed != set_value_raw.size()) {
+              throw std::invalid_argument("trailing characters");
+            }
+          } catch (...) {
+            std::cerr << "inferctl admin rate-limit: --set must be an integer"
+                      << std::endl;
+            return 1;
+          }
           auto resp = client.Put(
               BuildUrl(host, port, "/v1/admin/rate_limit"),
               json({{"tokens_per_minute", new_limit}}).dump(), headers);
-          std::cout << resp.body << std::endl;
-          return 0;
+          return PrintJsonResponseAndReturn(resp,
+                                            "inferctl admin rate-limit --set");
         }
         PrintUsage();
         return 1;
       }
+      if (target == "routing") {
+        bool get = false;
+        bool set = false;
+        bool allow_default_set = false;
+        bool require_ready_set = false;
+        bool fallback_scope_set = false;
+        std::string allow_default_raw;
+        std::string require_ready_raw;
+        std::string fallback_scope_value;
+        for (int i = 3; i < argc; ++i) {
+          std::string arg = argv[i];
+          if (arg == "--get") {
+            get = true;
+          } else if (arg == "--set") {
+            set = true;
+          } else if (arg == "--allow-default-fallback") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin routing",
+                                        "--allow-default-fallback",
+                                        "true|false", &allow_default_raw)) {
+              return 1;
+            }
+            allow_default_set = true;
+          } else if (arg == "--require-ready-backend") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin routing",
+                                        "--require-ready-backend", "true|false",
+                                        &require_ready_raw)) {
+              return 1;
+            }
+            require_ready_set = true;
+          } else if (arg == "--fallback-scope") {
+            if (!ParseRequiredFlagValue(
+                    argc, argv, &i, "admin routing", "--fallback-scope",
+                    "any_compatible|same_path_only", &fallback_scope_value)) {
+              return 1;
+            }
+            fallback_scope_set = true;
+          }
+        }
+        const int op_count = (get ? 1 : 0) + (set ? 1 : 0);
+        if (op_count == 0) {
+          if (allow_default_set || require_ready_set || fallback_scope_set) {
+            if (allow_default_set) {
+              std::cerr << "inferctl admin routing: --allow-default-fallback "
+                           "requires --set"
+                        << std::endl;
+            } else if (require_ready_set) {
+              std::cerr << "inferctl admin routing: --require-ready-backend "
+                           "requires --set"
+                        << std::endl;
+            } else {
+              std::cerr << "inferctl admin routing: --fallback-scope requires "
+                           "--set"
+                        << std::endl;
+            }
+            return 1;
+          }
+          PrintUsage();
+          return 1;
+        }
+        if (op_count > 1) {
+          std::cerr << "inferctl admin routing: choose exactly one of --get, "
+                       "--set"
+                    << std::endl;
+          return 1;
+        }
+        if (!set &&
+            (allow_default_set || require_ready_set || fallback_scope_set)) {
+          if (allow_default_set) {
+            std::cerr << "inferctl admin routing: --allow-default-fallback "
+                         "requires --set"
+                      << std::endl;
+          } else if (require_ready_set) {
+            std::cerr << "inferctl admin routing: --require-ready-backend "
+                         "requires --set"
+                      << std::endl;
+          } else {
+            std::cerr << "inferctl admin routing: --fallback-scope requires "
+                         "--set"
+                      << std::endl;
+          }
+          return 1;
+        }
+        if (get) {
+          auto resp =
+              client.Get(BuildUrl(host, port, "/v1/admin/routing"), headers);
+          return PrintJsonResponseAndReturn(resp,
+                                            "inferctl admin routing --get");
+        }
+
+        if (!allow_default_set && !require_ready_set && !fallback_scope_set) {
+          std::cerr << "inferctl admin routing: --set requires at least one of "
+                       "--allow-default-fallback, --require-ready-backend, "
+                       "--fallback-scope"
+                    << std::endl;
+          return 1;
+        }
+
+        json body_j;
+        if (allow_default_set) {
+          bool parsed_value = false;
+          if (!ParseStrictBoolValue(allow_default_raw, &parsed_value)) {
+            std::cerr << "inferctl admin routing: --allow-default-fallback "
+                         "must be true or false"
+                      << std::endl;
+            return 1;
+          }
+          body_j["allow_default_fallback"] = parsed_value;
+        }
+        if (require_ready_set) {
+          bool parsed_value = false;
+          if (!ParseStrictBoolValue(require_ready_raw, &parsed_value)) {
+            std::cerr << "inferctl admin routing: --require-ready-backend must "
+                         "be true or false"
+                      << std::endl;
+            return 1;
+          }
+          body_j["require_ready_backend"] = parsed_value;
+        }
+        if (fallback_scope_set) {
+          if (fallback_scope_value != "any_compatible" &&
+              fallback_scope_value != "same_path_only") {
+            std::cerr << "inferctl admin routing: --fallback-scope must be "
+                         "any_compatible or same_path_only"
+                      << std::endl;
+            return 1;
+          }
+          body_j["fallback_scope"] = fallback_scope_value;
+        }
+        auto resp = client.Put(BuildUrl(host, port, "/v1/admin/routing"),
+                               body_j.dump(), headers);
+        return PrintJsonResponseAndReturn(resp, "inferctl admin routing --set");
+      }
       if (target == "models") {
         bool list = false;
+        bool list_json = false;
         std::string load_path;
         std::string load_backend;
         std::string load_id;
@@ -780,24 +1513,119 @@ int main(int argc, char **argv) {
           std::string arg = argv[i];
           if (arg == "--list") {
             list = true;
-          } else if (arg == "--load" && i + 1 < argc) {
-            load_path = argv[++i];
-          } else if (arg == "--backend" && i + 1 < argc) {
-            load_backend = argv[++i];
-          } else if (arg == "--id" && i + 1 < argc) {
-            load_id = argv[++i];
+          } else if (arg == "--json") {
+            list_json = true;
+          } else if (arg == "--load") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin models",
+                                        "--load", "PATH", &load_path)) {
+              return 1;
+            }
+          } else if (arg == "--backend") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin models",
+                                        "--backend", "TYPE", &load_backend)) {
+              return 1;
+            }
+          } else if (arg == "--id") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin models", "--id",
+                                        "NAME", &load_id)) {
+              return 1;
+            }
           } else if (arg == "--default") {
             load_default = true;
-          } else if (arg == "--unload" && i + 1 < argc) {
-            unload_id = argv[++i];
-          } else if (arg == "--set-default" && i + 1 < argc) {
-            set_default_id = argv[++i];
+          } else if (arg == "--unload") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin models",
+                                        "--unload", "ID", &unload_id)) {
+              return 1;
+            }
+          } else if (arg == "--set-default") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin models",
+                                        "--set-default", "ID",
+                                        &set_default_id)) {
+              return 1;
+            }
+          }
+        }
+        const int op_count = (list ? 1 : 0) + (!load_path.empty() ? 1 : 0) +
+                             (!unload_id.empty() ? 1 : 0) +
+                             (!set_default_id.empty() ? 1 : 0);
+        if (op_count == 0) {
+          if (list_json) {
+            std::cerr << "inferctl admin models: --json requires --list"
+                      << std::endl;
+            return 1;
+          }
+          if (load_default) {
+            std::cerr << "inferctl admin models: --default requires --load "
+                         "PATH"
+                      << std::endl;
+            return 1;
+          }
+          if (!load_backend.empty()) {
+            std::cerr << "inferctl admin models: --backend requires --load "
+                         "PATH"
+                      << std::endl;
+            return 1;
+          }
+          if (!load_id.empty()) {
+            std::cerr << "inferctl admin models: --id requires --load PATH"
+                      << std::endl;
+            return 1;
+          }
+          PrintUsage();
+          return 1;
+        }
+        if (op_count > 1) {
+          std::cerr << "inferctl admin models: choose exactly one of "
+                       "--list, --load, --unload, --set-default"
+                    << std::endl;
+          return 1;
+        }
+        if (!list && list_json) {
+          std::cerr << "inferctl admin models: --json requires --list"
+                    << std::endl;
+          return 1;
+        }
+        if (load_path.empty()) {
+          if (load_default) {
+            std::cerr << "inferctl admin models: --default requires --load "
+                         "PATH"
+                      << std::endl;
+            return 1;
+          }
+          if (!load_backend.empty()) {
+            std::cerr << "inferctl admin models: --backend requires --load "
+                         "PATH"
+                      << std::endl;
+            return 1;
+          }
+          if (!load_id.empty()) {
+            std::cerr << "inferctl admin models: --id requires --load PATH"
+                      << std::endl;
+            return 1;
           }
         }
         if (list) {
           auto resp =
               client.Get(BuildUrl(host, port, "/v1/admin/models"), headers);
-          std::cout << resp.body << std::endl;
+          if (resp.status == 401 || resp.status == 403) {
+            std::cerr << "inferctl admin models --list: authentication "
+                         "required (set --api-key or INFERCTL_API_KEY)\n";
+            return 1;
+          }
+          if (!IsHttpSuccess(resp.status)) {
+            std::cout << resp.body << std::endl;
+            return 1;
+          }
+          if (list_json) {
+            std::cout << resp.body << std::endl;
+            return 0;
+          }
+          try {
+            auto j = json::parse(resp.body);
+            PrintAdminModelsTable(j);
+          } catch (const json::exception &) {
+            std::cout << resp.body << std::endl;
+          }
           return 0;
         }
         if (!load_path.empty()) {
@@ -814,46 +1642,104 @@ int main(int argc, char **argv) {
           }
           auto resp = client.Post(BuildUrl(host, port, "/v1/admin/models"),
                                   payload.dump(), headers);
-          std::cout << resp.body << std::endl;
-          return 0;
+          return PrintJsonResponseAndReturn(resp,
+                                            "inferctl admin models --load");
         }
         if (!unload_id.empty()) {
           auto resp = client.Delete(BuildUrl(host, port, "/v1/admin/models"),
                                     json({{"id", unload_id}}).dump(), headers);
-          std::cout << resp.body << std::endl;
-          return 0;
+          return PrintJsonResponseAndReturn(resp,
+                                            "inferctl admin models --unload");
         }
         if (!set_default_id.empty()) {
           auto resp =
               client.Put(BuildUrl(host, port, "/v1/admin/models/default"),
                          json({{"id", set_default_id}}).dump(), headers);
-          std::cout << resp.body << std::endl;
-          return 0;
+          return PrintJsonResponseAndReturn(
+              resp, "inferctl admin models --set-default");
         }
         PrintUsage();
         return 1;
       }
       if (target == "cache") {
+        bool status = false;
         bool do_warm = false;
         std::string warm_tokens_str;
         std::string warm_completion;
+        bool warm_completion_tokens_set = false;
         int warm_completion_tokens = 0;
         for (int i = 3; i < argc; ++i) {
           std::string arg = argv[i];
-          if (arg == "--warm") {
+          if (arg == "--status") {
+            status = true;
+          } else if (arg == "--warm") {
             do_warm = true;
-          } else if (arg == "--tokens" && i + 1 < argc) {
-            warm_tokens_str = argv[++i];
-          } else if (arg == "--completion" && i + 1 < argc) {
-            warm_completion = argv[++i];
-          } else if (arg == "--completion-tokens" && i + 1 < argc) {
-            warm_completion_tokens = std::stoi(argv[++i]);
+          } else if (arg == "--tokens") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin cache",
+                                        "--tokens", "ID,ID,...",
+                                        &warm_tokens_str)) {
+              return 1;
+            }
+          } else if (arg == "--completion") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin cache",
+                                        "--completion", "TEXT",
+                                        &warm_completion)) {
+              return 1;
+            }
+          } else if (arg == "--completion-tokens") {
+            std::string completion_tokens_value;
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin cache",
+                                        "--completion-tokens", "N",
+                                        &completion_tokens_value)) {
+              return 1;
+            }
+            try {
+              warm_completion_tokens = std::stoi(completion_tokens_value);
+            } catch (...) {
+              std::cerr
+                  << "inferctl admin cache: --completion-tokens must be an "
+                     "integer"
+                  << std::endl;
+              return 1;
+            }
+            warm_completion_tokens_set = true;
           }
         }
+        if (status && do_warm) {
+          std::cerr << "inferctl admin cache: choose exactly one of --status "
+                       "or --warm"
+                    << std::endl;
+          return 1;
+        }
+        if (!status && !do_warm) {
+          status = true;
+        }
+        if (!do_warm && (!warm_tokens_str.empty() || !warm_completion.empty() ||
+                         warm_completion_tokens_set)) {
+          if (!warm_tokens_str.empty()) {
+            std::cerr << "inferctl admin cache: --tokens requires --warm"
+                      << std::endl;
+          } else if (!warm_completion.empty()) {
+            std::cerr << "inferctl admin cache: --completion requires --warm"
+                      << std::endl;
+          } else {
+            std::cerr << "inferctl admin cache: --completion-tokens requires "
+                         "--warm"
+                      << std::endl;
+          }
+          return 1;
+        }
         if (do_warm) {
-          if (warm_tokens_str.empty() || warm_completion.empty()) {
-            std::cerr << "Usage: inferctl admin cache --warm "
-                         "--tokens ID,... --completion TEXT\n";
+          if (warm_tokens_str.empty()) {
+            std::cerr << "inferctl admin cache: --tokens is required with "
+                         "--warm"
+                      << std::endl;
+            return 1;
+          }
+          if (warm_completion.empty()) {
+            std::cerr << "inferctl admin cache: --completion is required with "
+                         "--warm"
+                      << std::endl;
             return 1;
           }
           json tokens_arr = json::array();
@@ -872,37 +1758,75 @@ int main(int argc, char **argv) {
                       {"completion_tokens", warm_completion_tokens}};
           auto resp = client.Post(BuildUrl(host, port, "/v1/admin/cache/warm"),
                                   body_j.dump(), headers);
-          std::cout << resp.body << std::endl;
-          return 0;
+          return PrintJsonResponseAndReturn(resp,
+                                            "inferctl admin cache --warm");
         }
-        // Default: status
         auto resp =
             client.Get(BuildUrl(host, port, "/v1/admin/cache"), headers);
-        std::cout << resp.body << std::endl;
-        return 0;
+        return PrintJsonResponseAndReturn(resp,
+                                          "inferctl admin cache --status");
       }
       if (target == "api-keys" || target == "api-key") {
         bool list = false, remove = false, add = false;
-        std::string new_key, scopes_csv;
+        std::string add_key, remove_key, scopes_csv;
+        bool scopes_set = false;
         for (int i = 3; i < argc; ++i) {
           std::string arg = argv[i];
           if (arg == "--list")
             list = true;
-          else if (arg == "--add" && i + 1 < argc) {
-            new_key = argv[++i];
+          else if (arg == "--add") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin api-keys",
+                                        "--add", "KEY", &add_key)) {
+              return 1;
+            }
             add = true;
-          } else if (arg == "--scopes" && i + 1 < argc)
-            scopes_csv = argv[++i];
-          else if (arg == "--remove" && i + 1 < argc) {
-            new_key = argv[++i];
+          } else if (arg == "--scopes") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin api-keys",
+                                        "--scopes", "read,admin",
+                                        &scopes_csv)) {
+              return 1;
+            }
+            scopes_set = true;
+          } else if (arg == "--remove") {
+            if (!ParseRequiredFlagValue(argc, argv, &i, "admin api-keys",
+                                        "--remove", "KEY", &remove_key)) {
+              return 1;
+            }
             remove = true;
           }
+        }
+        const int op_count = (list ? 1 : 0) + (add ? 1 : 0) + (remove ? 1 : 0);
+        if (op_count == 0) {
+          if (scopes_set) {
+            std::cerr << "inferctl admin api-keys: --scopes requires --add KEY"
+                      << std::endl;
+            return 1;
+          }
+          PrintUsage();
+          return 1;
+        }
+        if (op_count > 1) {
+          std::cerr << "inferctl admin api-keys: choose exactly one of --list, "
+                       "--add, --remove"
+                    << std::endl;
+          return 1;
+        }
+        if (!add && scopes_set) {
+          std::cerr << "inferctl admin api-keys: --scopes requires --add KEY"
+                    << std::endl;
+          return 1;
+        }
+        if (add && !scopes_set) {
+          std::cerr
+              << "inferctl admin api-keys: --add requires --scopes read,admin"
+              << std::endl;
+          return 1;
         }
         if (list) {
           auto resp =
               client.Get(BuildUrl(host, port, "/v1/admin/api_keys"), headers);
-          std::cout << resp.body << std::endl;
-          return 0;
+          return PrintJsonResponseAndReturn(resp,
+                                            "inferctl admin api-keys --list");
         }
         if (add) {
           std::vector<std::string> scopes;
@@ -913,17 +1837,24 @@ int main(int argc, char **argv) {
             if (!trimmed.empty())
               scopes.push_back(trimmed);
           }
+          if (scopes.empty()) {
+            std::cerr << "inferctl admin api-keys: --scopes must include at "
+                         "least one scope"
+                      << std::endl;
+            return 1;
+          }
           auto resp = client.Post(
               BuildUrl(host, port, "/v1/admin/api_keys"),
-              json({{"key", new_key}, {"scopes", scopes}}).dump(), headers);
-          std::cout << resp.body << std::endl;
-          return 0;
+              json({{"key", add_key}, {"scopes", scopes}}).dump(), headers);
+          return PrintJsonResponseAndReturn(resp,
+                                            "inferctl admin api-keys --add");
         }
         if (remove) {
-          auto resp = client.Delete(BuildUrl(host, port, "/v1/admin/api_keys"),
-                                    json({{"key", new_key}}).dump(), headers);
-          std::cout << resp.body << std::endl;
-          return 0;
+          auto resp =
+              client.Delete(BuildUrl(host, port, "/v1/admin/api_keys"),
+                            json({{"key", remove_key}}).dump(), headers);
+          return PrintJsonResponseAndReturn(resp,
+                                            "inferctl admin api-keys --remove");
         }
         PrintUsage();
         return 1;
@@ -937,14 +1868,42 @@ int main(int argc, char **argv) {
       return 0;
     }
     if (command == "models") {
-      auto resp = client.Get(BuildUrl(host, port, "/v1/models"), headers);
+      bool output_json = false;
+      std::string model_id;
+      for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--json") {
+          output_json = true;
+        } else if (arg == "--id") {
+          if (!ParseRequiredFlagValue(argc, argv, &i, "models", "--id",
+                                      "MODEL_ID", &model_id)) {
+            return 1;
+          }
+        }
+      }
+      const std::string path =
+          model_id.empty() ? "/v1/models" : "/v1/models/" + model_id;
+      auto resp = client.Get(BuildUrl(host, port, path), headers);
       if (resp.status == 401 || resp.status == 403) {
         std::cerr << "inferctl models: authentication required (set --api-key "
                      "or INFERCTL_API_KEY)\n";
         return 1;
       }
+      if (!IsHttpSuccess(resp.status)) {
+        std::cout << resp.body << std::endl;
+        return 1;
+      }
+      if (output_json) {
+        std::cout << resp.body << std::endl;
+        return 0;
+      }
       try {
         auto j = json::parse(resp.body);
+        if (!model_id.empty()) {
+          // Reuse list-style table formatting for single-model lookups by
+          // wrapping the object into a synthetic data array.
+          j = json{{"data", json::array({j})}};
+        }
         if (!j.contains("data") || !j["data"].is_array()) {
           std::cout << resp.body << std::endl;
           return 0;
@@ -956,8 +1915,7 @@ int main(int argc, char **argv) {
         }
         // Print a simple table: ID | owned_by | created
         std::cout << std::left << std::setw(36) << "ID" << std::setw(20)
-                  << "OWNED-BY"
-                  << "CREATED\n";
+                  << "OWNED-BY" << "CREATED\n";
         std::cout << std::string(70, '-') << "\n";
         for (const auto &m : data) {
           std::string id = m.value("id", "");

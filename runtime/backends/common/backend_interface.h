@@ -12,9 +12,10 @@ struct LlamaBackendConfig;
 
 /// Abstract interface for all inference backends.
 ///
-/// This interface defines the contract that all backends (CPU, CUDA, ROCm, Metal)
-/// must implement. It focuses on the unified batching API and async execution,
-/// leaving backend-specific methods (Prefill, Decode, etc.) to subclass interfaces.
+/// This interface defines the contract that all backends (CPU, CUDA, ROCm,
+/// Metal) must implement. It focuses on the unified batching API and async
+/// execution, leaving backend-specific methods (Prefill, Decode, etc.) to
+/// subclass interfaces.
 class BackendInterface {
 public:
   virtual ~BackendInterface() = default;
@@ -41,11 +42,11 @@ public:
   virtual std::vector<UnifiedBatchOutput>
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) = 0;
 
-  /// Maximum number of tokens the backend can safely accept in one unified batch.
-  /// Used by scheduler/executor-side chunking guards.
+  /// Maximum number of tokens the backend can safely accept in one unified
+  /// batch. Used by scheduler/executor-side chunking guards.
   /// @return Maximum token capacity
   virtual int UnifiedBatchTokenCapacity() const {
-    return 2048;  // Default safe limit
+    return 2048; // Default safe limit
   }
 
   // ========================================================================
@@ -55,7 +56,7 @@ public:
   /// Whether this backend supports async unified batch execution.
   /// @return true if SupportsAsyncSubmit/TryCollect are implemented
   virtual bool SupportsAsyncUnifiedBatch() const {
-    return false;  // Default: synchronous only
+    return false; // Default: synchronous only
   }
 
   /// Submit a batch for async execution.
@@ -65,30 +66,30 @@ public:
   virtual UnifiedBatchHandle
   SubmitUnifiedBatchAsync(const std::vector<UnifiedBatchInput> &inputs,
                           UnifiedBatchLane lane = UnifiedBatchLane::kAuto) {
-    return 0;  // Default: not supported
+    return 0; // Default: not supported
   }
 
   /// Try to collect results from a previously submitted async batch.
   /// @param handle Handle returned by SubmitUnifiedBatchAsync
   /// @param outputs Output vector to populate if ready
-  /// @return true if outputs were collected, false if not ready or handle invalid
+  /// @return true if outputs were collected, false if not ready or handle
+  /// invalid
   virtual bool
   TryCollectUnifiedBatchAsync(UnifiedBatchHandle handle,
                               std::vector<UnifiedBatchOutput> *outputs) {
-    return false;  // Default: not supported
+    return false; // Default: not supported
   }
 
   // ========================================================================
   // Metadata and Diagnostics
   // ========================================================================
 
-  /// Human-readable name of this backend (e.g., "llama_cpp_cpu", "native_cuda").
+  /// Human-readable name of this backend (e.g., "llama_cpp_cpu",
+  /// "native_cuda").
   virtual std::string Name() const = 0;
 
   /// Whether this backend is a fallback (degraded mode).
-  virtual bool IsFallback() const {
-    return false;
-  }
+  virtual bool IsFallback() const { return false; }
 
   /// Human-readable reason for fallback status.
   virtual const std::string &FallbackReason() const {

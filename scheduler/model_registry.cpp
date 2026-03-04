@@ -1,4 +1,5 @@
 #include "scheduler/model_registry.h"
+#include "model/model_format.h"
 #include "server/logging/logger.h"
 
 #include <yaml-cpp/yaml.h>
@@ -91,6 +92,18 @@ bool ModelRegistry::ParseYaml(const std::string &yaml_text,
         e.id = node["id"].as<std::string>();
       if (node["backend"])
         e.backend = node["backend"].as<std::string>();
+      if (node["format"]) {
+        const auto requested_format = node["format"].as<std::string>();
+        const auto normalized_format = NormalizeModelFormat(requested_format);
+        if (!normalized_format.empty()) {
+          e.format = normalized_format;
+        } else {
+          log::Warn("model_registry",
+                    "invalid model format in registry entry; defaulting to "
+                    "auto",
+                    requested_format);
+        }
+      }
       if (e.path.empty()) {
         log::Warn("model_registry", "skipping registry entry with no path");
         continue;
@@ -138,7 +151,8 @@ int ModelRegistry::ApplyEntries(const std::vector<RegistryEntry> &entries) {
     if (path_to_id_.count(path))
       continue; // already managed
 
-    auto assigned_id = router_->LoadModel(entry.path, entry.backend, entry.id);
+    auto assigned_id =
+        router_->LoadModel(entry.path, entry.backend, entry.id, entry.format);
     if (assigned_id.empty()) {
       log::Error("model_registry", "failed to load model path=" + entry.path);
       continue;

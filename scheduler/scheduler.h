@@ -8,8 +8,8 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "runtime/speculative/speculative_decoder.h"
 #include "scheduler/fairness_controller.h"
-#include "scheduler/model_selection.h"
 #include "scheduler/model_router.h"
+#include "scheduler/model_selection.h"
 #include "scheduler/request_batch.h"
 
 #include <atomic>
@@ -38,12 +38,13 @@ struct DisaggregatedConfig {
 class Scheduler {
 public:
   struct Config {
-    Config() : max_batch_size(4), max_batch_tokens(8192),
-               min_batch_size(1), batch_accumulation_ms(0) {}
+    Config()
+        : max_batch_size(4), max_batch_tokens(8192), min_batch_size(1),
+          batch_accumulation_ms(0) {}
     int max_batch_size;
     int max_batch_tokens;
-    int min_batch_size;              // Minimum batch to wait for
-    int batch_accumulation_ms;       // Max wait time (0 = no waiting)
+    int min_batch_size;        // Minimum batch to wait for
+    int batch_accumulation_ms; // Max wait time (0 = no waiting)
   };
 
   explicit Scheduler(
@@ -54,9 +55,8 @@ public:
       const FairnessConfig &fairness_config = {},
       const DisaggregatedConfig &disagg_config = {},
       const ModelSelectionOptions &model_selection_options =
-          ModelSelectionOptions{
-              /*allow_capability_fallback_for_default=*/true,
-              /*require_ready_backend=*/true},
+          ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,
+                                /*require_ready_backend=*/true},
       Config config = Config());
   ~Scheduler();
 

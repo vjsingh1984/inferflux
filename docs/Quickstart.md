@@ -44,6 +44,7 @@ Navigate to `http://localhost:8080/ui` for the litehtml-based WebUI (chat playgr
 - `./build/inferctl completion --prompt "Hello" --model llama3`
 - `./build/inferctl chat --message "user:Who are you?" --interactive`
 - `./build/inferctl status`
+- `./build/inferctl models --json --api-key dev-key-123` (machine-friendly OpenAI-style `/v1/models` payload)
 - `./build/inferctl admin models --list --api-key dev-key-123`
 - `./build/inferctl admin models --load ~/.inferflux/models/<repo>/<file.gguf> --id local --default --api-key dev-key-123` (verifies the admin flow the WebUI uses)
 

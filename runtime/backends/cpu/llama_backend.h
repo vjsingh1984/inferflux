@@ -166,12 +166,12 @@ public:
   // later collection through TryCollectUnifiedBatchAsync().
 #ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
   bool SupportsAsyncUnifiedBatch() const override;
-  UnifiedBatchHandle
-  SubmitUnifiedBatchAsync(const std::vector<UnifiedBatchInput> &inputs,
-                          UnifiedBatchLane lane = UnifiedBatchLane::kAuto) override;
-  bool
-  TryCollectUnifiedBatchAsync(UnifiedBatchHandle handle,
-                              std::vector<UnifiedBatchOutput> *outputs) override;
+  UnifiedBatchHandle SubmitUnifiedBatchAsync(
+      const std::vector<UnifiedBatchInput> &inputs,
+      UnifiedBatchLane lane = UnifiedBatchLane::kAuto) override;
+  bool TryCollectUnifiedBatchAsync(
+      UnifiedBatchHandle handle,
+      std::vector<UnifiedBatchOutput> *outputs) override;
   // Maximum number of tokens the backend can safely accept in one unified
   // batch step. Used by scheduler/executor-side chunking guards.
   int UnifiedBatchTokenCapacity() const override;

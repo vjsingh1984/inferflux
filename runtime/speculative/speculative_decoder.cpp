@@ -6,16 +6,15 @@
 
 namespace inferflux {
 
-SpeculativeDecoder::SpeculativeDecoder(SpeculativeConfig config,
-                                       std::shared_ptr<CPUDeviceContext> device,
-                                       SimpleTokenizer* tokenizer,
-                                       std::shared_ptr<LlamaCPUBackend> draft_backend)
-    : config_(std::move(config)),
-      device_(std::move(device)),
-      tokenizer_(tokenizer),
-      draft_backend_(std::move(draft_backend)) {}
+SpeculativeDecoder::SpeculativeDecoder(
+    SpeculativeConfig config, std::shared_ptr<CPUDeviceContext> device,
+    SimpleTokenizer *tokenizer, std::shared_ptr<LlamaCPUBackend> draft_backend)
+    : config_(std::move(config)), device_(std::move(device)),
+      tokenizer_(tokenizer), draft_backend_(std::move(draft_backend)) {}
 
-SpeculativeDraft SpeculativeDecoder::Draft(const std::vector<int>& prompt_tokens, int max_new_tokens) {
+SpeculativeDraft
+SpeculativeDecoder::Draft(const std::vector<int> &prompt_tokens,
+                          int max_new_tokens) {
   SpeculativeDraft draft;
   if (!config_.enabled || max_new_tokens <= 0) {
     return draft;
@@ -29,17 +28,21 @@ SpeculativeDraft SpeculativeDecoder::Draft(const std::vector<int>& prompt_tokens
 
   std::vector<int> new_tokens;
   if (draft_backend_ && draft_backend_->IsReady()) {
-    auto draft_text = draft_backend_->Generate(tokenizer_->Decode(prompt_tokens), max_new_tokens);
+    auto draft_text = draft_backend_->Generate(
+        tokenizer_->Decode(prompt_tokens), max_new_tokens);
     new_tokens = tokenizer_->Encode(draft_text);
   } else {
     auto greedy = device_->RunGreedyDecode(prompt);
     if (greedy.size() > prompt.size()) {
-      new_tokens.assign(greedy.begin() + static_cast<std::ptrdiff_t>(prompt.size()), greedy.end());
+      new_tokens.assign(greedy.begin() +
+                            static_cast<std::ptrdiff_t>(prompt.size()),
+                        greedy.end());
     } else {
       new_tokens = greedy;
     }
   }
-  if (max_new_tokens > 0 && static_cast<int>(new_tokens.size()) > max_new_tokens) {
+  if (max_new_tokens > 0 &&
+      static_cast<int>(new_tokens.size()) > max_new_tokens) {
     new_tokens.resize(max_new_tokens);
   }
 
@@ -53,7 +56,8 @@ SpeculativeDraft SpeculativeDecoder::Draft(const std::vector<int>& prompt_tokens
   while (cursor < new_tokens.size()) {
     SpeculativeChunk chunk;
     chunk.start = draft.completion_tokens.size();
-    for (int i = 0; i < chunk_size && cursor < new_tokens.size(); ++i, ++cursor) {
+    for (int i = 0; i < chunk_size && cursor < new_tokens.size();
+         ++i, ++cursor) {
       draft.completion_tokens.push_back(new_tokens[cursor]);
     }
     chunk.end = draft.completion_tokens.size();
@@ -66,10 +70,10 @@ SpeculativeDraft SpeculativeDecoder::Draft(const std::vector<int>& prompt_tokens
   return draft;
 }
 
-SpeculativeValidationResult SpeculativeDecoder::Validate(const std::vector<int>& prompt_tokens,
-                                                         const SpeculativeDraft& draft,
-                                                         int max_new_tokens,
-                                                         std::shared_ptr<LlamaCPUBackend> target_backend) {
+SpeculativeValidationResult
+SpeculativeDecoder::Validate(const std::vector<int> &prompt_tokens,
+                             const SpeculativeDraft &draft, int max_new_tokens,
+                             std::shared_ptr<LlamaCPUBackend> target_backend) {
   SpeculativeValidationResult result;
   result.metrics.total_chunks = draft.chunks.size();
   if (max_new_tokens <= 0) {
@@ -100,14 +104,15 @@ SpeculativeValidationResult SpeculativeDecoder::Validate(const std::vector<int>&
   std::size_t target_index = 0;
   int limit = max_new_tokens;
 
-  for (const auto& chunk : draft.chunks) {
+  for (const auto &chunk : draft.chunks) {
     if (static_cast<int>(result.completion_tokens.size()) >= limit) {
       break;
     }
     bool chunk_ok = true;
     std::vector<int> chunk_tokens;
     for (std::size_t idx = chunk.start; idx < chunk.end; ++idx) {
-      if (static_cast<int>(result.completion_tokens.size() + chunk_tokens.size()) >= limit) {
+      if (static_cast<int>(result.completion_tokens.size() +
+                           chunk_tokens.size()) >= limit) {
         chunk_ok = false;
         break;
       }
@@ -123,8 +128,8 @@ SpeculativeValidationResult SpeculativeDecoder::Validate(const std::vector<int>&
       break;
     }
     result.metrics.reused_tokens += chunk_tokens.size();
-    result.completion_tokens.insert(result.completion_tokens.end(), chunk_tokens.begin(),
-                                    chunk_tokens.end());
+    result.completion_tokens.insert(result.completion_tokens.end(),
+                                    chunk_tokens.begin(), chunk_tokens.end());
     if (chunk_ok && chunk_tokens.size() == (chunk.end - chunk.start)) {
       result.metrics.accepted_chunks++;
     } else {
@@ -149,4 +154,4 @@ void SpeculativeDecoder::ClearValidationOverride() {
   validation_override_ = nullptr;
 }
 
-}  // namespace inferflux
+} // namespace inferflux

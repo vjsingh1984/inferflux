@@ -46,8 +46,12 @@ add_library(inferflux_core
   runtime/backends/cuda/native_cuda_executor.h
   runtime/backends/cuda/native_cuda_backend.cpp
   runtime/backends/cuda/native_cuda_backend.h
+  runtime/backends/cuda/native/safetensors_parser.cpp
+  runtime/backends/cuda/native/safetensors_parser.h
   runtime/backends/cuda/native_kernel_executor.cpp
   runtime/backends/cuda/native_kernel_executor.h
+  runtime/backends/cuda/native/native_tokenizer.cpp
+  runtime/backends/cuda/native/native_tokenizer.h
   runtime/backends/backend_capabilities.cpp
   runtime/backends/backend_capabilities.h
   runtime/backends/common/backend_types.h
@@ -131,14 +135,43 @@ find_package(CUDAToolkit QUIET)
 
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   message(STATUS "CUDA toolkit found: enabling CUDA build path")
+  enable_language(CUDA)
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90")
+  endif()
   set(LLAMA_CUDA ON CACHE BOOL "" FORCE)
   target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_CUDA=1)
   target_link_libraries(inferflux_core PUBLIC CUDA::cudart)
 
-  # Note: Native CUDA kernels (.cu files) require CUDA language to be enabled
-  # For now, we build the NativeKernelExecutor without custom kernels
-  # The executor will fall back to llama.cpp's CUDA backend for benchmarking
-  message(STATUS "Native CUDA backend infrastructure enabled (uses llama.cpp kernels)")
+  # Native CUDA inference kernels (no llama.cpp dependency)
+  add_library(inferflux_cuda_kernels STATIC
+    runtime/backends/cuda/native/cuda_kernels.cu
+    runtime/backends/cuda/native/kv_cache_gpu.cu
+    runtime/backends/cuda/native/gpu_sampler.cu
+    runtime/backends/cuda/kernels/flash_attention.cu
+  )
+  set_target_properties(inferflux_cuda_kernels PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(inferflux_cuda_kernels PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/external
+  )
+  target_link_libraries(inferflux_cuda_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::curand CUDA::nvToolsExt)
+
+  # Add native CUDA C++ sources to inferflux_core
+  target_sources(inferflux_core PRIVATE
+    runtime/backends/cuda/native/cublas_gemm.cpp
+    runtime/backends/cuda/native/weight_map.cpp
+    runtime/backends/cuda/native/model_forward_factory.cpp
+    runtime/backends/cuda/native/transformer_forward.cu
+  )
+  target_link_libraries(inferflux_core PUBLIC inferflux_cuda_kernels CUDA::cublas CUDA::nvToolsExt)
+  set_target_properties(inferflux_core PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  target_compile_definitions(inferflux_core PUBLIC INFERFLUX_NATIVE_KERNELS_READY=1)
+  message(STATUS "Native CUDA kernels enabled (cuBLAS + custom kernels)")
 
 else()
   if(ENABLE_CUDA)
@@ -393,6 +426,11 @@ add_executable(inferflux_tests
   tests/unit/test_backend_types.cpp
   tests/unit/test_batch_analyzer.cpp
   tests/unit/test_backend_interface.cpp
+  tests/unit/test_native_forward.cpp
+  tests/unit/test_dtype_traits.cpp
+  tests/unit/test_gpu_kv_cache.cpp
+  tests/unit/test_gpu_sampler.cpp
+  tests/unit/test_native_batching.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -440,8 +478,22 @@ add_test(NAME ModelFormatTests COMMAND inferflux_tests "[model_format]")
 set_tests_properties(ModelFormatTests PROPERTIES LABELS model_format)
 add_test(NAME ModelPathTests COMMAND inferflux_tests "[model_paths]")
 set_tests_properties(ModelPathTests PROPERTIES LABELS model_paths)
+add_test(NAME ModelIdentityTests COMMAND inferflux_tests "[model_identity]")
+set_tests_properties(ModelIdentityTests PROPERTIES LABELS model_identity)
+add_test(NAME EmbeddingsRoutingTests COMMAND inferflux_tests "[embeddings_routing]")
+set_tests_properties(EmbeddingsRoutingTests PROPERTIES LABELS embeddings_routing)
 add_test(NAME StopSequenceTests COMMAND inferflux_tests "[stop_sequences]")
 set_tests_properties(StopSequenceTests PROPERTIES LABELS stop_sequences)
+add_test(NAME NativeForwardTests COMMAND inferflux_tests "[native_forward]")
+set_tests_properties(NativeForwardTests PROPERTIES LABELS native_forward)
+add_test(NAME DtypeTraitsTests COMMAND inferflux_tests "[dtype_traits]")
+set_tests_properties(DtypeTraitsTests PROPERTIES LABELS dtype_traits)
+add_test(NAME GpuKvCacheTests COMMAND inferflux_tests "[gpu_kv_cache]")
+set_tests_properties(GpuKvCacheTests PROPERTIES LABELS gpu_kv_cache)
+add_test(NAME GpuSamplerTests COMMAND inferflux_tests "[gpu_sampler]")
+set_tests_properties(GpuSamplerTests PROPERTIES LABELS gpu_sampler)
+add_test(NAME NativeBatchTests COMMAND inferflux_tests "[native_batch]")
+set_tests_properties(NativeBatchTests PROPERTIES LABELS native_batch)
 if(ENABLE_MLX)
   add_test(NAME MlxLoaderTests COMMAND inferflux_tests "[mlx_loader]")
   set_tests_properties(MlxLoaderTests PROPERTIES LABELS mlx_loader)
@@ -578,6 +630,107 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME StubIntegration
            COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py)
   set_tests_properties(StubIntegration PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60
+    ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
+
+  # Focused CLI contract gate: script-facing model-list output modes +
+  # auth failure semantics.
+  add_test(
+    NAME IntegrationCLIModelListContract
+    COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
+            StubIntegrationTests.test_inferctl_models_json
+            StubIntegrationTests.test_inferctl_models_default_output
+            StubIntegrationTests.test_inferctl_admin_models_list_json
+            StubIntegrationTests.test_inferctl_models_json_auth_failure
+            StubIntegrationTests.test_inferctl_admin_models_list_json_auth_failure)
+  set_tests_properties(IntegrationCLIModelListContract PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60
+    ENVIRONMENT
+      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${CMAKE_BINARY_DIR}/inferctl")
+
+  add_test(
+    NAME IntegrationEmbeddingsRoutingContract
+    COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
+            StubIntegrationTests.test_embeddings_requires_input
+            StubIntegrationTests.test_embeddings_backend_unavailable_default_model
+            StubIntegrationTests.test_embeddings_explicit_model_not_found
+            StubIntegrationTests.test_completion_explicit_model_not_found)
+  set_tests_properties(IntegrationEmbeddingsRoutingContract PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60
+    ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
+
+  add_test(
+    NAME IntegrationModelIdentityContract
+    COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
+            StubIntegrationTests.test_models_get_by_id_not_found
+            StubIntegrationTests.test_admin_models_load_requires_path
+            StubIntegrationTests.test_admin_models_unload_requires_id
+            StubIntegrationTests.test_admin_models_unload_not_found
+            StubIntegrationTests.test_admin_models_set_default_requires_id
+            StubIntegrationTests.test_admin_models_set_default_not_found
+            StubIntegrationTests.test_inferctl_models_id_not_found_json
+            StubIntegrationTests.test_inferctl_models_id_not_found_default_output
+            StubIntegrationTests.test_inferctl_admin_models_unload_not_found
+            StubIntegrationTests.test_inferctl_admin_models_set_default_not_found)
+  set_tests_properties(IntegrationModelIdentityContract PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60
+    ENVIRONMENT
+      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${CMAKE_BINARY_DIR}/inferctl")
+
+  # Focused CLI contract gate: strict fail-fast argument semantics for
+  # automation-facing admin commands.
+  add_test(
+    NAME IntegrationCLIAdminArgContract
+    COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
+            StubIntegrationTests.test_inferctl_models_id_requires_value
+            StubIntegrationTests.test_inferctl_admin_models_load_requires_value
+            StubIntegrationTests.test_inferctl_admin_models_unload_requires_value
+            StubIntegrationTests.test_inferctl_admin_models_set_default_requires_value
+            StubIntegrationTests.test_inferctl_admin_models_rejects_multiple_operations
+            StubIntegrationTests.test_inferctl_admin_models_default_requires_load
+            StubIntegrationTests.test_inferctl_admin_cache_rejects_multiple_operations
+            StubIntegrationTests.test_inferctl_admin_cache_tokens_requires_warm
+            StubIntegrationTests.test_inferctl_admin_cache_warm_requires_tokens
+            StubIntegrationTests.test_inferctl_admin_cache_warm_requires_completion
+            StubIntegrationTests.test_inferctl_admin_cache_completion_tokens_requires_integer
+            StubIntegrationTests.test_inferctl_admin_cache_status_auth_failure
+            StubIntegrationTests.test_inferctl_admin_api_keys_rejects_multiple_operations
+            StubIntegrationTests.test_inferctl_admin_api_keys_scopes_requires_add
+            StubIntegrationTests.test_inferctl_admin_api_keys_add_requires_scopes
+            StubIntegrationTests.test_inferctl_admin_api_keys_add_requires_value
+            StubIntegrationTests.test_inferctl_admin_api_keys_remove_requires_value
+            StubIntegrationTests.test_inferctl_admin_api_keys_list_auth_failure
+            StubIntegrationTests.test_inferctl_admin_guardrails_rejects_multiple_operations
+            StubIntegrationTests.test_inferctl_admin_guardrails_set_requires_value
+            StubIntegrationTests.test_inferctl_admin_guardrails_list_auth_failure
+            StubIntegrationTests.test_inferctl_admin_rate_limit_rejects_multiple_operations
+            StubIntegrationTests.test_inferctl_admin_rate_limit_set_requires_value
+            StubIntegrationTests.test_inferctl_admin_rate_limit_set_requires_integer
+            StubIntegrationTests.test_inferctl_admin_rate_limit_get_auth_failure
+            StubIntegrationTests.test_inferctl_admin_routing_rejects_multiple_operations
+            StubIntegrationTests.test_inferctl_admin_routing_set_requires_fields
+            StubIntegrationTests.test_inferctl_admin_routing_allow_default_requires_set
+            StubIntegrationTests.test_inferctl_admin_routing_allow_default_requires_value
+            StubIntegrationTests.test_inferctl_admin_routing_allow_default_requires_boolean
+            StubIntegrationTests.test_inferctl_admin_routing_require_ready_requires_boolean
+            StubIntegrationTests.test_inferctl_admin_routing_fallback_scope_requires_value
+            StubIntegrationTests.test_inferctl_admin_routing_fallback_scope_validates_value
+            StubIntegrationTests.test_inferctl_admin_routing_get_auth_failure
+            StubIntegrationTests.test_inferctl_admin_routing_get)
+  set_tests_properties(IntegrationCLIAdminArgContract PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60
+    ENVIRONMENT
+      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${CMAKE_BINARY_DIR}/inferctl")
+
+  # Native CUDA backend metrics contract (stub-mode: verifies metric names + format).
+  add_test(NAME IntegrationNativeMetrics
+           COMMAND ${Python3_EXECUTABLE} tests/integration/native_metrics_test.py)
+  set_tests_properties(IntegrationNativeMetrics PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60
     ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")

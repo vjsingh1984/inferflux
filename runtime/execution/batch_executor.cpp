@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 using json = nlohmann::json;
@@ -56,6 +57,23 @@ private:
   LlamaCPUBackend *backend_{nullptr};
   bool active_{false};
 };
+
+bool WaitForUnifiedBatchAsync(
+    LlamaCPUBackend *backend, LlamaCPUBackend::UnifiedBatchHandle handle,
+    std::vector<LlamaCPUBackend::UnifiedBatchOutput> *outputs,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+  if (!backend || !outputs || handle == 0) {
+    return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (backend->TryCollectUnifiedBatchAsync(handle, outputs)) {
+      return true;
+    }
+    std::this_thread::yield();
+  }
+  return backend->TryCollectUnifiedBatchAsync(handle, outputs);
+}
 
 } // namespace
 
@@ -682,6 +700,14 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
       }
     } else if (req->n_past == 0 && !req->bpe_prompt_tokens.empty()) {
       states[i].in_prefill = true;
+    } else if (req->n_past > 0 && !req->bpe_prompt_tokens.empty() &&
+               req->prefill_offset > 0 &&
+               req->prefill_offset <
+                   static_cast<int>(req->bpe_prompt_tokens.size())) {
+      // Deferred scheduler prefill path: prefill_offset may already skip a
+      // copied KV prefix. Continue unified prefill from that offset.
+      req->n_past = req->prefill_offset;
+      states[i].in_prefill = true;
     } else {
       states[i].active = false;
       out.completion = "[batch state error]";
@@ -701,6 +727,36 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     std::vector<LlamaCPUBackend::UnifiedBatchInput> batch_inputs;
     std::vector<std::size_t> active_idx;
 
+    int active_prefill_reqs = 0;
+    int active_decode_reqs = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (!states[i].active) {
+        continue;
+      }
+      auto *req = eligible[i];
+      if (req->cancellation_flag && req->cancellation_flag->load()) {
+        continue;
+      }
+      if (states[i].in_prefill) {
+        active_prefill_reqs++;
+      } else if (states[i].tokens_generated < states[i].decode_limit) {
+        active_decode_reqs++;
+      }
+    }
+
+    const int backend_step_token_cap =
+        std::max(1, backend->UnifiedBatchTokenCapacity());
+    const int prefill_token_budget =
+        std::max(1, backend_step_token_cap - active_decode_reqs);
+    int prefill_chunk_cap = kMaxPrefillChunkSize;
+    if (active_prefill_reqs > 0) {
+      // Keep each mixed-step submission under backend unified-batch capacity
+      // while allowing chunked prefill to remain in flight across steps.
+      prefill_chunk_cap =
+          std::max(1, std::min(kMaxPrefillChunkSize,
+                               prefill_token_budget / active_prefill_reqs));
+    }
+
     for (std::size_t i = 0; i < n; ++i) {
       if (!states[i].active)
         continue;
@@ -714,7 +770,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
         // Slice the next chunk of the prompt (§P1d).
         int remaining = static_cast<int>(req->bpe_prompt_tokens.size()) -
                         req->prefill_offset;
-        int chunk_size = std::min(remaining, kMaxPrefillChunkSize);
+        int chunk_size = std::min(remaining, prefill_chunk_cap);
         if (chunk_size <= 0) {
           states[i].in_prefill = false; // Safety
           continue;
@@ -746,8 +802,81 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     if (active_idx.empty())
       break;
 
-    auto step = backend->ExecuteUnifiedBatch(batch_inputs);
-    if (step.empty()) {
+    std::vector<LlamaCPUBackend::UnifiedBatchOutput> step;
+    bool step_ok = true;
+    if (backend->SupportsAsyncUnifiedBatch()) {
+      std::vector<LlamaCPUBackend::UnifiedBatchInput> decode_inputs;
+      std::vector<LlamaCPUBackend::UnifiedBatchInput> prefill_inputs;
+      std::vector<std::size_t> decode_positions;
+      std::vector<std::size_t> prefill_positions;
+      decode_inputs.reserve(batch_inputs.size());
+      prefill_inputs.reserve(batch_inputs.size());
+      decode_positions.reserve(batch_inputs.size());
+      prefill_positions.reserve(batch_inputs.size());
+
+      for (std::size_t j = 0; j < batch_inputs.size(); ++j) {
+        std::size_t req_idx = active_idx[j];
+        if (states[req_idx].in_prefill) {
+          prefill_positions.push_back(j);
+          prefill_inputs.push_back(batch_inputs[j]);
+        } else {
+          decode_positions.push_back(j);
+          decode_inputs.push_back(batch_inputs[j]);
+        }
+      }
+
+      step.resize(batch_inputs.size());
+      LlamaCPUBackend::UnifiedBatchHandle decode_handle = 0;
+      LlamaCPUBackend::UnifiedBatchHandle prefill_handle = 0;
+
+      if (!decode_inputs.empty()) {
+        decode_handle = backend->SubmitUnifiedBatchAsync(
+            decode_inputs, LlamaCPUBackend::UnifiedBatchLane::kDecode);
+        if (decode_handle == 0) {
+          step_ok = false;
+        }
+      }
+      if (step_ok && !prefill_inputs.empty()) {
+        // Submit both lanes before waiting so async backends can overlap
+        // decode/pre-fill execution in the same scheduler step.
+        prefill_handle = backend->SubmitUnifiedBatchAsync(
+            prefill_inputs, LlamaCPUBackend::UnifiedBatchLane::kPrefill);
+        if (prefill_handle == 0) {
+          step_ok = false;
+        }
+      }
+
+      if (decode_handle != 0) {
+        std::vector<LlamaCPUBackend::UnifiedBatchOutput> decode_outputs;
+        if (!WaitForUnifiedBatchAsync(backend.get(), decode_handle,
+                                      &decode_outputs) ||
+            decode_outputs.size() != decode_positions.size()) {
+          step_ok = false;
+        } else {
+          for (std::size_t i = 0; i < decode_positions.size(); ++i) {
+            step[decode_positions[i]] = decode_outputs[i];
+          }
+        }
+      }
+
+      if (prefill_handle != 0) {
+        std::vector<LlamaCPUBackend::UnifiedBatchOutput> prefill_outputs;
+        if (!WaitForUnifiedBatchAsync(backend.get(), prefill_handle,
+                                      &prefill_outputs) ||
+            prefill_outputs.size() != prefill_positions.size()) {
+          step_ok = false;
+        } else {
+          for (std::size_t i = 0; i < prefill_positions.size(); ++i) {
+            step[prefill_positions[i]] = prefill_outputs[i];
+          }
+        }
+      }
+    } else {
+      step = backend->ExecuteUnifiedBatch(batch_inputs);
+      step_ok = !step.empty();
+    }
+
+    if (!step_ok || step.empty()) {
       // Backend returned nothing for active inputs — fail them to avoid loop.
       for (auto idx : active_idx)
         states[idx].active = false;
@@ -898,6 +1027,33 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     return;
 
   const int kMaxPrefillChunkSize = 512;
+  int active_prefill_reqs = 0;
+  int active_decode_reqs = 0;
+  for (auto *req : batch.requests) {
+    if (!req->exec_active || req->phase == RequestPhase::kFinished ||
+        req->phase == RequestPhase::kAborted) {
+      continue;
+    }
+    if (req->cancellation_flag && req->cancellation_flag->load()) {
+      continue;
+    }
+    if (req->exec_in_prefill) {
+      active_prefill_reqs++;
+    } else if (req->exec_tokens_generated < req->exec_decode_limit) {
+      active_decode_reqs++;
+    }
+  }
+  const int backend_step_token_cap =
+      std::max(1, backend->UnifiedBatchTokenCapacity());
+  const int prefill_token_budget =
+      std::max(1, backend_step_token_cap - active_decode_reqs);
+  int prefill_chunk_cap = kMaxPrefillChunkSize;
+  if (active_prefill_reqs > 0) {
+    prefill_chunk_cap =
+        std::max(1, std::min(kMaxPrefillChunkSize,
+                             prefill_token_budget / active_prefill_reqs));
+  }
+
   std::vector<LlamaCPUBackend::UnifiedBatchInput> batch_inputs;
   std::vector<InferenceRequest *> active_reqs;
 
@@ -916,7 +1072,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     if (req->exec_in_prefill) {
       int remaining =
           static_cast<int>(req->bpe_prompt_tokens.size()) - req->prefill_offset;
-      int chunk_size = std::min(remaining, kMaxPrefillChunkSize);
+      int chunk_size = std::min(remaining, prefill_chunk_cap);
       if (chunk_size <= 0) {
         req->exec_in_prefill = false;
         continue;
@@ -946,7 +1102,79 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     return;
   }
 
-  auto step_outputs = backend->ExecuteUnifiedBatch(batch_inputs);
+  std::vector<LlamaCPUBackend::UnifiedBatchOutput> step_outputs;
+  if (backend->SupportsAsyncUnifiedBatch()) {
+    std::vector<LlamaCPUBackend::UnifiedBatchInput> decode_inputs;
+    std::vector<LlamaCPUBackend::UnifiedBatchInput> prefill_inputs;
+    std::vector<std::size_t> decode_positions;
+    std::vector<std::size_t> prefill_positions;
+    decode_inputs.reserve(batch_inputs.size());
+    prefill_inputs.reserve(batch_inputs.size());
+    decode_positions.reserve(batch_inputs.size());
+    prefill_positions.reserve(batch_inputs.size());
+
+    for (std::size_t j = 0; j < batch_inputs.size(); ++j) {
+      if (active_reqs[j]->exec_in_prefill) {
+        prefill_positions.push_back(j);
+        prefill_inputs.push_back(batch_inputs[j]);
+      } else {
+        decode_positions.push_back(j);
+        decode_inputs.push_back(batch_inputs[j]);
+      }
+    }
+
+    step_outputs.resize(batch_inputs.size());
+    bool step_ok = true;
+    LlamaCPUBackend::UnifiedBatchHandle decode_handle = 0;
+    LlamaCPUBackend::UnifiedBatchHandle prefill_handle = 0;
+
+    if (!decode_inputs.empty()) {
+      decode_handle = backend->SubmitUnifiedBatchAsync(
+          decode_inputs, LlamaCPUBackend::UnifiedBatchLane::kDecode);
+      if (decode_handle == 0) {
+        step_ok = false;
+      }
+    }
+    if (step_ok && !prefill_inputs.empty()) {
+      prefill_handle = backend->SubmitUnifiedBatchAsync(
+          prefill_inputs, LlamaCPUBackend::UnifiedBatchLane::kPrefill);
+      if (prefill_handle == 0) {
+        step_ok = false;
+      }
+    }
+
+    if (decode_handle != 0) {
+      std::vector<LlamaCPUBackend::UnifiedBatchOutput> decode_outputs;
+      if (!WaitForUnifiedBatchAsync(backend.get(), decode_handle,
+                                    &decode_outputs) ||
+          decode_outputs.size() != decode_positions.size()) {
+        step_ok = false;
+      } else {
+        for (std::size_t i = 0; i < decode_positions.size(); ++i) {
+          step_outputs[decode_positions[i]] = decode_outputs[i];
+        }
+      }
+    }
+
+    if (prefill_handle != 0) {
+      std::vector<LlamaCPUBackend::UnifiedBatchOutput> prefill_outputs;
+      if (!WaitForUnifiedBatchAsync(backend.get(), prefill_handle,
+                                    &prefill_outputs) ||
+          prefill_outputs.size() != prefill_positions.size()) {
+        step_ok = false;
+      } else {
+        for (std::size_t i = 0; i < prefill_positions.size(); ++i) {
+          step_outputs[prefill_positions[i]] = prefill_outputs[i];
+        }
+      }
+    }
+
+    if (!step_ok) {
+      step_outputs.clear();
+    }
+  } else {
+    step_outputs = backend->ExecuteUnifiedBatch(batch_inputs);
+  }
   if (step_outputs.empty()) {
     for (auto *req : active_reqs)
       req->exec_active = false;

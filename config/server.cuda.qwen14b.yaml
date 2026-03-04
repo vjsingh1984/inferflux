@@ -1,0 +1,84 @@
+server:
+  host: 0.0.0.0
+  http_port: 8080
+  max_concurrent: 1024
+  enable_metrics: true
+  enable_tracing: false
+
+models:
+  - id: qwen2.5-coder-14b
+    path: models/qwen2.5-coder-14b-instruct-q4_k_m.gguf
+    format: gguf
+    backend: cuda
+    default: true
+
+runtime:
+  backend_priority: [cuda, cpu]
+  cuda:
+    enabled: true
+    attention:
+      kernel: auto # auto | fa2 | fa3 | standard
+    flash_attention:
+      enabled: true
+      tile_size: 128
+    phase_overlap:
+      enabled: true
+      min_prefill_tokens: 256
+      prefill_replica: false
+  backend_exposure:
+    prefer_native: true
+    allow_universal_fallback: true
+  capability_routing:
+    allow_default_fallback: true
+    require_ready_backend: true
+    fallback_scope: any_compatible
+  scheduler:
+    max_batch_size: 16  # Suitable for 14B model
+    max_batch_tokens: 16384
+    min_batch_size: 4
+    batch_accumulation_ms: 5
+  tensor_parallel: 1
+  mps_layers: 0
+  fairness:
+    enable_preemption: true
+    high_priority_threshold: 5
+    max_timeslice_tokens: 64
+  speculative_decoding:
+    enabled: false
+    draft_model: ""
+    max_prefill_tokens: 256
+    chunk_size: 4
+  nvme_offload:
+    path: ""
+    workers: 1
+    queue_depth: 256
+  paged_kv:
+    cpu_pages: 2048  # Reduced from 4096 for 14B model
+    eviction: lru
+
+adapters: []
+
+auth:
+  api_keys:
+    - key: dev-key-123
+      scopes: [generate, read, admin]
+    - key: user-key-123
+      scopes: [generate, read]
+  rate_limit_per_minute: 120
+  oidc_issuer: https://issuer.example.com
+  oidc_audience: inferflux
+
+guardrails:
+  blocklist:
+    - secret
+    - confidential
+  opa_endpoint: ""
+
+logging:
+  level: info
+  format: json
+  audit_log: logs/audit.log
+
+registry:
+  path: ""
+  poll_interval_ms: 5000

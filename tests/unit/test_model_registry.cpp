@@ -23,6 +23,7 @@ public:
     std::string path;
     std::string backend;
     std::string id;
+    std::string format;
   };
 
   std::vector<LoadCall> load_calls;
@@ -33,10 +34,11 @@ public:
   std::vector<ModelInfo> ListModels() const override { return {}; }
 
   std::string LoadModel(const std::string &path, const std::string &backend,
-                        const std::string &id) override {
+                        const std::string &id,
+                        const std::string &format) override {
     if (fail_load)
       return "";
-    load_calls.push_back({path, backend, id});
+    load_calls.push_back({path, backend, id, format});
     return id.empty() ? ("auto-id-" + std::to_string(next_id_suffix++)) : id;
   }
 
@@ -46,6 +48,7 @@ public:
   }
 
   ModelInfo *Resolve(const std::string &) override { return nullptr; }
+  ModelInfo *ResolveExact(const std::string &) override { return nullptr; }
   std::shared_ptr<LlamaCPUBackend> GetBackend(const std::string &) override {
     return nullptr;
   }
@@ -93,6 +96,7 @@ TEST_CASE("ModelRegistry loads models on startup", "[model_registry]") {
 models:
   - id: m1
     path: /models/a.gguf
+    format: gguf
     backend: cpu
   - id: m2
     path: /models/b.gguf
@@ -107,7 +111,36 @@ models:
   REQUIRE(router->load_calls[0].id == "m1");
   REQUIRE(router->load_calls[0].path == "/models/a.gguf");
   REQUIRE(router->load_calls[0].backend == "cpu");
+  REQUIRE(router->load_calls[0].format == "gguf");
   REQUIRE(router->load_calls[1].id == "m2");
+  REQUIRE(router->load_calls[1].format == "auto");
+}
+
+TEST_CASE("ModelRegistry normalizes format values and defaults invalid ones",
+          "[model_registry]") {
+  auto router = std::make_shared<StubRouter>();
+  ModelRegistry reg(router);
+
+  auto path = WriteTempRegistry(R"(
+models:
+  - id: sf
+    path: /models/sf
+    format: safe_tensors
+  - id: bad
+    path: /models/bad
+    format: unknown-format
+)");
+
+  int n = reg.LoadAndWatch(path, 99999);
+  reg.Stop();
+  fs::remove(path);
+
+  REQUIRE(n == 2);
+  REQUIRE(router->load_calls.size() == 2u);
+  REQUIRE(router->load_calls[1].id == "sf");
+  REQUIRE(router->load_calls[1].format == "safetensors");
+  REQUIRE(router->load_calls[0].id == "bad");
+  REQUIRE(router->load_calls[0].format == "auto");
 }
 
 TEST_CASE("ModelRegistry skips entry with no path", "[model_registry]") {

@@ -1,0 +1,95 @@
+#pragma once
+
+#include "runtime/backends/cuda/native/cublas_gemm.h"
+#include "runtime/backends/cuda/native/kv_cache_gpu.h"
+#include "runtime/backends/cuda/native/weight_map.h"
+#include "runtime/backends/cuda/native_kernel_executor.h"
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace inferflux {
+
+/**
+ * Abstract interface for model-type-specific forward passes.
+ *
+ * Implementations handle the full transformer forward pass from
+ * token IDs through logits computation.
+ */
+class ModelForward {
+public:
+  virtual ~ModelForward() = default;
+
+  /**
+   * Initialize scratch buffers and bind to model weights.
+   */
+  virtual bool Initialize(const SafetensorsLoader::ModelConfig &config,
+                          const WeightMap &weights, IKvCacheGpu *kv_cache,
+                          CublasGemm *gemm, cudaStream_t stream) = 0;
+
+  /**
+   * Run forward pass for a single sequence.
+   *
+   * @param token_ids   Token IDs to process
+   * @param n_past      Number of past KV cache entries
+   * @param sequence_id Sequence slot in KV cache
+   * @param d_logits    Output: [vocab_size] FP32 logits on device
+   * @return true on success
+   */
+  virtual bool Forward(const std::vector<int> &token_ids, int n_past,
+                       int sequence_id, float *d_logits) = 0;
+
+  /**
+   * Run batched forward pass for multiple decode sequences (1 token each).
+   *
+   * Batches compute-dominant GEMMs while keeping attention per-sequence.
+   * Default implementation falls back to sequential Forward() calls.
+   *
+   * @param token_ids    One token per sequence [batch_size]
+   * @param n_past       KV cache positions per sequence [batch_size]
+   * @param sequence_ids KV cache slot per sequence [batch_size]
+   * @param d_logits     Output: [batch_size * vocab_size] FP32 logits
+   * @param batch_size   Number of sequences
+   * @return true on success
+   */
+  virtual bool BatchForward(const std::vector<int> &token_ids,
+                            const std::vector<int> &n_past,
+                            const std::vector<int> &sequence_ids,
+                            float *d_logits, int batch_size) {
+    // Default: sequential Forward() calls (backward compat)
+    for (int i = 0; i < batch_size; ++i) {
+      std::vector<int> single_token = {token_ids[i]};
+      if (!Forward(single_token, n_past[i], sequence_ids[i],
+                   d_logits + i * VocabSize())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Set the CUDA stream for forward passes.
+   * Subclasses should propagate to cuBLAS handle and sampler.
+   */
+  virtual void SetStream(cudaStream_t /*stream*/) {}
+
+  /**
+   * Return the vocab size for offset calculations in batched forward.
+   */
+  virtual int VocabSize() const = 0;
+
+  /**
+   * Free scratch buffers.
+   */
+  virtual void FreeScratchBuffers() = 0;
+
+  /**
+   * Model type name for logging.
+   */
+  virtual std::string ModelType() const = 0;
+};
+
+} // namespace inferflux

@@ -8,6 +8,7 @@ server.log
 *.gguf
 .env.local
 config/policy_store.conf
+config/policy_store.conf.bak
 blogs/
 
 # MLX external dependencies — fetched by CMake FetchContent or cloned manually;

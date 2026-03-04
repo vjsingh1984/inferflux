@@ -7,13 +7,12 @@
 namespace inferflux {
 
 class StructuredOutputAdapter {
- public:
-  static bool BuildConstraint(const std::string& type,
-                              const std::string& schema,
-                              const std::string& grammar,
-                              const std::string& root,
-                              StructuredConstraint* out,
-                              std::string* error);
+public:
+  static bool BuildConstraint(const std::string &type,
+                              const std::string &schema,
+                              const std::string &grammar,
+                              const std::string &root,
+                              StructuredConstraint *out, std::string *error);
 };
 
-}  // namespace inferflux
+} // namespace inferflux

@@ -8,15 +8,15 @@
 namespace inferflux {
 
 class RateLimiter {
- public:
+public:
   explicit RateLimiter(int tokens_per_minute);
 
-  bool Allow(const std::string& key);
+  bool Allow(const std::string &key);
   bool Enabled() const;
   void UpdateLimit(int tokens_per_minute);
   int CurrentLimit() const;
 
- private:
+private:
   struct Entry {
     double tokens{0.0};
     std::chrono::steady_clock::time_point last;
@@ -28,4 +28,4 @@ class RateLimiter {
   mutable std::mutex mutex_;
 };
 
-}  // namespace inferflux
+} // namespace inferflux

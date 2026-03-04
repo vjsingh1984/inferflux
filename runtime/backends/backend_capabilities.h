@@ -38,12 +38,10 @@ struct CapabilityCheckResult {
 // Shared constructors for request capability requirements.
 // These helpers keep endpoint-level routing policy in sync across scheduler,
 // HTTP handlers, and future admission paths.
-BackendFeatureRequirements
-BuildGenerationFeatureRequirements(bool needs_streaming, bool needs_logprobs,
-                                   bool needs_structured_output,
-                                   bool needs_vision,
-                                   bool needs_speculative_decoding = false,
-                                   bool needs_fairness_preemption = false);
+BackendFeatureRequirements BuildGenerationFeatureRequirements(
+    bool needs_streaming, bool needs_logprobs, bool needs_structured_output,
+    bool needs_vision, bool needs_speculative_decoding = false,
+    bool needs_fairness_preemption = false);
 BackendFeatureRequirements BuildEmbeddingFeatureRequirements();
 
 CapabilityCheckResult

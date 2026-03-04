@@ -95,6 +95,42 @@ jobs:
         run: ctest --test-dir build --output-on-failure --timeout 90
 
       # ------------------------------------------------------------------
+      # Focused assertion: inferctl model-list output modes
+      # Keep these checks explicit in logs to prevent accidental regressions
+      # in script-facing JSON output or default table formatting behavior.
+      # ------------------------------------------------------------------
+      - name: Assert inferctl model-list output modes
+        run: ctest --test-dir build -R IntegrationCLIModelListContract --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
+      # Focused assertion: embeddings capability-routing contract
+      # Validates default fallback policy, explicit model pinning semantics,
+      # and backend-unavailable handling across unit + integration tests.
+      # ------------------------------------------------------------------
+      - name: Assert embeddings routing contract
+        run: |
+          ctest --test-dir build -R EmbeddingsRoutingTests --output-on-failure --timeout 90 -V
+          ctest --test-dir build -R IntegrationEmbeddingsRoutingContract --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
+      # Focused assertion: model identity contract
+      # Ensures strict explicit-ID semantics across /v1/models/{id} and
+      # admin model lifecycle operations (load/unload/set-default).
+      # ------------------------------------------------------------------
+      - name: Assert model identity contract
+        run: |
+          ctest --test-dir build -R ModelIdentityTests --output-on-failure --timeout 90 -V
+          ctest --test-dir build -R IntegrationModelIdentityContract --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
+      # Focused assertion: inferctl admin argument contract
+      # Ensures fail-fast required values, operation exclusivity, and
+      # non-2xx exit semantics for automation-facing admin commands.
+      # ------------------------------------------------------------------
+      - name: Assert inferctl admin argument contract
+        run: ctest --test-dir build -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
       # SBOM — CycloneDX 1.5 JSON + SPDX 2.3 tag-value
       # ------------------------------------------------------------------
       - name: Generate SBOM
@@ -263,6 +299,121 @@ jobs:
         run: cmake --build build --target inferfluxd -j$(nproc)
 
   # ---------------------------------------------------------------------------
+  # CUDA throughput gate (self-hosted GPU)
+  # Runs only when explicitly enabled via repo variable:
+  #   INFERFLUX_ENABLE_CUDA_THROUGHPUT_GATE=true
+  #
+  # Required repo variables:
+  #   INFERFLUX_CUDA_MODEL_PATH      absolute model path on runner host
+  #
+  # Optional tuning variables:
+  #   INFERFLUX_TP_CONCURRENCY       default 8
+  #   INFERFLUX_TP_REQUESTS          default 96
+  #   INFERFLUX_TP_WARMUP            default 8
+  #   INFERFLUX_TP_MAX_TOKENS        default 64
+  #   INFERFLUX_TP_MIN_TOK_S         default 120.0
+  #   INFERFLUX_TP_MIN_SUCCESS_RATE  default 1.0
+  #   INFERFLUX_TP_MIN_OVERLAP_MS    default -1.0 (disabled)
+  #   INFERFLUX_TP_MAX_ATTN_FALLBACKS default -1.0 (disabled)
+  #   INFERFLUX_TP_ATTN_MODE         default auto
+  #   INFERFLUX_TP_EXPECT_ATTN       default "" (disabled)
+  #   INFERFLUX_TP_TARGET_PREFILL_TOKENS default 4096
+  # ---------------------------------------------------------------------------
+  cuda-throughput-gate:
+    name: CUDA throughput gate (self-hosted)
+    if: ${{ vars.INFERFLUX_ENABLE_CUDA_THROUGHPUT_GATE == 'true' }}
+    runs-on: [self-hosted, linux, x64, cuda]
+    timeout-minutes: 45
+    env:
+      INFERFLUX_TP_MODEL_PATH: ${{ vars.INFERFLUX_CUDA_MODEL_PATH }}
+      INFERFLUX_TP_CONCURRENCY: ${{ vars.INFERFLUX_TP_CONCURRENCY || '8' }}
+      INFERFLUX_TP_REQUESTS: ${{ vars.INFERFLUX_TP_REQUESTS || '96' }}
+      INFERFLUX_TP_WARMUP: ${{ vars.INFERFLUX_TP_WARMUP || '8' }}
+      INFERFLUX_TP_MAX_TOKENS: ${{ vars.INFERFLUX_TP_MAX_TOKENS || '64' }}
+      INFERFLUX_TP_MIN_TOK_S: ${{ vars.INFERFLUX_TP_MIN_TOK_S || '120.0' }}
+      INFERFLUX_TP_MIN_SUCCESS_RATE: ${{ vars.INFERFLUX_TP_MIN_SUCCESS_RATE || '1.0' }}
+      INFERFLUX_TP_MIN_OVERLAP_MS: ${{ vars.INFERFLUX_TP_MIN_OVERLAP_MS || '-1.0' }}
+      INFERFLUX_TP_MAX_ATTN_FALLBACKS: ${{ vars.INFERFLUX_TP_MAX_ATTN_FALLBACKS || '-1.0' }}
+      INFERFLUX_TP_ATTN_MODE: ${{ vars.INFERFLUX_TP_ATTN_MODE || 'auto' }}
+      INFERFLUX_TP_EXPECT_ATTN: ${{ vars.INFERFLUX_TP_EXPECT_ATTN || '' }}
+      INFERFLUX_TP_TARGET_PREFILL_TOKENS: ${{ vars.INFERFLUX_TP_TARGET_PREFILL_TOKENS || '4096' }}
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Verify toolchain
+        run: |
+          command -v cmake
+          command -v python3
+
+      - name: Configure (CUDA=ON)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_CUDA=ON \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
+            -DENABLE_MTMD=OFF \
+            -DENABLE_SBOM=OFF
+
+      - name: Build inferfluxd
+        run: cmake --build build --target inferfluxd -j$(nproc)
+
+      - name: Run CUDA throughput gate
+        run: |
+          set -euo pipefail
+          if [ -z "${INFERFLUX_TP_MODEL_PATH}" ]; then
+            echo "INFERFLUX_CUDA_MODEL_PATH repo variable is required for cuda-throughput-gate"
+            exit 1
+          fi
+
+          declare -a EXPECT_ATTN_ARGS=()
+          if [ -n "${INFERFLUX_TP_EXPECT_ATTN}" ]; then
+            EXPECT_ATTN_ARGS=(--expect-cuda-attention-kernel "${INFERFLUX_TP_EXPECT_ATTN}")
+          fi
+
+          ./scripts/run_throughput_gate.py \
+            --server-bin ./build/inferfluxd \
+            --config config/server.cuda.yaml \
+            --host 127.0.0.1 \
+            --port 18081 \
+            --endpoint /v1/completions \
+            --model tinyllama \
+            --backend cuda \
+            --concurrency "${INFERFLUX_TP_CONCURRENCY}" \
+            --requests "${INFERFLUX_TP_REQUESTS}" \
+            --warmup-requests "${INFERFLUX_TP_WARMUP}" \
+            --max-tokens "${INFERFLUX_TP_MAX_TOKENS}" \
+            --mixed-prompt-workload \
+            --target-total-prefill-tokens "${INFERFLUX_TP_TARGET_PREFILL_TOKENS}" \
+            --min-completion-tok-per-sec "${INFERFLUX_TP_MIN_TOK_S}" \
+            --min-success-rate "${INFERFLUX_TP_MIN_SUCCESS_RATE}" \
+            --require-metrics \
+            --require-cuda-lanes \
+            --require-cuda-overlap \
+            --min-cuda-overlap-duration-ms "${INFERFLUX_TP_MIN_OVERLAP_MS}" \
+            --max-cuda-attention-fallbacks "${INFERFLUX_TP_MAX_ATTN_FALLBACKS}" \
+            --server-log-path build/throughput_gate_server.log \
+            --server-env "INFERFLUX_CUDA_ATTENTION_KERNEL=${INFERFLUX_TP_ATTN_MODE}" \
+            --server-env "INFERFLUX_MODELS=id=tinyllama,path=${INFERFLUX_TP_MODEL_PATH},backend=cuda,default=true" \
+            "${EXPECT_ATTN_ARGS[@]}"
+
+      - name: Upload throughput gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-throughput-gate-logs-${{ github.sha }}
+          path: build/throughput_gate_server.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
   # Coverage — gcov/lcov instrumented Debug build, Codecov upload.
   # Runs unit + stub-integration test suite; uploads lcov.info to Codecov.
   # A 50 % line-coverage floor is enforced via .codecov.yml; missing tokens
@@ -310,6 +461,36 @@ jobs:
 
       - name: Build
         run: cmake --build build-cov -j$(nproc)
+
+      # ------------------------------------------------------------------
+      # Focused assertion: inferctl model-list output modes
+      # Keep these checks explicit in logs to prevent accidental regressions
+      # in script-facing JSON output or default table formatting behavior.
+      # ------------------------------------------------------------------
+      - name: Assert inferctl model-list output modes
+        run: ctest --test-dir build-cov -R IntegrationCLIModelListContract --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
+      # Focused assertion: embeddings capability-routing contract
+      # ------------------------------------------------------------------
+      - name: Assert embeddings routing contract
+        run: |
+          ctest --test-dir build-cov -R EmbeddingsRoutingTests --output-on-failure --timeout 90 -V
+          ctest --test-dir build-cov -R IntegrationEmbeddingsRoutingContract --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
+      # Focused assertion: model identity contract
+      # ------------------------------------------------------------------
+      - name: Assert model identity contract
+        run: |
+          ctest --test-dir build-cov -R ModelIdentityTests --output-on-failure --timeout 90 -V
+          ctest --test-dir build-cov -R IntegrationModelIdentityContract --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
+      # Focused assertion: inferctl admin argument contract
+      # ------------------------------------------------------------------
+      - name: Assert inferctl admin argument contract
+        run: ctest --test-dir build-cov -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
 
       # ------------------------------------------------------------------
       # Run tests + collect coverage in one CMake target

@@ -19,7 +19,8 @@ namespace inferflux {
 struct RegistryEntry {
   std::string id;   // Requested model ID (auto-derived from filename if empty).
   std::string path; // Path to weights file or directory.
-  std::string backend; // "cpu", "cuda", "mps", or "" for auto-detect.
+  std::string format{"auto"}; // auto|gguf|safetensors|hf
+  std::string backend;        // "cpu", "cuda", "mps", or "" for auto-detect.
 };
 
 // ── ModelRegistry ────────────────────────────────────────────────────────────
@@ -30,6 +31,7 @@ struct RegistryEntry {
 //   models:
 //     - id: llama3-8b
 //       path: /models/llama3-8b-q4.gguf
+//       format: gguf
 //       backend: cpu
 //     - path: /models/mistral-7b.gguf   # id derived from filename
 //

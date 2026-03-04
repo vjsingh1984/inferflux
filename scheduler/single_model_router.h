@@ -41,9 +41,11 @@ public:
   std::vector<ModelInfo> ListModels() const override;
   std::string LoadModel(const std::string &path,
                         const std::string &backend_hint = "",
-                        const std::string &requested_id = "") override;
+                        const std::string &requested_id = "",
+                        const std::string &model_format = "auto") override;
   bool UnloadModel(const std::string &id) override;
   ModelInfo *Resolve(const std::string &requested_model) override;
+  ModelInfo *ResolveExact(const std::string &model_id) override;
   std::shared_ptr<LlamaCPUBackend>
   GetBackend(const std::string &model_id) override;
   bool SetDefaultModel(const std::string &model_id) override;

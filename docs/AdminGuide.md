@@ -35,8 +35,15 @@
 registry.yaml ──poll──▶ ModelRegistry ──update──▶ Backend Manager ──▶ Scheduler slots
         ▲                      │                         │
         │                      └── emits events to logs & metrics
-        └── Git / Ops edits (id,path,backend,default)
+        └── Git / Ops edits (id,path,format,backend,default)
 ```
+
+`GET /v1/admin/models` now reports both `source_path` and
+`effective_load_path` so operators can verify when `hf://` or safetensors
+entries resolved to a concrete local GGUF artifact.
+Identity contract: unknown IDs consistently return `model_not_found` for
+`GET /v1/models/{id}`, `DELETE /v1/admin/models`, and
+`PUT /v1/admin/models/default`; missing admin IDs return `id is required`.
 
 ## Monitoring table
 
@@ -55,5 +62,6 @@ registry.yaml ──poll──▶ ModelRegistry ──update──▶ Backend Ma
 | Memory pressure | inspect paged KV metrics, adjust NVMe offload, shrink batch size |
 | Auth errors | confirm API-key scopes and OIDC tokens |
 | Model churn | use registry (CQ-8) to add/remove models without restart |
+| Admin policy write fails (`policy_persist_failed`) | verify `INFERFLUX_POLICY_STORE` path is writable, check filesystem permissions/space, and confirm backup file (`.bak`) integrity |
 
 Keep this guide handy for ops runbooks. For developer-centric workflows see `docs/DeveloperGuide.md`; for CLI usage see `docs/UserGuide.md`. ✅

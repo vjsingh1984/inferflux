@@ -26,8 +26,7 @@ struct LlamaBackendTraits {
 
 LlamaBackendTarget ParseLlamaBackendTarget(const std::string &hint);
 LlamaBackendTraits DescribeLlamaBackendTarget(LlamaBackendTarget target);
-LlamaBackendConfig
-TuneLlamaBackendConfig(LlamaBackendTarget target,
-                       const LlamaBackendConfig &base);
+LlamaBackendConfig TuneLlamaBackendConfig(LlamaBackendTarget target,
+                                          const LlamaBackendConfig &base);
 
 } // namespace inferflux

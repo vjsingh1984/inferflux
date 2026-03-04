@@ -13,10 +13,22 @@ model:
 models:
   - id: llama3-8b
     path: models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
+    format: auto
     backend: cpu
     default: true
 runtime:
   backend_priority: [cpu]
+  cuda:
+    enabled: false
+    attention:
+      kernel: auto # auto | fa3 | fa2 | standard
+    flash_attention:
+      enabled: false
+      tile_size: 128
+    phase_overlap:
+      enabled: false
+      min_prefill_tokens: 256
+      prefill_replica: false
   backend_exposure:
     prefer_native: true
     allow_universal_fallback: true
@@ -24,6 +36,9 @@ runtime:
     allow_default_fallback: true
     require_ready_backend: true
     fallback_scope: any_compatible # any_compatible | same_path_only
+  scheduler:
+    max_batch_size: 4
+    max_batch_tokens: 8192
   tensor_parallel: 1
   mps_layers: 0
   fairness:

@@ -67,6 +67,10 @@ void MetricsRegistry::RecordBatch(std::size_t request_count,
   }
 }
 
+void MetricsRegistry::RecordBatchTokenBudgetSkip() {
+  scheduler_batch_token_budget_skips_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void MetricsRegistry::RecordPrefixLookup(bool hit) {
   if (hit) {
     prefix_hits_.fetch_add(1, std::memory_order_relaxed);
@@ -265,6 +269,63 @@ void MetricsRegistry::SetFlashAttentionEnabled(bool enabled) {
   flash_attention_enabled_.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
+void MetricsRegistry::RecordFlashAttentionExecution(const std::string &kernel,
+                                                    double duration_ms,
+                                                    int prompt_tokens) {
+  // Record execution time histogram
+  flash_attention_exec_latency_.Record(duration_ms);
+
+  // Record request counter for the specific kernel
+  if (kernel == "fa2") {
+    flash_attention_requests_fa2_.fetch_add(1, std::memory_order_relaxed);
+  } else if (kernel == "fa3") {
+    flash_attention_requests_fa3_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    flash_attention_requests_standard_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::SetFlashAttentionMemoryMB(double memory_mb) {
+  flash_attention_memory_mb_.store(memory_mb, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordFlashAttentionRequest(const std::string &kernel) {
+  // This is called when a request starts processing with FlashAttention
+  // Separate from RecordFlashAttentionExecution which is called on completion
+  if (kernel == "fa2") {
+    flash_attention_requests_fa2_.fetch_add(1, std::memory_order_relaxed);
+  } else if (kernel == "fa3") {
+    flash_attention_requests_fa3_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    flash_attention_requests_standard_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::RecordRocmKernelSelection(const std::string &kernel) {
+  // Track which kernel is selected for ROCm backend
+  // This is called when the ROCm backend selects an attention kernel
+  if (kernel == "fa2") {
+    rocm_flash_attention_requests_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::RecordRocmFlashAttentionExecution(double duration_ms,
+                                                        int tokens) {
+  // Record ROCm FlashAttention execution time
+  // Reuse the FlashAttention histogram for ROCm
+  flash_attention_exec_latency_.Record(duration_ms);
+}
+
+void MetricsRegistry::SetRocmMemoryUsageMB(double memory_mb) {
+  rocm_memory_mb_.store(memory_mb, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordRocmDeviceProperties(int device_id,
+                                                 const std::string &arch) {
+  // Record ROCm device properties
+  rocm_device_arch_ = arch;
+}
+
 void MetricsRegistry::RecordKVTransfer(double transfer_ms) {
   kv_transfer_latency_.Record(transfer_ms);
 }
@@ -314,6 +375,168 @@ void MetricsRegistry::SetPrefillQueueDepth(int depth) {
 
 void MetricsRegistry::SetDecodeQueueDepth(int depth) {
   decode_queue_depth_.store(depth, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::SetSchedulerBatchLimits(int max_batch_size,
+                                              int max_batch_tokens) {
+  scheduler_batch_limit_size_.store(max_batch_size, std::memory_order_relaxed);
+  scheduler_batch_limit_tokens_.store(max_batch_tokens,
+                                      std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordCudaLaneSubmission(bool decode_lane) {
+  if (decode_lane) {
+    cuda_decode_lane_submissions_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    cuda_prefill_lane_submissions_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::RecordCudaLaneCompletion(bool decode_lane) {
+  if (decode_lane) {
+    cuda_decode_lane_completions_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    cuda_prefill_lane_completions_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::RecordCudaLaneExecutionStart(bool decode_lane) {
+  bool maybe_start_overlap = false;
+  if (decode_lane) {
+    cuda_decode_lane_inflight_.fetch_add(1, std::memory_order_relaxed);
+    if (cuda_prefill_lane_inflight_.load(std::memory_order_relaxed) > 0) {
+      cuda_lane_overlap_events_.fetch_add(1, std::memory_order_relaxed);
+      maybe_start_overlap = true;
+    }
+  } else {
+    cuda_prefill_lane_inflight_.fetch_add(1, std::memory_order_relaxed);
+    if (cuda_decode_lane_inflight_.load(std::memory_order_relaxed) > 0) {
+      cuda_lane_overlap_events_.fetch_add(1, std::memory_order_relaxed);
+      maybe_start_overlap = true;
+    }
+  }
+
+  if (maybe_start_overlap) {
+    std::lock_guard<std::mutex> lock(cuda_overlap_timing_mutex_);
+    if (!cuda_overlap_active_) {
+      cuda_overlap_active_ = true;
+      cuda_overlap_started_at_ = std::chrono::steady_clock::now();
+    }
+  }
+}
+
+void MetricsRegistry::RecordCudaLaneExecutionStop(bool decode_lane) {
+  if (decode_lane) {
+    const int previous =
+        cuda_decode_lane_inflight_.fetch_sub(1, std::memory_order_relaxed);
+    if (previous <= 0) {
+      cuda_decode_lane_inflight_.store(0, std::memory_order_relaxed);
+    }
+  } else {
+    const int previous =
+        cuda_prefill_lane_inflight_.fetch_sub(1, std::memory_order_relaxed);
+    if (previous <= 0) {
+      cuda_prefill_lane_inflight_.store(0, std::memory_order_relaxed);
+    }
+  }
+
+  if (cuda_decode_lane_inflight_.load(std::memory_order_relaxed) == 0 &&
+      cuda_prefill_lane_inflight_.load(std::memory_order_relaxed) == 0) {
+    std::lock_guard<std::mutex> lock(cuda_overlap_timing_mutex_);
+    if (cuda_overlap_active_) {
+      const auto elapsed_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - cuda_overlap_started_at_)
+              .count();
+      if (elapsed_us > 0) {
+        cuda_lane_overlap_duration_us_.fetch_add(
+            static_cast<uint64_t>(elapsed_us), std::memory_order_relaxed);
+      }
+      cuda_overlap_active_ = false;
+    }
+  }
+}
+
+void MetricsRegistry::RecordCudaLaneOverlap(double duration_ms) {
+  // Record an overlap event and its duration
+  cuda_lane_overlap_events_.fetch_add(1, std::memory_order_relaxed);
+  const auto duration_us = static_cast<uint64_t>(duration_ms * 1000.0);
+  if (duration_us > 0) {
+    cuda_lane_overlap_duration_us_.fetch_add(duration_us,
+                                             std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::SetCudaLaneQueueDepth(bool decode_lane, int depth) {
+  if (decode_lane) {
+    cuda_decode_lane_queue_depth_.store(depth, std::memory_order_relaxed);
+  } else {
+    cuda_prefill_lane_queue_depth_.store(depth, std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::RecordNativeForwardPass(bool is_decode, int batch_size,
+                                              double forward_ms) {
+  if (is_decode) {
+    native_forward_decode_total_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    native_forward_prefill_total_.fetch_add(1, std::memory_order_relaxed);
+  }
+  native_forward_batch_tokens_total_.fetch_add(batch_size,
+                                               std::memory_order_relaxed);
+  native_forward_latency_.Record(forward_ms);
+}
+
+void MetricsRegistry::RecordNativeSampling(int batch_size, double sampling_ms) {
+  (void)batch_size;
+  native_sampling_latency_.Record(sampling_ms);
+}
+
+void MetricsRegistry::RecordNativeBatchDecode(int batch_size, double total_ms) {
+  (void)batch_size;
+  (void)total_ms;
+  // Tracked via forward + sampling histograms; this is for future use.
+}
+
+void MetricsRegistry::SetNativeKvCacheOccupancy(int active_sequences,
+                                                int max_sequences) {
+  native_kv_active_sequences_.store(active_sequences,
+                                    std::memory_order_relaxed);
+  native_kv_max_sequences_.store(max_sequences, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::SetCudaAttentionKernel(const std::string &kernel) {
+  std::string normalized = kernel;
+  if (normalized != "fa3" && normalized != "fa2" && normalized != "standard") {
+    normalized = "standard";
+  }
+  std::lock_guard<std::mutex> lock(cuda_attention_kernel_mutex_);
+  cuda_attention_kernel_ = normalized;
+}
+
+void MetricsRegistry::RecordCudaAttentionKernelFallback(
+    const std::string &requested_kernel, const std::string &selected_kernel,
+    const std::string &reason) {
+  const std::string requested =
+      requested_kernel.empty() ? "auto" : requested_kernel;
+  const std::string selected =
+      selected_kernel.empty() ? "standard" : selected_kernel;
+  const std::string fallback_reason = reason.empty() ? "unspecified" : reason;
+  const std::string key = requested + "|" + selected + "|" + fallback_reason;
+  std::lock_guard<std::mutex> lock(cuda_attention_fallback_mutex_);
+  cuda_attention_fallback_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordCudaAttentionKernelSwitch(
+    const std::string &from_kernel, const std::string &to_kernel) {
+  const std::string from = from_kernel.empty() ? "unknown" : from_kernel;
+  const std::string to = to_kernel.empty() ? "unknown" : to_kernel;
+  if (from == to) {
+    return;
+  }
+  const std::string key = from + "|" + to;
+  std::lock_guard<std::mutex> lock(cuda_attention_switch_mutex_);
+  cuda_attention_switch_counts_[key] += 1;
 }
 
 MetricsRegistry::CacheMetrics MetricsRegistry::GetCacheMetrics() const {
@@ -391,6 +614,14 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_batch_size_max gauge\n";
   out << "inferflux_batch_size_max{backend=\"" << backend << "\"} "
       << max_batch_size_.load() << "\n";
+
+  out << "# HELP inferflux_scheduler_batch_token_budget_skips_total Requests "
+         "deferred because adding them would exceed the current batch token "
+         "budget\n";
+  out << "# TYPE inferflux_scheduler_batch_token_budget_skips_total counter\n";
+  out << "inferflux_scheduler_batch_token_budget_skips_total{backend=\""
+      << backend << "\"} " << scheduler_batch_token_budget_skips_.load()
+      << "\n";
 
   out << "# HELP inferflux_fairness_preemptions_total Scheduler swaps "
          "triggered by fairness\n";
@@ -817,6 +1048,40 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_flash_attention_enabled " << flash_attention_enabled_.load()
       << "\n";
 
+  out << "# HELP inferflux_flash_attention_requests_total Total requests "
+         "processed "
+         "by Flash Attention kernel type\n";
+  out << "# TYPE inferflux_flash_attention_requests_total counter\n";
+  out << "inferflux_flash_attention_requests_total{kernel=\"fa2\"} "
+      << flash_attention_requests_fa2_.load() << "\n";
+  out << "inferflux_flash_attention_requests_total{kernel=\"fa3\"} "
+      << flash_attention_requests_fa3_.load() << "\n";
+  out << "inferflux_flash_attention_requests_total{kernel=\"standard\"} "
+      << flash_attention_requests_standard_.load() << "\n";
+
+  out << "# HELP inferflux_flash_attention_memory_mb Flash Attention KV cache "
+         "memory usage in megabytes\n";
+  out << "# TYPE inferflux_flash_attention_memory_mb gauge\n";
+  out << "inferflux_flash_attention_memory_mb "
+      << flash_attention_memory_mb_.load() << "\n";
+
+  out << "# HELP inferflux_flash_attention_execution_ms Flash Attention kernel "
+         "execution time in milliseconds\n";
+  out << "# TYPE inferflux_flash_attention_execution_ms histogram\n";
+  for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
+    out << "inferflux_flash_attention_execution_ms_bucket{le=\"" << std::fixed
+        << std::setprecision(0) << LatencyHistogram::kBuckets[i] << "\"} "
+        << flash_attention_exec_latency_.counts[i].load() << "\n";
+  }
+  out << "inferflux_flash_attention_execution_ms_bucket{le=\"+Inf\"} "
+      << flash_attention_exec_latency_.counts[LatencyHistogram::kBuckets.size()]
+             .load()
+      << "\n";
+  out << "inferflux_flash_attention_execution_ms_sum "
+      << flash_attention_exec_latency_.sum_ms.load() << "\n";
+  out << "inferflux_flash_attention_execution_ms_count "
+      << flash_attention_exec_latency_.total.load() << "\n";
+
   // --- Gauges ---
   out << "# HELP inferflux_active_connections Current number of active HTTP "
          "connections\n";
@@ -838,6 +1103,189 @@ std::string MetricsRegistry::RenderPrometheus() const {
          "waiting in the decode pool\n";
   out << "# TYPE inferflux_decode_queue_depth gauge\n";
   out << "inferflux_decode_queue_depth " << decode_queue_depth_.load() << "\n";
+
+  out << "# HELP inferflux_scheduler_batch_limit_size Configured scheduler "
+         "max requests per batch\n";
+  out << "# TYPE inferflux_scheduler_batch_limit_size gauge\n";
+  out << "inferflux_scheduler_batch_limit_size "
+      << scheduler_batch_limit_size_.load() << "\n";
+
+  out << "# HELP inferflux_scheduler_batch_limit_tokens Configured scheduler "
+         "max prompt tokens per batch\n";
+  out << "# TYPE inferflux_scheduler_batch_limit_tokens gauge\n";
+  out << "inferflux_scheduler_batch_limit_tokens "
+      << scheduler_batch_limit_tokens_.load() << "\n";
+
+  // --- Native CUDA backend metrics ---
+  out << "# HELP inferflux_native_forward_passes_total Native CUDA forward "
+         "passes by phase\n";
+  out << "# TYPE inferflux_native_forward_passes_total counter\n";
+  out << "inferflux_native_forward_passes_total{phase=\"prefill\"} "
+      << native_forward_prefill_total_.load() << "\n";
+  out << "inferflux_native_forward_passes_total{phase=\"decode\"} "
+      << native_forward_decode_total_.load() << "\n";
+
+  out << "# HELP inferflux_native_forward_batch_tokens_total Total tokens "
+         "processed by native forward passes\n";
+  out << "# TYPE inferflux_native_forward_batch_tokens_total counter\n";
+  out << "inferflux_native_forward_batch_tokens_total "
+      << native_forward_batch_tokens_total_.load() << "\n";
+
+  out << "# HELP inferflux_native_forward_duration_ms Native forward pass "
+         "latency in milliseconds\n";
+  out << "# TYPE inferflux_native_forward_duration_ms histogram\n";
+  for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
+    out << "inferflux_native_forward_duration_ms_bucket{le=\"" << std::fixed
+        << std::setprecision(0) << LatencyHistogram::kBuckets[i] << "\"} "
+        << native_forward_latency_.counts[i].load() << "\n";
+  }
+  out << "inferflux_native_forward_duration_ms_bucket{le=\"+Inf\"} "
+      << native_forward_latency_.counts[LatencyHistogram::kBuckets.size()]
+             .load()
+      << "\n";
+  out << "inferflux_native_forward_duration_ms_sum "
+      << native_forward_latency_.sum_ms.load() << "\n";
+  out << "inferflux_native_forward_duration_ms_count "
+      << native_forward_latency_.total.load() << "\n";
+
+  out << "# HELP inferflux_native_sampling_duration_ms Native sampling latency "
+         "in milliseconds\n";
+  out << "# TYPE inferflux_native_sampling_duration_ms histogram\n";
+  for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
+    out << "inferflux_native_sampling_duration_ms_bucket{le=\"" << std::fixed
+        << std::setprecision(0) << LatencyHistogram::kBuckets[i] << "\"} "
+        << native_sampling_latency_.counts[i].load() << "\n";
+  }
+  out << "inferflux_native_sampling_duration_ms_bucket{le=\"+Inf\"} "
+      << native_sampling_latency_.counts[LatencyHistogram::kBuckets.size()]
+             .load()
+      << "\n";
+  out << "inferflux_native_sampling_duration_ms_sum "
+      << native_sampling_latency_.sum_ms.load() << "\n";
+  out << "inferflux_native_sampling_duration_ms_count "
+      << native_sampling_latency_.total.load() << "\n";
+
+  out << "# HELP inferflux_native_kv_active_sequences Active KV cache "
+         "sequences in native backend\n";
+  out << "# TYPE inferflux_native_kv_active_sequences gauge\n";
+  out << "inferflux_native_kv_active_sequences "
+      << native_kv_active_sequences_.load() << "\n";
+
+  out << "# HELP inferflux_native_kv_max_sequences Maximum KV cache sequences "
+         "in native backend\n";
+  out << "# TYPE inferflux_native_kv_max_sequences gauge\n";
+  out << "inferflux_native_kv_max_sequences " << native_kv_max_sequences_.load()
+      << "\n";
+
+  out << "# HELP inferflux_cuda_lane_submissions_total Unified-batch lane "
+         "submissions in CUDA runtime\n";
+  out << "# TYPE inferflux_cuda_lane_submissions_total counter\n";
+  out << "inferflux_cuda_lane_submissions_total{lane=\"decode\"} "
+      << cuda_decode_lane_submissions_.load() << "\n";
+  out << "inferflux_cuda_lane_submissions_total{lane=\"prefill\"} "
+      << cuda_prefill_lane_submissions_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_lane_completions_total Unified-batch lane "
+         "completions in CUDA runtime\n";
+  out << "# TYPE inferflux_cuda_lane_completions_total counter\n";
+  out << "inferflux_cuda_lane_completions_total{lane=\"decode\"} "
+      << cuda_decode_lane_completions_.load() << "\n";
+  out << "inferflux_cuda_lane_completions_total{lane=\"prefill\"} "
+      << cuda_prefill_lane_completions_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_lane_queue_depth Pending lane queue depth in "
+         "CUDA runtime\n";
+  out << "# TYPE inferflux_cuda_lane_queue_depth gauge\n";
+  out << "inferflux_cuda_lane_queue_depth{lane=\"decode\"} "
+      << cuda_decode_lane_queue_depth_.load() << "\n";
+  out << "inferflux_cuda_lane_queue_depth{lane=\"prefill\"} "
+      << cuda_prefill_lane_queue_depth_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_lane_overlap_events_total CUDA lane execution "
+         "windows where decode/prefill overlapped\n";
+  out << "# TYPE inferflux_cuda_lane_overlap_events_total counter\n";
+  out << "inferflux_cuda_lane_overlap_events_total "
+      << cuda_lane_overlap_events_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_lane_overlap_duration_ms_total Total "
+         "wall-clock "
+         "duration where decode/prefill lanes overlapped\n";
+  out << "# TYPE inferflux_cuda_lane_overlap_duration_ms_total counter\n";
+  const double overlap_duration_ms =
+      static_cast<double>(
+          cuda_lane_overlap_duration_us_.load(std::memory_order_relaxed)) /
+      1000.0;
+  out << "inferflux_cuda_lane_overlap_duration_ms_total " << overlap_duration_ms
+      << "\n";
+
+  int overlap_active = 0;
+  {
+    std::lock_guard<std::mutex> lock(cuda_overlap_timing_mutex_);
+    overlap_active = cuda_overlap_active_ ? 1 : 0;
+  }
+  out << "# HELP inferflux_cuda_lane_overlap_active Whether decode/prefill "
+         "lanes are currently overlapping (1=true)\n";
+  out << "# TYPE inferflux_cuda_lane_overlap_active gauge\n";
+  out << "inferflux_cuda_lane_overlap_active " << overlap_active << "\n";
+
+  out << "# HELP inferflux_cuda_lane_inflight Active CUDA lane workers "
+         "currently executing a batch\n";
+  out << "# TYPE inferflux_cuda_lane_inflight gauge\n";
+  out << "inferflux_cuda_lane_inflight{lane=\"decode\"} "
+      << cuda_decode_lane_inflight_.load() << "\n";
+  out << "inferflux_cuda_lane_inflight{lane=\"prefill\"} "
+      << cuda_prefill_lane_inflight_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_attention_kernel_selected CUDA attention "
+         "kernel currently selected (one-hot gauge)\n";
+  out << "# TYPE inferflux_cuda_attention_kernel_selected gauge\n";
+  std::string selected_kernel = "standard";
+  {
+    std::lock_guard<std::mutex> lock(cuda_attention_kernel_mutex_);
+    selected_kernel = cuda_attention_kernel_;
+  }
+  for (const char *kernel : {"fa3", "fa2", "standard"}) {
+    out << "inferflux_cuda_attention_kernel_selected{kernel=\"" << kernel
+        << "\"} " << (selected_kernel == kernel ? 1 : 0) << "\n";
+  }
+
+  out << "# HELP inferflux_cuda_attention_kernel_fallbacks_total CUDA "
+         "attention kernel fallback decisions by requested/selected kernel\n";
+  out << "# TYPE inferflux_cuda_attention_kernel_fallbacks_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(cuda_attention_fallback_mutex_);
+    for (const auto &[key, count] : cuda_attention_fallback_counts_) {
+      auto p1 = key.find('|');
+      auto p2 =
+          (p1 == std::string::npos) ? std::string::npos : key.find('|', p1 + 1);
+      if (p1 == std::string::npos || p2 == std::string::npos) {
+        continue;
+      }
+      const std::string requested = key.substr(0, p1);
+      const std::string selected = key.substr(p1 + 1, p2 - p1 - 1);
+      const std::string reason = key.substr(p2 + 1);
+      out << "inferflux_cuda_attention_kernel_fallbacks_total{requested=\""
+          << requested << "\",selected=\"" << selected << "\",reason=\""
+          << reason << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_cuda_attention_kernel_switches_total CUDA "
+         "attention kernel selection switches across model reloads\n";
+  out << "# TYPE inferflux_cuda_attention_kernel_switches_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(cuda_attention_switch_mutex_);
+    for (const auto &[key, count] : cuda_attention_switch_counts_) {
+      auto split = key.find('|');
+      if (split == std::string::npos) {
+        continue;
+      }
+      const std::string from = key.substr(0, split);
+      const std::string to = key.substr(split + 1);
+      out << "inferflux_cuda_attention_kernel_switches_total{from_kernel=\""
+          << from << "\",to_kernel=\"" << to << "\"} " << count << "\n";
+    }
+  }
 
   return out.str();
 }

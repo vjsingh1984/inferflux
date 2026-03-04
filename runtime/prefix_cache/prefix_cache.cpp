@@ -6,9 +6,8 @@ namespace inferflux {
 
 PrefixCache::PrefixCache(std::size_t capacity) : capacity_(capacity) {}
 
-bool PrefixCache::Lookup(const std::vector<int>& tokens,
-                         std::string* completion,
-                         int* completion_tokens) {
+bool PrefixCache::Lookup(const std::vector<int> &tokens,
+                         std::string *completion, int *completion_tokens) {
   if (capacity_ == 0) {
     return false;
   }
@@ -30,9 +29,8 @@ bool PrefixCache::Lookup(const std::vector<int>& tokens,
   return true;
 }
 
-void PrefixCache::Insert(const std::vector<int>& tokens,
-                         const std::string& completion,
-                         int completion_tokens) {
+void PrefixCache::Insert(const std::vector<int> &tokens,
+                         const std::string &completion, int completion_tokens) {
   if (capacity_ == 0) {
     return;
   }
@@ -62,7 +60,7 @@ void PrefixCache::Insert(const std::vector<int>& tokens,
   table_[key] = std::move(state);
 }
 
-std::string PrefixCache::Serialize(const std::vector<int>& tokens) const {
+std::string PrefixCache::Serialize(const std::vector<int> &tokens) const {
   std::ostringstream oss;
   for (int token : tokens) {
     oss << token << ',';
@@ -70,4 +68,4 @@ std::string PrefixCache::Serialize(const std::vector<int>& tokens) const {
   return oss.str();
 }
 
-}  // namespace inferflux
+} // namespace inferflux

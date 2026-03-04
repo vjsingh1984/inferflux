@@ -115,6 +115,22 @@ TEST_CASE("MetricsRegistry prefill/decode queue gauges", "[metrics]") {
   REQUIRE(output.find("inferflux_decode_queue_depth 2") != std::string::npos);
 }
 
+TEST_CASE("MetricsRegistry scheduler batch limits and token-budget skips",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.SetSchedulerBatchLimits(8, 16384);
+  registry.RecordBatchTokenBudgetSkip();
+  registry.RecordBatchTokenBudgetSkip();
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_scheduler_batch_limit_size 8") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_batch_limit_tokens 16384") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_batch_token_budget_skips_total{"
+                      "backend=\"cpu\"} 2") != std::string::npos);
+}
+
 TEST_CASE("MetricsRegistry records per-model token counters", "[metrics]") {
   inferflux::MetricsRegistry registry;
   registry.RecordModelRoute("llama3-8b", "cuda", true);
@@ -185,5 +201,79 @@ TEST_CASE("MetricsRegistry records capability route fallback counters",
   REQUIRE(output.find("inferflux_capability_route_fallbacks_total{"
                       "from_backend=\"rocm\",to_backend=\"cpu\","
                       "feature=\"backend_unavailable\"} 1") !=
+          std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry records CUDA lane runtime metrics", "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordCudaLaneSubmission(true);
+  registry.RecordCudaLaneSubmission(false);
+  registry.RecordCudaLaneSubmission(false);
+  registry.RecordCudaLaneCompletion(true);
+  registry.RecordCudaLaneCompletion(false);
+  registry.RecordCudaLaneExecutionStart(true);
+  registry.RecordCudaLaneExecutionStart(false);
+  registry.RecordCudaLaneExecutionStop(false);
+  registry.RecordCudaLaneExecutionStop(true);
+  registry.SetCudaLaneQueueDepth(true, 3);
+  registry.SetCudaLaneQueueDepth(false, 7);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_cuda_lane_submissions_total{lane=\"decode\"} "
+                      "1") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_submissions_total{lane=\"prefill\"} "
+                      "2") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_completions_total{lane=\"decode\"} "
+                      "1") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_completions_total{lane=\"prefill\"} "
+                      "1") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_queue_depth{lane=\"decode\"} 3") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_queue_depth{lane=\"prefill\"} 7") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_overlap_events_total 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_overlap_duration_ms_total ") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_overlap_active 0") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_inflight{lane=\"decode\"} 0") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_inflight{lane=\"prefill\"} 0") !=
+          std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry exports selected CUDA attention kernel gauge",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.SetCudaAttentionKernel("fa2");
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(
+      output.find("inferflux_cuda_attention_kernel_selected{kernel=\"fa3\"} "
+                  "0") != std::string::npos);
+  REQUIRE(
+      output.find("inferflux_cuda_attention_kernel_selected{kernel=\"fa2\"} "
+                  "1") != std::string::npos);
+  REQUIRE(output.find(
+              "inferflux_cuda_attention_kernel_selected{kernel=\"standard\"} "
+              "0") != std::string::npos);
+}
+
+TEST_CASE(
+    "MetricsRegistry records CUDA attention kernel fallbacks and switches",
+    "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordCudaAttentionKernelFallback("fa3", "fa2", "fa3_unavailable");
+  registry.RecordCudaAttentionKernelFallback("fa3", "fa2", "fa3_unavailable");
+  registry.RecordCudaAttentionKernelSwitch("standard", "fa2");
+  registry.RecordCudaAttentionKernelSwitch("fa2", "fa2");
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_cuda_attention_kernel_fallbacks_total{"
+                      "requested=\"fa3\",selected=\"fa2\","
+                      "reason=\"fa3_unavailable\"} 2") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_attention_kernel_switches_total{"
+                      "from_kernel=\"standard\",to_kernel=\"fa2\"} 1") !=
           std::string::npos);
 }

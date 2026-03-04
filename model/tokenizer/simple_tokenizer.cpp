@@ -13,7 +13,7 @@ SimpleTokenizer::SimpleTokenizer() {
   reverse_[2] = "<eos>";
 }
 
-int SimpleTokenizer::AddToken(const std::string& token) {
+int SimpleTokenizer::AddToken(const std::string &token) {
   auto it = vocab_.find(token);
   if (it != vocab_.end()) {
     return it->second;
@@ -24,12 +24,14 @@ int SimpleTokenizer::AddToken(const std::string& token) {
   return id;
 }
 
-std::vector<std::string> SimpleTokenizer::Tokenize(const std::string& text) const {
+std::vector<std::string>
+SimpleTokenizer::Tokenize(const std::string &text) const {
   std::vector<std::string> words;
   std::string current;
   for (char c : text) {
     if (std::isalnum(static_cast<unsigned char>(c))) {
-      current.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+      current.push_back(
+          static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
     } else {
       if (!current.empty()) {
         words.push_back(current);
@@ -47,28 +49,29 @@ std::vector<std::string> SimpleTokenizer::Tokenize(const std::string& text) cons
   return words;
 }
 
-std::vector<int> SimpleTokenizer::Encode(const std::string& text) {
+std::vector<int> SimpleTokenizer::Encode(const std::string &text) {
   auto words = Tokenize(text);
   if (words.empty()) {
     return {};
   }
   std::vector<int> tokens;
-  tokens.push_back(1);  // <bos>
-  for (const auto& word : words) {
+  tokens.push_back(1); // <bos>
+  for (const auto &word : words) {
     tokens.push_back(AddToken(word));
   }
   return tokens;
 }
 
-std::string SimpleTokenizer::Decode(const std::vector<int>& tokens) const {
+std::string SimpleTokenizer::Decode(const std::vector<int> &tokens) const {
   std::ostringstream stream;
   bool first_word = true;
   for (int token : tokens) {
     if (token <= 1 || token >= static_cast<int>(reverse_.size())) {
       continue;
     }
-    const std::string& word = reverse_[token];
-    if (!first_word && word != "." && word != "," && word != "!" && word != "?") {
+    const std::string &word = reverse_[token];
+    if (!first_word && word != "." && word != "," && word != "!" &&
+        word != "?") {
       stream << ' ';
     }
     stream << word;
@@ -77,4 +80,4 @@ std::string SimpleTokenizer::Decode(const std::vector<int>& tokens) const {
   return stream.str();
 }
 
-}  // namespace inferflux
+} // namespace inferflux

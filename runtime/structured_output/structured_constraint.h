@@ -13,4 +13,4 @@ struct StructuredConstraint {
   std::string schema;
 };
 
-}  // namespace inferflux
+} // namespace inferflux

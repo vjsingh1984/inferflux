@@ -11,4 +11,4 @@ struct Tensor {
   std::vector<int64_t> shape;
 };
 
-}  // namespace inferflux
+} // namespace inferflux

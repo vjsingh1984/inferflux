@@ -16,17 +16,19 @@ struct KVPacket {
   std::vector<uint8_t> prompt_tokens;
   std::vector<uint8_t> kv_blob;
   int kv_page{-1};
-  int n_past{-1};       // Filled after phased Prefill(); -1 if not yet prefilled.
-  int sequence_id{-1};  // KV cache sequence slot used during Prefill(); -1 = unassigned.
+  int n_past{-1}; // Filled after phased Prefill(); -1 if not yet prefilled.
+  int sequence_id{
+      -1}; // KV cache sequence slot used during Prefill(); -1 = unassigned.
   std::string metadata;
-  std::chrono::steady_clock::time_point enqueue_time{std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point enqueue_time{
+      std::chrono::steady_clock::now()};
 };
 
 // Common interface for KV-state transports (in-process queue and POSIX SHM).
 // Both KVChannel and ShmKVTransport implement this so they are substitutable
 // in DisaggregatedConfig without touching Scheduler or BatchExecutor.
 class IKVTransport {
- public:
+public:
   virtual ~IKVTransport() = default;
   virtual bool Enqueue(KVPacket packet) = 0;
   virtual std::optional<KVPacket> TryDequeue() = 0;
@@ -37,7 +39,7 @@ class IKVTransport {
 // Thread-safe in-process queue.  Default transport when INFERFLUX_KV_TRANSPORT
 // is unset or set to "channel".
 class KVChannel : public IKVTransport {
- public:
+public:
   explicit KVChannel(std::size_t capacity = 64);
 
   void SetCapacity(std::size_t capacity);
@@ -48,11 +50,11 @@ class KVChannel : public IKVTransport {
   std::size_t Size() const override;
   void Clear();
 
- private:
+private:
   mutable std::mutex mutex_;
   std::deque<KVPacket> queue_;
   std::size_t capacity_;
 };
 
-}  // namespace disaggregated
-}  // namespace inferflux
+} // namespace disaggregated
+} // namespace inferflux

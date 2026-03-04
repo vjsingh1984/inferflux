@@ -8,7 +8,7 @@ This living tracker keeps a single view of competitive posture, blocking tech de
 | --- | --- | --- | --- |
 | Throughput | F → needs CUDA kernels | Finalize FlashAttention plan, hardware sign-off | Runtime |
 | Continuous batching | D | Finish GPU overlap design doc | Scheduler |
-| Guardrails & Policy | B- | Measure guardrail verdict latency P95 | Policy |
+| Guardrails & Policy | B | Add per-model RBAC + key-rotation workflows | Policy |
 | Observability | B+ | Add per-priority fairness gauges | Observability |
 | Distributed runtime | D | Ship expert/tensor parallel UX | Distributed Runtime |
 
@@ -48,7 +48,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 | Disaggregated prefill/decode  |  A   |   A+   |   A     |    N/A    |  N/A   |   **D**   | C (Q4) | Distributed Runtime |
 | Model parallelism (TP/PP/EP)  |  A   |   A+   |   A     |    C      |   C    |   **D**   | C (Q4) | Distributed Runtime |
 | OpenAI API compatibility      |  A   |   A    |   B     |    B      |   A    |   **B+**  | A (Q4) | Server |
-| Enterprise auth & RBAC        |  B   |   C    |   B     |    F      |   F    |   **B-**  | B+ (Q3) | Policy |
+| Enterprise auth & RBAC        |  B   |   C    |   B     |    F      |   F    |   **B**   | B+ (Q3) | Policy |
 | Observability                 |  A   |   B    |   A     |    D      |   D    |   **B+**  | B (Q3) | Observability |
 | Ease of local setup           |  B+  |   B    |   C     |    C      |   A+   |   **C**   | B (Q3) | CLI |
 | Model management UX           |  B   |   B    |   C     |    C      |   A+   |   **D**   | C+ (Q3) | CLI |
@@ -57,7 +57,9 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
 **Overall grade: C (up from C-; KV warm prefix reuse + 7 correctness bug fixes in §2.5 and §3.2; 3 additional debt items closed: misleading comment, seq_slots_free_ data race → atomic bitmask, INF-7 BPE prefix matching)**
 
 **Scorecard status notes (March 2026):**
-- **Production throughput: F (foundations improving)** — CUDA model selection is now wired end-to-end (router/backend factory + CUDA strategy backend + default-hint routing on CUDA-enabled nodes), but we still lack measured overlap/kernels (FA3, stream-level prefill/decode overlap). Grade stays F until benchmarked.
+- **Production throughput: F (foundations improving)** — CUDA model selection is now wired end-to-end (router/backend factory + CUDA strategy backend + default-hint routing on CUDA-enabled nodes), and mixed-batch decode-first arbitration scaffolding is now live in `CudaBackend::ExecuteUnifiedBatch`. We still lack measured kernel-level overlap/FA3 validation, so grade stays F until benchmarked.
+  - **Batching controls (new):** scheduler batch admission is now deployment-tunable (`runtime.scheduler.max_batch_size`, `runtime.scheduler.max_batch_tokens`, env overrides) so operators can tune throughput/latency tradeoffs without recompiling.
+  - **Batch pressure telemetry (new):** `inferflux_scheduler_batch_token_budget_skips_total` plus `inferflux_scheduler_batch_limit_size/tokens` expose when throughput is constrained by current batching policy.
   - **Backend exposure policy (new):** factory now treats backend exposure as
     native-preferred with universal llama fallback (configurable) so unstable
     native paths can fail open to llama.cpp while preserving a clear path to
@@ -80,11 +82,12 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
     1. Finish CUDA build path wiring (ENABLE_CUDA defaults, llama.cpp build flags, sanity tests) so the server can actually load GPU models.
     2. Add CI compile-check with CUDA toolkit + self-hosted smoke test (load small GPTQ model, run queries).
   - **Kernel / scheduler overlap**
-    1. Implement overlapped prefill/decode for CUDA: dedicate streams, rework scheduler to hand off work without CPU blocking.
+    1. Extend current decode-first mixed-batch scaffold (`runtime.cuda.phase_overlap.*`) into true dual-stream CUDA execution with explicit event fencing.
     2. Integrate Flash Attention / FA3 kernels and verify we hit target batch sizes.
   - **Throughput metrics / watchdog**
     1. Expose tokens/sec, GPU utilization, and queue depth per GPU shard in Prometheus.
-    2. Add regression tests/benchmarks that fail CI if tokens/sec drops below baseline.
+    2. **[DONE]** Add regression benchmark gate that fails CI on tok/s regressions:
+       `scripts/run_throughput_gate.py` + guarded `cuda-throughput-gate` workflow job.
 - **Continuous batching: D** — `WorkerLoop` batches up to 4 concurrent requests per cycle (batch-level concurrency, fairness-aware); unified phased execution is now grouped per backend instance (mixed-model batches no longer fully fall back to per-request decode). Still no GPU-level in-flight token overlap (requires vLLM-style paged KV scheduler).
 - **KV cache efficiency: D** — `RadixPrefixCache` provides completion-level caching (trie over token IDs, LRU eviction, partial-match metrics). KV warm prefix store (`kv_prefix_store_`, capacity 4, LRU) allows `CopySequencePrefix`+`PrefillPartial` to skip re-evaluating shared prompt prefixes on the CPU path. No GPU KV page reuse (requires vLLM-style paged KV). D stays — warm store is CPU-only and covers O(1) copy within one llama_context.
 - **Prefix caching: B** — `RadixPrefixCache` (compressed trie, LRU eviction, partial-match Prometheus counters) for completion-level caching. KV warm prefix store (`kv_prefix_store_`, 4-slot LRU): `CopySequencePrefix`+`PrefillPartial` lets requests sharing a prompt prefix skip re-evaluating those tokens entirely. B-→B. Gap to A: GPU KV page reuse (vLLM-style paged attention + zero-copy across requests).
@@ -110,7 +113,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
     1. Update `docs/Architecture.md` with a “Model Parallelism” section once EP/TP MVP lands.
     2. Add operator guide (`docs/operators/tp_ep_setup.md`) plus Helm values for configuring TP/EP (per-stage GPU counts, process layout).
 - **OpenAI API compat: B→B+** — Chat completions, completions, SSE streaming, structured output, image_url, tool calls, model-native chat templates, `/v1/models` + `/v1/models/{id}`, `stop` sequences, `n>1` (multiple completions per request, 1-10), `best_of` (generate N server-side, return top n by cumulative logprob; integrates with internal logprob ranking) all done. Missing: logprobs on streaming.
-- **Enterprise auth/RBAC: B-** — OIDC RS256 (JWKS TTL cache), API-key SHA-256, rate-limiter, OPA client, encrypted policy store (AES-GCM), audit log (hash-by-default). Gap to B+: fine-grained per-model RBAC, key rotation UI.
+- **Enterprise auth/RBAC: B** — OIDC RS256 (JWKS TTL cache), API-key SHA-256, rate-limiter, OPA client, encrypted policy store (AES-GCM), audit log (hash-by-default), and transactional fail-closed policy writes with rollback (`policy_persist_failed`) across admin mutations. Gap to B+: fine-grained per-model RBAC, key rotation UI.
 - **Observability: B+** — 5 latency histograms, Prometheus `/metrics`, W3C traceparent, `Span` RAII, audit log, fairness/preemption metrics, KV-transfer histogram, MoE counter, flash-attention gauge, and per-model token counters (`inferflux_model_prompt_tokens_total`, `inferflux_model_completion_tokens_total`) for throughput rate dashboards; structured JSON logs (`server/logging/logger.h`, `INFERFLUX_LOG_FORMAT=json`); Grafana dashboard (`deploy/grafana/dashboard.json`, 9 panels); 7 Prometheus alert rules (`deploy/prometheus/alerts.yml`); Docker + docker-compose stack (`deploy/Dockerfile`, `deploy/docker-compose.yml`). Gap to A: self-hosted GPU runner for live metric CI.
 - **Ease of local setup: C** — CLI quickstart + the embedded WebUI help with day-zero config, but we still lack packaged installers, polished Docker images, and a production-ready SPA. The new deployment files are placeholders; until we ship signed installers (brew/winget/tarball) and the UI is feature-complete, the grade stays at C.
   - **Next steps**
@@ -118,7 +121,7 @@ open-source standards. HuggingFace deprecated TGI (Dec 2025) in their favor. NVI
     2. Expand `/ui` into a full SPA (chat history, model selection, admin views) with assets under `webui/static/`.
     3. Extend Quickstart/Troubleshooting with screenshots, diagnostics, and advanced workflows (cache warmers, persistence, multi-model hints).
 - **Model management UX: D→C+** — `inferctl pull` live, `inferctl admin models --list/--load` via `/v1/admin/models`, `/v1/models` + `/v1/models/{id}` OpenAI-standard endpoints live, `inferctl models` top-level command (calls `GET /v1/models`, formats table of id/owned_by/created). `ModelRegistry` hot-reload: watches `registry.yaml`, auto-loads/unloads models without restart (CQ-8 — Done).
-- **Test/CI: B** — 18 ctest targets (14 unit + 4 integration incl. SHM smoke, LoggerTests, StructuredTests, ModelRegistryTests), 5-job CI (build-test/MPS/CUDA-check/coverage/clang-format), SBOM artifact, Codecov (60% target). Gap to A: live GPU test runner, property-based tests.
+- **Test/CI: B** — 18 ctest targets (14 unit + 4 integration incl. SHM smoke, LoggerTests, StructuredTests, ModelRegistryTests), baseline 5-job CI plus guarded GPU throughput gate (`cuda-throughput-gate`), SBOM artifact, Codecov (60% target). Gap to A: always-on live GPU test runner, property-based tests.
 - **Hardware breadth: D→C-** — CPUs + MPS ship today; MLX backend is functional for Metal/Apple Silicon (safetensors + HF tokenizer, stochastic sampling, RoPE scaling, logprobs) and now has full phased execution parity (INF-8 Done: `Prefill`/`Decode`/`FreeSequence`/`CopySequencePrefix`/`ExecuteUnifiedBatch` overrides + per-sequence KV slot management). CUDA routing is now strategy-based and load-path integrated; ROCm remains pending.
   - **Recorded MLX parity follow-up (no runtime change in this session):**
     expose MLX capabilities via the same backend-traits surface used by
@@ -230,7 +233,7 @@ throughput over vanilla TP for MoE models using expert parallelism.
 | INF-2 | Scheduler and execution pipeline need true prefill/decode overlap and GPU-aware scheduling. | `scheduler/scheduler.cpp`, `runtime/execution/batch_executor.cpp` | **Status**: Foundational components (phased execution, fairness) are in place. **Next**: Implement interleaved prefill/decode on GPU. | `docs/Architecture.md` |
 | INF-7 | **[FIXED]** BPE-token prefix matching for KV store ensures boundary alignment. | `runtime/backends/cpu/llama_backend.cpp` | *(Fixed)* | `docs/Architecture.md` |
 | INF-8 | **[FIXED]** MLX backend phased execution parity. `MlxBackend` overrides `Prefill`/`PrefillPartial`/`Decode`/`FreeSequence`/`CopySequencePrefix`/`ExecuteUnifiedBatch`; `MlxExecutionEngine` per-sequence KV slot management (`AllocSlot`/`FreeSlot`/`StepSeq`/`CopySlotPrefix`). | `runtime/backends/mlx/mlx_backend.cpp`, `mlx_execution.cpp` | *(Fixed)* | `docs/Architecture.md` |
-| INF-9 | **[IN PROGRESS]** CUDA backend foundation: strategy factory + polymorphic CUDA backend (`LoadModel` virtual dispatch) now routes CUDA-capable loads without CPU-wrapper stubs. Backend priority chains + exposure provenance now land in router/api/metrics for deterministic multi-hardware behavior and fallback observability. Scheduler now supports capability-aware same-model backend reroute for default routing with explicit-model pinning guardrails. | `runtime/backends/cuda/cuda_backend.cpp`, `runtime/backends/backend_factory.cpp`, `scheduler/single_model_router.cpp`, `scheduler/scheduler.cpp`, `server/http/http_server.cpp`, `server/metrics/metrics.cpp` | Next: integrate FA3 kernels + measured prefill/decode overlap in scheduler/executor. | `docs/Architecture.md` |
+| INF-9 | **[IN PROGRESS]** CUDA backend foundation: strategy factory + polymorphic CUDA backend (`LoadModel` virtual dispatch) now routes CUDA-capable loads without CPU-wrapper stubs. Backend priority chains + exposure provenance now land in router/api/metrics for deterministic multi-hardware behavior and fallback observability. Scheduler now supports capability-aware same-model backend reroute for default routing with explicit-model pinning guardrails. New phase-overlap scaffold splits mixed unified batches into decode-first + prefill lanes under `runtime.cuda.phase_overlap.*`, and a backend-agnostic async unified-batch contract now allows lane-aware submission/polling without scheduler branching by backend internals. Optional dual-context overlap mode now runs prefill on a replica context and hands KV to decode via `SerializeSequence/HydrateSequence` (`runtime.cuda.phase_overlap.prefill_replica`), reducing serialized decode/prefill contention. CUDA attention policy supports safe runtime fallback (`fa3 -> fa2 -> standard`) with selected-kernel, fallback, and switch telemetry (`inferflux_cuda_attention_kernel_selected`, `inferflux_cuda_attention_kernel_fallbacks_total`, `inferflux_cuda_attention_kernel_switches_total`). Async phased execution now submits decode/prefill lanes concurrently, prefill-replica handoffs batch decode-context hydration, and overlap telemetry (`inferflux_cuda_lane_overlap_events_total`) verifies real dual-lane execution. | `runtime/backends/cuda/cuda_backend.cpp`, `runtime/backends/cpu/llama_backend.cpp`, `runtime/execution/batch_executor.cpp`, `runtime/backends/backend_factory.cpp`, `scheduler/single_model_router.cpp`, `scheduler/scheduler.cpp`, `server/http/http_server.cpp`, `server/metrics/metrics.cpp` | Next: validate FA3 kernel-level overlap/throughput on enterprise GPUs; per-layer kernel telemetry remains blocked on upstream llama.cpp hooks. | `docs/Architecture.md` |
 | INF-10 | **[FIXED]** Stop sequences on first token. `BatchExecutor` now applies `ApplyStop` to the pre-sampled first token in phased and unified batches, ensuring immediate termination if a stop sequence is matched. | `runtime/execution/batch_executor.cpp` | *(Fixed)* | — |
 | INF-11 | **[FIXED]** Memory leak in RadixPrefixCache eviction. `EvictOneSequence` now correctly releases KV block references via `kv_cache_->ReleaseBlocksRef` before clearing the node. | `runtime/prefix_cache/radix_prefix_cache.cpp` | *(Fixed)* | — |
 
@@ -429,7 +432,7 @@ Every production GPU server uses it.
 
 **Remaining (hardware-blocked):**
 - FA3 CUDA kernels on Hopper/Ada — link against cutlass or flash-attention library
-- Per-layer kernel selection metrics
+- Per-layer kernel selection metrics (runtime fallback/switch counters are now exported; per-layer needs upstream llama.cpp hooks)
 
 ### 2.8 Model Management UX (`inferctl pull`)
 

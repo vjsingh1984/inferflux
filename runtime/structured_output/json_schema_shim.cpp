@@ -8,12 +8,12 @@
 // llama.cpp's entire CLI support stack.
 
 int LLAMA_BUILD_NUMBER = 0;
-const char* LLAMA_COMMIT = "inferflux";
-const char* LLAMA_COMPILER = "clang";
-const char* LLAMA_BUILD_TARGET = "unknown";
+const char *LLAMA_COMMIT = "inferflux";
+const char *LLAMA_COMPILER = "clang";
+const char *LLAMA_BUILD_TARGET = "unknown";
 
-std::string string_join(const std::vector<std::string>& values,
-                        const std::string& separator) {
+std::string string_join(const std::vector<std::string> &values,
+                        const std::string &separator) {
   std::ostringstream result;
   for (std::size_t i = 0; i < values.size(); ++i) {
     if (i > 0) {
@@ -24,8 +24,8 @@ std::string string_join(const std::vector<std::string>& values,
   return result.str();
 }
 
-std::vector<std::string> string_split(const std::string& str,
-                                      const std::string& delimiter) {
+std::vector<std::string> string_split(const std::string &str,
+                                      const std::string &delimiter) {
   std::vector<std::string> parts;
   std::size_t start = 0;
   std::size_t end = str.find(delimiter);
@@ -38,7 +38,7 @@ std::vector<std::string> string_split(const std::string& str,
   return parts;
 }
 
-std::string string_repeat(const std::string& str, std::size_t n) {
+std::string string_repeat(const std::string &str, std::size_t n) {
   if (n == 0) {
     return "";
   }

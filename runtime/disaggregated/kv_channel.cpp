@@ -5,7 +5,8 @@
 namespace inferflux {
 namespace disaggregated {
 
-KVChannel::KVChannel(std::size_t capacity) : capacity_(std::max<std::size_t>(1, capacity)) {}
+KVChannel::KVChannel(std::size_t capacity)
+    : capacity_(std::max<std::size_t>(1, capacity)) {}
 
 void KVChannel::SetCapacity(std::size_t capacity) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -52,5 +53,5 @@ void KVChannel::Clear() {
   queue_.clear();
 }
 
-}  // namespace disaggregated
-}  // namespace inferflux
+} // namespace disaggregated
+} // namespace inferflux

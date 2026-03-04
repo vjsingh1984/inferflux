@@ -44,6 +44,16 @@ target-specific optimization paths and minimizing duplicated control logic.
 4. Added backend exposure provenance + deterministic priority chains:
    - `BackendFactory::NormalizeHintList(...)` centralizes backend priority
      normalization.
+   - Explicit CUDA provider hints are now supported for deterministic routing:
+     `cuda_native` (native only; fail if unavailable) and
+     `cuda_universal`/`cuda_llama` (force universal llama path).
+   - Native CUDA currently routes through a scaffold backend that reports
+     `provider=native` with `backend_fallback=true` until custom kernels are
+     wired; `INFERFLUX_NATIVE_CUDA_STRICT=1` can hard-fail this delegate path.
+   - Native scaffold executor can be selected explicitly with
+     `INFERFLUX_NATIVE_CUDA_EXECUTOR=delegate|direct_llama` to compare
+     delegated vs non-delegating control-plane paths while kernels are under
+     development.
    - `SingleModelRouter` now resolves backend candidates from a priority chain
      (`runtime.backend_priority` / `INFERFLUX_BACKEND_PRIORITY`) and records
      per-model provenance (`requested_backend`, `backend_provider`,
@@ -59,6 +69,24 @@ target-specific optimization paths and minimizing duplicated control logic.
    - Selection logic is centralized in `scheduler/model_selection.*` and reused
      by both scheduler and HTTP preflight checks to avoid control-plane drift.
    - Prometheus exports `inferflux_capability_route_fallbacks_total`.
+6. Added a backend-agnostic async unified-batch contract:
+   - `LlamaCPUBackend` now supports async submit/poll with synchronous fallback.
+   - `CudaBackend` now runs decode-priority lane queues behind that contract.
+   - `BatchExecutor` submits decode/prefill lanes explicitly when async is
+     supported, preserving a single control-plane path.
+   - `Scheduler` prefill now uses unified prefill submissions when async lanes
+     are available, so prefill-lane telemetry reflects real request traffic
+     (with legacy `Prefill`/`PrefillPartial` fallback on failure).
+   - `NativeCudaBackend` now delegates readiness + core prefill/decode/tokenizer
+     operations to its active executor backend so `cuda_native` requests execute
+     through the scaffold path instead of being treated as not-ready.
+7. Added CUDA attention policy ladder:
+   - `runtime.cuda.attention.kernel` / `INFERFLUX_CUDA_ATTENTION_KERNEL`
+     supports `auto|fa3|fa2|standard`.
+   - Runtime selects best available kernel with safe fallback (`fa3 -> fa2 ->
+     standard`) and exports `inferflux_cuda_attention_kernel_selected`,
+     `inferflux_cuda_attention_kernel_fallbacks_total`, and
+     `inferflux_cuda_attention_kernel_switches_total`.
 
 ## Recorded Follow-ups (MLX, no code change in this session)
 
@@ -71,6 +99,10 @@ target-specific optimization paths and minimizing duplicated control logic.
 
 ## Next Implementation Steps (CUDA-focused)
 
-1. Stream-aware prefill/decode overlap in executor/scheduler.
+1. [x] Promote decode-priority async lane runtime to concurrent dual-lane
+   execution with sequence fencing; optional `prefill_replica` mode runs
+   prefill on a replica context with KV handoff before decode.
 2. GPU KV residency and reuse policy to remove host-side bottlenecks.
-3. CI throughput guardrail target (tokens/sec floor) on CUDA runner hardware.
+3. [x] CI throughput guardrail target (tokens/sec floor) on CUDA runner
+   hardware via `scripts/run_throughput_gate.py` + `cuda-throughput-gate`
+   workflow job.

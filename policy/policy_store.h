@@ -35,6 +35,10 @@ public:
   int RateLimitPerMinute() const override;
   void SetRateLimitPerMinute(int limit) override;
 
+  std::optional<RoutingPolicyEntry> RoutingPolicy() const override;
+  void SetRoutingPolicy(const RoutingPolicyEntry &policy) override;
+  void ClearRoutingPolicy() override;
+
   std::string Name() const override { return "ini"; }
 
 private:
@@ -43,6 +47,7 @@ private:
   std::unordered_map<std::string, std::vector<std::string>> api_keys_;
   std::vector<std::string> guardrail_blocklist_;
   int rate_limit_per_minute_{0};
+  std::optional<RoutingPolicyEntry> routing_policy_;
   bool encryption_enabled_{false};
   std::array<unsigned char, 32> key_{};
 

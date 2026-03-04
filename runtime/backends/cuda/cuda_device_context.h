@@ -8,7 +8,7 @@
 namespace inferflux {
 
 class CudaDeviceContext : public DeviceContext {
- public:
+public:
   CudaDeviceContext();
   ~CudaDeviceContext() override;
 
@@ -18,8 +18,8 @@ class CudaDeviceContext : public DeviceContext {
   std::unique_ptr<DeviceBuffer> Allocate(std::size_t bytes) override;
   void Free(std::unique_ptr<DeviceBuffer> buffer) override;
 
- private:
+private:
   bool available_{false};
 };
 
-}  // namespace inferflux
+} // namespace inferflux

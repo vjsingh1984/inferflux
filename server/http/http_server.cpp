@@ -1,5 +1,6 @@
 #include "server/http/http_server.h"
 
+#include "model/model_format.h"
 #include "runtime/backends/backend_capabilities.h"
 #include "runtime/backends/cpu/llama_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
@@ -15,6 +16,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
@@ -165,6 +167,15 @@ json BuildCapabilitiesJson(const BackendCapabilities &capabilities) {
   };
 }
 
+std::string ModelSourcePath(const ModelInfo &info) {
+  return info.source_path.empty() ? info.path : info.source_path;
+}
+
+std::string ModelEffectiveLoadPath(const ModelInfo &info) {
+  const std::string source = ModelSourcePath(info);
+  return info.effective_load_path.empty() ? source : info.effective_load_path;
+}
+
 json BuildBackendExposureJson(const ModelInfo &info) {
   const std::string requested =
       info.requested_backend.empty() ? info.backend : info.requested_backend;
@@ -179,11 +190,80 @@ json BuildBackendExposureJson(const ModelInfo &info) {
   };
 }
 
+json BuildModelIdentityJson(const ModelInfo &info) {
+  return json{
+      {"id", info.id},
+      {"path", info.path},
+      {"source_path", ModelSourcePath(info)},
+      {"effective_load_path", ModelEffectiveLoadPath(info)},
+      {"format", info.format},
+      {"requested_format", info.requested_format},
+      {"backend", info.backend},
+      {"backend_exposure", BuildBackendExposureJson(info)},
+      {"ready", info.ready},
+      {"capabilities", BuildCapabilitiesJson(info.capabilities)},
+  };
+}
+
+json BuildOpenAIModelJson(const ModelInfo &info, int64_t created_ts) {
+  json model = BuildModelIdentityJson(info);
+  model["object"] = "model";
+  model["created"] = created_ts;
+  model["owned_by"] = "inferflux";
+  return model;
+}
+
+json BuildAdminModelJson(const ModelInfo &info, const std::string &default_id) {
+  json model = BuildModelIdentityJson(info);
+  model["requested_backend"] =
+      info.requested_backend.empty() ? info.backend : info.requested_backend;
+  model["backend_provider"] =
+      info.backend_provider.empty() ? "universal" : info.backend_provider;
+  model["default"] = (info.id == default_id);
+  return model;
+}
+
+std::string BuildModelNotFoundResponse() {
+  return BuildResponse(json({{"error", "model_not_found"}}).dump(), 404,
+                       "Not Found");
+}
+
+std::string ParseJsonStringField(const std::string &body,
+                                 const std::string &field) {
+  try {
+    auto j = json::parse(body);
+    if (j.contains(field) && j[field].is_string()) {
+      return j[field].get<std::string>();
+    }
+  } catch (const json::exception &) {
+  }
+  return "";
+}
+
+const ModelInfo *FindModelById(const std::vector<ModelInfo> &models,
+                               const std::string &model_id) {
+  auto it = std::find_if(
+      models.begin(), models.end(),
+      [&](const ModelInfo &candidate) { return candidate.id == model_id; });
+  if (it == models.end()) {
+    return nullptr;
+  }
+  return &(*it);
+}
+
 BackendFeatureRequirements
 BuildGenerationRequirements(const CompletionRequestPayload &payload) {
-  return BuildGenerationFeatureRequirements(
-      payload.stream, payload.logprobs, payload.has_response_format,
-      payload.has_images);
+  return BuildGenerationFeatureRequirements(payload.stream, payload.logprobs,
+                                            payload.has_response_format,
+                                            payload.has_images);
+}
+
+bool IsDefaultModelAlias(const std::string &model) {
+  std::string normalized = model;
+  std::transform(
+      normalized.begin(), normalized.end(), normalized.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return normalized == "default";
 }
 
 CompletionRequestPayload ParseJsonPayload(const std::string &body) {
@@ -1394,10 +1474,29 @@ void HttpServer::HandleClient(ClientSession &session) {
     } catch (const json::exception &) {
     }
     auto start = std::chrono::steady_clock::now();
-    guardrail_->UpdateBlocklist(list);
-    if (policy_store_) {
-      policy_store_->SetGuardrailBlocklist(list);
-      policy_store_->Save();
+    {
+      std::lock_guard<std::mutex> policy_lock(policy_update_mutex_);
+      auto previous_blocklist = guardrail_->Blocklist();
+      auto previous_store_blocklist = policy_store_
+                                          ? policy_store_->GuardrailBlocklist()
+                                          : std::vector<std::string>{};
+
+      guardrail_->UpdateBlocklist(list);
+      if (policy_store_) {
+        policy_store_->SetGuardrailBlocklist(list);
+        if (!policy_store_->Save()) {
+          policy_store_->SetGuardrailBlocklist(previous_store_blocklist);
+          guardrail_->UpdateBlocklist(previous_blocklist);
+          SendAll(session,
+                  BuildResponse(BuildErrorBody("policy_persist_failed"), 500,
+                                "Internal Server Error"));
+          if (audit_logger_) {
+            audit_logger_->Log(auth_ctx.subject, "", "policy_persist_failed",
+                               "guardrail_update");
+          }
+          return;
+        }
+      }
     }
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
@@ -1443,12 +1542,32 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
     auto start = std::chrono::steady_clock::now();
-    if (rate_limiter_) {
-      rate_limiter_->UpdateLimit(value);
-    }
-    if (policy_store_) {
-      policy_store_->SetRateLimitPerMinute(value);
-      policy_store_->Save();
+    {
+      std::lock_guard<std::mutex> policy_lock(policy_update_mutex_);
+      int previous_limit = rate_limiter_ ? rate_limiter_->CurrentLimit() : 0;
+      int previous_store_limit =
+          policy_store_ ? policy_store_->RateLimitPerMinute() : 0;
+
+      if (rate_limiter_) {
+        rate_limiter_->UpdateLimit(value);
+      }
+      if (policy_store_) {
+        policy_store_->SetRateLimitPerMinute(value);
+        if (!policy_store_->Save()) {
+          policy_store_->SetRateLimitPerMinute(previous_store_limit);
+          if (rate_limiter_) {
+            rate_limiter_->UpdateLimit(previous_limit);
+          }
+          SendAll(session,
+                  BuildResponse(BuildErrorBody("policy_persist_failed"), 500,
+                                "Internal Server Error"));
+          if (audit_logger_) {
+            audit_logger_->Log(auth_ctx.subject, "", "policy_persist_failed",
+                               "rate_limit_update");
+          }
+          return;
+        }
+      }
     }
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
@@ -1503,9 +1622,36 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
     auto start = std::chrono::steady_clock::now();
-    auth_->AddKey(key, scopes);
-    policy_store_->SetApiKey(key, scopes);
-    policy_store_->Save();
+    {
+      std::lock_guard<std::mutex> policy_lock(policy_update_mutex_);
+      std::optional<std::vector<std::string>> previous_scopes;
+      const std::string key_hash = ApiKeyAuth::HashKey(key);
+      for (const auto &entry : policy_store_->ApiKeys()) {
+        if (entry.key == key_hash) {
+          previous_scopes = entry.scopes;
+          break;
+        }
+      }
+
+      auth_->AddKey(key, scopes);
+      policy_store_->SetApiKey(key, scopes);
+      if (!policy_store_->Save()) {
+        if (previous_scopes.has_value()) {
+          auth_->AddKeyHashed(key_hash, *previous_scopes);
+          policy_store_->SetApiKey(key, *previous_scopes);
+        } else {
+          auth_->RemoveKey(key);
+          policy_store_->RemoveApiKey(key);
+        }
+        SendAll(session, BuildResponse(BuildErrorBody("policy_persist_failed"),
+                                       500, "Internal Server Error"));
+        if (audit_logger_) {
+          audit_logger_->Log(auth_ctx.subject, "", "policy_persist_failed",
+                             "api_key_upsert");
+        }
+        return;
+      }
+    }
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
     std::cout << "[policy] api-key upsert applied in " << elapsed.count()
@@ -1540,9 +1686,33 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
     auto start = std::chrono::steady_clock::now();
-    auth_->RemoveKey(key);
-    policy_store_->RemoveApiKey(key);
-    policy_store_->Save();
+    {
+      std::lock_guard<std::mutex> policy_lock(policy_update_mutex_);
+      std::optional<std::vector<std::string>> previous_scopes;
+      const std::string key_hash = ApiKeyAuth::HashKey(key);
+      for (const auto &entry : policy_store_->ApiKeys()) {
+        if (entry.key == key_hash) {
+          previous_scopes = entry.scopes;
+          break;
+        }
+      }
+
+      auth_->RemoveKey(key);
+      policy_store_->RemoveApiKey(key);
+      if (!policy_store_->Save()) {
+        if (previous_scopes.has_value()) {
+          auth_->AddKeyHashed(key_hash, *previous_scopes);
+          policy_store_->SetApiKey(key, *previous_scopes);
+        }
+        SendAll(session, BuildResponse(BuildErrorBody("policy_persist_failed"),
+                                       500, "Internal Server Error"));
+        if (audit_logger_) {
+          audit_logger_->Log(auth_ctx.subject, "", "policy_persist_failed",
+                             "api_key_remove");
+        }
+        return;
+      }
+    }
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
     std::cout << "[policy] api-key removal applied in " << elapsed.count()
@@ -1570,18 +1740,7 @@ void HttpServer::HandleClient(ClientSession &session) {
     payload["default_model"] = default_id;
     payload["models"] = json::array();
     for (const auto &info : models) {
-      payload["models"].push_back(
-          {{"id", info.id},
-           {"path", info.path},
-           {"backend", info.backend},
-           {"requested_backend", info.requested_backend.empty()
-                                     ? info.backend
-                                     : info.requested_backend},
-           {"backend_provider", info.backend_provider},
-           {"backend_exposure", BuildBackendExposureJson(info)},
-           {"ready", info.ready},
-           {"capabilities", BuildCapabilitiesJson(info.capabilities)},
-           {"default", info.id == default_id}});
+      payload["models"].push_back(BuildAdminModelJson(info, default_id));
     }
     SendAll(session, BuildResponse(payload.dump()));
     return;
@@ -1600,6 +1759,7 @@ void HttpServer::HandleClient(ClientSession &session) {
     std::string path_value;
     std::string backend_hint;
     std::string requested_id;
+    std::string requested_format = "auto";
     bool set_default = false;
     try {
       auto j = json::parse(body);
@@ -1611,6 +1771,9 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
       if (j.contains("id") && j["id"].is_string()) {
         requested_id = j["id"].get<std::string>();
+      }
+      if (j.contains("format") && j["format"].is_string()) {
+        requested_format = j["format"].get<std::string>();
       }
       if (j.contains("default")) {
         if (j["default"].is_boolean()) {
@@ -1631,7 +1794,14 @@ void HttpServer::HandleClient(ClientSession &session) {
                                      "Bad Request"));
       return;
     }
-    auto id = router->LoadModel(path_value, backend_hint, requested_id);
+    if (!requested_format.empty() && !IsModelFormatValue(requested_format) &&
+        NormalizeModelFormat(requested_format) != "auto") {
+      SendAll(session, BuildResponse(BuildErrorBody("invalid model format"),
+                                     400, "Bad Request"));
+      return;
+    }
+    auto id = router->LoadModel(path_value, backend_hint, requested_id,
+                                requested_format);
     if (id.empty()) {
       SendAll(session, BuildResponse(BuildErrorBody("load_failed"), 500,
                                      "Internal Server Error"));
@@ -1658,22 +1828,14 @@ void HttpServer::HandleClient(ClientSession &session) {
                                      "Service Unavailable"));
       return;
     }
-    std::string id;
-    try {
-      auto j = json::parse(body);
-      if (j.contains("id") && j["id"].is_string()) {
-        id = j["id"].get<std::string>();
-      }
-    } catch (const json::exception &) {
-    }
+    std::string id = ParseJsonStringField(body, "id");
     if (id.empty()) {
       SendAll(session, BuildResponse(BuildErrorBody("id is required"), 400,
                                      "Bad Request"));
       return;
     }
     if (!router->UnloadModel(id)) {
-      SendAll(session, BuildResponse(BuildErrorBody("model_not_found"), 404,
-                                     "Not Found"));
+      SendAll(session, BuildModelNotFoundResponse());
       return;
     }
     SendAll(session, BuildResponse(json({{"status", "ok"}}).dump()));
@@ -1694,22 +1856,14 @@ void HttpServer::HandleClient(ClientSession &session) {
                                      "Service Unavailable"));
       return;
     }
-    std::string id;
-    try {
-      auto j = json::parse(body);
-      if (j.contains("id") && j["id"].is_string()) {
-        id = j["id"].get<std::string>();
-      }
-    } catch (const json::exception &) {
-    }
+    std::string id = ParseJsonStringField(body, "id");
     if (id.empty()) {
       SendAll(session, BuildResponse(BuildErrorBody("id is required"), 400,
                                      "Bad Request"));
       return;
     }
     if (!router->SetDefaultModel(id)) {
-      SendAll(session, BuildResponse(BuildErrorBody("model_not_found"), 404,
-                                     "Not Found"));
+      SendAll(session, BuildModelNotFoundResponse());
       return;
     }
     SendAll(
@@ -1764,11 +1918,10 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
       if (j.contains("require_ready_backend")) {
         if (!j["require_ready_backend"].is_boolean()) {
-          SendAll(
-              session,
-              BuildResponse(
-                  BuildErrorBody("require_ready_backend must be a boolean"),
-                  400, "Bad Request"));
+          SendAll(session,
+                  BuildResponse(
+                      BuildErrorBody("require_ready_backend must be a boolean"),
+                      400, "Bad Request"));
           return;
         }
         updated.require_ready_backend = j["require_ready_backend"].get<bool>();
@@ -1776,19 +1929,17 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
       if (j.contains("fallback_scope")) {
         if (!j["fallback_scope"].is_string()) {
-          SendAll(
-              session,
-              BuildResponse(BuildErrorBody("fallback_scope must be a string"),
-                            400, "Bad Request"));
+          SendAll(session, BuildResponse(BuildErrorBody(
+                                             "fallback_scope must be a string"),
+                                         400, "Bad Request"));
           return;
         }
         const std::string scope_value = j["fallback_scope"].get<std::string>();
         if (!IsCapabilityFallbackScopeValue(scope_value)) {
           SendAll(session,
                   BuildResponse(
-                      BuildErrorBody(
-                          "fallback_scope must be any_compatible or "
-                          "same_path_only"),
+                      BuildErrorBody("fallback_scope must be any_compatible or "
+                                     "same_path_only"),
                       400, "Bad Request"));
           return;
         }
@@ -1797,26 +1948,61 @@ void HttpServer::HandleClient(ClientSession &session) {
         touched = true;
       }
     } catch (const json::exception &) {
-      SendAll(session,
-              BuildResponse(BuildErrorBody("invalid JSON body"), 400,
-                            "Bad Request"));
+      SendAll(session, BuildResponse(BuildErrorBody("invalid JSON body"), 400,
+                                     "Bad Request"));
       return;
     }
     if (!touched) {
-      SendAll(session,
-              BuildResponse(
-                  BuildErrorBody("at least one routing policy field is "
-                                 "required"),
-                  400, "Bad Request"));
+      SendAll(session, BuildResponse(BuildErrorBody(
+                                         "at least one routing policy field is "
+                                         "required"),
+                                     400, "Bad Request"));
       return;
     }
 
     {
-      std::lock_guard<std::mutex> lock(model_selection_mutex_);
-      model_selection_options_ = updated;
-    }
-    if (scheduler_) {
-      scheduler_->UpdateModelSelectionOptions(updated);
+      std::lock_guard<std::mutex> policy_lock(policy_update_mutex_);
+      ModelSelectionOptions previous;
+      {
+        std::lock_guard<std::mutex> lock(model_selection_mutex_);
+        previous = model_selection_options_;
+        model_selection_options_ = updated;
+      }
+      if (scheduler_) {
+        scheduler_->UpdateModelSelectionOptions(updated);
+      }
+      if (policy_store_) {
+        auto previous_store_policy = policy_store_->RoutingPolicy();
+        RoutingPolicyEntry routing_policy;
+        routing_policy.allow_default_fallback =
+            updated.allow_capability_fallback_for_default;
+        routing_policy.require_ready_backend = updated.require_ready_backend;
+        routing_policy.fallback_scope =
+            CapabilityFallbackScopeToString(updated.capability_fallback_scope);
+        policy_store_->SetRoutingPolicy(routing_policy);
+        if (!policy_store_->Save()) {
+          if (previous_store_policy.has_value()) {
+            policy_store_->SetRoutingPolicy(*previous_store_policy);
+          } else {
+            policy_store_->ClearRoutingPolicy();
+          }
+          {
+            std::lock_guard<std::mutex> lock(model_selection_mutex_);
+            model_selection_options_ = previous;
+          }
+          if (scheduler_) {
+            scheduler_->UpdateModelSelectionOptions(previous);
+          }
+          SendAll(session,
+                  BuildResponse(BuildErrorBody("policy_persist_failed"), 500,
+                                "Internal Server Error"));
+          if (audit_logger_) {
+            audit_logger_->Log(auth_ctx.subject, "", "policy_persist_failed",
+                               "routing_policy_update");
+          }
+          return;
+        }
+      }
     }
 
     json payload{
@@ -1909,9 +2095,11 @@ void HttpServer::HandleClient(ClientSession &session) {
   // Distinct from the admin-only /v1/admin/models (load/unload/default).
   // Every OpenAI-compatible SDK (LangChain, LlamaIndex, openai-python) calls
   // this endpoint to discover available models.
+  static constexpr std::size_t kV1ModelsPrefixLen = 11; // "/v1/models/"
   if (method == "GET" &&
       (path == "/v1/models" ||
-       (path.size() > 12 && path.substr(0, 12) == "/v1/models/"))) {
+       (path.size() > kV1ModelsPrefixLen &&
+        path.substr(0, kV1ModelsPrefixLen) == "/v1/models/"))) {
     if (!RequireScope(auth_ctx, "read", session, "read scope required")) {
       return;
     }
@@ -1926,15 +2114,7 @@ void HttpServer::HandleClient(ClientSession &session) {
     if (path == "/v1/models") {
       json data = json::array();
       for (const auto &m : models) {
-        data.push_back(
-            {{"id", m.id},
-             {"object", "model"},
-             {"created", created_ts},
-             {"owned_by", "inferflux"},
-             {"backend", m.backend},
-             {"backend_exposure", BuildBackendExposureJson(m)},
-             {"ready", m.ready},
-             {"capabilities", BuildCapabilitiesJson(m.capabilities)}});
+        data.push_back(BuildOpenAIModelJson(m, created_ts));
       }
       SendAll(session,
               BuildResponse(json({{"object", "list"}, {"data", data}}).dump()));
@@ -1942,26 +2122,13 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
 
     // /v1/models/{id}
-    std::string model_id = path.substr(12); // strip "/v1/models/"
-    for (const auto &m : models) {
-      if (m.id == model_id) {
-        SendAll(
-            session,
-            BuildResponse(
-                json({{"id", m.id},
-                      {"object", "model"},
-                      {"created", created_ts},
-                      {"owned_by", "inferflux"},
-                      {"backend", m.backend},
-                      {"backend_exposure", BuildBackendExposureJson(m)},
-                      {"ready", m.ready},
-                      {"capabilities", BuildCapabilitiesJson(m.capabilities)}})
-                    .dump()));
-        return;
-      }
+    std::string model_id = path.substr(kV1ModelsPrefixLen); // strip prefix
+    if (const ModelInfo *model = FindModelById(models, model_id)) {
+      SendAll(session,
+              BuildResponse(BuildOpenAIModelJson(*model, created_ts).dump()));
+      return;
     }
-    SendAll(session,
-            BuildResponse(BuildErrorBody("model_not_found"), 404, "Not Found"));
+    SendAll(session, BuildModelNotFoundResponse());
     return;
   }
 
@@ -2004,15 +2171,26 @@ void HttpServer::HandleClient(ClientSession &session) {
     std::shared_ptr<LlamaCPUBackend> embed_backend;
     std::string resolved_model = embed_model.empty() ? "default" : embed_model;
     if (router) {
-      BackendFeatureRequirements requirements = BuildEmbeddingFeatureRequirements();
+      BackendFeatureRequirements requirements =
+          BuildEmbeddingFeatureRequirements();
       ModelSelectionOptions embedding_options;
       {
         std::lock_guard<std::mutex> lock(model_selection_mutex_);
         embedding_options = model_selection_options_;
       }
       embedding_options.require_ready_backend = true;
-      auto selection = SelectModelForRequest(
-          router, embed_model, requirements, embedding_options);
+      auto selection = SelectModelForRequest(router, embed_model, requirements,
+                                             embedding_options);
+      if (selection.status == ModelSelectionStatus::kNotFound &&
+          !embed_model.empty() && !IsDefaultModelAlias(embed_model)) {
+        SendAll(session, BuildResponse(BuildErrorBody("model_not_found"), 404,
+                                       "Not Found"));
+        if (audit_logger_) {
+          audit_logger_->Log(auth_ctx.subject, embed_model, "model_not_found",
+                             "Unknown embeddings model");
+        }
+        return;
+      }
       if (selection.status == ModelSelectionStatus::kUnsupported) {
         if (metrics_) {
           metrics_->RecordCapabilityRejection(selection.info.backend,
@@ -2250,6 +2428,17 @@ void HttpServer::HandleClient(ClientSession &session) {
       auto selection = SelectModelForRequest(
           router, parsed.model, BuildGenerationRequirements(parsed),
           generation_options);
+      if (selection.status == ModelSelectionStatus::kNotFound &&
+          !parsed.model.empty() && !IsDefaultModelAlias(parsed.model)) {
+        auto payload =
+            BuildResponse(BuildErrorBody("model_not_found"), 404, "Not Found");
+        SendAll(session, payload);
+        if (audit_logger_) {
+          audit_logger_->Log(auth_ctx.subject, parsed.model, "model_not_found",
+                             "Unknown requested model");
+        }
+        return;
+      }
       if (selection.status == ModelSelectionStatus::kUnsupported) {
         if (metrics_) {
           metrics_->RecordCapabilityRejection(selection.info.backend,

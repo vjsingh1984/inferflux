@@ -15,12 +15,10 @@ CapabilityCheckResult Missing(const std::string &feature,
 
 } // namespace
 
-BackendFeatureRequirements
-BuildGenerationFeatureRequirements(bool needs_streaming, bool needs_logprobs,
-                                   bool needs_structured_output,
-                                   bool needs_vision,
-                                   bool needs_speculative_decoding,
-                                   bool needs_fairness_preemption) {
+BackendFeatureRequirements BuildGenerationFeatureRequirements(
+    bool needs_streaming, bool needs_logprobs, bool needs_structured_output,
+    bool needs_vision, bool needs_speculative_decoding,
+    bool needs_fairness_preemption) {
   BackendFeatureRequirements requirements;
   requirements.needs_streaming = needs_streaming;
   requirements.needs_logprobs = needs_logprobs;

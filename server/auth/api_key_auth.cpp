@@ -9,25 +9,26 @@
 namespace inferflux {
 
 namespace {
-std::unordered_set<std::string> MakeScopes(const std::vector<std::string>& scopes) {
+std::unordered_set<std::string>
+MakeScopes(const std::vector<std::string> &scopes) {
   std::unordered_set<std::string> set;
   if (scopes.empty()) {
     set.insert("generate");
     set.insert("read");
     return set;
   }
-  for (const auto& scope : scopes) {
+  for (const auto &scope : scopes) {
     if (!scope.empty()) {
       set.insert(scope);
     }
   }
   return set;
 }
-}  // namespace
+} // namespace
 
-std::string ApiKeyAuth::HashKey(const std::string& key) {
+std::string ApiKeyAuth::HashKey(const std::string &key) {
   unsigned char hash[SHA256_DIGEST_LENGTH];
-  SHA256(reinterpret_cast<const unsigned char*>(key.data()), key.size(), hash);
+  SHA256(reinterpret_cast<const unsigned char *>(key.data()), key.size(), hash);
   std::ostringstream hex;
   hex << std::hex << std::setfill('0');
   for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
@@ -36,11 +37,13 @@ std::string ApiKeyAuth::HashKey(const std::string& key) {
   return hex.str();
 }
 
-void ApiKeyAuth::AddKey(const std::string& key, const std::vector<std::string>& scopes) {
+void ApiKeyAuth::AddKey(const std::string &key,
+                        const std::vector<std::string> &scopes) {
   AddKeyHashed(HashKey(key), scopes);
 }
 
-void ApiKeyAuth::AddKeyHashed(const std::string& hash, const std::vector<std::string>& scopes) {
+void ApiKeyAuth::AddKeyHashed(const std::string &hash,
+                              const std::vector<std::string> &scopes) {
   std::unique_lock lock(mutex_);
   keys_[hash] = MakeScopes(scopes);
   if (keys_[hash].find("read") == keys_[hash].end()) {
@@ -48,7 +51,7 @@ void ApiKeyAuth::AddKeyHashed(const std::string& hash, const std::vector<std::st
   }
 }
 
-bool ApiKeyAuth::IsAllowed(const std::string& key) const {
+bool ApiKeyAuth::IsAllowed(const std::string &key) const {
   std::shared_lock lock(mutex_);
   return keys_.find(HashKey(key)) != keys_.end();
 }
@@ -58,7 +61,7 @@ bool ApiKeyAuth::HasKeys() const {
   return !keys_.empty();
 }
 
-std::vector<std::string> ApiKeyAuth::Scopes(const std::string& key) const {
+std::vector<std::string> ApiKeyAuth::Scopes(const std::string &key) const {
   std::shared_lock lock(mutex_);
   auto it = keys_.find(HashKey(key));
   if (it == keys_.end()) {
@@ -67,9 +70,9 @@ std::vector<std::string> ApiKeyAuth::Scopes(const std::string& key) const {
   return std::vector<std::string>(it->second.begin(), it->second.end());
 }
 
-void ApiKeyAuth::RemoveKey(const std::string& key) {
+void ApiKeyAuth::RemoveKey(const std::string &key) {
   std::unique_lock lock(mutex_);
   keys_.erase(HashKey(key));
 }
 
-}  // namespace inferflux
+} // namespace inferflux

@@ -1,6 +1,7 @@
 #include "runtime/backends/backend_factory.h"
 
 #include "runtime/backends/cuda/cuda_backend.h"
+#include "runtime/backends/cuda/native_cuda_backend.h"
 #include "server/logging/logger.h"
 
 #if INFERFLUX_HAS_MLX
@@ -26,11 +27,31 @@ BackendExposurePolicy LoadPolicy() {
 }
 
 bool SupportsNativeBackend(LlamaBackendTarget target) {
-  // Native CUDA/ROCm/MPS runtime backends are intentionally not wired yet.
-  // We keep this gate explicit so the factory can expose policy-driven
-  // fallback behavior (native-preferred -> universal llama fallback).
-  (void)target;
+  // Policy-path native selection remains disabled until native kernels are
+  // implemented and stable. Explicit backend hints (cuda_native) are still
+  // routable for scaffold/testing.
+  if (target == LlamaBackendTarget::kCuda) {
+    return NativeCudaBackend::NativeKernelsReady();
+  }
   return false;
+}
+
+bool IsExplicitNativeHint(const std::string &hint) {
+  return hint == "cuda_native";
+}
+
+bool IsExplicitUniversalHint(const std::string &hint) {
+  return hint == "cuda_universal" || hint == "cuda_llama";
+}
+
+std::shared_ptr<LlamaCPUBackend>
+CreateNativeBackendForTarget(LlamaBackendTarget target) {
+  if (target == LlamaBackendTarget::kCuda) {
+#ifdef INFERFLUX_HAS_CUDA
+    return std::make_shared<NativeCudaBackend>();
+#endif
+  }
+  return nullptr;
 }
 
 BackendFactoryResult CpuFallback(const std::string &reason) {
@@ -98,6 +119,21 @@ BackendFactoryResult UniversalLlamaForTarget(LlamaBackendTarget target,
                      "'. Falling back to CPU backend.");
 }
 
+BackendFactoryResult NativeUnavailableResult(LlamaBackendTarget target,
+                                             const LlamaBackendTraits &traits,
+                                             const std::string &reason) {
+  BackendFactoryResult out;
+  out.target = target;
+  out.traits = traits;
+  out.capabilities = traits.capabilities;
+  out.provider = BackendProvider::kNative;
+  out.backend_label = traits.label;
+  out.fallback_reason = reason;
+  log::Error("backend_factory",
+             "No backend exposed for '" + traits.label + "': " + reason);
+  return out;
+}
+
 } // namespace
 
 std::string BackendFactory::NormalizeHint(const std::string &backend_hint) {
@@ -108,7 +144,8 @@ std::string BackendFactory::NormalizeHint(const std::string &backend_hint) {
   std::transform(
       lowered.begin(), lowered.end(), lowered.begin(),
       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  if (lowered == "auto" || lowered == "mlx") {
+  if (lowered == "auto" || lowered == "mlx" || IsExplicitNativeHint(lowered) ||
+      IsExplicitUniversalHint(lowered)) {
     return lowered;
   }
   return DescribeLlamaBackendTarget(ParseLlamaBackendTarget(lowered)).label;
@@ -143,6 +180,15 @@ BackendFactory::NormalizeHintList(const std::vector<std::string> &backend_hints,
 
 BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
   std::string hint = NormalizeHint(backend_hint);
+  bool force_native = false;
+  bool force_universal = false;
+  if (IsExplicitNativeHint(hint)) {
+    hint = "cuda";
+    force_native = true;
+  } else if (IsExplicitUniversalHint(hint)) {
+    hint = "cuda";
+    force_universal = true;
+  }
   if (hint == "auto") {
 #ifdef INFERFLUX_HAS_CUDA
     hint = "cuda";
@@ -167,32 +213,60 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
   }
 
   if (hint == "cuda" || hint == "mps" || hint == "rocm" || hint == "vulkan") {
+    if (force_native) {
+      auto backend = CreateNativeBackendForTarget(target);
+      if (backend) {
+        BackendFactoryResult out;
+        out.target = target;
+        out.traits = traits;
+        out.capabilities = traits.capabilities;
+        out.backend_label = traits.label;
+        out.provider = BackendProvider::kNative;
+        out.backend = std::move(backend);
+        out.config = TuneLlamaBackendConfig(target, {});
+        if (!SupportsNativeBackend(target)) {
+          out.used_fallback = true;
+          out.fallback_reason =
+              "native backend scaffold mode active; native kernels are not "
+              "wired yet";
+          log::Warn("backend_factory", "Using native scaffold backend for '" +
+                                           hint + "': " + out.fallback_reason);
+        }
+        return out;
+      }
+      return NativeUnavailableResult(
+          target, traits,
+          "native backend explicitly requested but unavailable");
+    }
+
+    if (force_universal) {
+      return UniversalLlamaForTarget(target, hint);
+    }
+
     if (policy.prefer_native && SupportsNativeBackend(target)) {
-      // Reserved for future native backend wiring.
+      // Native kernels are ready - create native backend
+      auto backend = CreateNativeBackendForTarget(target);
+      if (!backend) {
+        return NativeUnavailableResult(
+            target, traits,
+            "native backend indicated as ready but creation failed");
+      }
       BackendFactoryResult out;
       out.target = target;
       out.traits = traits;
       out.capabilities = traits.capabilities;
       out.backend_label = traits.label;
       out.provider = BackendProvider::kNative;
+      out.backend = std::move(backend);
       out.config = TuneLlamaBackendConfig(target, {});
       return out;
     }
 
     if (policy.prefer_native && !policy.allow_universal_fallback) {
-      BackendFactoryResult out;
-      out.target = target;
-      out.traits = traits;
-      out.capabilities = traits.capabilities;
-      out.provider = BackendProvider::kNative;
-      out.backend_label = traits.label;
-      out.fallback_reason =
+      return NativeUnavailableResult(
+          target, traits,
           "native backend requested but unavailable; universal fallback "
-          "disabled";
-      log::Error("backend_factory",
-                 "No backend exposed for '" + hint +
-                     "': native preferred, universal fallback disabled.");
-      return out;
+          "disabled");
     }
 
     BackendFactoryResult out;

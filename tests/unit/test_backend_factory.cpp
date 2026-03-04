@@ -2,6 +2,7 @@
 
 #include "runtime/backends/backend_factory.h"
 #include "runtime/backends/cuda/cuda_backend.h"
+#include "runtime/backends/cuda/native_cuda_backend.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
 
 using namespace inferflux;
@@ -74,6 +75,47 @@ TEST_CASE("BackendFactory cuda hint resolves predictably",
   REQUIRE(selection.backend_label == "cpu");
   REQUIRE(selection.config.gpu_layers == 0);
   REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) == nullptr);
+#endif
+}
+
+TEST_CASE("BackendFactory explicit cuda_universal hint forces universal provider",
+          "[backend_factory]") {
+  BackendFactory::SetExposurePolicy({true, false});
+  auto selection = BackendFactory::Create("cuda_universal");
+
+  REQUIRE(selection.provider == BackendProvider::kUniversalLlama);
+#ifdef INFERFLUX_HAS_CUDA
+  REQUIRE(selection.backend != nullptr);
+  REQUIRE(selection.backend_label == "cuda");
+  REQUIRE_FALSE(selection.used_fallback);
+  REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) != nullptr);
+#else
+  REQUIRE(selection.backend != nullptr);
+  REQUIRE(selection.backend_label == "cpu");
+  REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) == nullptr);
+#endif
+
+  BackendFactory::SetExposurePolicy({true, true});
+}
+
+TEST_CASE("BackendFactory explicit cuda_native hint requires native provider",
+          "[backend_factory]") {
+  BackendFactory::SetExposurePolicy({false, true});
+  auto selection = BackendFactory::Create("cuda_native");
+
+  REQUIRE(selection.provider == BackendProvider::kNative);
+#ifdef INFERFLUX_HAS_CUDA
+  REQUIRE(selection.backend != nullptr);
+  REQUIRE(selection.backend_label == "cuda");
+  REQUIRE(dynamic_cast<NativeCudaBackend *>(selection.backend.get()) !=
+          nullptr);
+  REQUIRE(selection.used_fallback);
+  REQUIRE(selection.fallback_reason.find("scaffold mode") !=
+          std::string::npos);
+#else
+  REQUIRE(selection.backend == nullptr);
+  REQUIRE(selection.fallback_reason.find("explicitly requested") !=
+          std::string::npos);
 #endif
 }
 
@@ -170,11 +212,17 @@ TEST_CASE("TuneLlamaBackendConfig disables acceleration knobs for CPU",
   cfg.gpu_layers = 32;
   cfg.use_flash_attention = true;
   cfg.flash_attention_tile = 256;
+  cfg.cuda_phase_overlap_scaffold = true;
+  cfg.cuda_phase_overlap_prefill_replica = true;
+  cfg.cuda_attention_kernel = "fa3";
 
   auto tuned = TuneLlamaBackendConfig(LlamaBackendTarget::kCpu, cfg);
   REQUIRE(tuned.gpu_layers == 0);
   REQUIRE_FALSE(tuned.use_flash_attention);
   REQUIRE(tuned.flash_attention_tile == 256);
+  REQUIRE_FALSE(tuned.cuda_phase_overlap_scaffold);
+  REQUIRE_FALSE(tuned.cuda_phase_overlap_prefill_replica);
+  REQUIRE(tuned.cuda_attention_kernel == "standard");
 }
 
 TEST_CASE("TuneLlamaBackendConfig preserves flash attention for MPS",
@@ -184,11 +232,41 @@ TEST_CASE("TuneLlamaBackendConfig preserves flash attention for MPS",
   cfg.gpu_layers = 0;
   cfg.use_flash_attention = true;
   cfg.flash_attention_tile = 0;
+  cfg.cuda_phase_overlap_scaffold = true;
+  cfg.cuda_phase_overlap_prefill_replica = true;
 
   auto tuned = TuneLlamaBackendConfig(LlamaBackendTarget::kMps, cfg);
   REQUIRE(tuned.gpu_layers == 99);
   REQUIRE(tuned.use_flash_attention);
   REQUIRE(tuned.flash_attention_tile == 128);
+  REQUIRE_FALSE(tuned.cuda_phase_overlap_scaffold);
+  REQUIRE_FALSE(tuned.cuda_phase_overlap_prefill_replica);
+}
+
+TEST_CASE("TuneLlamaBackendConfig keeps CUDA overlap scaffold settings",
+          "[backend_factory]") {
+  BackendFactory::SetExposurePolicy({true, true});
+  LlamaBackendConfig cfg;
+  cfg.cuda_phase_overlap_scaffold = true;
+  cfg.cuda_phase_overlap_prefill_replica = true;
+  cfg.cuda_phase_overlap_min_prefill_tokens = 0;
+  cfg.cuda_attention_kernel = "FA3";
+
+  auto tuned = TuneLlamaBackendConfig(LlamaBackendTarget::kCuda, cfg);
+  REQUIRE(tuned.cuda_phase_overlap_scaffold);
+  REQUIRE(tuned.cuda_phase_overlap_prefill_replica);
+  REQUIRE(tuned.cuda_phase_overlap_min_prefill_tokens == 256);
+  REQUIRE(tuned.cuda_attention_kernel == "fa3");
+}
+
+TEST_CASE("TuneLlamaBackendConfig normalizes unknown CUDA attention kernel",
+          "[backend_factory]") {
+  BackendFactory::SetExposurePolicy({true, true});
+  LlamaBackendConfig cfg;
+  cfg.cuda_attention_kernel = "unknown-kernel";
+
+  auto tuned = TuneLlamaBackendConfig(LlamaBackendTarget::kCuda, cfg);
+  REQUIRE(tuned.cuda_attention_kernel == "auto");
 }
 
 TEST_CASE("BackendFactory can disable universal fallback for native policy",
@@ -215,4 +293,11 @@ TEST_CASE("BackendFactory NormalizeHintList deduplicates and falls back",
   auto fallback = BackendFactory::NormalizeHintList({}, "ROCM");
   REQUIRE(fallback.size() == 1);
   REQUIRE(fallback[0] == "rocm");
+}
+
+TEST_CASE("BackendFactory NormalizeHint keeps explicit provider hints",
+          "[backend_factory]") {
+  REQUIRE(BackendFactory::NormalizeHint("CUDA_NATIVE") == "cuda_native");
+  REQUIRE(BackendFactory::NormalizeHint("cuda_universal") == "cuda_universal");
+  REQUIRE(BackendFactory::NormalizeHint("cuda_llama") == "cuda_llama");
 }

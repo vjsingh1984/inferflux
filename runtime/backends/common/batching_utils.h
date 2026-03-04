@@ -81,10 +81,9 @@ public:
   /// @param inputs Batch to split
   /// @param prefill_indices Output: indices of prefill inputs
   /// @param decode_indices Output: indices of decode inputs
-  static void SplitBatchByType(
-      const std::vector<UnifiedBatchInput> &inputs,
-      std::vector<size_t> &prefill_indices,
-      std::vector<size_t> &decode_indices) {
+  static void SplitBatchByType(const std::vector<UnifiedBatchInput> &inputs,
+                               std::vector<size_t> &prefill_indices,
+                               std::vector<size_t> &decode_indices) {
 
     prefill_indices.clear();
     decode_indices.clear();

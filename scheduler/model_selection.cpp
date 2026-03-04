@@ -19,6 +19,10 @@ std::string ToLower(std::string value) {
   return value;
 }
 
+bool IsDefaultModelAlias(const std::string &value) {
+  return ToLower(value) == "default";
+}
+
 BackendCapabilities EffectiveCapabilities(const ModelInfo &info) {
   BackendCapabilities capabilities = info.capabilities;
   if (!info.supports_structured_output) {
@@ -142,7 +146,10 @@ SelectModelForRequest(ModelRouter *router, const std::string &requested_model,
                       const BackendFeatureRequirements &requirements,
                       const ModelSelectionOptions &options) {
   ModelSelectionResult result;
-  const bool explicit_model_requested = !requested_model.empty();
+  const bool explicit_model_requested =
+      !requested_model.empty() && !IsDefaultModelAlias(requested_model);
+  const std::string resolved_request =
+      explicit_model_requested ? requested_model : "";
   const bool allow_default_fallback =
       options.allow_capability_fallback_for_default &&
       !explicit_model_requested;
@@ -153,7 +160,9 @@ SelectModelForRequest(ModelRouter *router, const std::string &requested_model,
     return result;
   }
 
-  auto *primary = router->Resolve(requested_model);
+  auto *primary = explicit_model_requested
+                      ? router->ResolveExact(requested_model)
+                      : router->Resolve(resolved_request);
   if (!primary) {
     result.status = ModelSelectionStatus::kNotFound;
     result.reason = "model not found";

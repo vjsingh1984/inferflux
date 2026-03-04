@@ -17,21 +17,19 @@ struct PrefixCacheEntry {
 };
 
 class PrefixCache {
- public:
+public:
   explicit PrefixCache(std::size_t capacity = 256);
 
-  bool Lookup(const std::vector<int>& tokens,
-              std::string* completion,
-              int* completion_tokens);
+  bool Lookup(const std::vector<int> &tokens, std::string *completion,
+              int *completion_tokens);
 
-  void Insert(const std::vector<int>& tokens,
-              const std::string& completion,
+  void Insert(const std::vector<int> &tokens, const std::string &completion,
               int completion_tokens);
 
   std::size_t Capacity() const { return capacity_; }
 
- private:
-  std::string Serialize(const std::vector<int>& tokens) const;
+private:
+  std::string Serialize(const std::vector<int> &tokens) const;
 
   struct EntryState {
     PrefixCacheEntry entry;
@@ -44,4 +42,4 @@ class PrefixCache {
   mutable std::mutex mutex_;
 };
 
-}  // namespace inferflux
+} // namespace inferflux

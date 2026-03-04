@@ -1,6 +1,7 @@
 #include "policy/policy_store.h"
 #include "server/auth/api_key_auth.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -58,6 +59,22 @@ std::vector<unsigned char> HexDecode(const std::string &hex) {
   }
   return out;
 }
+
+bool ParseBoolValue(const std::string &value, bool *parsed) {
+  std::string lowered = value;
+  std::transform(
+      lowered.begin(), lowered.end(), lowered.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (lowered == "true" || lowered == "1" || lowered == "yes") {
+    *parsed = true;
+    return true;
+  }
+  if (lowered == "false" || lowered == "0" || lowered == "no") {
+    *parsed = false;
+    return true;
+  }
+  return false;
+}
 } // namespace
 
 PolicyStore::PolicyStore(std::string path, std::string passphrase)
@@ -107,52 +124,93 @@ bool PolicyStore::Load() {
   api_keys_.clear();
   guardrail_blocklist_.clear();
   rate_limit_per_minute_ = 0;
-  std::ifstream input(path_, std::ios::binary);
-  if (!input.good()) {
-    return false;
-  }
-  std::string raw((std::istreambuf_iterator<char>(input)),
-                  std::istreambuf_iterator<char>());
-  std::string plaintext = raw;
-  if (raw.rfind("ENC", 0) == 0) {
-    if (!encryption_enabled_) {
+  routing_policy_.reset();
+  auto parse_from_path = [&](const std::string &source_path) -> bool {
+    std::ifstream input(source_path, std::ios::binary);
+    if (!input.good()) {
       return false;
     }
-    if (!Decrypt(raw, &plaintext)) {
-      return false;
-    }
-  }
-  std::istringstream buffer(plaintext);
-  std::string line;
-  std::string section;
-  while (std::getline(buffer, line)) {
-    line = Trim(line);
-    if (line.empty() || line[0] == '#') {
-      continue;
-    }
-    if (line.front() == '[' && line.back() == ']') {
-      section = line.substr(1, line.size() - 2);
-      continue;
-    }
-    auto eq = line.find('=');
-    if (eq == std::string::npos) {
-      continue;
-    }
-    auto key = Trim(line.substr(0, eq));
-    auto value = Trim(line.substr(eq + 1));
-    if (section == "api_keys") {
-      api_keys_[key] = SplitCSV(value);
-    } else if (section == "guardrail" && key == "words") {
-      guardrail_blocklist_ = SplitCSV(value);
-    } else if (section == "rate_limit" && key == "tokens") {
-      try {
-        rate_limit_per_minute_ = std::stoi(value);
-      } catch (...) {
-        rate_limit_per_minute_ = 0;
+    std::string raw((std::istreambuf_iterator<char>(input)),
+                    std::istreambuf_iterator<char>());
+    std::string plaintext = raw;
+    if (raw.rfind("ENC", 0) == 0) {
+      if (!encryption_enabled_) {
+        return false;
+      }
+      if (!Decrypt(raw, &plaintext)) {
+        return false;
       }
     }
+
+    std::unordered_map<std::string, std::vector<std::string>> loaded_api_keys;
+    std::vector<std::string> loaded_guardrail;
+    int loaded_rate_limit = 0;
+    std::optional<RoutingPolicyEntry> loaded_routing;
+    RoutingPolicyEntry parsed_routing_policy;
+    bool has_routing_policy = false;
+
+    std::istringstream buffer(plaintext);
+    std::string line;
+    std::string section;
+    while (std::getline(buffer, line)) {
+      line = Trim(line);
+      if (line.empty() || line[0] == '#') {
+        continue;
+      }
+      if (line.front() == '[' && line.back() == ']') {
+        section = line.substr(1, line.size() - 2);
+        continue;
+      }
+      auto eq = line.find('=');
+      if (eq == std::string::npos) {
+        continue;
+      }
+      auto key = Trim(line.substr(0, eq));
+      auto value = Trim(line.substr(eq + 1));
+      if (section == "api_keys") {
+        loaded_api_keys[key] = SplitCSV(value);
+      } else if (section == "guardrail" && key == "words") {
+        loaded_guardrail = SplitCSV(value);
+      } else if (section == "rate_limit" && key == "tokens") {
+        try {
+          loaded_rate_limit = std::stoi(value);
+        } catch (...) {
+          loaded_rate_limit = 0;
+        }
+      } else if (section == "routing" && key == "allow_default_fallback") {
+        bool parsed = parsed_routing_policy.allow_default_fallback;
+        if (ParseBoolValue(value, &parsed)) {
+          parsed_routing_policy.allow_default_fallback = parsed;
+        }
+        has_routing_policy = true;
+      } else if (section == "routing" && key == "require_ready_backend") {
+        bool parsed = parsed_routing_policy.require_ready_backend;
+        if (ParseBoolValue(value, &parsed)) {
+          parsed_routing_policy.require_ready_backend = parsed;
+        }
+        has_routing_policy = true;
+      } else if (section == "routing" && key == "fallback_scope") {
+        if (!value.empty()) {
+          parsed_routing_policy.fallback_scope = value;
+        }
+        has_routing_policy = true;
+      }
+    }
+    if (has_routing_policy) {
+      loaded_routing = parsed_routing_policy;
+    }
+
+    api_keys_ = std::move(loaded_api_keys);
+    guardrail_blocklist_ = std::move(loaded_guardrail);
+    rate_limit_per_minute_ = loaded_rate_limit;
+    routing_policy_ = std::move(loaded_routing);
+    return true;
+  };
+
+  if (parse_from_path(path_)) {
+    return true;
   }
-  return true;
+  return parse_from_path(path_ + ".bak");
 }
 
 bool PolicyStore::Save() const {
@@ -167,21 +225,70 @@ bool PolicyStore::Save() const {
   plaintext << "words=" << JoinCSV(guardrail_blocklist_) << "\n";
   plaintext << "\n[rate_limit]\n";
   plaintext << "tokens=" << rate_limit_per_minute_ << "\n";
-  std::string serialized = plaintext.str();
-
-  std::ofstream output(path_, std::ios::trunc | std::ios::binary);
-  if (!output.good()) {
-    return false;
+  if (routing_policy_.has_value()) {
+    plaintext << "\n[routing]\n";
+    plaintext << "allow_default_fallback="
+              << (routing_policy_->allow_default_fallback ? "true" : "false")
+              << "\n";
+    plaintext << "require_ready_backend="
+              << (routing_policy_->require_ready_backend ? "true" : "false")
+              << "\n";
+    plaintext << "fallback_scope=" << routing_policy_->fallback_scope << "\n";
   }
+  std::string serialized = plaintext.str();
   if (encryption_enabled_) {
     std::string encrypted;
     if (!Encrypt(serialized, &encrypted)) {
       return false;
     }
-    output << encrypted;
-  } else {
-    output << serialized;
+    serialized = std::move(encrypted);
   }
+
+  const std::filesystem::path target(path_);
+  const std::filesystem::path temp(path_ + ".tmp");
+  const std::filesystem::path backup(path_ + ".bak");
+
+  {
+    std::ofstream output(temp, std::ios::trunc | std::ios::binary);
+    if (!output.good()) {
+      return false;
+    }
+    output << serialized;
+    output.flush();
+    if (!output.good()) {
+      std::error_code ec;
+      std::filesystem::remove(temp, ec);
+      return false;
+    }
+  }
+
+  std::error_code exists_ec;
+  if (std::filesystem::exists(target, exists_ec)) {
+    std::error_code copy_ec;
+    std::filesystem::copy_file(
+        target, backup, std::filesystem::copy_options::overwrite_existing,
+        copy_ec);
+  }
+
+  std::error_code rename_ec;
+  std::filesystem::rename(temp, target, rename_ec);
+  if (rename_ec) {
+    std::error_code remove_ec;
+    std::filesystem::remove(target, remove_ec);
+    rename_ec.clear();
+    std::filesystem::rename(temp, target, rename_ec);
+  }
+  if (rename_ec) {
+    std::error_code cleanup_ec;
+    std::filesystem::remove(temp, cleanup_ec);
+    return false;
+  }
+
+  std::error_code perm_ec;
+  std::filesystem::permissions(target,
+                               std::filesystem::perms::owner_read |
+                                   std::filesystem::perms::owner_write,
+                               std::filesystem::perm_options::replace, perm_ec);
   return true;
 }
 
@@ -226,6 +333,21 @@ int PolicyStore::RateLimitPerMinute() const {
 void PolicyStore::SetRateLimitPerMinute(int limit) {
   std::lock_guard<std::mutex> lock(mutex_);
   rate_limit_per_minute_ = limit;
+}
+
+std::optional<RoutingPolicyEntry> PolicyStore::RoutingPolicy() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return routing_policy_;
+}
+
+void PolicyStore::SetRoutingPolicy(const RoutingPolicyEntry &policy) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  routing_policy_ = policy;
+}
+
+void PolicyStore::ClearRoutingPolicy() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  routing_policy_.reset();
 }
 
 bool PolicyStore::Encrypt(const std::string &plaintext,

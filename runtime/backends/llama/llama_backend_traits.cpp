@@ -9,10 +9,9 @@ namespace {
 
 std::string NormalizeHint(const std::string &hint) {
   std::string lowered = hint;
-  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-                 [](unsigned char c) {
-                   return static_cast<char>(std::tolower(c));
-                 });
+  std::transform(
+      lowered.begin(), lowered.end(), lowered.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return lowered;
 }
 
@@ -26,6 +25,14 @@ BackendCapabilities BuildCapabilitiesForTarget(LlamaBackendTarget target) {
   caps.supports_vision = false;
 #endif
   return caps;
+}
+
+std::string NormalizeCudaAttentionKernel(const std::string &value) {
+  std::string lowered = NormalizeHint(value);
+  if (lowered == "fa3" || lowered == "fa2" || lowered == "standard") {
+    return lowered;
+  }
+  return "auto";
 }
 
 } // namespace
@@ -81,8 +88,8 @@ LlamaBackendTraits DescribeLlamaBackendTarget(LlamaBackendTarget target) {
   }
 }
 
-LlamaBackendConfig
-TuneLlamaBackendConfig(LlamaBackendTarget target, const LlamaBackendConfig &base) {
+LlamaBackendConfig TuneLlamaBackendConfig(LlamaBackendTarget target,
+                                          const LlamaBackendConfig &base) {
   LlamaBackendConfig tuned = base;
   const auto traits = DescribeLlamaBackendTarget(target);
 
@@ -100,6 +107,18 @@ TuneLlamaBackendConfig(LlamaBackendTarget target, const LlamaBackendConfig &base
 
   if (tuned.flash_attention_tile <= 0) {
     tuned.flash_attention_tile = 128;
+  }
+
+  if (target == LlamaBackendTarget::kCuda) {
+    tuned.cuda_attention_kernel =
+        NormalizeCudaAttentionKernel(tuned.cuda_attention_kernel);
+    if (tuned.cuda_phase_overlap_min_prefill_tokens <= 0) {
+      tuned.cuda_phase_overlap_min_prefill_tokens = 256;
+    }
+  } else {
+    tuned.cuda_attention_kernel = "standard";
+    tuned.cuda_phase_overlap_scaffold = false;
+    tuned.cuda_phase_overlap_prefill_replica = false;
   }
 
   return tuned;
