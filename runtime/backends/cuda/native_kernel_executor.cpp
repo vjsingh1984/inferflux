@@ -743,7 +743,6 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   }
 
   // 7. Allocate device logits buffer (sized for batched decode)
-  int max_batch = 32;
   cudaError_t err =
       cudaMalloc(&d_logits_, static_cast<size_t>(max_batch) *
                                  config.vocab_size * sizeof(float));
