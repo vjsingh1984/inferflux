@@ -163,6 +163,368 @@ flowchart TD
 | `hf` | HuggingFace URI | Auto-detected | `hf://org/repo` |
 | `auto` | Auto-detect | Auto-detected | Unknown format |
 
+### Model Formats and Quantization - Deep Dive
+
+```mermaid
+graph TB
+    subgraph "Model Format Ecosystem"
+        A[Storage Format]
+        B[Quantization Format]
+        C[Complete Format]
+
+        A --> A1[Safetensors]
+        A --> A2[PyTorch .bin]
+
+        B --> B1[Q4_K_M]
+        B --> B2[Q5_K_M]
+        B --> B3[Q8_0]
+
+        C --> C1[GGUF]
+
+        C1 --> B1
+        C1 --> B2
+        C1 --> B3
+
+        A1 --> D[Can Store Quantized Weights]
+        A2 --> D
+
+        style A1 fill:#ff6b6b
+        style C1 fill:#4ecdc4
+        style B1 fill:#feca57
+        style D fill:#ff9ff3
+    end
+```
+
+#### Understanding the Difference
+
+**Storage Format vs. Quantization Format**
+
+| Aspect | Storage Format | Quantization Format |
+|--------|----------------|---------------------|
+| **Purpose** | How tensors are stored | How weights are compressed |
+| **Examples** | Safetensors, PyTorch .bin | Q4_K_M, Q5_K_M, Q8_0 |
+| **Contains** | Raw tensor data (fp16, bf16, fp32, int8, int4) | Quantization scheme + scales + metadata |
+| **Dequantization** | Needs custom kernels | Built into format handler |
+| **Independence** | Can be used with any model | Tied to specific framework |
+
+#### GGUF Format
+
+GGUF is a **self-contained format** created by llama.cpp:
+
+```mermaid
+graph LR
+    subgraph "GGUF File Structure"
+        A1[Model Weights]
+        A2[Quantization Data<br/>Q4_K_M, Q5_K_M]
+        A3[Tensor Info<br/>shapes, dtypes]
+        A4[Model Architecture]
+        A5[Tokenizer]
+        A6[Metadata]
+
+        A1 --> G[.gguf File]
+        A2 --> G
+        A3 --> G
+        A4 --> G
+        A5 --> G
+        A6 --> G
+    end
+
+    style G fill:#4ecdc4
+    style A2 fill:#feca57
+```
+
+**What GGUF Contains:**
+- ✅ Model weights (quantized or full precision)
+- ✅ Quantization scheme (Q4_K_M, Q5_K_M, Q8_0, etc.)
+- ✅ Dequantization parameters (scales, zero-points)
+- ✅ Model architecture (layer counts, sizes)
+- ✅ Tokenizer vocabulary
+- ✅ Metadata (model name, context length)
+
+**GGUF Quantization Options:**
+
+| Quantization | Bits | VRAM (3B model) | Quality | Description |
+|--------------|------|-----------------|---------|-------------|
+| **Q4_K_M** | 4 | 2.0 GB | Good | Recommended for most use cases |
+| **Q5_K_M** | 5 | 2.4 GB | Better | Balance of quality and size |
+| **Q5_K_S** | 5 | 2.3 GB | Better | Small variants |
+| **Q8_0** | 8 | 3.5 GB | Excellent | Near-float quality |
+| **F16** | 16 | 5.6 GB | Perfect | Full precision |
+
+**Q4_K_M Details:**
+- **4-bit quantization** with specific structure
+- **Block-wise quantization** (32-256 elements per block)
+- **Separate scales** per block for accuracy
+- **Asymmetric quantization** (different scale for positive/negative)
+- **Optimized for llama.cpp** inference
+
+#### Safetensors Format
+
+Safetensors is a **tensor storage format** created by HuggingFace:
+
+```mermaid
+graph LR
+    subgraph "Safetensors File Structure"
+        B1[FP16 Tensors]
+        B2[BF16 Tensors]
+        B3[FP32 Tensors]
+        B4[Int8 Tensors<br/>Possible]
+        B5[Int4 Tensors<br/>Possible]
+
+        B1 --> S[model.safetensors]
+        B2 --> S
+        B3 --> S
+        B4 --> S
+        B5 --> S
+    end
+
+    style S fill:#45b7d1
+    style B1 fill:#4ecdc4
+    style B2 fill:#4ecdc4
+    style B3 fill:#4ecdc4
+    style B5 fill:#feca57
+```
+
+**What Safetensors Contains:**
+- ✅ Tensor data (any dtype: fp32, fp16, bf16, int8, int4, etc.)
+- ✅ Tensor metadata (shapes, dtypes, names)
+- ✅ Safety validation (no pickle/code execution)
+- ❌ No model architecture
+- ❌ No tokenizer
+- ❌ No quantization/dequantization logic
+
+**Safetensors Data Types:**
+
+| Dtype | Bits | Native Support | Notes |
+|-------|------|-----------------|-------|
+| `F32` | 32 | ✅ Yes | Float32 (full precision) |
+| `F16` | 16 | ✅ Yes | Float16 (half precision) |
+| `BF16` | 16 | ✅ Yes | BFloat16 (brain float) |
+| `I8` | 8 | ⚠️ Possible | Int8 (requires dequant kernels) |
+| `I4` | 4 | ⚠️ Possible | Int4 (requires dequant kernels) |
+
+#### Can Safetensors Use Q4_K_M Quantization?
+
+**Short Answer:** No, not directly.
+
+**Technical Explanation:**
+
+```mermaid
+graph TB
+    A["Can Safetensors use Q4_K_M?"] --> B{What is Q4_K_M?}
+
+    B --> C["GGUF Quantization Format"]
+    B --> D["Specific Block Structure"]
+    B --> E["llama.cpp Dequant Kernels"]
+
+    C --> F["Requires GGUF Format"]
+    D --> G["Tied to llama.cpp"]
+    E --> H["Built into llama.cpp"]
+
+    F --> I["❌ Not in Safetensors"]
+    G --> I
+    H --> J["❌ Not in Native Kernels"]
+
+    K["Safetensors CAN:"] --> L["Store int4 weights"]
+    K --> M["Store custom quantization"]
+    K --> N["Dequant on-the-fly (future)"]
+
+    style I fill:#ff6b6b
+    style L fill:#4ecdc4
+    style M fill:#4ecdc4
+    style N fill:#feca57
+```
+
+**Why Q4_K_M Doesn't Work with Safetensors:**
+
+1. **Q4_K_M is a GGUF-specific format**
+   - Defined by llama.cpp
+   - Includes dequantization logic in GGUF reader
+   - Block structure optimized for llama.cpp
+
+2. **Safetensors is storage-only**
+   - Can store int4/8 tensors
+   - No quantization metadata format
+   - No dequantization kernels
+
+3. **Native kernels expect FP16/BF16**
+   - Current implementation: FP16/BF16 only
+   - No on-the-fly dequantization
+   - Direct tensor-to-compute path
+
+**What IS Possible:**
+
+| Option | Format | Backend | Status |
+|--------|--------|---------|--------|
+| **Quantized GGUF** | `.gguf` (Q4_K_M) | `cuda_universal` | ✅ Working |
+| **Full precision Safetensors** | `.safetensors` (BF16) | `cuda_native` | ✅ Working |
+| **Int8 Safetensors** | `.safetensors` (int8) | `cuda_native` | 🔮 Future |
+| **Int4 Safetensors** | `.safetensors` (int4) | `cuda_native` | 🔮 Future |
+| **Custom Quantized Safetensors** | `.safetensors` (custom) | `cuda_native` | 🔮 Requires dev work |
+
+#### Performance Comparison
+
+| Format | Quantization | VRAM (3B) | Throughput | Quality | Backend |
+|--------|--------------|------------|------------|---------|---------|
+| **GGUF Q4_K_M** | 4-bit | 2.0 GB | 104 tok/s | Good | llama.cpp |
+| **GGUF Q5_K_M** | 5-bit | 2.4 GB | 90 tok/s | Better | llama.cpp |
+| **GGUF Q8_0** | 8-bit | 3.5 GB | 65 tok/s | Excellent | llama.cpp |
+| **GGUF F16** | 16-bit | 5.6 GB | 43 tok/s | Perfect | llama.cpp |
+| **Safetensors BF16** | 16-bit | 5.8 GB | 85 tok/s | Perfect | Native |
+| **Safetensors FP16** | 16-bit | 5.8 GB | 80 tok/s | Perfect | Native |
+| **Safetensors Int8** | 8-bit | ~3 GB | ~? tok/s | Excellent | 🔮 Future |
+| **Safetensors Int4** | 4-bit | ~2 GB | ~? tok/s | Good | 🔮 Future |
+
+**Key Findings:**
+- **GGUF Q4_K_M**: Best VRAM efficiency (2.0 GB)
+- **Safetensors BF16**: Best performance for precision (85 tok/s)
+- **Safetensors FP16**: Comparable to GGUF F16, but faster (80 vs 43 tok/s)
+- **Native kernels**: 2x faster than GGUF F16 for same precision
+
+#### Decision Guide
+
+```mermaid
+graph TB
+    A[Select Model] --> B{Priorities?}
+
+    B -->|Minimize VRAM| C["Use GGUF Q4_K_M"]
+    B -->|Max Quality| D["Safetensors BF16<br/>Native Kernels"]
+    B -->|Balance| E{Model Available?}
+
+    E -->|Safetensors| D
+    E -->|GGUF only| F["Use GGUF Q4_K_M"]
+    E -->|Both| G{"VRAM < 6GB?"}
+
+    G -->|Yes| C
+    G -->|No| H["Safetensors BF16<br/>for better quality"]
+
+    C --> I[<b>Result:</b><br/>GGUF + llama.cpp]
+    D --> J[<b>Result:</b><br/>Safetensors + Native Kernels]
+    F --> I
+    H --> J
+
+    style C fill:#ff6b6b
+    style D fill:#4ecdc4
+    style I fill:#feca57
+    style J fill:#45b7d1
+```
+
+#### Configuration Examples
+
+**Option 1: Quantized GGUF (Low VRAM)**
+```yaml
+models:
+  - id: qwen2.5-3b-quantized
+    path: models/qwen2.5-3b-Q4_K_M.gguf
+    format: gguf
+    backend: cuda_universal  # Uses llama.cpp
+    default: true
+```
+
+**Option 2: Full Precision Safetensors (Best Quality)**
+```yaml
+models:
+  - id: qwen2.5-3b-bf16
+    path: models/qwen2.5-3b-safetensors/
+    format: safetensors
+    backend: cuda_native  # Uses native kernels (auto-detected)
+    default: true
+```
+
+**Option 3: Both Available (Auto-Select)**
+```yaml
+models:
+  # Low VRAM option
+  - id: qwen2.5-3b-quantized
+    path: models/qwen2.5-3b-Q4_K_M.gguf
+    backend: cuda
+
+  # High quality option
+  - id: qwen2.5-3b-bf16
+    path: models/qwen2.5-3b-safetensors/
+    backend: cuda_native
+    default: true
+```
+
+#### Future Work: Quantized Safetensors with Native Kernels
+
+To support quantized safetensors (int4/int8) with native kernels:
+
+```mermaid
+graph TB
+    A[Quantized Safetensors Support] --> B[Dequantization Kernels]
+    A --> C[Block-wise Scales]
+    A --> D[Unified Pipeline]
+
+    B --> E[int4 → fp16 CUDA kernels]
+    B --> F[int8 → fp16 CUDA kernels]
+
+    C --> G[Load scale metadata]
+    C --> H[Per-block dequantization]
+
+    D --> I[Detect quantization]
+    D --> J[Select dequant kernels]
+    D --> K[Unified forward pass]
+
+    style B fill:#ff6b6b
+    style C fill:#feca57
+    style D fill:#45b7d1
+    style E fill:#ff9ff3
+    style K fill:#1dd1a1
+```
+
+**Required Implementation:**
+
+1. **Dequantization Kernels**
+   ```cpp
+   // Int4 → FP16 dequantization
+   __global__ void dequant_int4_to_fp16(
+       const uint8_t* input,
+       const half* scales,
+       half* output,
+       int block_size
+   );
+   ```
+
+2. **Scale Metadata**
+   ```yaml
+   # Would need to store scales in safetensors
+   scales:
+     - tensor: model.layers.0.self_attn.q_proj
+       block_size: 64
+       scales: [0.123, 0.456, ...]
+   ```
+
+3. **Unified Pipeline**
+   ```cpp
+   if (is_quantized) {
+       dequantize_weights();
+       run_fp16_kernels();
+   } else {
+       run_fp16_kernels_directly();
+   }
+   ```
+
+**Expected Performance (Estimated):**
+
+| Format | VRAM | Throughput | Quality | Backend |
+|--------|------|------------|---------|---------|
+| Safetensors Int8 | ~3.0 GB | ~70 tok/s | Excellent | Native + Dequant |
+| Safetensors Int4 | ~2.2 GB | ~60 tok/s | Good | Native + Dequant |
+
+**Timeline:** This feature is planned for Q2 2026.
+
+#### Summary
+
+| Question | Answer |
+|----------|--------|
+| **Can safetensors use Q4_K_M?** | No - Q4_K_M is GGUF-specific |
+| **Can safetensors be quantized?** | Yes - can store int4/int8, but needs dequant kernels |
+| **Can native kernels use quantization?** | Not yet - FP16/BF16 only currently |
+| **Best for low VRAM?** | GGUF Q4_K_M (2.0 GB VRAM) |
+| **Best for quality?** | Safetensors BF16 with native kernels |
+| **Future support?** | Planned for Q2 2026 |
+
 ### Backend Options
 
 | Backend | Description | Formats | Hardware |
