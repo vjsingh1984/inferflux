@@ -96,8 +96,15 @@ struct ToolCallResult {
 
 namespace {
 
+constexpr std::size_t kKiB = 1024ULL;
+constexpr std::size_t kMiB = kKiB * kKiB;
+
+void LogJsonParseFailure(const char *context, const std::exception &ex) {
+  log::Debug("http_server", std::string(context) + ": " + ex.what());
+}
+
 constexpr std::size_t kMaxResponseFormatBytes =
-    16 * 1024; // 16 KB cap for schemas/grammars.
+    16ULL * kKiB; // 16 KB cap for schemas/grammars.
 
 } // namespace
 
@@ -251,7 +258,8 @@ std::string ParseJsonStringField(const std::string &body,
     if (j.contains(field) && j[field].is_string()) {
       return j[field].get<std::string>();
     }
-  } catch (const json::exception &) {
+  } catch (const json::exception &ex) {
+    LogJsonParseFailure("ParseJsonStringField", ex);
   }
   return "";
 }
@@ -515,7 +523,8 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
     if (payload.best_of < payload.n) {
       payload.best_of = payload.n;
     }
-  } catch (const json::exception &) {
+  } catch (const json::exception &ex) {
+    LogJsonParseFailure("ParseJsonPayload", ex);
     // Return defaults on parse failure.
   }
   return payload;
@@ -604,7 +613,8 @@ ToolCallResult DetectToolCall(const std::string &text) {
       auto j = json::parse(s);
       if (j.contains("tool_call") && j["tool_call"].is_object())
         return fill_from_obj(j["tool_call"]);
-    } catch (...) {
+    } catch (const json::exception &ex) {
+      LogJsonParseFailure("ExtractToolCall.try_inferflux", ex);
     }
     return false;
   };
@@ -634,7 +644,8 @@ ToolCallResult DetectToolCall(const std::string &text) {
         auto j = json::parse(inner);
         if (j.is_object() && fill_from_obj(j))
           return result;
-      } catch (...) {
+      } catch (const json::exception &ex) {
+        LogJsonParseFailure("ExtractToolCall.tool_call_tag", ex);
       }
     }
   }
@@ -669,7 +680,8 @@ ToolCallResult DetectToolCall(const std::string &text) {
             if (arr.is_array() && !arr.empty() && arr[0].is_object() &&
                 fill_from_obj(arr[0]))
               return result;
-          } catch (...) {
+          } catch (const json::exception &ex) {
+            LogJsonParseFailure("ExtractToolCall.mistral_tool_calls", ex);
           }
         }
       }
@@ -685,7 +697,8 @@ ToolCallResult DetectToolCall(const std::string &text) {
         auto j = json::parse(text.substr(pos));
         if (j.is_object() && fill_from_obj(j))
           return result;
-      } catch (...) {
+      } catch (const json::exception &ex) {
+        LogJsonParseFailure("ExtractToolCall.bare_name_object", ex);
       }
     }
   }
@@ -1237,7 +1250,7 @@ void HttpServer::HandleClient(ClientSession &session) {
   // Dynamically read the full HTTP request: headers + body based on
   // Content-Length.
   constexpr std::size_t kInitialBuf = 4096;
-  constexpr std::size_t kMaxRequest = 16 * 1024 * 1024; // 16 MB hard limit
+  constexpr std::size_t kMaxRequest = 16ULL * kMiB; // 16 MB hard limit
   std::string request;
   request.resize(kInitialBuf);
   std::size_t total = 0;
@@ -1285,7 +1298,9 @@ void HttpServer::HandleClient(ClientSession &session) {
         try {
           content_length =
               std::stoull(request.substr(val_start, val_end - val_start));
-        } catch (...) {
+        } catch (const std::exception &ex) {
+          log::Debug("http_server", "Invalid Content-Length header: " +
+                                        std::string(ex.what()));
         }
       }
     }
@@ -1487,7 +1502,8 @@ void HttpServer::HandleClient(ClientSession &session) {
       if (j.contains("blocklist") && j["blocklist"].is_array()) {
         list = j["blocklist"].get<std::vector<std::string>>();
       }
-    } catch (const json::exception &) {
+    } catch (const json::exception &ex) {
+      LogJsonParseFailure("admin.guardrails.put", ex);
     }
     auto start = std::chrono::steady_clock::now();
     {
@@ -1549,7 +1565,8 @@ void HttpServer::HandleClient(ClientSession &session) {
         value = j["tokens_per_minute"].get<int>();
         valid = true;
       }
-    } catch (const json::exception &) {
+    } catch (const json::exception &ex) {
+      LogJsonParseFailure("admin.rate_limit.put", ex);
     }
     if (!valid) {
       SendAll(session,
@@ -1630,7 +1647,8 @@ void HttpServer::HandleClient(ClientSession &session) {
       if (j.contains("scopes") && j["scopes"].is_array()) {
         scopes = j["scopes"].get<std::vector<std::string>>();
       }
-    } catch (const json::exception &) {
+    } catch (const json::exception &ex) {
+      LogJsonParseFailure("admin.api_keys.post", ex);
     }
     if (key.empty()) {
       SendAll(session, BuildResponse(BuildErrorBody("key is required"), 400,
@@ -1694,7 +1712,8 @@ void HttpServer::HandleClient(ClientSession &session) {
       if (j.contains("key") && j["key"].is_string()) {
         key = j["key"].get<std::string>();
       }
-    } catch (const json::exception &) {
+    } catch (const json::exception &ex) {
+      LogJsonParseFailure("admin.api_keys.delete", ex);
     }
     if (key.empty()) {
       SendAll(session, BuildResponse(BuildErrorBody("key is required"), 400,
@@ -1803,7 +1822,8 @@ void HttpServer::HandleClient(ClientSession &session) {
           set_default = (val == "true" || val == "1" || val == "yes");
         }
       }
-    } catch (const json::exception &) {
+    } catch (const json::exception &ex) {
+      LogJsonParseFailure("admin.models.post", ex);
     }
     if (path_value.empty()) {
       SendAll(session, BuildResponse(BuildErrorBody("path is required"), 400,
@@ -2107,7 +2127,8 @@ void HttpServer::HandleClient(ClientSession &session) {
       if (j.contains("block_table") && j["block_table"].is_array()) {
         block_table = j["block_table"].get<std::vector<int>>();
       }
-    } catch (const json::exception &) {
+    } catch (const json::exception &ex) {
+      LogJsonParseFailure("admin.cache.warm.post", ex);
     }
     if (tokens.empty() || block_table.empty()) {
       SendAll(session, BuildResponse(BuildErrorBody(
@@ -2195,7 +2216,8 @@ void HttpServer::HandleClient(ClientSession &session) {
           }
         }
       }
-    } catch (const json::exception &) {
+    } catch (const json::exception &ex) {
+      LogJsonParseFailure("embeddings.post", ex);
     }
     if (inputs.empty()) {
       SendAll(session, BuildResponse(BuildErrorBody("input is required"), 400,
@@ -2736,6 +2758,7 @@ void HttpServer::HandleClient(ClientSession &session) {
       };
     }
 
+    const std::string audit_prompt = req.prompt;
     try {
       auto future = scheduler_->Generate(std::move(req));
       auto result = future.get();
@@ -2796,7 +2819,7 @@ void HttpServer::HandleClient(ClientSession &session) {
                                     result.speculative.reused_tokens);
       }
       if (audit_logger_) {
-        audit_logger_->LogRequest(auth_ctx.subject, parsed.model, req.prompt,
+        audit_logger_->LogRequest(auth_ctx.subject, parsed.model, audit_prompt,
                                   result.completion, result.prompt_tokens,
                                   result.completion_tokens);
       }
