@@ -1,7 +1,7 @@
 # InferFlux Roadmap
 
 **Snapshot date:** March 5, 2026  
-**Current overall grade:** C+ (revalidated March 5, 2026 after contract + throughput gate reruns)  
+**Current overall grade:** C+ (revalidated March 5, 2026 after commit-history + gate reruns)  
 **Target overall grade:** B- (2026), B (2027)
 
 ## 1) One-Screen Plan
@@ -29,7 +29,7 @@ flowchart LR
 |---|---|---|---|---|
 | Throughput | C+ | B | Native CUDA kernels + overlap/FA maturity still below target | [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#4](https://github.com/vjsingh1984/inferflux/issues/4), [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
 | Continuous batching | C- | B | No full GPU iteration scheduler yet | [#3](https://github.com/vjsingh1984/inferflux/issues/3) |
-| Resource economy | C+ | B | Efficiency/autoscaling SLO set is still partial | [#9](https://github.com/vjsingh1984/inferflux/issues/9) |
+| Resource economy | B- | B | Memory-pressure telemetry export and autoscaling SLO set remain partial | [#9](https://github.com/vjsingh1984/inferflux/issues/9) |
 | CI/TDD enforcement | B+ | A- | GPU behavior lane remains conditional on self-hosted availability | [#5](https://github.com/vjsingh1984/inferflux/issues/5), [#10](https://github.com/vjsingh1984/inferflux/issues/10) |
 | Distributed runtime | C- | C+ | Failure-path/fault-matrix coverage still incomplete | [#11](https://github.com/vjsingh1984/inferflux/issues/11) |
 | Capability identity | B | B+ | Native path still scaffolded even with strict policy contracts in place | [#1](https://github.com/vjsingh1984/inferflux/issues/1), [#2](https://github.com/vjsingh1984/inferflux/issues/2) |
@@ -40,9 +40,18 @@ flowchart LR
 | Check | Result | Grade impact |
 |---|---|---|
 | Focused contract smoke (`ModelIdentity`, `EmbeddingsRouting`, CLI/admin contracts, throughput contract suites) | 8/8 pass | Raised confidence in capability identity and CI/TDD dimensions |
-| CUDA throughput gate (`gpu_profile=ada_rtx_4000`, `--require-cuda-lanes`) | Failed (`113.346` completion tok/s; lane + overlap + mixed-iteration counters stayed `0`; fallback=`true`; provider=`universal`) | Keeps throughput + continuous batching below target and confirms native CUDA path is still inactive in default `backend=cuda` flow |
-| CUDA throughput gate (relaxed lane requirement) | Passed (`161.117` completion tok/s, `1.0` success rate, fallback=`true`, provider=`universal`) | Confirms stable universal baseline while native CUDA path remains incomplete |
+| Startup/slot coverage (`StartupAdvisorTests`, `SequenceSlotManagerTests`) | 2/2 pass | Confirms recent memory-pressure handling and advisor behavior landed with regression coverage |
+| CUDA throughput gate (`gpu_profile=ada_rtx_4000`, `--require-cuda-lanes`) | Failed (`137.33` completion tok/s; lane + overlap + mixed-iteration counters stayed `0`; fallback=`true`; provider=`universal`) | Keeps throughput + continuous batching below target and confirms native CUDA path is still inactive in default `backend=cuda` flow |
+| CUDA throughput gate (relaxed lane requirement) | Passed (`265.675` completion tok/s, `1.0` success rate, fallback=`true`, provider=`universal`) | Confirms stable universal baseline while native CUDA path remains incomplete |
 | Canonical docs contract (`scripts/check_docs_contract.py`) | Passed after consolidation/index refresh | Raises confidence in OSS docs/operator clarity dimension |
+
+## 2.2) Latest Commit-History Findings (March 5, 2026)
+
+| Commit | Finding | Grade implication |
+|---|---|---|
+| `707138b` | Landed FP16 OOM handling path: pre-flight memory checks, graceful degradation, quantization-detection wiring, and `INFERFLUX_MODEL_PATH` override fixes | Improves resource-economy reliability confidence; does not yet resolve throughput-core blockers |
+| `4230fcd` | Consolidated docs taxonomy + archive evidence map | Improves OSS docs/operator clarity and reduces duplicated guidance |
+| `44a9a70` | Native GGUF CUDA scaffolding and exposure plumbing landed | Raises implementation readiness, but still below required native throughput contract gates |
 
 ## 3) Foundational Program (Priority Order)
 

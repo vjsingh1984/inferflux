@@ -29,6 +29,12 @@ flowchart LR
 | Capacity controls | Use StartupAdvisor recommendations + conservative `max_parallel_sequences` + monitored memory pressure |
 | Validation gate | Run throughput/contract checks before rollout; treat archived FP16 data as snapshot evidence, not guaranteed ceilings |
 
+## 2.1) Latest Code Findings
+
+| Commit | Finding | Operational impact |
+|---|---|---|
+| `707138b` | Landed FP16 OOM handling: pre-flight admission check + graceful degradation + quantization-detection wiring + model-path override fix | Reduces OOM crash risk and improves FP16 capacity safety posture |
+
 ## 3) Canonical Source Map
 
 | Need | Source of truth |
