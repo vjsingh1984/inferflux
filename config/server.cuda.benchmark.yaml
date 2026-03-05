@@ -1,0 +1,56 @@
+# InferFlux CUDA Benchmark Configuration
+# 16 HTTP workers for concurrent throughput testing
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  workers: 16  # Updated from 4 to 16 for concurrent throughput testing
+
+auth:
+  api_key:
+    enabled: true
+    keys:
+      - "dev-key-123"
+
+models:
+  - id: qwen2.5-3b-f16
+    path: "models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-f16.gguf"
+    format: gguf
+    backend: cuda_universal  # Use llama.cpp CUDA backend
+    default: true
+
+runtime:
+  backend_priority: "cuda,cuda_universal,cpu"
+  capability_routing:
+    enabled: true
+
+  cuda:
+    enabled: true
+    device_id: 0
+    flash_attention:
+      enabled: true
+      kernel: fa2
+
+metrics:
+  enabled: true
+  path: "/metrics"
+
+logging:
+  level: "info"
+  format: "json"
+  file:
+    enabled: true
+    path: "logs/cuda_benchmark.log"
+    max_size_mb: 100
+    max_files: 10
+
+health:
+  enabled: true
+  endpoints:
+    livez: "/healthz"
+    readyz: "/readyz"
+
+policy:
+  audit:
+    enabled: true
+    log_path: "logs/audit.log"
