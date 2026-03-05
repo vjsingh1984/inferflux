@@ -19,29 +19,41 @@ namespace {
 
 void BatchClear(llama_batch &batch) { batch.n_tokens = 0; }
 
-void BatchAdd(llama_batch &batch, llama_token id, llama_pos pos, bool logits) {
+struct BatchTokenInput {
+  llama_token id;
+  llama_pos pos;
+  bool logits{false};
+};
+
+void BatchAdd(llama_batch &batch, const BatchTokenInput &input) {
   if (!batch.seq_id[batch.n_tokens]) {
     throw std::runtime_error("llama_batch capacity exceeded");
   }
-  batch.token[batch.n_tokens] = id;
-  batch.pos[batch.n_tokens] = pos;
+  batch.token[batch.n_tokens] = input.id;
+  batch.pos[batch.n_tokens] = input.pos;
   batch.n_seq_id[batch.n_tokens] = 1;
   batch.seq_id[batch.n_tokens][0] = 0;
-  batch.logits[batch.n_tokens] = logits ? 1 : 0;
+  batch.logits[batch.n_tokens] = input.logits ? 1 : 0;
   batch.n_tokens++;
 }
 
 // Sequence-aware variant for phased prefill/decode (§2.5 Option A).
-void BatchAddSeq(llama_batch &batch, llama_token id, llama_pos pos,
-                 llama_seq_id seq_id, bool logits) {
+struct BatchSeqTokenInput {
+  llama_token id;
+  llama_pos pos;
+  llama_seq_id seq_id;
+  bool logits{false};
+};
+
+void BatchAddSeq(llama_batch &batch, const BatchSeqTokenInput &input) {
   if (!batch.seq_id[batch.n_tokens]) {
     throw std::runtime_error("llama_batch capacity exceeded");
   }
-  batch.token[batch.n_tokens] = id;
-  batch.pos[batch.n_tokens] = pos;
+  batch.token[batch.n_tokens] = input.id;
+  batch.pos[batch.n_tokens] = input.pos;
   batch.n_seq_id[batch.n_tokens] = 1;
-  batch.seq_id[batch.n_tokens][0] = seq_id;
-  batch.logits[batch.n_tokens] = logits ? 1 : 0;
+  batch.seq_id[batch.n_tokens][0] = input.seq_id;
+  batch.logits[batch.n_tokens] = input.logits ? 1 : 0;
   batch.n_tokens++;
 }
 
@@ -378,8 +390,8 @@ std::string LlamaCPUBackend::Generate(
                                     std::to_string(end) + "]");
 
     for (std::size_t i = start; i < end; ++i) {
-      BatchAdd(batch, prompt_tokens[i], position++,
-               i == prompt_tokens.size() - 1);
+      BatchAdd(batch,
+               {prompt_tokens[i], position++, i == prompt_tokens.size() - 1});
     }
 
     log::Debug("llama_backend", "Calling llama_decode for prompt batch " +
@@ -501,7 +513,7 @@ std::string LlamaCPUBackend::Generate(
         }
       }
     }
-    BatchAdd(batch, token, position++, true);
+    BatchAdd(batch, {token, position++, true});
 
     auto decode_start = std::chrono::high_resolution_clock::now();
     if (llama_decode(context_, batch) != 0) {
@@ -678,7 +690,7 @@ std::string LlamaCPUBackend::GenerateWithImages(
       break;
     if (should_stop && should_stop())
       break;
-    BatchAdd(batch, token, n_past++, true);
+    BatchAdd(batch, {token, n_past++, true});
     if (llama_decode(context_, batch) != 0) {
       log::Error("llama_backend", "llama_decode failed (vision decode loop)");
       break;
@@ -716,9 +728,9 @@ LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
     std::size_t end = std::min(prompt_tokens.size(),
                                start + static_cast<std::size_t>(token_cap));
     for (std::size_t i = start; i < end; ++i) {
-      BatchAddSeq(batch, prompt_tokens[i], static_cast<llama_pos>(i),
-                  static_cast<llama_seq_id>(sequence_id),
-                  /*logits=*/i == prompt_tokens.size() - 1);
+      BatchAddSeq(batch, {prompt_tokens[i], static_cast<llama_pos>(i),
+                          static_cast<llama_seq_id>(sequence_id),
+                          /*logits=*/i == prompt_tokens.size() - 1});
     }
     if (llama_decode(context_, batch) != 0) {
       log::Error("llama_backend", "Prefill: llama_decode failed for seq " +
@@ -775,6 +787,8 @@ void LlamaCPUBackend::CopySequencePrefix(int src_seq, int dst_seq,
       static_cast<llama_pos>(n_tokens), static_cast<llama_pos>(-1));
 }
 
+// Legacy API shape retained for backend compatibility.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 LlamaCPUBackend::PrefillResult
 LlamaCPUBackend::PrefillPartial(const std::string &prompt, int sequence_id,
                                 int n_past_start) {
@@ -798,10 +812,10 @@ LlamaCPUBackend::PrefillPartial(const std::string &prompt, int sequence_id,
   for (int start = n_past_start; start < n_total; start += token_cap) {
     int end = std::min(n_total, start + token_cap);
     for (int i = start; i < end; ++i) {
-      BatchAddSeq(batch, prompt_tokens[static_cast<std::size_t>(i)],
-                  static_cast<llama_pos>(i),
-                  static_cast<llama_seq_id>(sequence_id),
-                  /*logits=*/i == n_total - 1);
+      BatchAddSeq(batch, {prompt_tokens[static_cast<std::size_t>(i)],
+                          static_cast<llama_pos>(i),
+                          static_cast<llama_seq_id>(sequence_id),
+                          /*logits=*/i == n_total - 1});
     }
     if (llama_decode(context_, batch) != 0) {
       log::Error("llama_backend", "PrefillPartial: llama_decode failed seq " +
@@ -878,8 +892,8 @@ std::string LlamaCPUBackend::Decode(
       llama_batch_free(batch);
       return output;
     }
-    BatchAddSeq(batch, first_token, position++,
-                static_cast<llama_seq_id>(sequence_id), true);
+    BatchAddSeq(batch, {first_token, position++,
+                        static_cast<llama_seq_id>(sequence_id), true});
     if (llama_decode(context_, batch) != 0) {
       llama_batch_free(batch);
       return output;
@@ -929,8 +943,8 @@ std::string LlamaCPUBackend::Decode(
         }
       }
     }
-    BatchAddSeq(batch, token, position++,
-                static_cast<llama_seq_id>(sequence_id), true);
+    BatchAddSeq(batch, {token, position++,
+                        static_cast<llama_seq_id>(sequence_id), true});
     if (llama_decode(context_, batch) != 0) {
       log::Error("llama_backend", "Decode: llama_decode failed for seq " +
                                       std::to_string(sequence_id));
@@ -950,6 +964,7 @@ std::string LlamaCPUBackend::Decode(
 
   return output;
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
 std::vector<LlamaCPUBackend::BatchDecodeOutput>
 LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
@@ -976,8 +991,9 @@ LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
         inp.n_past -= static_cast<int>(discard);
       }
     }
-    BatchAddSeq(batch, inp.feed_token, static_cast<llama_pos>(inp.n_past),
-                static_cast<llama_seq_id>(inp.sequence_id), /*logits=*/true);
+    BatchAddSeq(batch, {inp.feed_token, static_cast<llama_pos>(inp.n_past),
+                        static_cast<llama_seq_id>(inp.sequence_id),
+                        /*logits=*/true});
   }
 
   if (llama_decode(context_, batch) != 0) {
@@ -1099,8 +1115,9 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
       bool is_last = (j == inp.tokens.size() - 1);
       bool should_request = is_last && inp.request_logits;
 
-      BatchAddSeq(batch, inp.tokens[j], static_cast<llama_pos>(inp.n_past + j),
-                  static_cast<llama_seq_id>(inp.sequence_id), should_request);
+      BatchAddSeq(batch,
+                  {inp.tokens[j], static_cast<llama_pos>(inp.n_past + j),
+                   static_cast<llama_seq_id>(inp.sequence_id), should_request});
 
       if (should_request) {
         // llama_get_logits_ith() / llama_sampler_sample(..., ith) expects the
@@ -1352,9 +1369,9 @@ std::vector<float> LlamaCPUBackend::Embed(const std::string &text) {
       config_.batch_size, static_cast<int32_t>(tokens.size()) + 1);
   llama_batch batch = llama_batch_init(batch_cap, 0, 1);
   for (std::size_t i = 0; i < tokens.size(); ++i) {
-    BatchAddSeq(batch, tokens[i], static_cast<llama_pos>(i),
-                /*seq_id=*/0,
-                /*logits=*/i == tokens.size() - 1);
+    BatchAddSeq(batch, {tokens[i], static_cast<llama_pos>(i),
+                        /*seq_id=*/0,
+                        /*logits=*/i == tokens.size() - 1});
   }
 
   if (llama_decode(embed_ctx_, batch) != 0) {

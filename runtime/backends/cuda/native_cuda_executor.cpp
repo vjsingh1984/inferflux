@@ -64,7 +64,7 @@ public:
   const std::string &FallbackReason() const override {
     static const std::string reason =
         "native backend scaffold mode active; execution delegates to "
-        "universal llama CUDA path";
+        "llama.cpp CUDA backend";
     return reason;
   }
 

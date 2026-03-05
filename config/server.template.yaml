@@ -22,7 +22,7 @@ models:
   - id: model-name
     path: /path/to/model.gguf
     format: gguf                    # Rule 7: Set explicitly (gguf, safetensors, hf, auto)
-    backend: cuda                   # Rule 8: cuda, cpu, mps, rocm, cuda_native, cuda_universal
+    backend: cuda                   # Rule 8: cuda, cpu, mps, rocm, cuda_native, cuda_llama_cpp
     default: true
 
   # Example safetensors model configuration
@@ -62,7 +62,7 @@ runtime:
   # Backend exposure policy
   backend_exposure:
     prefer_native: true             # Prefer native implementations
-    allow_universal_fallback: true  # Allow fallback to llama.cpp backends
+    allow_llama_cpp_fallback: true  # Allow fallback to llama.cpp backends
     strict_native_request: false    # Fail explicit cuda_native when native kernels are not ready
 
   # Capability routing for graceful degradation
@@ -155,7 +155,7 @@ runtime:
 #
 # Rule 8: GPU unused
 #   Trigger: GPU available, all models on CPU
-#   Fix: Set models[*].backend to cuda/cuda_universal/cuda_native
+#   Fix: Set models[*].backend to cuda/cuda_llama_cpp/cuda_native
 
 # ============================================================================
 # AUTHENTICATION

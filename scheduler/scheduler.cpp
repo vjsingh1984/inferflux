@@ -1,11 +1,11 @@
 #include "scheduler/scheduler.h"
 
 #include "runtime/execution/batch_executor.h"
-#include "server/logging/logger.h"
 #include "runtime/execution/parallel_context.h"
 #include "runtime/structured_output/structured_output_adapter.h"
 #include "scheduler/model_selection.h"
 #include "scheduler/single_model_router.h"
+#include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 #include "server/tracing/span.h"
 
@@ -90,10 +90,17 @@ bool WaitForUnifiedBatchAsync(
   return backend->TryCollectUnifiedBatchAsync(handle, outputs);
 }
 
+struct PrefillStepState {
+  int sequence_id{-1};
+  int n_past_start{0};
+};
+
 bool ExecutePhasedPrefillStep(LlamaCPUBackend *backend,
                               const InferenceRequest &inference,
-                              int sequence_id, int n_past_start,
+                              const PrefillStepState &state,
                               LlamaCPUBackend::PrefillResult *result) {
+  const int sequence_id = state.sequence_id;
+  const int n_past_start = state.n_past_start;
   if (!backend || !result || sequence_id < 0) {
     return false;
   }
@@ -933,7 +940,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
 
             bool prefill_ok =
                 ExecutePhasedPrefillStep(pending->resolved_backend.get(), inf,
-                                         seq_id, prefill_start, &pr);
+                                         {seq_id, prefill_start}, &pr);
             if (!prefill_ok) {
               if (copied_prefix) {
                 pr = pending->resolved_backend->PrefillPartial(
@@ -1337,12 +1344,12 @@ void Scheduler::EvictionWorkerLoop() {
   while (eviction_running_) {
     std::this_thread::sleep_for(std::chrono::seconds(30));
 
-    if (!eviction_running_) break;
+    if (!eviction_running_)
+      break;
 
     // Evict slots idle for >5 minutes
     // Returns vector of (slot_id, sequence_id) pairs for evicted slots
-    auto evicted_slots = slot_manager_->EvictIdleSlots(
-        std::chrono::minutes(5));
+    auto evicted_slots = slot_manager_->EvictIdleSlots(std::chrono::minutes(5));
 
     if (!evicted_slots.empty()) {
       // Note: For proper cleanup, we'd need to call backend->FreeSequence()
@@ -1355,16 +1362,20 @@ void Scheduler::EvictionWorkerLoop() {
       // 2. Calling backend->FreeSequence(sequence_id) for each evicted slot
       // 3. Calling FreeSeqSlot(slot_id) for scheduler bitmask cleanup
 
-      log::Info("scheduler", "Evicted " + std::to_string(evicted_slots.size()) +
-                " idle KV cache slots (seq_ids: " +
-                [&evicted_slots]() {
-                  std::string ids;
-                  for (const auto &[slot_id, seq_id] : evicted_slots) {
-                    if (!ids.empty()) ids += ", ";
-                    ids += std::to_string(seq_id);
-                  }
-                  return ids;
-                }() + ")");
+      log::Info(
+          "scheduler",
+          "Evicted " + std::to_string(evicted_slots.size()) +
+              " idle KV cache slots (seq_ids: " +
+              [&evicted_slots]() {
+                std::string ids;
+                for (const auto &[slot_id, seq_id] : evicted_slots) {
+                  if (!ids.empty())
+                    ids += ", ";
+                  ids += std::to_string(seq_id);
+                }
+                return ids;
+              }() +
+              ")");
     }
   }
 }

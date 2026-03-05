@@ -40,8 +40,8 @@ bool IsExplicitNativeHint(const std::string &hint) {
   return hint == "cuda_native";
 }
 
-bool IsExplicitUniversalHint(const std::string &hint) {
-  return hint == "cuda_universal" || hint == "cuda_llama";
+bool IsExplicitLlamaCppHint(const std::string &hint) {
+  return hint == "cuda_llama_cpp" || hint == "cuda_llama";
 }
 
 std::shared_ptr<LlamaCPUBackend>
@@ -64,19 +64,19 @@ BackendFactoryResult CpuFallback(const std::string &reason) {
   out.capabilities = out.traits.capabilities;
   out.backend = std::make_shared<LlamaCPUBackend>();
   out.backend_label = out.traits.label;
-  out.provider = BackendProvider::kUniversalLlama;
+  out.provider = BackendProvider::kLlamaCpp;
   out.config = TuneLlamaBackendConfig(out.target, {});
   return out;
 }
 
-BackendFactoryResult UniversalLlamaForTarget(LlamaBackendTarget target,
-                                             const std::string &hint) {
+BackendFactoryResult LlamaCppForTarget(LlamaBackendTarget target,
+                                      const std::string &hint) {
   BackendFactoryResult out;
   out.target = target;
   out.traits = DescribeLlamaBackendTarget(target);
   out.capabilities = out.traits.capabilities;
   out.backend_label = out.traits.label;
-  out.provider = BackendProvider::kUniversalLlama;
+  out.provider = BackendProvider::kLlamaCpp;
   out.config = TuneLlamaBackendConfig(target, {});
 
   if (hint == "cuda") {
@@ -145,7 +145,7 @@ std::string BackendFactory::NormalizeHint(const std::string &backend_hint) {
       lowered.begin(), lowered.end(), lowered.begin(),
       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   if (lowered == "auto" || lowered == "mlx" || IsExplicitNativeHint(lowered) ||
-      IsExplicitUniversalHint(lowered)) {
+      IsExplicitLlamaCppHint(lowered)) {
     return lowered;
   }
   return DescribeLlamaBackendTarget(ParseLlamaBackendTarget(lowered)).label;
@@ -181,13 +181,13 @@ BackendFactory::NormalizeHintList(const std::vector<std::string> &backend_hints,
 BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
   std::string hint = NormalizeHint(backend_hint);
   bool force_native = false;
-  bool force_universal = false;
+  bool force_llama_cpp = false;
   if (IsExplicitNativeHint(hint)) {
     hint = "cuda";
     force_native = true;
-  } else if (IsExplicitUniversalHint(hint)) {
+  } else if (IsExplicitLlamaCppHint(hint)) {
     hint = "cuda";
-    force_universal = true;
+    force_llama_cpp = true;
   }
   if (hint == "auto") {
 #ifdef INFERFLUX_HAS_CUDA
@@ -205,7 +205,7 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
 
   if (hint == "mlx") {
     // MLX has its own backend implementation today.
-    return UniversalLlamaForTarget(LlamaBackendTarget::kMps, hint);
+    return LlamaCppForTarget(LlamaBackendTarget::kMps, hint);
   }
 
   if (hint == "cpu") {
@@ -246,8 +246,8 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
           "native backend explicitly requested but unavailable");
     }
 
-    if (force_universal) {
-      return UniversalLlamaForTarget(target, hint);
+    if (force_llama_cpp) {
+      return LlamaCppForTarget(target, hint);
     }
 
     if (policy.prefer_native && SupportsNativeBackend(target)) {
@@ -269,21 +269,21 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
       return out;
     }
 
-    if (policy.prefer_native && !policy.allow_universal_fallback) {
+    if (policy.prefer_native && !policy.allow_llama_cpp_fallback) {
       return NativeUnavailableResult(
           target, traits,
-          "native backend requested but unavailable; universal fallback "
+          "native backend requested but unavailable; llama.cpp fallback "
           "disabled");
     }
 
     BackendFactoryResult out;
-    out = UniversalLlamaForTarget(target, hint);
+    out = LlamaCppForTarget(target, hint);
     if (policy.prefer_native && !SupportsNativeBackend(target)) {
       out.used_fallback = true;
       out.fallback_reason =
-          "native backend unavailable; exposed universal llama backend";
+          "native backend unavailable; exposed llama.cpp backend";
       log::Warn("backend_factory",
-                "Using universal llama backend for '" + hint +
+                "Using llama.cpp backend for '" + hint +
                     "' because native backend is not available yet.");
     }
     return out;

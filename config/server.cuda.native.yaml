@@ -36,7 +36,7 @@ runtime:
 
   backend_exposure:
     prefer_native: true
-    allow_universal_fallback: true  # Changed from false to allow fallback
+    allow_llama_cpp_fallback: true  # Changed from false to allow fallback
 
   capability_routing:
     allow_default_fallback: true

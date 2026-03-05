@@ -17,9 +17,9 @@ std::string ProviderLabel(BackendProvider provider) {
   switch (provider) {
   case BackendProvider::kNative:
     return "native";
-  case BackendProvider::kUniversalLlama:
+  case BackendProvider::kLlamaCpp:
   default:
-    return "universal";
+    return "llama_cpp";
   }
 }
 
@@ -128,7 +128,7 @@ bool SingleModelRouter::RegisterModel(
           ? entry.info.backend
           : BackendFactory::NormalizeHint(info.requested_backend);
   entry.info.backend_provider =
-      info.backend_provider.empty() ? "universal" : info.backend_provider;
+      info.backend_provider.empty() ? "llama_cpp" : info.backend_provider;
   entry.info.backend_fallback = info.backend_fallback;
   entry.info.backend_fallback_reason = info.backend_fallback_reason;
   auto register_target = ParseLlamaBackendTarget(entry.info.backend);

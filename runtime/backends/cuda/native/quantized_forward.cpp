@@ -128,6 +128,7 @@ bool QuantizedForward::Forward(const std::vector<int> &token_ids, int n_past,
   return RunForwardPass(token_ids, n_past, sequence_id, d_logits);
 }
 
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 bool QuantizedForward::BatchForward(const std::vector<int> &token_ids,
                                     const std::vector<int> &n_past,
                                     const std::vector<int> &sequence_ids,
@@ -145,6 +146,7 @@ bool QuantizedForward::BatchForward(const std::vector<int> &token_ids,
   }
   return true;
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
 void QuantizedForward::SetStream(cudaStream_t stream) {
   stream_ = stream;
@@ -158,13 +160,13 @@ void QuantizedForward::FreeScratchBuffers() { FreeScratchBuffersImpl(); }
 void QuantizedForward::FreeScratchBuffersImpl() {
 #define CUDA_FREE(ptr)                                                         \
   do {                                                                         \
-    if (ptr) {                                                                 \
-      if (!CheckCudaStatus(cudaFree(ptr),                                      \
+    if ((ptr)) {                                                               \
+      if (!CheckCudaStatus(cudaFree((ptr)),                                    \
                            std::string("cudaFree(" #ptr ")"))) {               \
         log::Warn("quantized_forward",                                         \
                   "Continuing cleanup after cudaFree failure for " #ptr);      \
       }                                                                        \
-      ptr = nullptr;                                                           \
+      (ptr) = nullptr;                                                         \
     }                                                                          \
   } while (0)
 
@@ -205,7 +207,7 @@ bool QuantizedForward::AllocateScratch() {
 
 #define CUDA_ALLOC(ptr, size)                                                  \
   do {                                                                         \
-    cudaError_t err = cudaMalloc(&ptr, size);                                  \
+    cudaError_t err = cudaMalloc(&(ptr), (size));                              \
     if (err != cudaSuccess) {                                                  \
       log::Error("quantized_forward",                                          \
                  "Failed to allocate " #ptr ": " +                             \
@@ -275,11 +277,11 @@ bool QuantizedForward::RunForwardPass(const std::vector<int> &token_ids,
   for (int layer = 0; layer < num_layers_; ++layer) {
     // Input RMS norm
     const half *input_norm_weights = weights_->LayerInputNorm(layer);
-    ComputeRMSNorm(d_hidden_, input_norm_weights, d_norm_out_, hidden_size_,
-                   rms_norm_eps_);
+    ComputeRMSNorm({d_hidden_, input_norm_weights, d_norm_out_},
+                   {hidden_size_, rms_norm_eps_});
 
     // Attention
-    if (!ComputeAttention(layer, n_past, sequence_id)) {
+    if (!ComputeAttention(layer, {n_past, sequence_id})) {
       return false;
     }
 
@@ -288,8 +290,8 @@ bool QuantizedForward::RunForwardPass(const std::vector<int> &token_ids,
 
     // Post-attention RMS norm
     const half *post_norm_weights = weights_->LayerPostAttnNorm(layer);
-    ComputeRMSNorm(d_hidden_, post_norm_weights, d_norm_out_, hidden_size_,
-                   rms_norm_eps_);
+    ComputeRMSNorm({d_hidden_, post_norm_weights, d_norm_out_},
+                   {hidden_size_, rms_norm_eps_});
 
     // FFN
     if (!ComputeFFN(layer)) {
@@ -302,8 +304,8 @@ bool QuantizedForward::RunForwardPass(const std::vector<int> &token_ids,
 
   // Final RMS norm
   const half *final_norm_weights = weights_->FinalNorm();
-  ComputeRMSNorm(d_hidden_, final_norm_weights, d_norm_out_, hidden_size_,
-                 rms_norm_eps_);
+  ComputeRMSNorm({d_hidden_, final_norm_weights, d_norm_out_},
+                 {hidden_size_, rms_norm_eps_});
 
   // LM head
   const half *lm_head_weights = weights_->LmHead();
@@ -322,8 +324,9 @@ bool QuantizedForward::RunForwardPass(const std::vector<int> &token_ids,
   return true;
 }
 
-bool QuantizedForward::ComputeAttention(int layer, int n_past,
-                                        int sequence_id) {
+bool QuantizedForward::ComputeAttention(int layer,
+                                        const AttentionState &state) {
+  (void)state.sequence_id;
   const half *q_proj = weights_->LayerQProj(layer);
   const half *k_proj = weights_->LayerKProj(layer);
   const half *v_proj = weights_->LayerVProj(layer);
@@ -341,7 +344,7 @@ bool QuantizedForward::ComputeAttention(int layer, int n_past,
   // d_v_new = d_hidden * v_proj^T
 
   // Apply RoPE
-  ApplyRoPE(d_q_, d_k_new_, n_past, layer);
+  ApplyRoPE({d_q_, d_k_new_}, {state.n_past, layer});
 
   // Store K, V in cache
   // TODO: Implement KV cache storage
@@ -384,15 +387,20 @@ bool QuantizedForward::ComputeFFN(int layer) {
   return true;
 }
 
-bool QuantizedForward::ComputeRMSNorm(const half *input, const half *weight,
-                                      half *output, int size, float eps) {
+bool QuantizedForward::ComputeRMSNorm(const RmsNormBuffers &buffers,
+                                      const RmsNormParams &params) {
+  (void)buffers;
+  (void)params;
   // TODO: Implement RMSNorm kernel
   // For now, this is a placeholder
   // output = input * sqrt(mean(input^2) + eps)^-1 * weight
   return true;
 }
 
-void QuantizedForward::ApplyRoPE(half *q, half *k, int n_past, int layer) {
+void QuantizedForward::ApplyRoPE(const RoPEBuffers &buffers,
+                                 const RoPEParams &params) {
+  (void)buffers;
+  (void)params;
   // TODO: Implement RoPE
   // Apply rotary position embeddings to Q and K
 }

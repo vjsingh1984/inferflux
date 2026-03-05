@@ -52,7 +52,7 @@ public:
   // Insert a sequence of tokens and its corresponding block_table.
   void Insert(const std::vector<int> &tokens,
               const std::vector<int> &block_table, int sequence_id,
-              std::shared_ptr<LlamaCPUBackend> backend);
+              const std::shared_ptr<LlamaCPUBackend> &backend);
 
   std::size_t Capacity() const { return capacity_; }
   std::size_t Size() const; // total nodes in tree
@@ -74,7 +74,7 @@ private:
 
   // DFS: collect nodes matching a criteria.
   void CollectNodes(RadixNode *node,
-                    std::function<bool(const RadixNode *)> criteria,
+                    const std::function<bool(const RadixNode *)> &criteria,
                     std::vector<std::pair<uint64_t, RadixNode *>> &out) const;
 
   std::shared_ptr<PagedKVCache> kv_cache_;

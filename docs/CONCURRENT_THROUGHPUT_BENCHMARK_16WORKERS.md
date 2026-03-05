@@ -23,7 +23,7 @@
 - **Total tokens generated**: ~1,230 tokens
 - **Total time**: ~133 seconds
 - **Success rate**: 100% (16/16 requests)
-- **Backend**: CPU (llama.cpp universal provider)
+- **Backend**: CPU (llama.cpp provider)
 - **Model**: Qwen 2.5 3B FP16 GGUF (6.33 GB)
 
 ---
@@ -242,7 +242,7 @@ Streaming speedup: 1.00x
 
 ```
 Model: qwen2.5-3b-instruct-f16
-Backend: cpu (universal provider)
+Backend: cpu (llama.cpp provider)
 Format: gguf
 Path: models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-f16.gguf
 HTTP Workers: 16 (default)

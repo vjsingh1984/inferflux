@@ -24,7 +24,7 @@
 - **Tokens per request**: 100 max tokens
 - **Total tokens**: ~1,300 tokens generated
 - **HTTP Workers**: 16 (default)
-- **Backend**: CUDA (llama.cpp universal provider)
+- **Backend**: CUDA (llama.cpp provider)
 - **Model**: Qwen 2.5 3B FP16 GGUF (6.33 GB)
 - **GPU**: NVIDIA RTX 4000 Ada Generation
 
@@ -173,11 +173,11 @@ models:
   - id: qwen2.5-3b-f16
     path: "models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-f16.gguf"
     format: gguf
-    backend: cuda_universal  # ✅ CUDA backend (llama.cpp)
+    backend: cuda_llama_cpp  # ✅ CUDA backend (llama.cpp)
     default: true
 
 runtime:
-  backend_priority: "cuda,cuda_universal,cpu"
+  backend_priority: "cuda,cuda_llama_cpp,cpu"
   cuda:
     enabled: true
     flash_attention:
@@ -195,7 +195,7 @@ INFERFLUX_HTTP_WORKERS=16
 INFERFLUX_MODEL_PATH="models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-f16.gguf"
 
 # Backend priority
-INFERFLUX_BACKEND_PRIORITY="cuda,cuda_universal,cpu"
+INFERFLUX_BACKEND_PRIORITY="cuda,cuda_llama_cpp,cpu"
 ```
 
 ---
@@ -324,7 +324,7 @@ Streaming speedup: 1.37x
 
 ```
 Model: qwen2.5-3b-instruct-f16
-Backend: cuda (universal provider via llama.cpp)
+Backend: cuda (llama.cpp provider)
 Format: gguf
 Path: models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-f16.gguf
 HTTP Workers: 16 (default)

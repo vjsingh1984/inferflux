@@ -80,7 +80,7 @@ inline uint16_t bf16_to_fp16(uint16_t bf16) {
   return (sign << 15) | (fp16_exp << 10) | fp16_mantissa;
 }
 
-void ConvertBF16ToFP16(const void *src, void *dst, size_t num_elements) {
+void ConvertBF16ToFP16(const void *src, size_t num_elements, void *dst) {
   const uint16_t *in = static_cast<const uint16_t *>(src);
   uint16_t *out = static_cast<uint16_t *>(dst);
   for (size_t i = 0; i < num_elements; ++i) {
@@ -444,7 +444,7 @@ bool SafetensorsLoader::UploadToGPU(cudaStream_t stream,
       if (convert_buf.size() < num_elements) {
         convert_buf.resize(num_elements);
       }
-      ConvertBF16ToFP16(tensor.cpu_data, convert_buf.data(), num_elements);
+      ConvertBF16ToFP16(tensor.cpu_data, num_elements, convert_buf.data());
       upload_data = convert_buf.data();
       bf16_converted++;
     }

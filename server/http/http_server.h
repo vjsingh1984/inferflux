@@ -50,7 +50,7 @@ public:
              Guardrail *guardrail, AuditLogger *audit_logger,
              PolicyBackend *policy_store,
              std::shared_ptr<SpeculativeDecoder> speculative_decoder,
-             TlsConfig tls_config, int num_workers = 4,
+             const TlsConfig &tls_config, int num_workers = 4,
              const ModelSelectionOptions &model_selection_options = {});
   ~HttpServer();
 

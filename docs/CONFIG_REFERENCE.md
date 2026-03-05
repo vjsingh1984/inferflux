@@ -110,7 +110,7 @@ models:
   - id: llama3-8b
     path: models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
     format: gguf
-    backend: cuda_universal
+    backend: cuda_llama_cpp
     default: true
 
 runtime:
@@ -143,7 +143,7 @@ runtime:
   backend_priority: [cuda, cpu]
   backend_exposure:
     prefer_native: true
-    allow_universal_fallback: true
+    allow_llama_cpp_fallback: true
     strict_native_request: false
 ```
 
@@ -151,7 +151,7 @@ runtime:
 
 | Model format | Recommended backend | Notes |
 |---|---|---|
-| `gguf` | `cuda_universal` or `cpu` | strongest compatibility path |
+| `gguf` | `cuda_llama_cpp` or `cpu` | strongest compatibility path |
 | `safetensors` | `cuda_native` | native provider path |
 | `hf` | `cuda` or `cpu` | resolved to local model format |
 | `auto` | `cuda`/`cpu` | format inferred from path |
@@ -162,14 +162,14 @@ runtime:
 runtime:
   backend_exposure:
     prefer_native: true
-    allow_universal_fallback: true
+    allow_llama_cpp_fallback: true
     strict_native_request: false
 ```
 
 | Key | Behavior |
 |---|---|
 | `prefer_native` | choose native provider when eligible |
-| `allow_universal_fallback` | allow fallback to universal path when native unavailable |
+| `allow_llama_cpp_fallback` | allow fallback to universal path when native unavailable |
 | `strict_native_request` | explicit `cuda_native` requests fail fast if native path is not ready |
 
 When strict mode is enabled, unsupported explicit native requests fail with `422 backend_policy_violation`.
@@ -265,7 +265,7 @@ Scope contract:
 | `INFERFLUX_NATIVE_CUDA_EXECUTOR` | native/universal CUDA executor behavior |
 | `INFERFLUX_BACKEND_PRIORITY` | runtime backend priority chain |
 | `INFERFLUX_BACKEND_PREFER_NATIVE` | `runtime.backend_exposure.prefer_native` |
-| `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` | `runtime.backend_exposure.allow_universal_fallback` |
+| `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` | `runtime.backend_exposure.allow_llama_cpp_fallback` |
 | `INFERFLUX_BACKEND_STRICT_NATIVE_REQUEST` | `runtime.backend_exposure.strict_native_request` |
 | `INFERFLUX_DISABLE_STARTUP_ADVISOR` | suppress startup recommendations |
 | `INFERFLUX_HTTP_WORKERS` | HTTP server thread pool size (default: 16) |

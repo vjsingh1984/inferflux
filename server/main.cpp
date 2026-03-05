@@ -218,7 +218,7 @@ int main(int argc, char **argv) {
   int cuda_phase_overlap_min_prefill_tokens = 256;
   bool cuda_phase_overlap_prefill_replica = false;
   bool backend_prefer_native = true;
-  bool backend_allow_universal_fallback = true;
+  bool backend_allow_llama_cpp_fallback = true;
   bool backend_strict_native_request = false;
   std::vector<std::string> backend_priority;
   bool speculative_enabled = false;
@@ -386,9 +386,9 @@ int main(int argc, char **argv) {
           if (exposure["prefer_native"]) {
             backend_prefer_native = exposure["prefer_native"].as<bool>();
           }
-          if (exposure["allow_universal_fallback"]) {
-            backend_allow_universal_fallback =
-                exposure["allow_universal_fallback"].as<bool>();
+          if (exposure["allow_llama_cpp_fallback"]) {
+            backend_allow_llama_cpp_fallback =
+                exposure["allow_llama_cpp_fallback"].as<bool>();
           }
           if (exposure["strict_native_request"]) {
             backend_strict_native_request =
@@ -719,7 +719,7 @@ int main(int argc, char **argv) {
   }
   if (const char *env_allow_fallback =
           std::getenv("INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK")) {
-    backend_allow_universal_fallback = ParseBool(env_allow_fallback);
+    backend_allow_llama_cpp_fallback = ParseBool(env_allow_fallback);
   }
   if (const char *env_strict_native =
           std::getenv("INFERFLUX_BACKEND_STRICT_NATIVE_REQUEST")) {
@@ -882,14 +882,14 @@ int main(int argc, char **argv) {
   std::cout << "Paged KV cache pages: " << cache_pages
             << " eviction=" << normalized_policy << std::endl;
   inferflux::BackendFactory::SetExposurePolicy(
-      {backend_prefer_native, backend_allow_universal_fallback,
+      {backend_prefer_native, backend_allow_llama_cpp_fallback,
        backend_strict_native_request});
   inferflux::log::Info(
       "server",
       "Backend exposure policy: prefer_native=" +
           std::string(backend_prefer_native ? "true" : "false") +
-          ", allow_universal_fallback=" +
-          std::string(backend_allow_universal_fallback ? "true" : "false") +
+          ", allow_llama_cpp_fallback=" +
+          std::string(backend_allow_llama_cpp_fallback ? "true" : "false") +
           ", strict_native_request=" +
           std::string(backend_strict_native_request ? "true" : "false"));
   inferflux::log::Info(
@@ -1332,8 +1332,8 @@ int main(int argc, char **argv) {
     advisor_ctx.config.max_batch_tokens = scheduler_config.max_batch_tokens;
     advisor_ctx.config.kv_cpu_pages = paged_kv_pages;
     advisor_ctx.config.prefer_native = backend_prefer_native;
-    advisor_ctx.config.allow_universal_fallback =
-        backend_allow_universal_fallback;
+    advisor_ctx.config.allow_llama_cpp_fallback =
+        backend_allow_llama_cpp_fallback;
     advisor_ctx.config.strict_native_request = backend_strict_native_request;
     advisor_ctx.config.backend_priority =
         normalized_backend_priority.empty()

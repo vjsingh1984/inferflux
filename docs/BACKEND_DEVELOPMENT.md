@@ -53,7 +53,7 @@ mindmap
         Custom kernels
         FlashAttention-2
         Phase overlap
-      cuda_universal
+      cuda_llama_cpp
         llama.cpp bridge
         GGUF support
         Cross-platform
@@ -276,7 +276,7 @@ BackendCapabilities GetCapabilities() const override {
 ```mermaid
 graph LR
     subgraph "Model Format Ecosystem"
-        A[GGUF] --> D[cuda_universal, cpu, mps]
+        A[GGUF] --> D[cuda_llama_cpp, cpu, mps]
         B[Safetensors] --> E[cuda_native]
         C[HuggingFace] --> F[Auto-detect]
     end

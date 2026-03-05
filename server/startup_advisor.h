@@ -29,7 +29,7 @@ struct AdvisorModelInfo {
   std::string path;
   std::string format{"unknown"};
   std::string backend{"cpu"};
-  std::string backend_provider{"universal"};
+  std::string backend_provider{"llama_cpp"};
   bool backend_fallback{false};
   std::string backend_fallback_reason;
   std::uint64_t file_size_bytes{0};
@@ -73,7 +73,7 @@ struct AdvisorConfig {
   int max_batch_tokens{2048};
   std::size_t kv_cpu_pages{32};
   bool prefer_native{true};
-  bool allow_universal_fallback{true};
+  bool allow_llama_cpp_fallback{true};
   bool strict_native_request{false};
   std::string backend_priority;
   int tp_degree{1};

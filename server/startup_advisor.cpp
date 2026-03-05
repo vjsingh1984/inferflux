@@ -533,12 +533,12 @@ std::uint64_t CalculatePerSlotKvSize(int n_ctx, int hidden_dim, int n_layers,
 // Existing rules (preserved)
 // ---------------------------------------------------------------------------
 
-// Rule 1: Backend mismatch — safetensors on CUDA using universal provider.
+// Rule 1: Backend mismatch — safetensors on CUDA using llama.cpp provider.
 int CheckBackendMismatch(const StartupAdvisorContext &ctx) {
   int count = 0;
   for (const auto &m : ctx.models) {
     if (m.format == "safetensors" && m.backend == "cuda" &&
-        m.backend_provider == "universal") {
+        m.backend_provider == "llama_cpp") {
       log::Info(kComponent, "[RECOMMEND] backend: Model '" + m.id +
                                 "' uses safetensors on CUDA — set "
                                 "INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel");

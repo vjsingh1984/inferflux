@@ -81,7 +81,7 @@ Look for:
 | Platform | Issue | Fix |
 |---|---|---|
 | macOS | Metal command queue failures | set `GGML_METAL_DISABLE=1` for CPU fallback |
-| NVIDIA CUDA | explicit `cuda_native` rejected | adjust strict mode or use `cuda_universal` until native ready |
+| NVIDIA CUDA | explicit `cuda_native` rejected | adjust strict mode or use `cuda_llama_cpp` until native ready |
 | Docker | config/model persistence | mount config/models volumes and verify permissions |
 
 Docker quick commands:

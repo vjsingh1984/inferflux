@@ -2,8 +2,8 @@
 
 #include "runtime/backends/cuda/native/cublas_gemm.h"
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
-#include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/model_forward.h"
+#include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/quantized_weight_map.h"
 #include <memory>
 
@@ -37,8 +37,7 @@ public:
    * @return true on success
    */
   bool Initialize(const ModelInfo &config, QuantizedWeightMap *weights,
-                 IKvCacheGpu *kv_cache, CublasGemm *gemm,
-                 cudaStream_t stream);
+                  IKvCacheGpu *kv_cache, CublasGemm *gemm, cudaStream_t stream);
 
   // ModelForward interface (compatibility shim)
   bool Initialize(const SafetensorsLoader::ModelConfig &config,
@@ -48,10 +47,10 @@ public:
   bool Forward(const std::vector<int> &token_ids, int n_past, int sequence_id,
                float *d_logits) override;
 
-  bool BatchForward(const std::vector<int> &token_ids,
-                    const std::vector<int> &n_past,
-                    const std::vector<int> &sequence_ids, float *d_logits,
-                    int batch_size) override;
+  bool BatchForward(
+      const std::vector<int> &token_ids, const std::vector<int> &n_past,
+      const std::vector<int> &sequence_ids, float *d_logits,
+      int batch_size) override; // NOLINT(bugprone-easily-swappable-parameters)
 
   void SetStream(cudaStream_t stream) override;
   void FreeScratchBuffers() override;
@@ -66,6 +65,32 @@ public:
   std::string GetQuantizationType() const { return quantization_type_; }
 
 private:
+  struct AttentionState {
+    int n_past{0};
+    int sequence_id{-1};
+  };
+
+  struct RmsNormParams {
+    int size{0};
+    float eps{0.0F};
+  };
+
+  struct RmsNormBuffers {
+    const half *input{nullptr};
+    const half *weight{nullptr};
+    half *output{nullptr};
+  };
+
+  struct RoPEBuffers {
+    half *q{nullptr};
+    half *k{nullptr};
+  };
+
+  struct RoPEParams {
+    int n_past{0};
+    int layer{0};
+  };
+
   void FreeScratchBuffersImpl();
 
   // Forward pass implementation
@@ -73,17 +98,17 @@ private:
                       int sequence_id, float *d_logits);
 
   // Attention computation
-  bool ComputeAttention(int layer, int n_past, int sequence_id);
+  bool ComputeAttention(int layer, const AttentionState &state);
 
   // Feed-forward network
   bool ComputeFFN(int layer);
 
   // Layer normalization
-  bool ComputeRMSNorm(const half *input, const half *weight, half *output,
-                       int size, float eps);
+  bool ComputeRMSNorm(const RmsNormBuffers &buffers,
+                      const RmsNormParams &params);
 
   // RoPE (Rotary Position Embedding)
-  void ApplyRoPE(half *q, half *k, int n_past, int layer);
+  void ApplyRoPE(const RoPEBuffers &buffers, const RoPEParams &params);
 
   // Model config
   int hidden_size_{0};
@@ -130,6 +155,7 @@ private:
  * @param model_type Model architecture type (llama, qwen2, etc.)
  * @return Unique pointer to QuantizedForward
  */
-std::unique_ptr<QuantizedForward> CreateQuantizedForward(const std::string &model_type);
+std::unique_ptr<QuantizedForward>
+CreateQuantizedForward(const std::string &model_type);
 
 } // namespace inferflux

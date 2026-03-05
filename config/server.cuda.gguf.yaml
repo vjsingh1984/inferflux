@@ -63,7 +63,7 @@ models:
 # Runtime configuration
 runtime:
   # Backend selection
-  backend_priority: "cuda_native,cuda_universal,cpu"
+  backend_priority: "cuda_native,cuda_llama_cpp,cpu"
   capability_routing:
     enabled: true
 

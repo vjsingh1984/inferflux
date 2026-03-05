@@ -25,8 +25,8 @@ struct ModelInfo {
   std::string requested_format{"auto"}; // Requested format hint (or auto).
   std::string backend;           // Backend type: "cpu", "cuda", "mps", "rocm".
   std::string requested_backend; // Requested backend hint ("cuda",
-                                 // "cuda_native", "cuda_universal", "auto"...).
-  std::string backend_provider{"universal"}; // "native" or "universal".
+                                 // "cuda_native", "cuda_llama_cpp", "auto"...).
+  std::string backend_provider{"llama_cpp"}; // "native" or "llama_cpp".
   bool backend_fallback{false};        // True when requested backend fell back.
   std::string backend_fallback_reason; // Optional fallback explanation.
   bool ready{false}; // True when the model is loaded and serving.

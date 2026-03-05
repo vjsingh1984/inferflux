@@ -27,6 +27,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -57,10 +58,10 @@ std::string GetHeaderValue(const std::string &headers,
 }
 
 std::string BuildResponse(const std::string &body, int status = 200,
-                          const std::string &status_text = "OK",
+                          std::string_view status_text = "OK",
                           const std::string &extra_headers = "") {
-  std::string headers =
-      "HTTP/1.1 " + std::to_string(status) + " " + status_text + "\r\n";
+  std::string headers = "HTTP/1.1 " + std::to_string(status) + " " +
+                        std::string(status_text) + "\r\n";
   headers += "Content-Type: application/json\r\n";
   headers += "Access-Control-Allow-Origin: *\r\n";
   if (!extra_headers.empty()) {
@@ -187,7 +188,7 @@ json BuildBackendExposureJson(const ModelInfo &info) {
   const std::string requested =
       info.requested_backend.empty() ? info.backend : info.requested_backend;
   const std::string provider =
-      info.backend_provider.empty() ? "universal" : info.backend_provider;
+      info.backend_provider.empty() ? "llama_cpp" : info.backend_provider;
   return json{
       {"requested_backend", requested},
       {"exposed_backend", info.backend},
@@ -225,7 +226,7 @@ json BuildAdminModelJson(const ModelInfo &info, const std::string &default_id) {
   model["requested_backend"] =
       info.requested_backend.empty() ? info.backend : info.requested_backend;
   model["backend_provider"] =
-      info.backend_provider.empty() ? "universal" : info.backend_provider;
+      info.backend_provider.empty() ? "llama_cpp" : info.backend_provider;
   model["default"] = (info.id == default_id);
   return model;
 }
@@ -252,11 +253,12 @@ std::string StripPrefix(const std::string &value, const std::string &prefix) {
 }
 
 std::string ParseJsonStringField(const std::string &body,
-                                 const std::string &field) {
+                                 std::string_view field) {
   try {
+    const std::string field_name(field);
     auto j = json::parse(body);
-    if (j.contains(field) && j[field].is_string()) {
-      return j[field].get<std::string>();
+    if (j.contains(field_name) && j[field_name].is_string()) {
+      return j[field_name].get<std::string>();
     }
   } catch (const json::exception &ex) {
     LogJsonParseFailure("ParseJsonStringField", ex);
@@ -854,10 +856,10 @@ std::vector<std::string> SplitForStreaming(const std::string &text) {
 
 // `logprob` is non-null when the caller collected per-token logprobs (i.e.
 // the request had logprobs=true with streaming).  Ignored on finish chunks.
-std::string BuildStreamChunk(const std::string &id, const std::string &model,
+std::string BuildStreamChunk(const std::string &id, std::string_view model,
                              std::time_t ts, const std::string &content,
                              bool finish,
-                             const std::string &finish_reason = "stop",
+                             std::string_view finish_reason = "stop",
                              const TokenLogprob *logprob = nullptr) {
   json j;
   j["id"] = id;
@@ -905,7 +907,7 @@ std::string BuildStreamChunk(const std::string &id, const std::string &model,
 //   3. tool_calls[0] function.arguments (full JSON string)
 //   4. finish_reason=tool_calls, empty delta
 std::string BuildToolCallStreamChunks(const std::string &id,
-                                      const std::string &model, std::time_t ts,
+                                      std::string_view model, std::time_t ts,
                                       const ToolCallResult &tc) {
   std::string out;
   auto base = [&]() -> json {
@@ -979,7 +981,7 @@ HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
                        RateLimiter *rate_limiter, Guardrail *guardrail,
                        AuditLogger *audit_logger, PolicyBackend *policy_store,
                        std::shared_ptr<SpeculativeDecoder> speculative_decoder,
-                       TlsConfig tls_config, int num_workers,
+                       const TlsConfig &tls_config, int num_workers,
                        const ModelSelectionOptions &model_selection_options)
     : host_(std::move(host)), port_(port), scheduler_(scheduler),
       auth_(std::move(auth)), metrics_(metrics), oidc_(oidc),

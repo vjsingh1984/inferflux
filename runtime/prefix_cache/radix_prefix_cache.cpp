@@ -143,7 +143,7 @@ void RadixPrefixCache::SplitEdge(RadixNode *parent, int first_token,
 void RadixPrefixCache::Insert(const std::vector<int> &tokens,
                               const std::vector<int> &block_table,
                               int sequence_id,
-                              std::shared_ptr<LlamaCPUBackend> backend) {
+                              const std::shared_ptr<LlamaCPUBackend> &backend) {
   if (capacity_ == 0 || tokens.empty() || block_table.empty()) {
     return;
   }
@@ -227,7 +227,7 @@ void RadixPrefixCache::Insert(const std::vector<int> &tokens,
 }
 
 void RadixPrefixCache::CollectNodes(
-    RadixNode *node, std::function<bool(const RadixNode *)> criteria,
+    RadixNode *node, const std::function<bool(const RadixNode *)> &criteria,
     std::vector<std::pair<uint64_t, RadixNode *>> &out) const {
   if (criteria(node)) {
     out.emplace_back(node->last_used, node);

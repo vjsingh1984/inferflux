@@ -34,7 +34,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     A[Safetensors Model] --> B{Backend}
-    B -->|cuda_universal| C[⚠️ Mismatch]
+    B -->|cuda_llama_cpp| C[⚠️ Mismatch]
     B -->|cuda_native| D[✅ Correct]
 
     C --> E[Recommendation:<br/>INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel]
@@ -45,7 +45,7 @@ flowchart LR
     style E fill:#ff9ff3
 ```
 
-**Trigger:** Safetensors + CUDA + universal provider
+**Trigger:** Safetensors + CUDA + llama.cpp provider
 
 **Recommendation:**
 ```
@@ -53,7 +53,7 @@ flowchart LR
 set INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
 ```
 
-**Why it matters:** The universal llama.cpp backend doesn't support safetensors. The native CUDA backend must be used explicitly.
+**Why it matters:** The llama.cpp.cpp backend doesn't support safetensors. The native CUDA backend must be used explicitly.
 
 **Fix:**
 ```yaml

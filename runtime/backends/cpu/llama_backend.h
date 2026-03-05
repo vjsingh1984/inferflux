@@ -201,7 +201,9 @@ public:
              &on_chunk = {},
          const std::function<bool()> &should_stop = {}, int logprob_top_n = 0,
          std::vector<TokenLogprob> *out_logprobs = nullptr,
-         int first_token = -1, const std::vector<std::string> &stop_seqs = {});
+         int first_token = -1,
+         const std::vector<std::string> &stop_seqs =
+             {}); // NOLINT(bugprone-easily-swappable-parameters)
 
   // Execute one shared decode step for N sequences simultaneously.
   std::vector<BatchDecodeOutput>
@@ -212,8 +214,9 @@ public:
 
   // Partial prefill that evaluates only the suffix of prompt starting at
   // n_past_start.
-  virtual PrefillResult PrefillPartial(const std::string &prompt,
-                                       int sequence_id, int n_past_start);
+  virtual PrefillResult PrefillPartial(
+      const std::string &prompt, int sequence_id,
+      int n_past_start); // NOLINT(bugprone-easily-swappable-parameters)
 
   // Release KV cache slots for the given sequence_id.
   virtual void FreeSequence(int sequence_id);

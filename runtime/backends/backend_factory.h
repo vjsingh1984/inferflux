@@ -10,13 +10,13 @@
 namespace inferflux {
 
 enum class BackendProvider {
-  kUniversalLlama,
+  kLlamaCpp,
   kNative,
 };
 
 struct BackendExposurePolicy {
   bool prefer_native{true};
-  bool allow_universal_fallback{true};
+  bool allow_llama_cpp_fallback{true};
   // When true, explicit native hints (e.g. cuda_native) fail fast unless
   // native kernels are ready; no scaffold/delegate path is accepted.
   bool strict_native_request{false};
@@ -28,7 +28,7 @@ struct BackendFactoryResult {
   LlamaBackendTarget target{LlamaBackendTarget::kCpu};
   LlamaBackendTraits traits{};
   BackendCapabilities capabilities{};
-  BackendProvider provider{BackendProvider::kUniversalLlama};
+  BackendProvider provider{BackendProvider::kLlamaCpp};
   bool used_fallback{false};
   std::string fallback_reason;
   LlamaBackendConfig config{};

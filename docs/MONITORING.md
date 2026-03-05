@@ -59,7 +59,7 @@ Example snapshot evidence (TinyLlama 1.1B Q4_K_M, March 5, 2026):
 
 | Backend path | Completion tok/s | Notes |
 |---|---:|---|
-| `cuda_universal` | `2774` | Lower latency in this specific small-model run |
+| `cuda_llama_cpp` | `2774` | Lower latency in this specific small-model run |
 | `cuda_native` | `2489` | Similar tier on this run; expected separation grows with larger models/workloads |
 
 Treat these as snapshot measurements, not guaranteed universal ordering.
