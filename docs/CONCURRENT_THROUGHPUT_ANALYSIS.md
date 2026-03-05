@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-05
 **Issue**: Low concurrent throughput (2 tok/s for 8 requests vs 35 tok/s sequential)
-**Status**: ✅ Root cause identified
+**Status**: ✅ Root cause identified; request-layer mitigation landed (`a18ca46`)
 
 ---
 
@@ -16,7 +16,7 @@
 | Concurrent (4) | 4 | ~10s | **~51 tok/s** ✅ |
 | Concurrent (8) | 8 | 392s | **2.04 tok/s** ❌ |
 
-**Issue**: Concurrent throughput with 8 requests is **17x slower** than sequential!
+**Issue**: Historical concurrent throughput with 8 requests was **17x slower** than sequential.
 
 ---
 
@@ -48,7 +48,7 @@ auto result = future.get();  // ❌ BLOCKS worker thread!
 **Problem**:
 1. Benchmark uses `"stream": false` (non-streaming mode)
 2. `future.get()` **blocks** the HTTP worker thread until request completes
-3. Only **4 worker threads** available (`num_workers=4`)
+3. Historical default had **4 worker threads** (`num_workers=4`, now 16 via `a18ca46`)
 4. Each request takes ~50 seconds to complete
 
 **With 8 concurrent requests**:
@@ -128,7 +128,7 @@ futures.push_back(scheduler_->Generate(std::move(cur)));  // Async!
 
 ---
 
-### Option 2: Increase HTTP Worker Pool ⚠️
+### Option 2: Increase HTTP Worker Pool ✅ (Implemented)
 
 **Change**: Increase `num_workers` from 4 to 16+
 
@@ -150,7 +150,8 @@ HttpServer http_server(tls_config, 16,  // num_workers=16
 - Doesn't fix the blocking issue completely
 - Scaling limit: still bounded by worker count
 
-**Effort**: ⭐⭐ (Simple config change)
+**Effort**: ⭐⭐ (Simple config change)  
+**Status**: ✅ Complete (`a18ca46`)
 
 ---
 
@@ -212,7 +213,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 ---
 
-### Phase 2: Worker Pool Increase (Short-term)
+### Phase 2: Worker Pool Increase (Landed)
 
 **Increase HTTP worker threads**
 
@@ -221,7 +222,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 HttpServer http_server(tls_config, 16,  // Increase from 4 to 16
 ```
 
-**Expected improvement**: Better concurrency for non-streaming requests
+**Result**: Better request-layer concurrency headroom for non-streaming requests
 
 ---
 
@@ -296,24 +297,24 @@ HttpServer http_server(tls_config, 16,  // Was: 4
 ### Solution Priorities
 
 1. ✅ **Use streaming** - Immediate 17-25x improvement
-2. ⚠️ **Increase workers** - Better non-streaming concurrency
+2. ✅ **Increase workers** - Better non-streaming concurrency (implemented)
 3. ✅ **Async refactoring** - Long-term scalability
 
 ### Expected Impact
 
 | Configuration | Concurrent (8) | Improvement |
 |----------------|----------------|-------------|
-| Current (stream: false) | 2.04 tok/s | Baseline |
+| Historical baseline (stream: false, 4 workers) | 2.04 tok/s | Root-cause baseline |
 | Streaming enabled | **35-50 tok/s** | **17-25x faster** ✅ |
-| + More workers | **50-100 tok/s** | **25-50x faster** ✅ |
+| + More workers (16 default) | rerun pending | request-layer bottleneck reduced |
 | + Async processing | **100+ tok/s** | **50x faster** ✅ |
 
 ---
 
 **Next Steps**:
-1. Update benchmark to use streaming mode
-2. Verify throughput improvement
-3. Document streaming best practices
+1. Capture fresh non-streaming concurrency benchmark with worker=16
+2. Keep streaming as default recommendation for high concurrency clients
+3. Document measured post-mitigation deltas
 4. Plan async refactoring for non-streaming
 
 ---

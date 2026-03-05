@@ -1,7 +1,7 @@
 # Concurrent Throughput Investigation Summary
 
 **Date**: 2026-03-05
-**Status**: ✅ Root cause identified, solution ready
+**Status**: ✅ Root cause identified, mitigation phase landed, kernel-level follow-up pending
 
 ---
 
@@ -9,9 +9,9 @@
 
 ### Problem
 
-Concurrent throughput is **17x slower** than sequential:
+Historical baseline showed concurrent throughput was **17x slower** than sequential:
 - Sequential: 35.56 tok/s ✅
-- Concurrent (8): 2.04 tok/s ❌
+- Concurrent (8): 2.04 tok/s ❌ (historical before worker-pool fix)
 
 ### Root Cause
 
@@ -25,7 +25,7 @@ auto result = future.get();  // ❌ BLOCKS until request completes
 
 ### Impact
 
-- Only 4 worker threads available
+- Historical default had only 4 worker threads available
 - Each request takes ~50 seconds
 - 8 concurrent requests → 4 run, 4 wait → ~392 seconds total
 - Throughput: 800 tokens / 392s = **2.04 tok/s**
@@ -56,6 +56,17 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -d '{"model":"default","messages":[...],"stream":true}'
 ```
 
+### Request-Layer Mitigation Landed ✅
+
+**Change landed**: increase default HTTP worker pool from 4 to 16  
+**Commit**: `a18ca46`  
+**Doc**: `docs/HTTP_WORKER_POOL_INCREASE.md`
+
+**Impact**:
+- Reduces non-streaming queue saturation at request layer
+- Improves concurrency headroom without changing API clients
+- Does **not** replace native CUDA kernel/overlap work
+
 ---
 
 ## Implementation Plan
@@ -70,7 +81,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 ---
 
-### Phase 2: Increase HTTP Worker Pool
+### Phase 2: Increase HTTP Worker Pool ✅
 
 **File**: `server/main.cpp`
 
@@ -86,9 +97,8 @@ HttpServer http_server(tls_config, 16,  // Increase from 4
 - Non-streaming: 2 tok/s → **8 tok/s** (4x better)
 - More concurrent requests possible
 
-**Effort**: ⭐⭐ (Simple config change)
-
-**Status**: ⏳ TODO
+**Effort**: ⭐⭐ (Simple config change)  
+**Status**: ✅ Complete (`a18ca46`)
 
 ---
 
@@ -126,16 +136,16 @@ auto future = scheduler_->Generate(std::move(req));
 
 | Configuration | Requests | Time | Throughput | Status |
 |----------------|----------|------|------------|--------|
-| **Current (non-streaming)** | 8 | 392s | 2.04 tok/s | ❌ Baseline |
-| **Streaming** | 8 | ~10-15s | **35-50 tok/s** | ✅ 17-25x faster |
-| **+ More workers** | 8 | ~100s | **8 tok/s** | ✅ 4x better |
-| **+ Async non-streaming** | 8 | ~10-15s | **35-50 tok/s** | ✅ 17-25x faster |
+| **Historical baseline (non-streaming, 4 workers)** | 8 | 392s | 2.04 tok/s | ✅ Root-cause baseline |
+| **Streaming** | 8 | ~10-15s | **35-50 tok/s** | ✅ Immediate mitigation path |
+| **Current default (non-streaming, 16 workers)** | 8 | rerun pending | expected better than baseline | ⏳ needs fresh benchmark capture |
+| **+ Async non-streaming** | 8 | ~10-15s target | **35-50 tok/s** target | ⏳ planned |
 
 ---
 
 ## Code Changes Needed
 
-### 1. HTTP Worker Pool Increase
+### 1. HTTP Worker Pool Increase ✅
 
 **File**: `server/main.cpp`
 
@@ -145,7 +155,8 @@ auto future = scheduler_->Generate(std::move(req));
                        scheduler, &auth,
 ```
 
-**Lines**: ~1230
+**Lines**: `server/main.cpp` (`http_workers=16`)  
+**Status**: Complete (`a18ca46`)
 
 ---
 
@@ -183,10 +194,10 @@ for chunk in response:
 
 ### For Developers (Short-term)
 
-⏳ **Increase HTTP worker pool** to 16 threads:
-- Simple config change
-- 4x improvement for non-streaming
-- No client code changes needed
+✅ **HTTP worker pool default increased to 16**:
+- Request-layer concurrency bottleneck reduced
+- Keeps client contract unchanged
+- Use `INFERFLUX_HTTP_WORKERS` to tune per host
 
 ### For Developers (Long-term)
 
@@ -222,7 +233,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | Solution documented | ✅ Complete |
 | Test scripts created | ✅ Complete |
 | Streaming best practice | ✅ Documented |
-| Worker pool increase | ⏳ TODO |
+| Worker pool increase | ✅ Complete (`a18ca46`) |
 | Async refactoring | ⏳ TODO |
 
 ---
@@ -230,13 +241,13 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ## Next Steps
 
 1. ✅ Document findings (this file)
-2. ⏳ Increase HTTP worker pool to 16
-3. ⏳ Test streaming with real workload
+2. ⏳ Rerun concurrent non-streaming benchmark with worker=16 and record measured delta
+3. ⏳ Keep streaming guidance as default for high concurrency clients
 4. ⏳ Plan async non-streaming refactoring
-5. ⏳ Update user documentation with streaming recommendations
+5. ⏳ Add throughput evidence snapshot for post-mitigation measurements
 
 ---
 
 **Date**: 2026-03-05
-**Status**: Investigation complete, solution ready to implement
-**Impact**: 17-25x concurrent throughput improvement with streaming
+**Status**: Mitigation phase complete at request layer; core kernel work remains
+**Impact**: Streaming remains highest-confidence mitigation; worker-pool increase reduces non-streaming saturation risk
