@@ -66,6 +66,8 @@ public:
   std::string GetQuantizationType() const { return quantization_type_; }
 
 private:
+  void FreeScratchBuffersImpl();
+
   // Forward pass implementation
   bool RunForwardPass(const std::vector<int> &token_ids, int n_past,
                       int sequence_id, float *d_logits);

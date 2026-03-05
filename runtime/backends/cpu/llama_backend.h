@@ -311,6 +311,7 @@ protected:
   int tp_rank_{0};
 
 private:
+  void TeardownSamplerImpl();
   std::vector<int> Tokenize(const std::string &prompt, bool add_bos) const;
   std::string TokenToString(int token) const;
 

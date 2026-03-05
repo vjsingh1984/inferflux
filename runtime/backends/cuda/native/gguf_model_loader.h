@@ -100,6 +100,8 @@ public:
   }
 
 private:
+  void FreeGPUMemoryImpl();
+
   // File handling
   bool ParseHeader(FILE *file);
   bool ParseKeyValuePairs(FILE *file);

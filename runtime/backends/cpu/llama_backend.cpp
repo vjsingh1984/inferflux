@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -66,6 +68,17 @@ namespace {
 std::mutex g_llama_init_mutex;
 int g_llama_init_refcount = 0;
 
+bool SizeToInt32(std::size_t value, int32_t *out) {
+  if (!out) {
+    return false;
+  }
+  if (value > static_cast<std::size_t>(std::numeric_limits<int32_t>::max())) {
+    return false;
+  }
+  *out = static_cast<int32_t>(value);
+  return true;
+}
+
 void LlamaBackendAcquire() {
   std::lock_guard<std::mutex> lock(g_llama_init_mutex);
   if (g_llama_init_refcount++ == 0) {
@@ -84,7 +97,7 @@ void LlamaBackendRelease() {
 LlamaCPUBackend::LlamaCPUBackend() { LlamaBackendAcquire(); }
 
 LlamaCPUBackend::~LlamaCPUBackend() {
-  TeardownSampler();
+  TeardownSamplerImpl();
 #ifdef INFERFLUX_HAS_MTMD
   if (mtmd_ctx_) {
     mtmd_free(mtmd_ctx_);
@@ -197,12 +210,23 @@ std::vector<int> LlamaCPUBackend::Tokenize(const std::string &prompt,
   }
   std::vector<llama_token> tokens;
   tokens.resize(prompt.size() + 8);
-  int n = llama_tokenize(vocab_, prompt.c_str(), prompt.size(), tokens.data(),
-                         tokens.size(), add_bos, true);
+  int32_t prompt_len = 0;
+  int32_t token_capacity = 0;
+  if (!SizeToInt32(prompt.size(), &prompt_len) ||
+      !SizeToInt32(tokens.size(), &token_capacity)) {
+    log::Error("llama_backend", "Prompt/token capacity exceeds int32 range");
+    return {};
+  }
+  int n = llama_tokenize(vocab_, prompt.c_str(), prompt_len, tokens.data(),
+                         token_capacity, add_bos, true);
   if (n < 0) {
-    tokens.resize(-n);
-    n = llama_tokenize(vocab_, prompt.c_str(), prompt.size(), tokens.data(),
-                       tokens.size(), add_bos, true);
+    tokens.resize(static_cast<std::size_t>(-n));
+    if (!SizeToInt32(tokens.size(), &token_capacity)) {
+      log::Error("llama_backend", "Token capacity exceeds int32 range");
+      return {};
+    }
+    n = llama_tokenize(vocab_, prompt.c_str(), prompt_len, tokens.data(),
+                       token_capacity, add_bos, true);
   }
   tokens.resize(n);
   return {tokens.begin(), tokens.end()};
@@ -261,7 +285,9 @@ void LlamaCPUBackend::SetupSampler(const std::string &grammar,
   active_sampler_ = chain;
 }
 
-void LlamaCPUBackend::TeardownSampler() {
+void LlamaCPUBackend::TeardownSampler() { TeardownSamplerImpl(); }
+
+void LlamaCPUBackend::TeardownSamplerImpl() {
   if (active_sampler_) {
     llama_sampler_free(active_sampler_);
     active_sampler_ = nullptr;
@@ -274,12 +300,19 @@ std::string LlamaCPUBackend::TokenToString(int token) const {
   }
   std::string buf;
   buf.resize(16);
+  int32_t buf_capacity = 0;
+  if (!SizeToInt32(buf.size(), &buf_capacity)) {
+    return {};
+  }
   int written =
-      llama_token_to_piece(vocab_, token, buf.data(), buf.size(), 0, false);
+      llama_token_to_piece(vocab_, token, buf.data(), buf_capacity, 0, false);
   if (written < 0) {
     buf.resize(static_cast<std::size_t>(-written));
-    if (llama_token_to_piece(vocab_, token, buf.data(), buf.size(), 0, false) <
-        0) {
+    if (!SizeToInt32(buf.size(), &buf_capacity)) {
+      return {};
+    }
+    if (llama_token_to_piece(vocab_, token, buf.data(), buf_capacity, 0,
+                             false) < 0) {
       return {};
     }
   } else {
@@ -295,8 +328,9 @@ std::string LlamaCPUBackend::Generate(
     const std::function<bool()> &should_stop, int logprob_top_n,
     std::vector<TokenLogprob> *out_logprobs,
     const std::vector<std::string> &stop_seqs) {
-  log::Debug("llama_backend", "Generate() called: prompt_len=" + std::to_string(prompt.size()) +
-             ", max_tokens=" + std::to_string(max_tokens));
+  log::Debug("llama_backend",
+             "Generate() called: prompt_len=" + std::to_string(prompt.size()) +
+                 ", max_tokens=" + std::to_string(max_tokens));
 
   if (!IsReady()) {
     log::Error("llama_backend", "Generate() called but backend not ready");
@@ -307,10 +341,12 @@ std::string LlamaCPUBackend::Generate(
   auto prompt_tokens = Tokenize(prompt, true);
   auto tokenization_end = std::chrono::high_resolution_clock::now();
   auto tokenization_ms = std::chrono::duration<float, std::milli>(
-      tokenization_end - tokenization_start).count();
+                             tokenization_end - tokenization_start)
+                             .count();
 
-  log::Debug("llama_backend", "Tokenization complete: " + std::to_string(prompt_tokens.size()) +
-             " tokens in " + std::to_string(tokenization_ms) + "ms");
+  log::Debug("llama_backend",
+             "Tokenization complete: " + std::to_string(prompt_tokens.size()) +
+                 " tokens in " + std::to_string(tokenization_ms) + "ms");
 
   if (prompt_tokens.empty()) {
     log::Warn("llama_backend", "Tokenization returned empty tokens");
@@ -336,16 +372,19 @@ std::string LlamaCPUBackend::Generate(
        start += static_cast<std::size_t>(token_cap)) {
     std::size_t end = std::min(prompt_tokens.size(),
                                start + static_cast<std::size_t>(token_cap));
-    log::Debug("llama_backend", "Processing prompt batch " + std::to_string(batch_count) +
-               ": tokens [" + std::to_string(start) + "-" + std::to_string(end) + "]");
+    log::Debug("llama_backend", "Processing prompt batch " +
+                                    std::to_string(batch_count) + ": tokens [" +
+                                    std::to_string(start) + "-" +
+                                    std::to_string(end) + "]");
 
     for (std::size_t i = start; i < end; ++i) {
       BatchAdd(batch, prompt_tokens[i], position++,
                i == prompt_tokens.size() - 1);
     }
 
-    log::Debug("llama_backend", "Calling llama_decode for prompt batch " + std::to_string(batch_count) +
-               " (" + std::to_string(end - start) + " tokens)");
+    log::Debug("llama_backend", "Calling llama_decode for prompt batch " +
+                                    std::to_string(batch_count) + " (" +
+                                    std::to_string(end - start) + " tokens)");
     auto decode_start = std::chrono::high_resolution_clock::now();
 
     if (llama_decode(context_, batch) != 0) {
@@ -355,27 +394,34 @@ std::string LlamaCPUBackend::Generate(
     }
 
     auto decode_end = std::chrono::high_resolution_clock::now();
-    auto decode_ms = std::chrono::duration<float, std::milli>(
-        decode_end - decode_start).count();
-    log::Debug("llama_backend", "llama_decode completed for batch " + std::to_string(batch_count) +
-               " in " + std::to_string(decode_ms) + "ms");
+    auto decode_ms =
+        std::chrono::duration<float, std::milli>(decode_end - decode_start)
+            .count();
+    log::Debug("llama_backend", "llama_decode completed for batch " +
+                                    std::to_string(batch_count) + " in " +
+                                    std::to_string(decode_ms) + "ms");
 
     BatchClear(batch);
     batch_count++;
   }
 
   auto prefill_end = std::chrono::high_resolution_clock::now();
-  auto prefill_ms = std::chrono::duration<float, std::milli>(
-      prefill_end - prefill_start).count();
-  log::Info("llama_backend", "Prefill complete: " + std::to_string(prompt_tokens.size()) +
-            " tokens in " + std::to_string(prefill_ms) + "ms (" +
-            std::to_string(prefill_ms / prompt_tokens.size()) + "ms/token)");
+  auto prefill_ms =
+      std::chrono::duration<float, std::milli>(prefill_end - prefill_start)
+          .count();
+  const float prefill_per_token_ms =
+      prefill_ms / static_cast<float>(prompt_tokens.size());
+  log::Info("llama_backend",
+            "Prefill complete: " + std::to_string(prompt_tokens.size()) +
+                " tokens in " + std::to_string(prefill_ms) + "ms (" +
+                std::to_string(prefill_per_token_ms) + "ms/token)");
 
   std::string output;
   llama_token eos = llama_vocab_eos(vocab_);
   int tokens_remaining = std::max(max_tokens, 1);
 
-  log::Debug("llama_backend", "Starting generation loop: max_tokens=" + std::to_string(tokens_remaining));
+  log::Debug("llama_backend", "Starting generation loop: max_tokens=" +
+                                  std::to_string(tokens_remaining));
 
   auto generation_start = std::chrono::high_resolution_clock::now();
   int generated_count = 0;
@@ -389,11 +435,13 @@ std::string LlamaCPUBackend::Generate(
     auto sample_start = std::chrono::high_resolution_clock::now();
     int token = llama_sampler_sample(active_sampler_, context_, -1);
     auto sample_end = std::chrono::high_resolution_clock::now();
-    auto sample_ms = std::chrono::duration<float, std::milli>(
-        sample_end - sample_start).count();
+    auto sample_ms =
+        std::chrono::duration<float, std::milli>(sample_end - sample_start)
+            .count();
 
     if (token == eos) {
-      log::Debug("llama_backend", "EOS token received at position " + std::to_string(generated_count));
+      log::Debug("llama_backend", "EOS token received at position " +
+                                      std::to_string(generated_count));
       break;
     }
 
@@ -405,9 +453,10 @@ std::string LlamaCPUBackend::Generate(
     output += piece;
 
     if (generated_count == 0 || generated_count % 10 == 0) {
-      log::Debug("llama_backend", "Generated token " + std::to_string(generated_count) +
-                 ": sample_ms=" + std::to_string(sample_ms) +
-                 ", output_len=" + std::to_string(output.size()));
+      log::Debug("llama_backend",
+                 "Generated token " + std::to_string(generated_count) +
+                     ": sample_ms=" + std::to_string(sample_ms) +
+                     ", output_len=" + std::to_string(output.size()));
     }
 
     // Check stop sequences: trim output and compute the streaming-safe portion.
@@ -423,11 +472,13 @@ std::string LlamaCPUBackend::Generate(
       }
     }
     if (stop_triggered) {
-      log::Debug("llama_backend", "Stop sequence triggered at token " + std::to_string(generated_count));
+      log::Debug("llama_backend", "Stop sequence triggered at token " +
+                                      std::to_string(generated_count));
       break;
     }
     if (should_stop && should_stop()) {
-      log::Debug("llama_backend", "Generation stopped by should_stop callback (post-chunk)");
+      log::Debug("llama_backend",
+                 "Generation stopped by should_stop callback (post-chunk)");
       break;
     }
     // Context-window management: sliding-window KV eviction when the next
@@ -439,8 +490,10 @@ std::string LlamaCPUBackend::Generate(
         llama_pos keep = n_ctx / 2;
         llama_pos discard = position - keep + 1;
         if (discard > 0) {
-          log::Debug("llama_backend", "Sliding window KV eviction: discarding " +
-                     std::to_string(discard) + " positions, keeping " + std::to_string(keep));
+          log::Debug("llama_backend",
+                     "Sliding window KV eviction: discarding " +
+                         std::to_string(discard) + " positions, keeping " +
+                         std::to_string(keep));
           llama_memory_seq_rm(llama_get_memory(context_), 0, 0, discard);
           llama_memory_seq_add(llama_get_memory(context_), 0, discard,
                                static_cast<llama_pos>(-1), -discard);
@@ -452,16 +505,19 @@ std::string LlamaCPUBackend::Generate(
 
     auto decode_start = std::chrono::high_resolution_clock::now();
     if (llama_decode(context_, batch) != 0) {
-      log::Error("llama_backend", "llama_decode failed while generating at token " +
-                 std::to_string(generated_count));
+      log::Error("llama_backend",
+                 "llama_decode failed while generating at token " +
+                     std::to_string(generated_count));
       break;
     }
     auto decode_end = std::chrono::high_resolution_clock::now();
-    auto decode_ms = std::chrono::duration<float, std::milli>(
-        decode_end - decode_start).count();
+    auto decode_ms =
+        std::chrono::duration<float, std::milli>(decode_end - decode_start)
+            .count();
 
     if (generated_count == 0 || generated_count % 10 == 0) {
-      log::Debug("llama_backend", "llama_decode for generated token: " + std::to_string(decode_ms) + "ms");
+      log::Debug("llama_backend", "llama_decode for generated token: " +
+                                      std::to_string(decode_ms) + "ms");
     }
 
     BatchClear(batch);
@@ -470,10 +526,15 @@ std::string LlamaCPUBackend::Generate(
 
   auto generation_end = std::chrono::high_resolution_clock::now();
   auto generation_ms = std::chrono::duration<float, std::milli>(
-      generation_end - generation_start).count();
-  log::Info("llama_backend", "Generation complete: " + std::to_string(generated_count) +
-            " tokens in " + std::to_string(generation_ms) + "ms (" +
-            std::to_string(generation_ms / std::max(1, generated_count)) + "ms/token)");
+                           generation_end - generation_start)
+                           .count();
+  const float generation_token_count =
+      static_cast<float>(std::max(1, generated_count));
+  log::Info("llama_backend",
+            "Generation complete: " + std::to_string(generated_count) +
+                " tokens in " + std::to_string(generation_ms) + "ms (" +
+                std::to_string(generation_ms / generation_token_count) +
+                "ms/token)");
 
   llama_batch_free(batch);
 
@@ -980,10 +1041,12 @@ bool LlamaCPUBackend::TryCollectUnifiedBatchAsync(
 std::vector<LlamaCPUBackend::UnifiedBatchOutput>
 LlamaCPUBackend::ExecuteUnifiedBatch(
     const std::vector<UnifiedBatchInput> &inputs) {
-  log::Debug("llama_backend", "ExecuteUnifiedBatch called with " + std::to_string(inputs.size()) + " inputs");
+  log::Debug("llama_backend", "ExecuteUnifiedBatch called with " +
+                                  std::to_string(inputs.size()) + " inputs");
 
   if (!context_ || !vocab_ || inputs.empty()) {
-    log::Warn("llama_backend", "ExecuteUnifiedBatch: context/vocab not ready or inputs empty");
+    log::Warn("llama_backend",
+              "ExecuteUnifiedBatch: context/vocab not ready or inputs empty");
     return {};
   }
   std::vector<UnifiedBatchOutput> results(inputs.size());
@@ -998,8 +1061,10 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
     }
   }
 
-  log::Debug("llama_backend", "ExecuteUnifiedBatch: total_tokens=" + std::to_string(total_tokens) +
-             ", requests_with_logits=" + std::to_string(requests_with_logits));
+  log::Debug(
+      "llama_backend",
+      "ExecuteUnifiedBatch: total_tokens=" + std::to_string(total_tokens) +
+          ", requests_with_logits=" + std::to_string(requests_with_logits));
 
   if (total_tokens == 0) {
     log::Debug("llama_backend", "ExecuteUnifiedBatch: no tokens to process");
@@ -1024,8 +1089,11 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
     if (inp.tokens.empty())
       continue;
 
-    log::Debug("llama_backend", "Input " + std::to_string(i) + ": seq_id=" + std::to_string(inp.sequence_id) +
-               ", n_past=" + std::to_string(inp.n_past) + ", tokens=" + std::to_string(inp.tokens.size()));
+    log::Debug("llama_backend",
+               "Input " + std::to_string(i) +
+                   ": seq_id=" + std::to_string(inp.sequence_id) +
+                   ", n_past=" + std::to_string(inp.n_past) +
+                   ", tokens=" + std::to_string(inp.tokens.size()));
 
     for (std::size_t j = 0; j < inp.tokens.size(); ++j) {
       bool is_last = (j == inp.tokens.size() - 1);
@@ -1044,7 +1112,8 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
     }
   }
 
-  log::Debug("llama_backend", "Calling llama_decode with " + std::to_string(total_tokens) + " tokens...");
+  log::Debug("llama_backend", "Calling llama_decode with " +
+                                  std::to_string(total_tokens) + " tokens...");
   auto decode_start = std::chrono::high_resolution_clock::now();
 
   if (llama_decode(context_, batch) != 0) {
@@ -1054,11 +1123,14 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
   }
 
   auto decode_end = std::chrono::high_resolution_clock::now();
-  auto decode_ms = std::chrono::duration<float, std::milli>(
-      decode_end - decode_start).count();
-  log::Info("llama_backend", "llama_decode completed: " + std::to_string(decode_ms) + "ms for " +
-            std::to_string(total_tokens) + " tokens (" +
-            std::to_string(decode_ms / std::max(1, total_tokens)) + "ms/token)");
+  auto decode_ms =
+      std::chrono::duration<float, std::milli>(decode_end - decode_start)
+          .count();
+  const float token_count = static_cast<float>(std::max(1, total_tokens));
+  log::Info("llama_backend",
+            "llama_decode completed: " + std::to_string(decode_ms) + "ms for " +
+                std::to_string(total_tokens) + " tokens (" +
+                std::to_string(decode_ms / token_count) + "ms/token)");
 
   llama_batch_free(batch);
 
