@@ -2,12 +2,18 @@
 # Quick test: Streaming vs Non-Streaming Concurrent Throughput
 # Verifies that streaming mode fixes the concurrent throughput issue
 
-set -e
+set -euo pipefail
 
 API_KEY="dev-key-123"
 PORT="8080"
 NUM_REQUESTS=8
 MAX_TOKENS=50
+TMP_PREFIX="/tmp/inferflux_stream_req_$$"
+
+cleanup_tmp() {
+    rm -f "${TMP_PREFIX}"_*.txt
+}
+trap cleanup_tmp EXIT
 
 echo "========================================"
 echo "Streaming vs Non-Streaming Test"
@@ -46,7 +52,11 @@ wait
 
 END=$(date +%s)
 NON_STREAM_TIME=$((END - START))
-NON_STREAM_TOK_PER_SEC=$(awk "BEGIN {printf \"%.2f\", ($NUM_REQUESTS * $MAX_TOKENS) / $NON_STREAM_TIME}")
+if [ $NON_STREAM_TIME -gt 0 ]; then
+    NON_STREAM_TOK_PER_SEC=$(awk "BEGIN {printf \"%.2f\", ($NUM_REQUESTS * $MAX_TOKENS) / $NON_STREAM_TIME}")
+else
+    NON_STREAM_TOK_PER_SEC="N/A (too fast)"
+fi
 
 echo "  Time: ${NON_STREAM_TIME}s"
 echo "  Throughput: ${NON_STREAM_TOK_PER_SEC} tok/s"
@@ -72,10 +82,10 @@ for i in $(seq 1 $NUM_REQUESTS); do
                 \"messages\": [{\"role\": \"user\", \"content\": \"Count to 5 (request $i)\"}],
                 \"max_tokens\": $MAX_TOKENS,
                 \"stream\": true
-            }" > /tmp/req_$i.txt
+            }" > "${TMP_PREFIX}_${i}.txt"
 
         # Count lines in streaming response (each chunk is a line)
-        LINES=$(wc -l < /tmp/req_$i.txt)
+        LINES=$(wc -l < "${TMP_PREFIX}_${i}.txt")
         if [ $LINES -gt 0 ]; then
             echo "  [Request $i] SUCCESS ($LINES chunks)"
         else
@@ -88,7 +98,11 @@ wait
 
 END=$(date +%s)
 STREAM_TIME=$((END - START))
-STREAM_TOK_PER_SEC=$(awk "BEGIN {printf \"%.2f\", ($NUM_REQUESTS * $MAX_TOKENS) / $STREAM_TIME}")
+if [ $STREAM_TIME -gt 0 ]; then
+    STREAM_TOK_PER_SEC=$(awk "BEGIN {printf \"%.2f\", ($NUM_REQUESTS * $MAX_TOKENS) / $STREAM_TIME}")
+else
+    STREAM_TOK_PER_SEC="N/A (too fast)"
+fi
 
 echo "  Time: ${STREAM_TIME}s"
 echo "  Throughput: ${STREAM_TOK_PER_SEC} tok/s"
@@ -99,17 +113,26 @@ echo "========================================"
 echo "Results Summary"
 echo "========================================"
 
-SPEEDUP=$(awk "BEGIN {printf \"%.2fx\", $NON_STREAM_TOK_PER_SEC / $STREAM_TOK_PER_SEC}")
-
-if [ "$STREAM_TOK_PER_SEC" -gt "$NON_STREAM_TOK_PER_SEC" ]; then
-    echo "Streaming is ${SPEEDUP}x FASTER ✅"
+# Calculate speedup only if both values are numeric
+if [[ "$STREAM_TOK_PER_SEC" != "N/A"* ]] && [[ "$NON_STREAM_TOK_PER_SEC" != "N/A"* ]]; then
+    if awk "BEGIN {exit ($STREAM_TOK_PER_SEC > $NON_STREAM_TOK_PER_SEC) ? 0 : 1}"; then
+        SPEEDUP=$(awk "BEGIN {printf \"%.2fx\", $STREAM_TOK_PER_SEC / $NON_STREAM_TOK_PER_SEC}")
+        echo "Streaming is ${SPEEDUP} FASTER [OK]"
+    else
+        SPEEDUP=$(awk "BEGIN {printf \"%.2fx\", $NON_STREAM_TOK_PER_SEC / $STREAM_TOK_PER_SEC}")
+        echo "Streaming is ${SPEEDUP} SLOWER [WARN]"
+    fi
 else
-    echo "Streaming is ${SPEEDUP}x SLOWER ❌"
+    SPEEDUP="N/A"
+    echo "Cannot calculate speedup (one or both tests too fast)"
 fi
 
 echo ""
 echo "Non-Streaming: ${NON_STREAM_TOK_PER_SEC} tok/s (${NON_STREAM_TIME}s)"
 echo "Streaming:     ${STREAM_TOK_PER_SEC} tok/s (${STREAM_TIME}s)"
+if [[ "$SPEEDUP" != "N/A" ]]; then
+    echo "Speedup:       ${SPEEDUP}"
+fi
 echo ""
 
 # Expected: Streaming should be 10-20x faster
