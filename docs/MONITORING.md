@@ -46,7 +46,25 @@ curl -s http://127.0.0.1:8080/metrics | head -120
 
 Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 
-## 4) Throughput Gate Contract
+## 4) CUDA/GGUF Quick Reference (Current Reality)
+
+| Workload/Signal | What to check | How to interpret |
+|---|---|---|
+| `backend_exposure.provider` and `fallback` | `/v1/models` or `inferctl models --json` | `provider=universal` + `fallback=true` means runtime is not on native provider path |
+| CUDA lane activity | `inferflux_cuda_lane_submissions_total{lane=...}` | Zero lane deltas under gate workload means overlap lane path is inactive |
+| Native forward counters | `inferflux_native_forward_passes_total{phase=...}` | Zero deltas indicate native forward path is not executing |
+| Attention kernel | `inferflux_cuda_attention_kernel_selected` | Confirms kernel selected on current path (`fa2`/`fa3`/`standard`) |
+
+Example snapshot evidence (TinyLlama 1.1B Q4_K_M, March 5, 2026):
+
+| Backend path | Completion tok/s | Notes |
+|---|---:|---|
+| `cuda_universal` | `2774` | Lower latency in this specific small-model run |
+| `cuda_native` | `2489` | Similar tier on this run; expected separation grows with larger models/workloads |
+
+Treat these as snapshot measurements, not guaranteed universal ordering.
+
+## 5) Throughput Gate Contract
 
 Use gate checks as release-quality guardrails:
 
@@ -61,7 +79,7 @@ Use gate checks as release-quality guardrails:
   --require-mixed-scheduler-iterations
 ```
 
-## 5) Profiling Workflow
+## 6) Profiling Workflow
 
 ```mermaid
 flowchart TD
@@ -79,7 +97,7 @@ nsys profile -t cuda,nvtx -o /tmp/inferflux_profile \
 nsys stats /tmp/inferflux_profile.qdrep | head -120
 ```
 
-## 6) Alert Baselines (Starter)
+## 7) Alert Baselines (Starter)
 
 | Alert | Trigger example |
 |---|---|
@@ -89,7 +107,7 @@ nsys stats /tmp/inferflux_profile.qdrep | head -120
 | Batch collapse | `inferflux_batch_size_max` drops while request load stable |
 | Overlap regression | overlap events drop to zero on mixed workload profile |
 
-## 7) Incident Matrix
+## 8) Incident Matrix
 
 | Symptom | First checks | Typical action |
 |---|---|---|
@@ -98,11 +116,14 @@ nsys stats /tmp/inferflux_profile.qdrep | head -120
 | Native CUDA expected but missing | model exposure fields + native counters | inspect backend policy/identity settings |
 | Cache not helping | prefix/kv reuse counters | increase pages, validate warmup patterns |
 
-## 8) Consolidation Notes
+## 9) Consolidation Notes
 
 Deep-dive legacy docs are archived as evidence:
 
 - [PERFORMANCE_TUNING_2026_03_05](archive/evidence/PERFORMANCE_TUNING_2026_03_05.md)
 - [PROFILING_OPERATIONS_GUIDE_2026_03_05](archive/evidence/PROFILING_OPERATIONS_GUIDE_2026_03_05.md)
+- [FLASHATTENTION_LIVE_TEST_RESULTS_2025_03_02](archive/evidence/FLASHATTENTION_LIVE_TEST_RESULTS_2025_03_02.md)
+- [GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05](archive/evidence/GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05.md)
+- [GGUF_PROFILING_QUICK_REFERENCE_2026_03_05](archive/evidence/GGUF_PROFILING_QUICK_REFERENCE_2026_03_05.md)
 
 For triage runbooks, see [Troubleshooting](Troubleshooting.md).

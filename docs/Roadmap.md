@@ -1,7 +1,7 @@
 # InferFlux Roadmap
 
 **Snapshot date:** March 5, 2026  
-**Current overall grade:** C+  
+**Current overall grade:** C+ (revalidated March 5, 2026)  
 **Target overall grade:** B- (2026), B (2027)
 
 ## 1) One-Screen Plan
@@ -27,12 +27,20 @@ flowchart LR
 
 | Dimension | Current | Target | Primary Blocker | Primary Issues |
 |---|---|---|---|---|
-| Throughput | C+ | B | Native path + batching maturity gap | [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#4](https://github.com/vjsingh1984/inferflux/issues/4), [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
-| Continuous batching | D | B | No full GPU iteration scheduler | [#3](https://github.com/vjsingh1984/inferflux/issues/3) |
-| Resource economy | C | B | Missing first-class efficiency SLO metrics | [#9](https://github.com/vjsingh1984/inferflux/issues/9) |
-| CI/TDD enforcement | B | A- | GPU behavior lane not mandatory everywhere | [#5](https://github.com/vjsingh1984/inferflux/issues/5), [#10](https://github.com/vjsingh1984/inferflux/issues/10) |
-| Distributed runtime | D | C+ | Failure-path contracts incomplete | [#11](https://github.com/vjsingh1984/inferflux/issues/11) |
-| Capability identity | C+ | B+ | Native/universal CUDA ambiguity risk | [#1](https://github.com/vjsingh1984/inferflux/issues/1), [#2](https://github.com/vjsingh1984/inferflux/issues/2) |
+| Throughput | C+ | B | Native CUDA kernels + overlap/FA maturity still below target | [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#4](https://github.com/vjsingh1984/inferflux/issues/4), [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
+| Continuous batching | C- | B | No full GPU iteration scheduler yet | [#3](https://github.com/vjsingh1984/inferflux/issues/3) |
+| Resource economy | C+ | B | Efficiency/autoscaling SLO set is still partial | [#9](https://github.com/vjsingh1984/inferflux/issues/9) |
+| CI/TDD enforcement | B+ | A- | GPU behavior lane remains conditional on self-hosted availability | [#5](https://github.com/vjsingh1984/inferflux/issues/5), [#10](https://github.com/vjsingh1984/inferflux/issues/10) |
+| Distributed runtime | C- | C+ | Failure-path/fault-matrix coverage still incomplete | [#11](https://github.com/vjsingh1984/inferflux/issues/11) |
+| Capability identity | B | B+ | Native path still scaffolded even with strict policy contracts in place | [#1](https://github.com/vjsingh1984/inferflux/issues/1), [#2](https://github.com/vjsingh1984/inferflux/issues/2) |
+
+## 2.1) Evidence Behind Current Grade
+
+| Check | Result | Grade impact |
+|---|---|---|
+| Focused contract smoke (`ModelIdentity`, `EmbeddingsRouting`, CLI/admin contracts, throughput contract suites) | 8/8 pass | Raised confidence in capability identity and CI/TDD dimensions |
+| CUDA throughput gate with `--require-cuda-lanes` | Failed (lane submissions remained `0`) | Keeps throughput + continuous batching below target |
+| CUDA throughput gate (relaxed lane requirement) | Passed (`240.252` completion tok/s, fallback=`true`, provider=`universal`) | Confirms stable baseline while native CUDA path remains incomplete |
 
 ## 3) Foundational Program (Priority Order)
 

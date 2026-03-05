@@ -175,3 +175,11 @@ Reference: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 
 - Confirm canonical docs are current: [INDEX](INDEX.md), [API Surface](API_SURFACE.md), [Quickstart](Quickstart.md).
 - Confirm release process checks: [ReleaseProcess](ReleaseProcess.md).
+
+## 11) Policy Reference
+
+| Domain | Primary doc |
+|---|---|
+| Guardrails and policy surface | [Policy](Policy.md) |
+| API/admin contract details | [API Surface](API_SURFACE.md) |
+| Runtime routing and model controls | [Roadmap](Roadmap.md), [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |

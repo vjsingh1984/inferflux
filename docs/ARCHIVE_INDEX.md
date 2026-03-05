@@ -23,6 +23,9 @@ flowchart LR
 | [NATIVE_vs_LLAMA_CPP_CUDA_BENCHMARK](archive/evidence/NATIVE_vs_LLAMA_CPP_CUDA_BENCHMARK.md) | Reference-Evidence | native vs universal snapshot |
 | [COMPLETE_STRESS_TEST_REPORT_2026_03_04](archive/evidence/COMPLETE_STRESS_TEST_REPORT_2026_03_04.md) | Reference-Evidence | stress/debug summary |
 | [GGUF_COMPLETE_IMPLEMENTATION_2026_03_04](archive/evidence/GGUF_COMPLETE_IMPLEMENTATION_2026_03_04.md) | Reference-Evidence | GGUF milestone snapshot |
+| [GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05](archive/evidence/GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05.md) | Reference-Evidence | GGUF concurrent throughput snapshot |
+| [GGUF_PROFILING_QUICK_REFERENCE_2026_03_05](archive/evidence/GGUF_PROFILING_QUICK_REFERENCE_2026_03_05.md) | Reference-Evidence | GGUF quick tuning snapshot |
+| [FLASHATTENTION_LIVE_TEST_RESULTS_2025_03_02](archive/evidence/FLASHATTENTION_LIVE_TEST_RESULTS_2025_03_02.md) | Reference-Evidence | FlashAttention validation snapshot |
 | [NSIGHT_QWEN3_VS_TINYLLAMA_COMPARISON](archive/evidence/NSIGHT_QWEN3_VS_TINYLLAMA_COMPARISON.md) | Reference-Evidence | Nsight comparison |
 | [GPU_OPTIMIZATION_FINDINGS_2026_03_03](archive/evidence/GPU_OPTIMIZATION_FINDINGS_2026_03_03.md) | Reference-Evidence | optimization findings |
 | [ROCM_BACKEND_IMPLEMENTATION_PLAN](archive/evidence/ROCM_BACKEND_IMPLEMENTATION_PLAN.md) | Reference-Evidence | ROCm planning context |

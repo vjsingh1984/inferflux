@@ -67,3 +67,11 @@ cpack --config build/CPackConfig.cmake -G WIX
 
 - Rebuild with `-DENABLE_MLX=ON` if MLX backend support is needed in macOS artifacts.
 - Docker remains optional (`docker/`) and is not required for package-native setup.
+
+## 7) Platform Backend Notes
+
+| Platform | Note | Reference |
+|---|---|---|
+| NVIDIA CUDA | use CUDA profile and throughput gate for behavior checks | [MONITORING](MONITORING.md) |
+| AMD ROCm | WSL2 has hard limitations; native Linux or cloud is preferred | [ROCM_INSTALLATION_GUIDE_WSL](ROCM_INSTALLATION_GUIDE_WSL.md) |
+| Apple Silicon | enable MPS/MLX build flags as needed | [CONFIG_REFERENCE](CONFIG_REFERENCE.md), [design/mlx_backend](design/mlx_backend.md) |

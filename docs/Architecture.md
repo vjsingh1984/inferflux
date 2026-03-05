@@ -137,7 +137,43 @@ For historical evidence and snapshots, use:
 - [Roadmap](Roadmap.md)
 - [TechDebt and Competitive Roadmap](TechDebt_and_Competitive_Roadmap.md)
 
-## 12) Related Docs
+## 12) Additional Reference Diagrams
+
+```mermaid
+graph TD
+  A[Client SDKs] --> B[HTTP/gRPC API]
+  B --> C[Auth and Rate Limiting]
+  C --> D[Scheduler]
+  D --> E[Model Manager]
+  D --> F[Runtime Core]
+  F --> G[DeviceContext CUDA/ROCm/MPS/CPU]
+  F --> H[Paged KV Cache]
+  D --> I[Telemetry]
+  I --> J[Prometheus]
+  I --> K[OpenTelemetry Collector]
+```
+
+```mermaid
+graph LR
+  subgraph Kubernetes Cluster
+    direction TB
+    CM[ConfigMap server.yaml]
+    Secret[API Keys]
+    Redis[(Redis KV)]
+    subgraph NodeGroup
+      Pod1((inferfluxd))
+      Pod2((inferfluxd))
+    end
+    CM --> Pod1
+    Secret --> Pod1
+    Redis --> Pod1
+    Redis --> Pod2
+  end
+  Prometheus --> Pod1
+  Prometheus --> Pod2
+```
+
+## 13) Related Docs
 
 - [Quickstart](Quickstart.md)
 - [CONFIG_REFERENCE](CONFIG_REFERENCE.md)

@@ -1,6 +1,7 @@
 # InferFlux Tech Debt and Competitive Roadmap
 
 **Snapshot date:** March 5, 2026  
+**Current overall grade:** C+ (aligned with [Roadmap](Roadmap.md))  
 **Purpose:** Single-page debt heatmap tied to issue-backed retirement gates.
 
 ## 1) Grade Heatmap
@@ -20,12 +21,20 @@ flowchart TB
 
 | Dimension | Grade | What is strong | What is weak |
 |---|---|---|---|
-| Vision and product coherence | B | Clear OSS identity, OpenAI-compatible API, enterprise posture | Throughput narrative still ahead of full native implementation |
-| Capabilities | C+ | Contract gates for models/admin/CLI are strong | Native CUDA provider path is still mixed in user perception |
+| Vision and product coherence | B | Clear OSS identity, OpenAI-compatible API, enterprise posture | Throughput narrative is still ahead of full native CUDA delivery |
+| Capabilities | B | Strong explicit-ID and admin/CLI argument contracts with embeddings/model identity gates | Native provider still scaffold/fallback in main CUDA path |
 | Scalability and economy | C | Fairness + phased execution + prefix cache foundation | No full GPU iteration scheduler or KV page allocator |
-| Resource efficiency | C | Token-budget and batching instrumentation baseline exists | Economy SLO instrumentation is incomplete |
-| Design and implementation quality | B- | Clear subsystem boundaries and capability structs | Transitional dual-path complexity in CUDA stack |
-| TDD and CI maturity | B | Broad unit+integration coverage and focused contract suites | Mandatory GPU behavioral lane is not universal yet |
+| Resource efficiency | C+ | Batch token-budget skip metrics and throughput-contract diagnostics are in place | Economy SLO set for autoscaling is still partial |
+| Design and implementation quality | B | Strong capability/policy abstractions and backend identity wiring | Transitional dual-path complexity remains in CUDA backend stack |
+| TDD and CI maturity | B+ | Focused contract suites mirrored in CI + coverage with drift-count assertions | Merge-blocking GPU behavioral coverage still depends on self-hosted availability |
+
+## 1.1) Evidence Snapshot (Revalidated)
+
+| Evidence | Result | Implication |
+|---|---|---|
+| `ctest -R "EmbeddingsRoutingTests|ModelIdentityTests|IntegrationCLIModelListContract|IntegrationEmbeddingsRoutingContract|IntegrationModelIdentityContract|IntegrationCLIAdminArgContract|ThroughputGateContractTests|ThroughputGateFailureContractTests"` | 8/8 passed | Capability identity + admin contract maturity increased |
+| `run_throughput_gate.py` (CUDA, mixed workload, `--require-cuda-lanes`) | Failed lane activity assertions | Native CUDA lane/overlap path is still not active in default `backend=cuda` runs |
+| `run_throughput_gate.py` (CUDA, relaxed lane requirement) | Passed (`240.252` completion tok/s, `1.0` success rate, fallback=`true`, provider=`universal`) | Throughput baseline is stable, but still universal fallback instead of native path |
 
 ## 2) Debt Register (Actionable)
 
