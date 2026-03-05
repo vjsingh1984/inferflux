@@ -71,6 +71,33 @@ inferflux_batch_size_max{backend="cuda"} 7
     self.assertEqual(args.min_batch_size_max, 2.0)
     self.assertEqual(args.min_batch_size_utilization, 0.06)
     self.assertTrue(args.require_mixed_scheduler_iterations)
+    self.assertEqual(args.backend, "cuda")
+
+  def test_gpu_profile_non_cuda_sets_backend_without_cuda_requirements(self):
+    with mock.patch.object(
+        sys, "argv",
+        [
+            "run_throughput_gate.py",
+            "--gpu-profile",
+            "apple_m3_max",
+        ]):
+      args = run_throughput_gate.parse_args()
+    self.assertEqual(args.backend, "mps")
+    self.assertFalse(args.require_cuda_lanes)
+    self.assertFalse(args.require_cuda_overlap)
+
+  def test_parse_args_normalizes_universal_provider_alias(self):
+    with mock.patch.object(
+        sys, "argv",
+        [
+            "run_throughput_gate.py",
+            "--gpu-profile",
+            "none",
+            "--require-backend-provider",
+            "llama_cpp",
+        ]):
+      args = run_throughput_gate.parse_args()
+    self.assertEqual(args.require_backend_provider, "llama_cpp")
 
   def test_fetch_metrics_snapshot_reads_batching_metrics(self):
     metrics_text = """

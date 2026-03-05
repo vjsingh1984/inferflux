@@ -199,17 +199,17 @@ TEST_CASE("MetricsRegistry records capability rejection counters",
 
 TEST_CASE("MetricsRegistry records backend exposure counters", "[metrics]") {
   inferflux::MetricsRegistry registry;
-  registry.RecordBackendExposure("cuda", "cuda", "universal", false);
-  registry.RecordBackendExposure("cuda", "cpu", "universal", true);
-  registry.RecordBackendExposure("cuda", "cpu", "universal", true);
+  registry.RecordBackendExposure("cuda", "cuda", "llama_cpp", false);
+  registry.RecordBackendExposure("cuda", "cpu", "llama_cpp", true);
+  registry.RecordBackendExposure("cuda", "cpu", "llama_cpp", true);
 
   auto output = registry.RenderPrometheus();
   REQUIRE(output.find("inferflux_backend_exposures_total{requested_backend="
                       "\"cuda\",exposed_backend=\"cuda\",provider="
-                      "\"universal\",fallback=\"false\"} 1") !=
+                      "\"llama_cpp\",fallback=\"false\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_backend_exposures_total{requested_backend="
-                      "\"cuda\",exposed_backend=\"cpu\",provider=\"universal\","
+                      "\"cuda\",exposed_backend=\"cpu\",provider=\"llama_cpp\","
                       "fallback=\"true\"} 2") != std::string::npos);
 }
 

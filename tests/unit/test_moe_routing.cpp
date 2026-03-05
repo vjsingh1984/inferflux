@@ -36,7 +36,7 @@ TEST_CASE("ModelInfo MoE fields default to false/0", "[moe]") {
   REQUIRE_FALSE(info.is_moe);
   REQUIRE(info.n_experts == 0);
   REQUIRE(info.n_active_experts == 0);
-  REQUIRE(info.backend_provider == "universal");
+  REQUIRE(info.backend_provider == "llama_cpp");
   REQUIRE_FALSE(info.backend_fallback);
   REQUIRE(info.backend_fallback_reason.empty());
 }
@@ -74,7 +74,7 @@ TEST_CASE("SingleModelRouter RegisterModel populates MoE fields (no model)",
   REQUIRE(resolved->n_experts == 0);
   REQUIRE(resolved->n_active_experts == 0);
   REQUIRE(resolved->requested_backend == "cpu");
-  REQUIRE(resolved->backend_provider == "universal");
+  REQUIRE(resolved->backend_provider == "llama_cpp");
   REQUIRE_FALSE(resolved->backend_fallback);
 }
 
