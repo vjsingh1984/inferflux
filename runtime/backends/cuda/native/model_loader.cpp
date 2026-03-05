@@ -1,0 +1,64 @@
+#include "runtime/backends/cuda/native/model_loader.h"
+#include "runtime/backends/cuda/native/safetensors_adapter.h"
+#include "runtime/backends/cuda/native/gguf_model_loader.h"
+#include "server/logging/logger.h"
+#include <filesystem>
+
+namespace inferflux {
+namespace runtime {
+namespace cuda {
+namespace native {
+
+//==============================================================================
+// Factory Functions
+//==============================================================================
+
+std::unique_ptr<IModelLoader>
+CreateModelLoader(const std::filesystem::path &model_path) {
+  log::Info("model_loader_factory",
+            "Detecting model format for: " + model_path.string());
+
+  // Check if path is a directory or file
+  bool is_directory = std::filesystem::is_directory(model_path);
+
+  // Case 1: Directory with config.json → safetensors
+  if (is_directory) {
+    std::string config_path = model_path / "config.json";
+    if (std::filesystem::exists(config_path)) {
+      log::Info("model_loader_factory", "Detected safetensors format");
+      return std::make_unique<SafetensorsLoaderAdapter>();
+    }
+
+    // Check for model.safetensors.index.json
+    std::string index_path = model_path / "model.safetensors.index.json";
+    if (std::filesystem::exists(index_path)) {
+      log::Info("model_loader_factory", "Detected safetensors format (index)");
+      return std::make_unique<SafetensorsLoaderAdapter>();
+    }
+
+    // Check for single model.safetensors file
+    std::string single_path = model_path / "model.safetensors";
+    if (std::filesystem::exists(single_path)) {
+      log::Info("model_loader_factory", "Detected safetensors format (single)");
+      return std::make_unique<SafetensorsLoaderAdapter>();
+    }
+  }
+
+  // Case 2: GGUF file (has .gguf extension)
+  if (!is_directory) {
+    std::string ext = model_path.extension().string();
+    if (ext == ".gguf") {
+      log::Info("model_loader_factory", "Detected GGUF format");
+      return std::make_unique<GGUFModelLoader>();
+    }
+  }
+
+  log::Error("model_loader_factory",
+             "Unable to detect model format for: " + model_path.string());
+  return nullptr;
+}
+
+} // namespace native
+} // namespace cuda
+} // namespace runtime
+} // namespace inferflux

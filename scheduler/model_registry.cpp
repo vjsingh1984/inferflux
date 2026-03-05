@@ -154,7 +154,13 @@ int ModelRegistry::ApplyEntries(const std::vector<RegistryEntry> &entries) {
     auto assigned_id =
         router_->LoadModel(entry.path, entry.backend, entry.id, entry.format);
     if (assigned_id.empty()) {
-      log::Error("model_registry", "failed to load model path=" + entry.path);
+      const std::string load_error = router_->LastLoadError();
+      if (!load_error.empty()) {
+        log::Error("model_registry", "failed to load model path=" + entry.path +
+                                         " reason=" + load_error);
+      } else {
+        log::Error("model_registry", "failed to load model path=" + entry.path);
+      }
       continue;
     }
     path_to_id_[path] = assigned_id;

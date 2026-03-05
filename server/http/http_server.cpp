@@ -228,6 +228,22 @@ std::string BuildModelNotFoundResponse() {
                        "Not Found");
 }
 
+bool HasPrefix(const std::string &value, const std::string &prefix) {
+  return value.size() >= prefix.size() &&
+         value.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::string StripPrefix(const std::string &value, const std::string &prefix) {
+  if (!HasPrefix(value, prefix)) {
+    return value;
+  }
+  std::string out = value.substr(prefix.size());
+  out.erase(out.begin(),
+            std::find_if(out.begin(), out.end(),
+                         [](unsigned char c) { return !std::isspace(c); }));
+  return out;
+}
+
 std::string ParseJsonStringField(const std::string &body,
                                  const std::string &field) {
   try {
@@ -1803,6 +1819,27 @@ void HttpServer::HandleClient(ClientSession &session) {
     auto id = router->LoadModel(path_value, backend_hint, requested_id,
                                 requested_format);
     if (id.empty()) {
+      const std::string load_error = router->LastLoadError();
+      if (HasPrefix(load_error, "backend_policy_violation:")) {
+        const std::string reason =
+            StripPrefix(load_error, "backend_policy_violation:");
+        json payload{
+            {"error", "backend_policy_violation"},
+            {"reason",
+             reason.empty() ? "backend policy rejected model load" : reason},
+        };
+        SendAll(session,
+                BuildResponse(payload.dump(), 422, "Unprocessable Entity"));
+        return;
+      }
+      if (!load_error.empty()) {
+        SendAll(
+            session,
+            BuildResponse(
+                json({{"error", "load_failed"}, {"reason", load_error}}).dump(),
+                500, "Internal Server Error"));
+        return;
+      }
       SendAll(session, BuildResponse(BuildErrorBody("load_failed"), 500,
                                      "Internal Server Error"));
       return;

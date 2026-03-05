@@ -79,6 +79,8 @@ add_library(inferflux_core
   model/tokenizer/simple_tokenizer.h
   model/model_format.cpp
   model/model_format.h
+  runtime/scheduler/sequence_slot_manager.cpp
+  runtime/scheduler/sequence_slot_manager.h
   scheduler/scheduler.cpp
   scheduler/fairness_controller.cpp
   scheduler/scheduler.h
@@ -151,6 +153,8 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/kv_cache_gpu.cu
     runtime/backends/cuda/native/gpu_sampler.cu
     runtime/backends/cuda/kernels/flash_attention.cu
+    # GGUF dequantization kernels
+    runtime/backends/cuda/native/kernels/dequantization.cu
   )
   set_target_properties(inferflux_cuda_kernels PROPERTIES
     CUDA_STANDARD 17
@@ -169,6 +173,19 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/weight_map.cpp
     runtime/backends/cuda/native/model_forward_factory.cpp
     runtime/backends/cuda/native/transformer_forward.cu
+    # GGUF quantization support (Phase 1-5: Foundation, GGUF Parsing, Handlers, CUDA Kernels, Forward Pass)
+    runtime/backends/cuda/native/model_loader.cpp
+    runtime/backends/cuda/native/safetensors_adapter.cpp
+    runtime/backends/cuda/native/quantization_handler.cpp
+    runtime/backends/cuda/native/gguf_util.cpp
+    runtime/backends/cuda/native/gguf_model_loader.cpp
+    runtime/backends/cuda/native/q4_k_m_handler.cpp
+    runtime/backends/cuda/native/q5_k_m_handler.cpp
+    runtime/backends/cuda/native/q6_k_handler.cpp
+    runtime/backends/cuda/native/q8_0_handler.cpp
+    runtime/backends/cuda/native/quantized_weight_map.cpp
+    runtime/backends/cuda/native/quantized_forward.cpp
+    runtime/backends/cuda/native/quantized_gemm.cpp
   )
   target_link_libraries(inferflux_core PUBLIC inferflux_cuda_kernels CUDA::cublas CUDA::nvToolsExt)
   set_target_properties(inferflux_core PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
@@ -399,6 +416,7 @@ add_executable(inferflux_tests
   tests/unit/test_audit_logger.cpp
   tests/unit/test_metrics.cpp
   tests/unit/test_scheduler.cpp
+  tests/unit/test_sequence_slot_manager.cpp
   tests/unit/test_policy_store.cpp
   tests/unit/test_oidc_validator.cpp
   tests/unit/test_prefix_cache.cpp
@@ -434,6 +452,8 @@ add_executable(inferflux_tests
   tests/unit/test_gpu_sampler.cpp
   tests/unit/test_native_batching.cpp
   tests/unit/test_startup_advisor.cpp
+  tests/unit/test_gguf_parsing.cpp
+  tests/integration/test_gguf_quantization.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -499,6 +519,12 @@ add_test(NAME NativeBatchTests COMMAND inferflux_tests "[native_batch]")
 set_tests_properties(NativeBatchTests PROPERTIES LABELS native_batch)
 add_test(NAME StartupAdvisorTests COMMAND inferflux_tests "[startup_advisor]")
 set_tests_properties(StartupAdvisorTests PROPERTIES LABELS startup_advisor)
+add_test(NAME GGUFTests COMMAND inferflux_tests "[gguf]")
+set_tests_properties(GGUFTests PROPERTIES LABELS gguf)
+add_test(NAME QuantizationTests COMMAND inferflux_tests "[quantization]")
+set_tests_properties(QuantizationTests PROPERTIES LABELS quantization)
+add_test(NAME SequenceSlotManagerTests COMMAND inferflux_tests "[slot_manager]")
+set_tests_properties(SequenceSlotManagerTests PROPERTIES LABELS slot_manager)
 if(ENABLE_MLX)
   add_test(NAME MlxLoaderTests COMMAND inferflux_tests "[mlx_loader]")
   set_tests_properties(MlxLoaderTests PROPERTIES LABELS mlx_loader)
@@ -631,6 +657,22 @@ if(Python3_Interpreter_FOUND)
   # regardless of whether the build directory is "build", "build-cov", etc.
   set(_INFERFLUX_SERVER_BIN "${CMAKE_BINARY_DIR}/inferfluxd")
 
+  # Focused throughput-gate contract tests (argument parsing + metrics parsing).
+  add_test(
+    NAME ThroughputGateContractTests
+    COMMAND ${Python3_EXECUTABLE} tests/integration/throughput_gate_contract_test.py)
+  set_tests_properties(ThroughputGateContractTests PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
+  # Throughput-gate failure message contract tests.
+  add_test(
+    NAME ThroughputGateFailureContractTests
+    COMMAND ${Python3_EXECUTABLE} tests/integration/throughput_gate_failure_contract_test.py)
+  set_tests_properties(ThroughputGateFailureContractTests PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
   # Stub-mode integration tests — run without a model; always enabled.
   add_test(NAME StubIntegration
            COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py)
@@ -647,6 +689,7 @@ if(Python3_Interpreter_FOUND)
             StubIntegrationTests.test_inferctl_models_json
             StubIntegrationTests.test_inferctl_models_default_output
             StubIntegrationTests.test_inferctl_admin_models_list_json
+            StubIntegrationTests.test_inferctl_admin_models_list_default_output
             StubIntegrationTests.test_inferctl_models_json_auth_failure
             StubIntegrationTests.test_inferctl_admin_models_list_json_auth_failure)
   set_tests_properties(IntegrationCLIModelListContract PROPERTIES
@@ -679,7 +722,8 @@ if(Python3_Interpreter_FOUND)
             StubIntegrationTests.test_inferctl_models_id_not_found_json
             StubIntegrationTests.test_inferctl_models_id_not_found_default_output
             StubIntegrationTests.test_inferctl_admin_models_unload_not_found
-            StubIntegrationTests.test_inferctl_admin_models_set_default_not_found)
+            StubIntegrationTests.test_inferctl_admin_models_set_default_not_found
+            StubIntegrationStrictNativePolicyTests.test_admin_models_load_explicit_native_rejected_in_strict_mode)
   set_tests_properties(IntegrationModelIdentityContract PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60

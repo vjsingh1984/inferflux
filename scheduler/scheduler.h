@@ -7,6 +7,7 @@
 #include "runtime/logprob.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "runtime/speculative/speculative_decoder.h"
+#include "runtime/scheduler/sequence_slot_manager.h"
 #include "scheduler/fairness_controller.h"
 #include "scheduler/model_router.h"
 #include "scheduler/model_selection.h"
@@ -86,6 +87,10 @@ public:
   int AllocSeqSlot();
   void FreeSeqSlot(int slot);
 
+  // Sequence slot manager for universal KV cache slot tracking.
+  scheduler::SequenceSlotManager *SlotManager() { return slot_manager_.get(); }
+  const scheduler::SequenceSlotManager *SlotManager() const { return slot_manager_.get(); }
+
 private:
   struct PendingRequest {
     InferenceRequest inference;
@@ -149,6 +154,12 @@ private:
   std::atomic<uint64_t> seq_slots_free_{};
   std::atomic<int> live_decode_workers_{
       0}; // live thread count; 0 = no pool or all exited
+
+  // Universal sequence slot manager for KV cache tracking across both backends.
+  std::unique_ptr<scheduler::SequenceSlotManager> slot_manager_;
+  std::thread eviction_thread_;
+  std::atomic<bool> eviction_running_{false};
+  void EvictionWorkerLoop();
 };
 
 } // namespace inferflux

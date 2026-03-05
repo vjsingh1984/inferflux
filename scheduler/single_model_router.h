@@ -50,6 +50,7 @@ public:
   GetBackend(const std::string &model_id) override;
   bool SetDefaultModel(const std::string &model_id) override;
   std::string DefaultModelId() const override;
+  std::string LastLoadError() const override;
   std::string Name() const override { return "single"; }
 
   // Returns the underlying backend (nullptr if no model is loaded).
@@ -72,6 +73,7 @@ private:
   mutable std::mutex mutex_;
   std::unordered_map<std::string, Entry> models_;
   std::string default_model_id_;
+  std::string last_load_error_;
   LlamaBackendConfig default_backend_config_{};
   std::string default_backend_hint_{"cpu"};
   std::vector<std::string> backend_priority_{"cpu"};

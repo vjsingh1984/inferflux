@@ -17,6 +17,9 @@ enum class BackendProvider {
 struct BackendExposurePolicy {
   bool prefer_native{true};
   bool allow_universal_fallback{true};
+  // When true, explicit native hints (e.g. cuda_native) fail fast unless
+  // native kernels are ready; no scaffold/delegate path is accepted.
+  bool strict_native_request{false};
 };
 
 struct BackendFactoryResult {

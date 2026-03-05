@@ -219,6 +219,7 @@ int main(int argc, char **argv) {
   bool cuda_phase_overlap_prefill_replica = false;
   bool backend_prefer_native = true;
   bool backend_allow_universal_fallback = true;
+  bool backend_strict_native_request = false;
   std::vector<std::string> backend_priority;
   bool speculative_enabled = false;
   std::string speculative_draft_model;
@@ -388,6 +389,10 @@ int main(int argc, char **argv) {
           if (exposure["allow_universal_fallback"]) {
             backend_allow_universal_fallback =
                 exposure["allow_universal_fallback"].as<bool>();
+          }
+          if (exposure["strict_native_request"]) {
+            backend_strict_native_request =
+                exposure["strict_native_request"].as<bool>();
           }
         }
         if (config["runtime"]["capability_routing"]) {
@@ -716,6 +721,10 @@ int main(int argc, char **argv) {
           std::getenv("INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK")) {
     backend_allow_universal_fallback = ParseBool(env_allow_fallback);
   }
+  if (const char *env_strict_native =
+          std::getenv("INFERFLUX_BACKEND_STRICT_NATIVE_REQUEST")) {
+    backend_strict_native_request = ParseBool(env_strict_native);
+  }
   if (const char *env_backend_priority =
           std::getenv("INFERFLUX_BACKEND_PRIORITY")) {
     auto parsed_priority = ParseBackendPriorityList(env_backend_priority);
@@ -861,13 +870,16 @@ int main(int argc, char **argv) {
   std::cout << "Paged KV cache pages: " << cache_pages
             << " eviction=" << normalized_policy << std::endl;
   inferflux::BackendFactory::SetExposurePolicy(
-      {backend_prefer_native, backend_allow_universal_fallback});
+      {backend_prefer_native, backend_allow_universal_fallback,
+       backend_strict_native_request});
   inferflux::log::Info(
       "server",
       "Backend exposure policy: prefer_native=" +
           std::string(backend_prefer_native ? "true" : "false") +
           ", allow_universal_fallback=" +
-          std::string(backend_allow_universal_fallback ? "true" : "false"));
+          std::string(backend_allow_universal_fallback ? "true" : "false") +
+          ", strict_native_request=" +
+          std::string(backend_strict_native_request ? "true" : "false"));
   inferflux::log::Info(
       "server",
       "Capability routing policy: allow_default_fallback=" +
@@ -999,7 +1011,13 @@ int main(int argc, char **argv) {
       auto assigned_id =
           router->LoadModel(cfg.path, cfg.backend, cfg.id, cfg.format);
       if (assigned_id.empty()) {
-        inferflux::log::Error("server", "Failed to load model", cfg.path);
+        const std::string load_error = router->LastLoadError();
+        if (!load_error.empty()) {
+          inferflux::log::Error("server", "Failed to load model: " + load_error,
+                                cfg.path);
+        } else {
+          inferflux::log::Error("server", "Failed to load model", cfg.path);
+        }
         continue;
       }
       cfg.id = assigned_id;
@@ -1282,7 +1300,8 @@ int main(int argc, char **argv) {
       am.n_experts = mi.n_experts;
       std::error_code ec;
       auto fsize = std::filesystem::file_size(mi.path, ec);
-      if (!ec) am.file_size_bytes = static_cast<std::uint64_t>(fsize);
+      if (!ec)
+        am.file_size_bytes = static_cast<std::uint64_t>(fsize);
       advisor_ctx.models.push_back(am);
     }
     // Probe GPU (post-model-load to get real free VRAM).
@@ -1301,6 +1320,7 @@ int main(int argc, char **argv) {
     advisor_ctx.config.prefer_native = backend_prefer_native;
     advisor_ctx.config.allow_universal_fallback =
         backend_allow_universal_fallback;
+    advisor_ctx.config.strict_native_request = backend_strict_native_request;
     advisor_ctx.config.backend_priority =
         normalized_backend_priority.empty()
             ? ""

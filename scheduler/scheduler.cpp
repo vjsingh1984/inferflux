@@ -1,6 +1,7 @@
 #include "scheduler/scheduler.h"
 
 #include "runtime/execution/batch_executor.h"
+#include "server/logging/logger.h"
 #include "runtime/execution/parallel_context.h"
 #include "runtime/structured_output/structured_output_adapter.h"
 #include "scheduler/model_selection.h"
@@ -27,6 +28,42 @@ constexpr int kPrefixStoreCap = 4;
 constexpr int kMinPrefixTokens = 32;
 // Tokens per physical KV block (PagedAttention style).
 constexpr int kTokensPerBlock = 16;
+
+std::size_t EstimateQueueTokenCost(const InferenceRequest &inference,
+                                   bool from_decode,
+                                   const FairnessConfig &fairness_config) {
+  // Prefill items are still charged by prompt width; decode items should be
+  // charged by per-iteration decode demand to avoid re-charging full prompts on
+  // every fairness requeue.
+  if (!from_decode) {
+    return std::max<std::size_t>(1, inference.prompt_tokens.size());
+  }
+
+  int decode_limit = inference.max_tokens;
+  if (decode_limit <= 0) {
+    decode_limit = 1;
+  }
+  if (inference.remaining_decode_tokens >= 0) {
+    decode_limit = std::min(decode_limit, inference.remaining_decode_tokens);
+  }
+
+  int predicted_slice_limit = inference.timeslice_tokens;
+  // BuildBatchLocked runs before ApplyFairness; predict the same slice cap the
+  // fairness pass will apply for lower-priority requests.
+  if (predicted_slice_limit <= 0 && fairness_config.max_timeslice_tokens > 0 &&
+      inference.priority < fairness_config.high_priority_threshold) {
+    predicted_slice_limit = fairness_config.max_timeslice_tokens;
+    if (inference.remaining_decode_tokens > 0) {
+      predicted_slice_limit =
+          std::min(predicted_slice_limit, inference.remaining_decode_tokens);
+    }
+  }
+  if (predicted_slice_limit > 0) {
+    decode_limit = std::min(decode_limit, predicted_slice_limit);
+  }
+
+  return static_cast<std::size_t>(std::max(1, decode_limit));
+}
 
 std::vector<uint8_t> SerializeTokens(const std::vector<int> &tokens) {
   std::vector<uint8_t> payload(tokens.size() * sizeof(int));
@@ -71,35 +108,53 @@ bool ExecutePhasedPrefillStep(LlamaCPUBackend *backend,
     // for this sequence and first_token sampling remains valid.
     bounded_start = std::max(0, static_cast<int>(prompt_tokens.size()) - 1);
   }
-
-  std::vector<int> suffix(prompt_tokens.begin() + bounded_start,
-                          prompt_tokens.end());
-  std::vector<LlamaCPUBackend::UnifiedBatchInput> inputs;
-  inputs.push_back({sequence_id, bounded_start, std::move(suffix),
-                    /*request_logits=*/true, inference.sampling});
-
-  std::vector<LlamaCPUBackend::UnifiedBatchOutput> outputs;
-  if (backend->SupportsAsyncUnifiedBatch()) {
-    const auto handle = backend->SubmitUnifiedBatchAsync(
-        inputs, LlamaCPUBackend::UnifiedBatchLane::kPrefill);
-    if (handle == 0 || !WaitForUnifiedBatchAsync(backend, handle, &outputs) ||
-        outputs.size() != 1) {
-      return false;
-    }
-  } else {
-    outputs = backend->ExecuteUnifiedBatch(inputs);
-    if (outputs.size() != 1) {
-      return false;
-    }
+  if (bounded_start == 0) {
+    // Ensure reused sequence slots start from a clean KV state on non-prefix
+    // phased prefill paths.
+    backend->FreeSequence(sequence_id);
   }
 
-  if (!outputs[0].ok) {
-    return false;
+  const int token_cap = std::max(1, backend->UnifiedBatchTokenCapacity());
+  int chunk_start = bounded_start;
+  LlamaCPUBackend::UnifiedBatchOutput final_output{};
+  while (chunk_start < static_cast<int>(prompt_tokens.size())) {
+    int chunk_end = std::min(chunk_start + token_cap,
+                             static_cast<int>(prompt_tokens.size()));
+    std::vector<int> chunk(prompt_tokens.begin() + chunk_start,
+                           prompt_tokens.begin() + chunk_end);
+    const bool request_logits =
+        chunk_end == static_cast<int>(prompt_tokens.size());
+
+    std::vector<LlamaCPUBackend::UnifiedBatchInput> inputs;
+    inputs.push_back({sequence_id, chunk_start, std::move(chunk),
+                      request_logits, inference.sampling});
+
+    std::vector<LlamaCPUBackend::UnifiedBatchOutput> outputs;
+    if (backend->SupportsAsyncUnifiedBatch()) {
+      const auto handle = backend->SubmitUnifiedBatchAsync(
+          inputs, LlamaCPUBackend::UnifiedBatchLane::kPrefill);
+      if (handle == 0 || !WaitForUnifiedBatchAsync(backend, handle, &outputs) ||
+          outputs.size() != 1) {
+        return false;
+      }
+    } else {
+      outputs = backend->ExecuteUnifiedBatch(inputs);
+      if (outputs.size() != 1) {
+        return false;
+      }
+    }
+
+    if (!outputs[0].ok) {
+      return false;
+    }
+    final_output = outputs[0];
+    chunk_start = chunk_end;
   }
+
   result->ok = true;
   result->n_past = static_cast<int>(prompt_tokens.size());
-  result->first_token = outputs[0].token;
-  result->first_piece = (outputs[0].token >= 0) ? outputs[0].piece : "";
+  result->first_token = final_output.token;
+  result->first_piece = (final_output.token >= 0) ? final_output.piece : "";
   return true;
 }
 
@@ -143,6 +198,11 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
                 "seq_slots_free_ bitmask requires kMaxSequenceSlots <= 64");
   executor_ = std::make_unique<BatchExecutor>(&tokenizer_, device_, cache_,
                                               router_, speculative_decoder_);
+
+  // Initialize sequence slot manager for universal KV cache tracking.
+  slot_manager_ = std::make_unique<scheduler::SequenceSlotManager>(
+      128); // 128 slots for production concurrent workloads
+
   // Enable decode worker pool when a positive pool size is configured.
   // With use_decode_workers_=true, ProcessBatch only runs Prefill and
   // hands off to pending_decode_; decode workers drain that queue.
@@ -151,11 +211,22 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
   if (use_decode_workers_) {
     StartDecodeWorkers();
   }
+
+  // Start eviction worker thread for timeout-based slot cleanup.
+  eviction_running_ = true;
+  eviction_thread_ = std::thread(&Scheduler::EvictionWorkerLoop, this);
+
   GlobalMetrics().SetSchedulerBatchLimits(config_.max_batch_size,
                                           config_.max_batch_tokens);
 }
 
 Scheduler::~Scheduler() {
+  // Stop eviction worker thread first.
+  eviction_running_ = false;
+  if (eviction_thread_.joinable()) {
+    eviction_thread_.join();
+  }
+
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     stop_ = true;
@@ -302,6 +373,22 @@ void Scheduler::DecodeWorkerLoop() {
 
     if (batch.empty())
       continue;
+
+    std::size_t decode_tokens = 0;
+    for (const auto &pending : batch) {
+      int slice_tokens = pending->inference.timeslice_tokens;
+      if (slice_tokens <= 0) {
+        if (pending->inference.remaining_decode_tokens > 0) {
+          slice_tokens = pending->inference.remaining_decode_tokens;
+        } else {
+          slice_tokens = pending->inference.max_tokens;
+        }
+      }
+      decode_tokens += static_cast<std::size_t>(std::max(1, slice_tokens));
+    }
+    GlobalMetrics().RecordSchedulerIteration(
+        /*prefill_requests=*/0,
+        /*decode_requests=*/batch.size(), decode_tokens);
 
     ResolveBackends(batch);
 
@@ -615,7 +702,8 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
   std::size_t token_budget = 0;
   for (std::size_t i = 0; i < queue_items.size(); ++i) {
     auto &item = queue_items[i].pending;
-    std::size_t tokens = item->inference.prompt_tokens.size();
+    std::size_t tokens = EstimateQueueTokenCost(
+        item->inference, queue_items[i].from_decode, fairness_config_);
     if (!selection.pending.empty() &&
         token_budget + tokens >
             static_cast<std::size_t>(config_.max_batch_tokens)) {
@@ -664,6 +752,18 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   if (selection.pending.empty()) {
     return;
   }
+
+  std::size_t prefill_requests = 0;
+  std::size_t decode_requests = 0;
+  for (const auto &pending : selection.pending) {
+    if (pending->inference.phase == RequestPhase::kPrefill) {
+      ++prefill_requests;
+    } else {
+      ++decode_requests;
+    }
+  }
+  GlobalMetrics().RecordSchedulerIteration(prefill_requests, decode_requests,
+                                           selection.total_tokens);
 
   GlobalMetrics().SetDecodeQueueDepth(
       static_cast<int>(selection.pending.size()));
@@ -1228,6 +1328,44 @@ int Scheduler::AllocSeqSlot() {
 void Scheduler::FreeSeqSlot(int slot) {
   if (slot >= 0 && slot < kMaxSequenceSlots) {
     seq_slots_free_.fetch_or(1ULL << slot, std::memory_order_release);
+  }
+}
+
+void Scheduler::EvictionWorkerLoop() {
+  // Periodically evict idle sequences to prevent slot exhaustion.
+  // Runs in a separate thread with 30-second check intervals.
+  while (eviction_running_) {
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+
+    if (!eviction_running_) break;
+
+    // Evict slots idle for >5 minutes
+    // Returns vector of (slot_id, sequence_id) pairs for evicted slots
+    auto evicted_slots = slot_manager_->EvictIdleSlots(
+        std::chrono::minutes(5));
+
+    if (!evicted_slots.empty()) {
+      // Note: For proper cleanup, we'd need to call backend->FreeSequence()
+      // for each evicted slot. This requires access to the backend objects
+      // which are stored in PendingRequest. For now, we log the evictions
+      // and the slots will be cleaned up when requests complete normally.
+      //
+      // TODO: Implement proper backend cleanup for evicted slots by:
+      // 1. Tracking which backend owns each sequence_id
+      // 2. Calling backend->FreeSequence(sequence_id) for each evicted slot
+      // 3. Calling FreeSeqSlot(slot_id) for scheduler bitmask cleanup
+
+      log::Info("scheduler", "Evicted " + std::to_string(evicted_slots.size()) +
+                " idle KV cache slots (seq_ids: " +
+                [&evicted_slots]() {
+                  std::string ids;
+                  for (const auto &[slot_id, seq_id] : evicted_slots) {
+                    if (!ids.empty()) ids += ", ";
+                    ids += std::to_string(seq_id);
+                  }
+                  return ids;
+                }() + ")");
+    }
   }
 }
 

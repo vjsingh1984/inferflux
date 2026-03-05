@@ -5,16 +5,39 @@
 #include "scheduler/fairness_controller.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/single_model_router.h"
+#include "server/metrics/metrics.h"
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
 using namespace inferflux;
 
 namespace {
+
+int64_t ReadBatchTokenBudgetSkipsTotal() {
+  const std::string output = GlobalMetrics().RenderPrometheus();
+  const std::string key =
+      "inferflux_scheduler_batch_token_budget_skips_total{backend=\"cpu\"} ";
+  auto pos = output.find(key);
+  if (pos == std::string::npos) {
+    return 0;
+  }
+  pos += key.size();
+  auto line_end = output.find('\n', pos);
+  const std::string value = output.substr(
+      pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+  try {
+    return std::stoll(value);
+  } catch (const std::exception &) {
+    return 0;
+  }
+}
 
 class ReadyStubBackend : public LlamaCPUBackend {
 public:
@@ -311,6 +334,64 @@ TEST_CASE("Scheduler prefill uses async unified prefill lane when available",
   REQUIRE(backend->DecodeSubmissions() > 0);
   REQUIRE(backend->PrefillFallbackCalls() == 0);
   REQUIRE(backend->PrefillPartialFallbackCalls() == 0);
+}
+
+TEST_CASE("Scheduler token budget accounts decode slices, not full prompts",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<ReadyStubBackend>(" next");
+
+  ModelInfo info;
+  info.id = "decode-budget-model";
+  info.path = "/tmp/decode-budget.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  FairnessConfig fairness_config;
+  fairness_config.max_timeslice_tokens = 1;
+  fairness_config.high_priority_threshold = 5;
+
+  Scheduler::Config scheduler_config;
+  scheduler_config.max_batch_size = 2;
+  scheduler_config.max_batch_tokens = 12;
+  scheduler_config.min_batch_size = 2;
+  scheduler_config.batch_accumulation_ms = 20;
+
+  Scheduler scheduler(
+      tokenizer, device, cache, router, nullptr, nullptr, fairness_config,
+      DisaggregatedConfig{},
+      ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,
+                            /*require_ready_backend=*/true},
+      scheduler_config);
+
+  GlobalMetrics().SetBackend("cpu");
+  const int64_t skips_before = ReadBatchTokenBudgetSkipsTotal();
+
+  auto make_request = []() {
+    InferenceRequest req;
+    req.prompt = "alpha beta gamma delta epsilon";
+    req.max_tokens = 20;
+    req.priority = 0;
+    return req;
+  };
+
+  auto fut1 = scheduler.Generate(make_request());
+  auto fut2 = scheduler.Generate(make_request());
+  auto resp1 = fut1.get();
+  auto resp2 = fut2.get();
+
+  REQUIRE_FALSE(resp1.no_backend);
+  REQUIRE_FALSE(resp2.no_backend);
+  REQUIRE_FALSE(resp1.completion.empty());
+  REQUIRE_FALSE(resp2.completion.empty());
+
+  const int64_t skips_after = ReadBatchTokenBudgetSkipsTotal();
+  REQUIRE(skips_after == skips_before);
 }
 
 TEST_CASE("FairnessController evaluation", "[fairness]") {

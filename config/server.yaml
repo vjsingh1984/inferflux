@@ -50,6 +50,7 @@ runtime:
   backend_exposure:
     prefer_native: true             # Prefer native implementations (native CUDA, MLX)
     allow_universal_fallback: true  # Allow fallback to llama.cpp backends
+    strict_native_request: false    # Fail explicit cuda_native when native kernels are not ready
 
   # Capability routing for graceful degradation
   capability_routing:

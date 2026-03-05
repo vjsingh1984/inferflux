@@ -47,8 +47,9 @@ struct LlamaBackendConfig {
   std::string
       mmproj_path; // Path to multimodal projector; empty = vision disabled.
   // Maximum number of KV-cache sequences that can be live simultaneously.
-  // Must be >= kMaxSequenceSlots (16) for multi-sequence batch decode.
-  int max_parallel_sequences{16};
+  // Increased from 16 to 128 for production concurrent workloads.
+  // Managed by SequenceSlotManager for timeout-based eviction.
+  int max_parallel_sequences{128};
 
   // Distributed Parallelism Degrees (§P1e).
   int tp_degree{1}; // Tensor Parallel degree

@@ -40,6 +40,12 @@ class RequestResult:
 class MetricsSnapshot:
   completion_tokens_global: float
   completion_tokens_model: float
+  batch_size_max: float
+  scheduler_batch_limit_size: float
+  scheduler_batch_token_budget_skips: float
+  scheduler_iterations_prefill: float
+  scheduler_iterations_decode: float
+  scheduler_iterations_mixed: float
   decode_lane_submissions: float
   prefill_lane_submissions: float
   cuda_lane_overlap_events: float
@@ -73,6 +79,11 @@ class GpuProfileDefaults:
   require_cuda_overlap: bool
   min_cuda_overlap_duration_ms: float
   max_cuda_attention_fallbacks: float
+  min_batch_size_max: float
+  min_batch_size_utilization: float
+  max_batch_token_budget_skips: float
+  max_batch_token_budget_skip_ratio: float
+  require_mixed_scheduler_iterations: bool
   expect_cuda_attention_kernel: str
   mixed_prompt_workload: bool
   unique_prompts: bool
@@ -85,6 +96,11 @@ GPU_PROFILE_DEFAULTS: Dict[str, GpuProfileDefaults] = {
         require_cuda_overlap=True,
         min_cuda_overlap_duration_ms=5.0,
         max_cuda_attention_fallbacks=1.0,
+        min_batch_size_max=2.0,
+        min_batch_size_utilization=0.06,
+        max_batch_token_budget_skips=-1.0,
+        max_batch_token_budget_skip_ratio=-1.0,
+        require_mixed_scheduler_iterations=True,
         expect_cuda_attention_kernel="",
         mixed_prompt_workload=True,
         unique_prompts=True,
@@ -126,6 +142,34 @@ def read_metric(metrics_text: str, metric_name: str,
     except ValueError:
       continue
   return total
+
+
+def read_metric_max(metrics_text: str, metric_name: str,
+                    labels: Optional[Dict[str, str]] = None) -> float:
+  found = False
+  max_value = 0.0
+  for line in metrics_text.splitlines():
+    line = line.strip()
+    if not line or line.startswith("#"):
+      continue
+    match = METRIC_LINE_RE.match(line)
+    if not match:
+      continue
+    name, raw_labels, raw_value = match.groups()
+    if name != metric_name:
+      continue
+    parsed_labels = _parse_labels(raw_labels or "")
+    if labels:
+      if not all(parsed_labels.get(k) == v for k, v in labels.items()):
+        continue
+    try:
+      value = float(raw_value)
+    except ValueError:
+      continue
+    if not found or value > max_value:
+      found = True
+      max_value = value
+  return max_value if found else 0.0
 
 
 def selected_attention_kernel(metrics_text: str) -> str:
@@ -372,6 +416,7 @@ def fetch_metrics_snapshot(args: argparse.Namespace) -> MetricsSnapshot:
   completion_labels: Dict[str, str] = {}
   if args.backend:
     completion_labels["backend"] = args.backend
+  metric_labels = completion_labels if completion_labels else None
   completion_total_global = read_metric(body, "inferflux_completion_tokens_total",
                                         completion_labels)
   completion_total_model = 0.0
@@ -381,6 +426,24 @@ def fetch_metrics_snapshot(args: argparse.Namespace) -> MetricsSnapshot:
       model_labels["backend"] = args.backend
     completion_total_model = read_metric(
         body, "inferflux_model_completion_tokens_total", model_labels)
+  batch_size_max = read_metric_max(body, "inferflux_batch_size_max",
+                                   metric_labels)
+  scheduler_batch_limit_size = read_metric(
+      body, "inferflux_scheduler_batch_limit_size")
+  batch_token_budget_skips = read_metric(
+      body, "inferflux_scheduler_batch_token_budget_skips_total",
+      metric_labels)
+  phase_metric_labels = {"phase": "prefill"}
+  if args.backend:
+    phase_metric_labels["backend"] = args.backend
+  scheduler_iterations_prefill = read_metric(
+      body, "inferflux_scheduler_iterations_total", phase_metric_labels)
+  phase_metric_labels["phase"] = "decode"
+  scheduler_iterations_decode = read_metric(
+      body, "inferflux_scheduler_iterations_total", phase_metric_labels)
+  phase_metric_labels["phase"] = "mixed"
+  scheduler_iterations_mixed = read_metric(
+      body, "inferflux_scheduler_iterations_total", phase_metric_labels)
 
   decode_lane_submissions = read_metric(
       body, "inferflux_cuda_lane_submissions_total", {"lane": "decode"})
@@ -400,6 +463,12 @@ def fetch_metrics_snapshot(args: argparse.Namespace) -> MetricsSnapshot:
   return MetricsSnapshot(
       completion_tokens_global=completion_total_global,
       completion_tokens_model=completion_total_model,
+      batch_size_max=batch_size_max,
+      scheduler_batch_limit_size=scheduler_batch_limit_size,
+      scheduler_batch_token_budget_skips=batch_token_budget_skips,
+      scheduler_iterations_prefill=scheduler_iterations_prefill,
+      scheduler_iterations_decode=scheduler_iterations_decode,
+      scheduler_iterations_mixed=scheduler_iterations_mixed,
       decode_lane_submissions=decode_lane_submissions,
       prefill_lane_submissions=prefill_lane_submissions,
       cuda_lane_overlap_events=overlap_events,
@@ -515,6 +584,18 @@ def apply_gpu_profile(args: argparse.Namespace) -> argparse.Namespace:
     args.min_cuda_overlap_duration_ms = defaults.min_cuda_overlap_duration_ms
   if args.max_cuda_attention_fallbacks < 0.0:
     args.max_cuda_attention_fallbacks = defaults.max_cuda_attention_fallbacks
+  if args.min_batch_size_max < 0.0:
+    args.min_batch_size_max = defaults.min_batch_size_max
+  if args.min_batch_size_utilization < 0.0:
+    args.min_batch_size_utilization = defaults.min_batch_size_utilization
+  if args.max_batch_token_budget_skips < 0.0:
+    args.max_batch_token_budget_skips = defaults.max_batch_token_budget_skips
+  if args.max_batch_token_budget_skip_ratio < 0.0:
+    args.max_batch_token_budget_skip_ratio = (
+        defaults.max_batch_token_budget_skip_ratio)
+  args.require_mixed_scheduler_iterations = (
+      args.require_mixed_scheduler_iterations or
+      defaults.require_mixed_scheduler_iterations)
   if not args.expect_cuda_attention_kernel:
     args.expect_cuda_attention_kernel = defaults.expect_cuda_attention_kernel
   args.mixed_prompt_workload = (
@@ -564,6 +645,23 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--require-no-backend-fallback", action="store_true")
   parser.add_argument("--min-cuda-overlap-duration-ms", type=float, default=-1.0)
   parser.add_argument("--max-cuda-attention-fallbacks", type=float, default=-1.0)
+  parser.add_argument(
+      "--min-batch-size-max", type=float, default=-1.0,
+      help="Minimum inferflux_batch_size_max observed during the gate run.")
+  parser.add_argument(
+      "--min-batch-size-utilization", type=float, default=-1.0,
+      help="Minimum observed max-batch utilization ratio "
+      "(inferflux_batch_size_max / inferflux_scheduler_batch_limit_size).")
+  parser.add_argument(
+      "--max-batch-token-budget-skips", type=float, default=-1.0,
+      help="Maximum inferflux_scheduler_batch_token_budget_skips_total delta allowed.")
+  parser.add_argument(
+      "--max-batch-token-budget-skip-ratio", type=float, default=-1.0,
+      help="Maximum allowed skip ratio "
+      "(batch-token-budget-skips delta / requests_total).")
+  parser.add_argument(
+      "--require-mixed-scheduler-iterations", action="store_true",
+      help="Require at least one mixed prefill+decode scheduler iteration.")
   parser.add_argument("--expect-cuda-attention-kernel",
                       choices=["fa3", "fa2", "standard"])
   parser.add_argument("--require-native-forward-passes", action="store_true",
@@ -594,6 +692,18 @@ def parse_args() -> argparse.Namespace:
     parser.error("--min-success-rate must be in [0.0, 1.0]")
   if args.server_bin and not args.config:
     parser.error("--config is required with --server-bin")
+  if args.min_batch_size_max < -1.0:
+    parser.error("--min-batch-size-max must be >= -1.0")
+  if args.min_batch_size_utilization < -1.0:
+    parser.error("--min-batch-size-utilization must be >= -1.0")
+  if args.min_batch_size_utilization > 1.0:
+    parser.error("--min-batch-size-utilization must be <= 1.0")
+  if args.max_batch_token_budget_skips < -1.0:
+    parser.error("--max-batch-token-budget-skips must be >= -1.0")
+  if args.max_batch_token_budget_skip_ratio < -1.0:
+    parser.error("--max-batch-token-budget-skip-ratio must be >= -1.0")
+  if args.server_log_path and not args.server_bin:
+    parser.error("--server-log-path requires --server-bin")
   return apply_gpu_profile(args)
 
 
@@ -602,8 +712,44 @@ def main() -> int:
   managed_server: Optional[ManagedServer] = None
   backend_exposure: Optional[BackendExposureSnapshot] = None
   backend_exposure_error = ""
-  before = MetricsSnapshot(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "unknown", 0.0, 0.0, 0.0)
-  after = MetricsSnapshot(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "unknown", 0.0, 0.0, 0.0)
+  before = MetricsSnapshot(
+      completion_tokens_global=0.0,
+      completion_tokens_model=0.0,
+      batch_size_max=0.0,
+      scheduler_batch_limit_size=0.0,
+      scheduler_batch_token_budget_skips=0.0,
+      scheduler_iterations_prefill=0.0,
+      scheduler_iterations_decode=0.0,
+      scheduler_iterations_mixed=0.0,
+      decode_lane_submissions=0.0,
+      prefill_lane_submissions=0.0,
+      cuda_lane_overlap_events=0.0,
+      cuda_lane_overlap_duration_ms=0.0,
+      cuda_attention_fallback_events=0.0,
+      selected_attention_kernel="unknown",
+      native_forward_prefill=0.0,
+      native_forward_decode=0.0,
+      native_forward_batch_tokens=0.0,
+  )
+  after = MetricsSnapshot(
+      completion_tokens_global=0.0,
+      completion_tokens_model=0.0,
+      batch_size_max=0.0,
+      scheduler_batch_limit_size=0.0,
+      scheduler_batch_token_budget_skips=0.0,
+      scheduler_iterations_prefill=0.0,
+      scheduler_iterations_decode=0.0,
+      scheduler_iterations_mixed=0.0,
+      decode_lane_submissions=0.0,
+      prefill_lane_submissions=0.0,
+      cuda_lane_overlap_events=0.0,
+      cuda_lane_overlap_duration_ms=0.0,
+      cuda_attention_fallback_events=0.0,
+      selected_attention_kernel="unknown",
+      native_forward_prefill=0.0,
+      native_forward_decode=0.0,
+      native_forward_batch_tokens=0.0,
+  )
   metrics_before_ok = False
   metrics_after_ok = False
 
@@ -660,6 +806,13 @@ def main() -> int:
     overlap_events_delta = 0.0
     overlap_duration_delta_ms = 0.0
     attention_fallback_delta = 0.0
+    batch_size_max_observed = 0.0
+    batch_size_utilization = 0.0
+    batch_token_budget_skips_delta = 0.0
+    batch_token_budget_skip_ratio = 0.0
+    scheduler_iterations_prefill_delta = 0.0
+    scheduler_iterations_decode_delta = 0.0
+    scheduler_iterations_mixed_delta = 0.0
     native_fwd_prefill_delta = 0.0
     native_fwd_decode_delta = 0.0
     native_fwd_batch_tokens_delta = 0.0
@@ -686,6 +839,27 @@ def main() -> int:
       attention_fallback_delta = max(
           0.0, after.cuda_attention_fallback_events -
           before.cuda_attention_fallback_events)
+      batch_size_max_observed = max(before.batch_size_max, after.batch_size_max)
+      scheduler_batch_limit_size_observed = max(
+          before.scheduler_batch_limit_size, after.scheduler_batch_limit_size)
+      if scheduler_batch_limit_size_observed > 0.0:
+        batch_size_utilization = (
+            batch_size_max_observed / scheduler_batch_limit_size_observed)
+      batch_token_budget_skips_delta = max(
+          0.0, after.scheduler_batch_token_budget_skips -
+          before.scheduler_batch_token_budget_skips)
+      if len(results) > 0:
+        batch_token_budget_skip_ratio = (
+            batch_token_budget_skips_delta / float(len(results)))
+      scheduler_iterations_prefill_delta = max(
+          0.0, after.scheduler_iterations_prefill -
+          before.scheduler_iterations_prefill)
+      scheduler_iterations_decode_delta = max(
+          0.0, after.scheduler_iterations_decode -
+          before.scheduler_iterations_decode)
+      scheduler_iterations_mixed_delta = max(
+          0.0, after.scheduler_iterations_mixed -
+          before.scheduler_iterations_mixed)
       native_fwd_prefill_delta = max(
           0.0, after.native_forward_prefill - before.native_forward_prefill)
       native_fwd_decode_delta = max(
@@ -716,6 +890,18 @@ def main() -> int:
         "cuda_lane_overlap_events_delta": round(overlap_events_delta, 2),
         "cuda_lane_overlap_duration_ms_delta": round(overlap_duration_delta_ms, 3),
         "cuda_attention_fallback_events_delta": round(attention_fallback_delta, 2),
+        "batch_size_max_observed": round(batch_size_max_observed, 2),
+        "batch_size_utilization": round(batch_size_utilization, 4),
+        "scheduler_batch_token_budget_skips_delta":
+        round(batch_token_budget_skips_delta, 2),
+        "scheduler_batch_token_budget_skip_ratio":
+        round(batch_token_budget_skip_ratio, 4),
+        "scheduler_iterations_prefill_delta":
+        round(scheduler_iterations_prefill_delta, 2),
+        "scheduler_iterations_decode_delta":
+        round(scheduler_iterations_decode_delta, 2),
+        "scheduler_iterations_mixed_delta":
+        round(scheduler_iterations_mixed_delta, 2),
         "cuda_attention_kernel_selected": after.selected_attention_kernel,
         "native_forward_prefill_delta": round(native_fwd_prefill_delta, 2),
         "native_forward_decode_delta": round(native_fwd_decode_delta, 2),
@@ -741,6 +927,13 @@ def main() -> int:
             "require_no_backend_fallback": args.require_no_backend_fallback,
             "min_cuda_overlap_duration_ms": args.min_cuda_overlap_duration_ms,
             "max_cuda_attention_fallbacks": args.max_cuda_attention_fallbacks,
+            "min_batch_size_max": args.min_batch_size_max,
+            "min_batch_size_utilization": args.min_batch_size_utilization,
+            "max_batch_token_budget_skips": args.max_batch_token_budget_skips,
+            "max_batch_token_budget_skip_ratio":
+            args.max_batch_token_budget_skip_ratio,
+            "require_mixed_scheduler_iterations":
+            args.require_mixed_scheduler_iterations,
             "expect_cuda_attention_kernel": args.expect_cuda_attention_kernel
             or "",
             "require_native_forward_passes": args.require_native_forward_passes,
@@ -803,6 +996,31 @@ def main() -> int:
       failures.append(
           f"cuda attention fallback events {attention_fallback_delta:.3f} "
           f"exceed max {args.max_cuda_attention_fallbacks:.3f}")
+    if (args.min_batch_size_max >= 0.0 and
+        batch_size_max_observed < args.min_batch_size_max):
+      failures.append(
+          f"batch size max {batch_size_max_observed:.3f} below min "
+          f"{args.min_batch_size_max:.3f}")
+    if (args.min_batch_size_utilization >= 0.0 and
+        batch_size_utilization < args.min_batch_size_utilization):
+      failures.append(
+          f"batch size utilization {batch_size_utilization:.4f} below min "
+          f"{args.min_batch_size_utilization:.4f}")
+    if (args.max_batch_token_budget_skips >= 0.0 and
+        batch_token_budget_skips_delta > args.max_batch_token_budget_skips):
+      failures.append(
+          f"batch token-budget skips {batch_token_budget_skips_delta:.3f} "
+          f"exceed max {args.max_batch_token_budget_skips:.3f}")
+    if (args.max_batch_token_budget_skip_ratio >= 0.0 and
+        batch_token_budget_skip_ratio > args.max_batch_token_budget_skip_ratio):
+      failures.append(
+          f"batch token-budget skip ratio {batch_token_budget_skip_ratio:.4f} "
+          f"exceed max {args.max_batch_token_budget_skip_ratio:.4f}")
+    if (args.require_mixed_scheduler_iterations and
+        scheduler_iterations_mixed_delta <= 0.0):
+      failures.append(
+          "mixed scheduler iterations missing "
+          "(inferflux_scheduler_iterations_total phase=\"mixed\" delta must be > 0)")
     if args.expect_cuda_attention_kernel:
       if after.selected_attention_kernel != args.expect_cuda_attention_kernel:
         failures.append(

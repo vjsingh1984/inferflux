@@ -43,6 +43,21 @@ void BatchAddSeq(llama_batch &batch, llama_token id, llama_pos pos,
   batch.n_tokens++;
 }
 
+int EffectiveBatchTokenCap(const llama_context *ctx, int config_batch_size) {
+  int cap = std::max(1, config_batch_size);
+  if (ctx) {
+    int per_sequence_cap = static_cast<int>(llama_n_ctx_seq(ctx));
+    if (per_sequence_cap > 1) {
+      // Keep one KV position free to avoid edge-case slot exhaustion on
+      // full-capacity submissions.
+      cap = std::min(cap, per_sequence_cap - 1);
+    } else if (per_sequence_cap > 0) {
+      cap = std::min(cap, per_sequence_cap);
+    }
+  }
+  return std::max(1, cap);
+}
+
 } // namespace
 
 namespace inferflux {
@@ -280,48 +295,121 @@ std::string LlamaCPUBackend::Generate(
     const std::function<bool()> &should_stop, int logprob_top_n,
     std::vector<TokenLogprob> *out_logprobs,
     const std::vector<std::string> &stop_seqs) {
+  log::Debug("llama_backend", "Generate() called: prompt_len=" + std::to_string(prompt.size()) +
+             ", max_tokens=" + std::to_string(max_tokens));
+
   if (!IsReady()) {
-    return {};
-  }
-  auto prompt_tokens = Tokenize(prompt, true);
-  if (prompt_tokens.empty()) {
+    log::Error("llama_backend", "Generate() called but backend not ready");
     return {};
   }
 
-  int32_t batch_cap = std::max<int32_t>(
-      config_.batch_size,
-      static_cast<int32_t>(prompt_tokens.size() + std::max(max_tokens, 1)));
-  llama_batch batch = llama_batch_init(batch_cap, 0, 1);
-  llama_pos position = 0;
-  for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-    BatchAdd(batch, prompt_tokens[i], position++,
-             i == prompt_tokens.size() - 1);
-  }
-  if (llama_decode(context_, batch) != 0) {
-    log::Error("llama_backend", "llama_decode failed for prompt");
-    llama_batch_free(batch);
+  auto tokenization_start = std::chrono::high_resolution_clock::now();
+  auto prompt_tokens = Tokenize(prompt, true);
+  auto tokenization_end = std::chrono::high_resolution_clock::now();
+  auto tokenization_ms = std::chrono::duration<float, std::milli>(
+      tokenization_end - tokenization_start).count();
+
+  log::Debug("llama_backend", "Tokenization complete: " + std::to_string(prompt_tokens.size()) +
+             " tokens in " + std::to_string(tokenization_ms) + "ms");
+
+  if (prompt_tokens.empty()) {
+    log::Warn("llama_backend", "Tokenization returned empty tokens");
     return {};
   }
-  BatchClear(batch);
+
+  // Generate() always uses sequence 0; clear it so each request starts with a
+  // consistent KV position baseline.
+  llama_memory_seq_rm(llama_get_memory(context_), 0, -1, -1);
+  log::Debug("llama_backend", "KV cache cleared for sequence 0");
+
+  const int32_t token_cap = static_cast<int32_t>(
+      EffectiveBatchTokenCap(context_, config_.batch_size));
+  log::Debug("llama_backend", "Batch token cap: " + std::to_string(token_cap));
+
+  llama_batch batch = llama_batch_init(token_cap, 0, 1);
+  llama_pos position = 0;
+
+  // Process prompt tokens in batches
+  auto prefill_start = std::chrono::high_resolution_clock::now();
+  int batch_count = 0;
+  for (std::size_t start = 0; start < prompt_tokens.size();
+       start += static_cast<std::size_t>(token_cap)) {
+    std::size_t end = std::min(prompt_tokens.size(),
+                               start + static_cast<std::size_t>(token_cap));
+    log::Debug("llama_backend", "Processing prompt batch " + std::to_string(batch_count) +
+               ": tokens [" + std::to_string(start) + "-" + std::to_string(end) + "]");
+
+    for (std::size_t i = start; i < end; ++i) {
+      BatchAdd(batch, prompt_tokens[i], position++,
+               i == prompt_tokens.size() - 1);
+    }
+
+    log::Debug("llama_backend", "Calling llama_decode for prompt batch " + std::to_string(batch_count) +
+               " (" + std::to_string(end - start) + " tokens)");
+    auto decode_start = std::chrono::high_resolution_clock::now();
+
+    if (llama_decode(context_, batch) != 0) {
+      log::Error("llama_backend", "llama_decode failed for prompt");
+      llama_batch_free(batch);
+      return {};
+    }
+
+    auto decode_end = std::chrono::high_resolution_clock::now();
+    auto decode_ms = std::chrono::duration<float, std::milli>(
+        decode_end - decode_start).count();
+    log::Debug("llama_backend", "llama_decode completed for batch " + std::to_string(batch_count) +
+               " in " + std::to_string(decode_ms) + "ms");
+
+    BatchClear(batch);
+    batch_count++;
+  }
+
+  auto prefill_end = std::chrono::high_resolution_clock::now();
+  auto prefill_ms = std::chrono::duration<float, std::milli>(
+      prefill_end - prefill_start).count();
+  log::Info("llama_backend", "Prefill complete: " + std::to_string(prompt_tokens.size()) +
+            " tokens in " + std::to_string(prefill_ms) + "ms (" +
+            std::to_string(prefill_ms / prompt_tokens.size()) + "ms/token)");
 
   std::string output;
   llama_token eos = llama_vocab_eos(vocab_);
   int tokens_remaining = std::max(max_tokens, 1);
 
+  log::Debug("llama_backend", "Starting generation loop: max_tokens=" + std::to_string(tokens_remaining));
+
+  auto generation_start = std::chrono::high_resolution_clock::now();
+  int generated_count = 0;
+
   while (tokens_remaining-- > 0) {
     if (should_stop && should_stop()) {
+      log::Debug("llama_backend", "Generation stopped by should_stop callback");
       break;
     }
+
+    auto sample_start = std::chrono::high_resolution_clock::now();
     int token = llama_sampler_sample(active_sampler_, context_, -1);
+    auto sample_end = std::chrono::high_resolution_clock::now();
+    auto sample_ms = std::chrono::duration<float, std::milli>(
+        sample_end - sample_start).count();
+
     if (token == eos) {
+      log::Debug("llama_backend", "EOS token received at position " + std::to_string(generated_count));
       break;
     }
+
     std::string piece = TokenToString(token);
     // Collect logprob before the next llama_decode invalidates the logits ptr.
     if (out_logprobs) {
       out_logprobs->push_back(CollectLogprob(token, piece, logprob_top_n));
     }
     output += piece;
+
+    if (generated_count == 0 || generated_count % 10 == 0) {
+      log::Debug("llama_backend", "Generated token " + std::to_string(generated_count) +
+                 ": sample_ms=" + std::to_string(sample_ms) +
+                 ", output_len=" + std::to_string(output.size()));
+    }
+
     // Check stop sequences: trim output and compute the streaming-safe portion.
     std::string emit_piece;
     bool stop_triggered = ApplyStop(piece, output, stop_seqs, &emit_piece);
@@ -330,13 +418,16 @@ std::string LlamaCPUBackend::Generate(
                                        ? &out_logprobs->back()
                                        : nullptr;
       if (!on_chunk(emit_piece, lp_ptr)) {
+        log::Debug("llama_backend", "Generation stopped by on_chunk callback");
         break;
       }
     }
     if (stop_triggered) {
+      log::Debug("llama_backend", "Stop sequence triggered at token " + std::to_string(generated_count));
       break;
     }
     if (should_stop && should_stop()) {
+      log::Debug("llama_backend", "Generation stopped by should_stop callback (post-chunk)");
       break;
     }
     // Context-window management: sliding-window KV eviction when the next
@@ -348,6 +439,8 @@ std::string LlamaCPUBackend::Generate(
         llama_pos keep = n_ctx / 2;
         llama_pos discard = position - keep + 1;
         if (discard > 0) {
+          log::Debug("llama_backend", "Sliding window KV eviction: discarding " +
+                     std::to_string(discard) + " positions, keeping " + std::to_string(keep));
           llama_memory_seq_rm(llama_get_memory(context_), 0, 0, discard);
           llama_memory_seq_add(llama_get_memory(context_), 0, discard,
                                static_cast<llama_pos>(-1), -discard);
@@ -356,12 +449,31 @@ std::string LlamaCPUBackend::Generate(
       }
     }
     BatchAdd(batch, token, position++, true);
+
+    auto decode_start = std::chrono::high_resolution_clock::now();
     if (llama_decode(context_, batch) != 0) {
-      log::Error("llama_backend", "llama_decode failed while generating");
+      log::Error("llama_backend", "llama_decode failed while generating at token " +
+                 std::to_string(generated_count));
       break;
     }
+    auto decode_end = std::chrono::high_resolution_clock::now();
+    auto decode_ms = std::chrono::duration<float, std::milli>(
+        decode_end - decode_start).count();
+
+    if (generated_count == 0 || generated_count % 10 == 0) {
+      log::Debug("llama_backend", "llama_decode for generated token: " + std::to_string(decode_ms) + "ms");
+    }
+
     BatchClear(batch);
+    generated_count++;
   }
+
+  auto generation_end = std::chrono::high_resolution_clock::now();
+  auto generation_ms = std::chrono::duration<float, std::milli>(
+      generation_end - generation_start).count();
+  log::Info("llama_backend", "Generation complete: " + std::to_string(generated_count) +
+            " tokens in " + std::to_string(generation_ms) + "ms (" +
+            std::to_string(generation_ms / std::max(1, generated_count)) + "ms/token)");
 
   llama_batch_free(batch);
 
@@ -535,19 +647,25 @@ LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
   llama_memory_seq_rm(llama_get_memory(context_),
                       static_cast<llama_seq_id>(sequence_id), -1, -1);
 
-  int32_t batch_cap = std::max<int32_t>(
-      config_.batch_size, static_cast<int32_t>(prompt_tokens.size() + 1));
-  llama_batch batch = llama_batch_init(batch_cap, 0, 1);
-  for (std::size_t i = 0; i < prompt_tokens.size(); ++i) {
-    BatchAddSeq(batch, prompt_tokens[i], static_cast<llama_pos>(i),
-                static_cast<llama_seq_id>(sequence_id),
-                /*logits=*/i == prompt_tokens.size() - 1);
-  }
-  if (llama_decode(context_, batch) != 0) {
-    log::Error("llama_backend", "Prefill: llama_decode failed for seq " +
-                                    std::to_string(sequence_id));
-    llama_batch_free(batch);
-    return {};
+  const int32_t token_cap = static_cast<int32_t>(
+      EffectiveBatchTokenCap(context_, config_.batch_size));
+  llama_batch batch = llama_batch_init(token_cap, 0, 1);
+  for (std::size_t start = 0; start < prompt_tokens.size();
+       start += static_cast<std::size_t>(token_cap)) {
+    std::size_t end = std::min(prompt_tokens.size(),
+                               start + static_cast<std::size_t>(token_cap));
+    for (std::size_t i = start; i < end; ++i) {
+      BatchAddSeq(batch, prompt_tokens[i], static_cast<llama_pos>(i),
+                  static_cast<llama_seq_id>(sequence_id),
+                  /*logits=*/i == prompt_tokens.size() - 1);
+    }
+    if (llama_decode(context_, batch) != 0) {
+      log::Error("llama_backend", "Prefill: llama_decode failed for seq " +
+                                      std::to_string(sequence_id));
+      llama_batch_free(batch);
+      return {};
+    }
+    BatchClear(batch);
   }
   // Sample the first output token while the logit buffer is fresh.
   // This must happen before any subsequent Prefill() call, which would
@@ -582,11 +700,18 @@ void LlamaCPUBackend::CopySequencePrefix(int src_seq, int dst_seq,
   // Clear dst slot first so no stale KV cells survive from a previous request.
   llama_memory_seq_rm(llama_get_memory(context_),
                       static_cast<llama_seq_id>(dst_seq), -1, -1);
-  // Copy positions [0, n_tokens) from src to dst.
-  llama_memory_seq_cp(
-      llama_get_memory(context_), static_cast<llama_seq_id>(src_seq),
-      static_cast<llama_seq_id>(dst_seq), static_cast<llama_pos>(0),
-      static_cast<llama_pos>(n_tokens));
+  if (n_tokens <= 0) {
+    return;
+  }
+  // Partial seq_cp can assert on cross-stream KV layouts; copy full source KV
+  // state first, then trim the destination to [0, n_tokens) via seq_rm.
+  llama_memory_seq_cp(llama_get_memory(context_),
+                      static_cast<llama_seq_id>(src_seq),
+                      static_cast<llama_seq_id>(dst_seq),
+                      static_cast<llama_pos>(0), static_cast<llama_pos>(-1));
+  llama_memory_seq_rm(
+      llama_get_memory(context_), static_cast<llama_seq_id>(dst_seq),
+      static_cast<llama_pos>(n_tokens), static_cast<llama_pos>(-1));
 }
 
 LlamaCPUBackend::PrefillResult
@@ -606,19 +731,24 @@ LlamaCPUBackend::PrefillPartial(const std::string &prompt, int sequence_id,
     r.n_past = n_total;
     return r;
   }
-  int32_t suffix_len = n_total - n_past_start;
-  int32_t batch_cap = std::max<int32_t>(config_.batch_size, suffix_len + 1);
-  llama_batch batch = llama_batch_init(batch_cap, 0, 1);
-  for (int i = n_past_start; i < n_total; ++i) {
-    BatchAddSeq(batch, prompt_tokens[i], static_cast<llama_pos>(i),
-                static_cast<llama_seq_id>(sequence_id),
-                /*logits=*/i == n_total - 1);
-  }
-  if (llama_decode(context_, batch) != 0) {
-    log::Error("llama_backend", "PrefillPartial: llama_decode failed seq " +
-                                    std::to_string(sequence_id));
-    llama_batch_free(batch);
-    return {};
+  const int32_t token_cap = static_cast<int32_t>(
+      EffectiveBatchTokenCap(context_, config_.batch_size));
+  llama_batch batch = llama_batch_init(token_cap, 0, 1);
+  for (int start = n_past_start; start < n_total; start += token_cap) {
+    int end = std::min(n_total, start + token_cap);
+    for (int i = start; i < end; ++i) {
+      BatchAddSeq(batch, prompt_tokens[static_cast<std::size_t>(i)],
+                  static_cast<llama_pos>(i),
+                  static_cast<llama_seq_id>(sequence_id),
+                  /*logits=*/i == n_total - 1);
+    }
+    if (llama_decode(context_, batch) != 0) {
+      log::Error("llama_backend", "PrefillPartial: llama_decode failed seq " +
+                                      std::to_string(sequence_id));
+      llama_batch_free(batch);
+      return {};
+    }
+    BatchClear(batch);
   }
   PrefillResult result;
   result.n_past = n_total;
@@ -820,7 +950,7 @@ LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
 bool LlamaCPUBackend::SupportsAsyncUnifiedBatch() const { return false; }
 
 int LlamaCPUBackend::UnifiedBatchTokenCapacity() const {
-  return std::max(1, config_.batch_size);
+  return EffectiveBatchTokenCap(context_, config_.batch_size);
 }
 
 LlamaCPUBackend::UnifiedBatchHandle LlamaCPUBackend::SubmitUnifiedBatchAsync(
@@ -850,9 +980,13 @@ bool LlamaCPUBackend::TryCollectUnifiedBatchAsync(
 std::vector<LlamaCPUBackend::UnifiedBatchOutput>
 LlamaCPUBackend::ExecuteUnifiedBatch(
     const std::vector<UnifiedBatchInput> &inputs) {
+  log::Debug("llama_backend", "ExecuteUnifiedBatch called with " + std::to_string(inputs.size()) + " inputs");
+
   if (!context_ || !vocab_ || inputs.empty()) {
+    log::Warn("llama_backend", "ExecuteUnifiedBatch: context/vocab not ready or inputs empty");
     return {};
   }
+  std::vector<UnifiedBatchOutput> results(inputs.size());
 
   // Count total tokens and requests for logits.
   int total_tokens = 0;
@@ -864,8 +998,21 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
     }
   }
 
+  log::Debug("llama_backend", "ExecuteUnifiedBatch: total_tokens=" + std::to_string(total_tokens) +
+             ", requests_with_logits=" + std::to_string(requests_with_logits));
+
   if (total_tokens == 0) {
+    log::Debug("llama_backend", "ExecuteUnifiedBatch: no tokens to process");
     return std::vector<UnifiedBatchOutput>(inputs.size());
+  }
+
+  const int token_cap = EffectiveBatchTokenCap(context_, config_.batch_size);
+  if (total_tokens > token_cap) {
+    log::Error("llama_backend", "ExecuteUnifiedBatch: token batch exceeds cap "
+                                "(" +
+                                    std::to_string(total_tokens) + " > " +
+                                    std::to_string(token_cap) + ")");
+    return results;
   }
 
   llama_batch batch = llama_batch_init(total_tokens, 0, 1);
@@ -876,6 +1023,9 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
     const auto &inp = inputs[i];
     if (inp.tokens.empty())
       continue;
+
+    log::Debug("llama_backend", "Input " + std::to_string(i) + ": seq_id=" + std::to_string(inp.sequence_id) +
+               ", n_past=" + std::to_string(inp.n_past) + ", tokens=" + std::to_string(inp.tokens.size()));
 
     for (std::size_t j = 0; j < inp.tokens.size(); ++j) {
       bool is_last = (j == inp.tokens.size() - 1);
@@ -894,12 +1044,22 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
     }
   }
 
-  std::vector<UnifiedBatchOutput> results(inputs.size());
+  log::Debug("llama_backend", "Calling llama_decode with " + std::to_string(total_tokens) + " tokens...");
+  auto decode_start = std::chrono::high_resolution_clock::now();
+
   if (llama_decode(context_, batch) != 0) {
     log::Error("llama_backend", "ExecuteUnifiedBatch: llama_decode failed");
     llama_batch_free(batch);
     return results;
   }
+
+  auto decode_end = std::chrono::high_resolution_clock::now();
+  auto decode_ms = std::chrono::duration<float, std::milli>(
+      decode_end - decode_start).count();
+  log::Info("llama_backend", "llama_decode completed: " + std::to_string(decode_ms) + "ms for " +
+            std::to_string(total_tokens) + " tokens (" +
+            std::to_string(decode_ms / std::max(1, total_tokens)) + "ms/token)");
+
   llama_batch_free(batch);
 
   llama_token eos = llama_vocab_eos(vocab_);

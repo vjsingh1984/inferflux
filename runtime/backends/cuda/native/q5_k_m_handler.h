@@ -1,0 +1,46 @@
+#pragma once
+
+#include "runtime/backends/cuda/native/kernels/dequantization.cuh"
+#include "runtime/backends/cuda/native/quantization_handler.h"
+#include <cuda_fp16.h>
+#include <cuda_runtime_api.h>
+#include <string>
+
+namespace inferflux {
+namespace runtime {
+namespace cuda {
+namespace native {
+
+/**
+ * @brief Q5_K_M quantization handler
+ *
+ * Handles dequantization of Q5_K_M format (5.5 bits per weight).
+ *
+ * Block structure:
+ * - 256 values per block
+ * - 8 blocks of 32 values each
+ * - Each block has 6-bit scale and 6-bit min
+ * - 5-bit quantized values (4 low bits + 1 high bit)
+ * - Super-block scale and min (FP16)
+ */
+class Q5_K_M_Handler : public IQuantizationHandler {
+public:
+  Q5_K_M_Handler() = default;
+  ~Q5_K_M_Handler() override = default;
+
+  // IQuantizationHandler interface
+  void DequantizeGpuToGpu(const void *quantized, half *dequantized,
+                          size_t num_elements,
+                          cudaStream_t stream) override;
+
+  std::string GetType() const override { return "q5_k_m"; }
+
+  size_t GetDequantizedSize(size_t quantized_size) const override;
+
+  double GetBitsPerValue() const override { return 5.5; }
+};
+
+} // namespace native
+} // namespace cuda
+} // namespace runtime
+} // namespace inferflux

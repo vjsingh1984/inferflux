@@ -1,24 +1,68 @@
-# Release & Pre-Release Pipeline
+# Release Process (Canonical OSS)
 
-InferFlux now has a dedicated GitHub Actions workflow (`.github/workflows/release.yml`) that attaches to every successful `CI` run:
+**Status:** Canonical
 
-1. **Pre-release verification (CI on `main`):** once the primary `CI` workflow finishes successfully on `main`, `release.yml` is triggered via `workflow_run`. Packaging jobs (Linux, macOS, Windows) run exactly once using the already-tested commit, and we upload the resulting installers as workflow artifacts for smoke testing.
-2. **Tagged release (`vX.Y.Z`):** CI also runs for tag pushes, which triggers the same packaging jobs. After all artifacts (including the Homebrew formula and winget manifest) are produced, the workflow creates a GitHub Release and publishes the exact artifacts that were validated in pre-release. No redundant builds occur between pre-release and release.
+```mermaid
+flowchart LR
+    A[Merge to main] --> B[CI passes]
+    B --> C[release.yml pre-release packaging]
+    C --> D[Smoke verify artifacts]
+    D --> E[Tag vX.Y.Z]
+    E --> F[CI + release.yml tag run]
+    F --> G[GitHub Release published]
+```
 
-## Trigger matrix
-| Trigger (via `workflow_run`) | Jobs | Output |
-|------------------------------|------|--------|
-| `CI` success on `main`       | `linux-packages`, `mac-packages`, `windows-packages`, `manifests` | TGZ/DEB/RPM + PKG/DMG + MSI/ZIP artifacts plus rendered Homebrew/Winget manifests (pre-release only). |
-| `CI` success on `v*.*.*` tag | Same jobs + `create-release` | Publishes a GitHub Release that reuses the pre-built artifacts (Linux/Mac/Windows installers + manifests). |
+## 1) Trigger Contract
 
-## Artifact names
-- Linux: `inferflux-<version>-Linux.tar.gz`, `.deb`, `.rpm`
-- macOS: `inferflux-<version>-Darwin.tar.gz`, `.pkg`, `.dmg`
-- Windows: `inferflux-<version>-win64.msi`, `.zip`
-- Manifests: `homebrew/inferflux.rb`, `winget/inferencial.inferflux.yaml` (rendered with the correct version, URLs, and SHA256 values)
+| Trigger | Workflow path | Output |
+|---|---|---|
+| `CI` success on `main` | `release.yml` via `workflow_run` | pre-release artifacts (Linux/macOS/Windows + manifests) |
+| `CI` success on `v*.*.*` tag | same packaging jobs + release job | GitHub Release with installers + manifests |
 
-## Manual promotion flow
-1. Merge changes into `main` — the pre-release jobs produce installers and manifests for smoke testing (no GitHub Release is created yet).
-2. Verify installers locally (see `docs/Installer.md` for commands).
-3. Tag the desired commit (`git tag v0.x.x && git push origin v0.x.x`).
-4. The tagged workflow reuses the exact artifacts produced by the packaging jobs and publishes a GitHub Release automatically (Linux/Mac/Windows installers plus Homebrew/Winget manifests).
+## 2) Artifact Contract
+
+| Platform | Artifacts |
+|---|---|
+| Linux | `inferflux-<version>-Linux.tar.gz`, `.deb`, `.rpm` |
+| macOS | `inferflux-<version>-Darwin.tar.gz`, `.pkg`, `.dmg` |
+| Windows | `inferflux-<version>-win64.msi`, `.zip` |
+| Package metadata | `homebrew/inferflux.rb`, `winget/inferencial.inferflux.yaml` |
+
+## 3) Promotion Runbook
+
+1. Merge to `main` and wait for green `CI`.
+2. Confirm pre-release packaging completed from `release.yml`.
+3. Smoke-test installers from artifacts.
+4. Tag the tested commit: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+5. Confirm tagged run publishes a GitHub Release.
+6. Verify release assets and checksums.
+
+## 4) Release Docs Gate (Must Pass)
+
+```mermaid
+flowchart TD
+    A[Code/API/CLI changed] --> B[Update canonical docs]
+    B --> C[Run docs contract gate]
+    C --> D[Run CI]
+    D --> E[Tag release]
+```
+
+| Check | Command |
+|---|---|
+| Canonical docs contract | `python3 scripts/check_docs_contract.py` |
+| Unit/integration baseline | `ctest --test-dir build --output-on-failure --timeout 90` |
+| API + CLI docs consistency | covered by docs gate |
+
+## 5) Pre-Tag Checklist
+
+- `README.md` reflects current binaries and endpoints.
+- `docs/INDEX.md` links only valid canonical docs.
+- `docs/Quickstart.md` commands are runnable.
+- `docs/API_SURFACE.md` matches implemented endpoints.
+- [DOCS_STYLE_GUIDE](DOCS_STYLE_GUIDE.md) constraints are met.
+
+## 6) References
+
+- [Installer](Installer.md)
+- [INDEX](INDEX.md)
+- [DOCS_STYLE_GUIDE](DOCS_STYLE_GUIDE.md)

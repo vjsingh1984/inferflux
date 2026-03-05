@@ -35,6 +35,10 @@ public:
   void RecordSpeculative(std::size_t total_chunks, std::size_t accepted_chunks,
                          std::size_t reused_tokens);
   void RecordBatch(std::size_t request_count, std::size_t token_count);
+  // Scheduler iteration accounting (prefill-only / decode-only / mixed).
+  void RecordSchedulerIteration(std::size_t prefill_requests,
+                                std::size_t decode_requests,
+                                std::size_t token_count);
   void RecordBatchTokenBudgetSkip();
   void RecordPrefixLookup(bool hit);
   void RecordPrefixMatchedTokens(int tokens);
@@ -177,6 +181,11 @@ private:
   std::atomic<uint64_t> total_batches_{0};
   std::atomic<uint64_t> total_batch_tokens_{0};
   std::atomic<uint64_t> max_batch_size_{0};
+  std::atomic<uint64_t> scheduler_iterations_prefill_{0};
+  std::atomic<uint64_t> scheduler_iterations_decode_{0};
+  std::atomic<uint64_t> scheduler_iterations_mixed_{0};
+  std::atomic<uint64_t> scheduler_iteration_requests_total_{0};
+  std::atomic<uint64_t> scheduler_iteration_tokens_total_{0};
   std::atomic<uint64_t> scheduler_batch_token_budget_skips_{0};
   std::atomic<uint64_t> prefix_hits_{0};
   std::atomic<uint64_t> prefix_misses_{0};

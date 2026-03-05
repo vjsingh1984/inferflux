@@ -67,6 +67,28 @@ void MetricsRegistry::RecordBatch(std::size_t request_count,
   }
 }
 
+void MetricsRegistry::RecordSchedulerIteration(std::size_t prefill_requests,
+                                               std::size_t decode_requests,
+                                               std::size_t token_count) {
+  if (prefill_requests == 0 && decode_requests == 0) {
+    return;
+  }
+  scheduler_iteration_requests_total_.fetch_add(
+      prefill_requests + decode_requests, std::memory_order_relaxed);
+  if (token_count > 0) {
+    scheduler_iteration_tokens_total_.fetch_add(token_count,
+                                                std::memory_order_relaxed);
+  }
+
+  if (prefill_requests > 0 && decode_requests > 0) {
+    scheduler_iterations_mixed_.fetch_add(1, std::memory_order_relaxed);
+  } else if (prefill_requests > 0) {
+    scheduler_iterations_prefill_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    scheduler_iterations_decode_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 void MetricsRegistry::RecordBatchTokenBudgetSkip() {
   scheduler_batch_token_budget_skips_.fetch_add(1, std::memory_order_relaxed);
 }
@@ -614,6 +636,30 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_batch_size_max gauge\n";
   out << "inferflux_batch_size_max{backend=\"" << backend << "\"} "
       << max_batch_size_.load() << "\n";
+
+  out << "# HELP inferflux_scheduler_iterations_total Scheduler iterations by "
+         "phase composition\n";
+  out << "# TYPE inferflux_scheduler_iterations_total counter\n";
+  out << "inferflux_scheduler_iterations_total{backend=\"" << backend
+      << "\",phase=\"prefill\"} " << scheduler_iterations_prefill_.load()
+      << "\n";
+  out << "inferflux_scheduler_iterations_total{backend=\"" << backend
+      << "\",phase=\"decode\"} " << scheduler_iterations_decode_.load()
+      << "\n";
+  out << "inferflux_scheduler_iterations_total{backend=\"" << backend
+      << "\",phase=\"mixed\"} " << scheduler_iterations_mixed_.load() << "\n";
+
+  out << "# HELP inferflux_scheduler_iteration_requests_total Requests touched "
+         "by scheduler iterations\n";
+  out << "# TYPE inferflux_scheduler_iteration_requests_total counter\n";
+  out << "inferflux_scheduler_iteration_requests_total{backend=\"" << backend
+      << "\"} " << scheduler_iteration_requests_total_.load() << "\n";
+
+  out << "# HELP inferflux_scheduler_iteration_tokens_total Estimated token "
+         "budget touched by scheduler iterations\n";
+  out << "# TYPE inferflux_scheduler_iteration_tokens_total counter\n";
+  out << "inferflux_scheduler_iteration_tokens_total{backend=\"" << backend
+      << "\"} " << scheduler_iteration_tokens_total_.load() << "\n";
 
   out << "# HELP inferflux_scheduler_batch_token_budget_skips_total Requests "
          "deferred because adding them would exceed the current batch token "

@@ -1,85 +1,69 @@
-# Installer & Packaging Notes
+# Installer Guide (Canonical OSS)
 
-InferFlux now produces native installers across every major desktop/server platform using `cmake --install` + CPack—no Docker images are required for these flows.
+**Status:** Canonical
 
-## Build once, package everywhere
+```mermaid
+flowchart LR
+    A[cmake configure/build] --> B[cpack generators]
+    B --> C[Linux packages]
+    B --> D[macOS packages]
+    B --> E[Windows packages]
+    C --> F[Smoke test]
+    D --> F
+    E --> F
+```
+
+## 1) Build Once
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_WEBUI=ON
 cmake --build build -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
-cmake --install build --prefix build/install # optional staging dir
+cmake --install build --prefix build/install
 ```
 
-All installers are emitted via `cpack --config build/CPackConfig.cmake -G <generator>`. The sections below call out the generator and any platform-specific metadata.
+## 2) Package Matrix
 
----
+| Platform | CPack generator | Primary outputs | Local install/test command |
+|---|---|---|---|
+| Linux Debian/Ubuntu | `DEB` | `.deb` | `sudo apt install ./inferflux-*.deb` |
+| Linux RHEL/Fedora | `RPM` | `.rpm` | `sudo rpm -i inferflux-*.rpm` |
+| Linux/macOS generic | `TGZ` | `.tar.gz` | extract + run `inferfluxd` |
+| macOS Installer | `productbuild` | `.pkg` | open package installer |
+| macOS App bundle | `DragNDrop` | `.dmg` | mount DMG and copy app |
+| Windows | `WIX` | `.msi` | run MSI installer |
 
-## Homebrew (macOS)
-
-- Formula lives in `installers/homebrew/inferflux.rb`. The release pipeline renders a versioned copy (sha256 + URL) and uploads it alongside the other artifacts so you can `brew tap inferencial/cli` without editing the template by hand.
-
-## macOS `.pkg` / `.dmg`
-
-- Instructions live in `installers/macos/README.md`.
-- Build commands:
-  ```bash
-  cpack --config build/CPackConfig.cmake -G productbuild
-  cpack --config build/CPackConfig.cmake -G DragNDrop
-  ```
-- Notarize/sign the `.pkg` and `.dmg`, then upload them to GitHub Releases (the release workflow already does this for tagged builds).
-- MLX backend: rebuild with `-DENABLE_MLX=ON` before running `cpack` if you need the experimental MLX backend available to end users.
-
----
-
-## Ubuntu / Debian (.deb)
-
-- See `installers/deb/README.md` for the Launchpad/apt metadata template.
-- Build commands:
-  ```bash
-  cpack --config build/CPackConfig.cmake -G DEB
-  sudo apt install ./inferflux-*.deb
-  ```
-- The generated `control` file already depends on `libssl3` and `libyaml-cpp0.7`.
-
-## Red Hat / Fedora (.rpm)
-
-- See `installers/rpm/README.md` for the SPEC snippet used by Copr/OBS.
-- Build commands:
-  ```bash
-  cpack --config build/CPackConfig.cmake -G RPM
-  sudo rpm -i inferflux-*.rpm
-  ```
-
----
-
-## Windows (MSI + winget)
-
-- `installers/windows/README.md` documents the WiX-based workflow.
-- Build commands (WiX installed and on PATH):
-  ```powershell
-  cpack --config build/CPackConfig.cmake -G WIX
-  ```
-- The release pipeline renders `installers/winget/inferencial.inferflux.yaml` with the correct version, download URL, and SHA256. Submit that manifest to `microsoft/winget-pkgs` once the GitHub Release is live.
-
----
-
-## Manual tarball (fallback)
-
-If you need a raw tarball (for GitHub Releases or mirrors):
+## 3) Packaging Commands
 
 ```bash
-cmake --install build --prefix dist
-tar -czf inferflux-$(git describe --tags --always).tar.gz -C dist .
+# Linux
+cpack --config build/CPackConfig.cmake -G DEB
+cpack --config build/CPackConfig.cmake -G RPM
+cpack --config build/CPackConfig.cmake -G TGZ
+
+# macOS
+cpack --config build/CPackConfig.cmake -G productbuild
+cpack --config build/CPackConfig.cmake -G DragNDrop
+
+# Windows (PowerShell with WiX on PATH)
+cpack --config build/CPackConfig.cmake -G WIX
 ```
 
----
+## 4) Verification Contract
 
-## (Optional) Containers
+| Check | Command |
+|---|---|
+| Binary starts | `inferfluxd --help` |
+| CLI works | `inferctl --help` |
+| Health endpoint | `curl -s http://127.0.0.1:8080/livez` |
+| Model listing | `./build/inferctl models --api-key dev-key-123` |
 
-Docker images remain available under `docker/` for environments that still prefer containers, but the official “Ease of Setup” score now hinges on the package-native flows above rather than Docker.
+## 5) Release Integration
 
----
+- Homebrew template: `installers/homebrew/inferflux.rb`
+- Winget template: `installers/winget/inferencial.inferflux.yaml`
+- Release workflow: [ReleaseProcess](ReleaseProcess.md)
 
-## CI-driven releases
+## 6) Notes
 
-See `docs/ReleaseProcess.md` for the GitHub Actions workflow that runs these packaging steps on every push to `main` (pre-release validation) and again when a tag matching `v*.*.*` is pushed (publishes a GitHub Release with every installer attached).
+- Rebuild with `-DENABLE_MLX=ON` if MLX backend support is needed in macOS artifacts.
+- Docker remains optional (`docker/`) and is not required for package-native setup.

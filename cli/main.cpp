@@ -201,6 +201,94 @@ std::string TruncateCell(const std::string &value, std::size_t max_width) {
   return value.substr(0, max_width - 3) + "...";
 }
 
+struct BackendExposureView {
+  std::string requested_backend;
+  std::string exposed_backend;
+  std::string provider;
+  bool fallback{false};
+  std::string fallback_reason;
+};
+
+BackendExposureView ParseBackendExposure(const json &model) {
+  BackendExposureView out;
+  out.exposed_backend = model.value("backend", "");
+  out.requested_backend =
+      model.value("requested_backend", out.exposed_backend);
+  out.provider = model.value("backend_provider", "unknown");
+  out.fallback = model.value("backend_fallback", false);
+  out.fallback_reason = model.value("backend_fallback_reason", "");
+
+  if (model.contains("backend_exposure") &&
+      model["backend_exposure"].is_object()) {
+    const auto &exposure = model["backend_exposure"];
+    out.exposed_backend =
+        exposure.value("exposed_backend", out.exposed_backend);
+    out.requested_backend =
+        exposure.value("requested_backend", out.requested_backend);
+    out.provider = exposure.value("provider", out.provider);
+    out.fallback = exposure.value("fallback", out.fallback);
+    out.fallback_reason = exposure.value("fallback_reason", out.fallback_reason);
+  }
+
+  if (out.requested_backend.empty()) {
+    out.requested_backend = out.exposed_backend;
+  }
+  if (out.provider.empty()) {
+    out.provider = "unknown";
+  }
+  return out;
+}
+
+void PrintModelsTable(const json &payload) {
+  if (!payload.contains("data") || !payload["data"].is_array()) {
+    std::cout << payload.dump() << std::endl;
+    return;
+  }
+  const auto &data = payload["data"];
+  if (data.empty()) {
+    std::cout << "(no models loaded)\n";
+    return;
+  }
+
+  constexpr int kIdW = 28;
+  constexpr int kExposedW = 11;
+  constexpr int kRequestedW = 11;
+  constexpr int kProviderW = 11;
+  constexpr int kFallbackW = 10;
+  constexpr int kReadyW = 8;
+  constexpr int kOwnerW = 14;
+
+  std::cout << std::left << std::setw(kIdW) << "ID" << std::setw(kExposedW)
+            << "EXPOSED-BE" << std::setw(kRequestedW) << "REQ-BE"
+            << std::setw(kProviderW) << "PROVIDER" << std::setw(kFallbackW)
+            << "FALLBACK" << std::setw(kReadyW) << "READY"
+            << std::setw(kOwnerW) << "OWNED-BY" << "CREATED\n";
+  std::cout << std::string(kIdW + kExposedW + kRequestedW + kProviderW +
+                               kFallbackW + kReadyW + kOwnerW + 12,
+                           '-')
+            << "\n";
+
+  for (const auto &m : data) {
+    const std::string id = m.value("id", "");
+    const auto exposure = ParseBackendExposure(m);
+    const bool ready = m.value("ready", false);
+    const std::string owned_by = m.value("owned_by", "");
+    const int64_t created = m.value("created", int64_t{0});
+
+    std::cout << std::left << std::setw(kIdW) << TruncateCell(id, kIdW - 1)
+              << std::setw(kExposedW)
+              << TruncateCell(exposure.exposed_backend, kExposedW - 1)
+              << std::setw(kRequestedW)
+              << TruncateCell(exposure.requested_backend, kRequestedW - 1)
+              << std::setw(kProviderW)
+              << TruncateCell(exposure.provider, kProviderW - 1)
+              << std::setw(kFallbackW) << (exposure.fallback ? "yes" : "no")
+              << std::setw(kReadyW) << (ready ? "yes" : "no")
+              << std::setw(kOwnerW) << TruncateCell(owned_by, kOwnerW - 1)
+              << created << "\n";
+  }
+}
+
 void PrintAdminModelsTable(const json &payload) {
   if (!payload.contains("models") || !payload["models"].is_array()) {
     std::cout << payload.dump() << std::endl;
@@ -215,25 +303,32 @@ void PrintAdminModelsTable(const json &payload) {
   const std::string default_id = payload.value("default_model", "");
 
   constexpr int kDefaultW = 4;
-  constexpr int kIdW = 24;
-  constexpr int kBackendW = 10;
+  constexpr int kIdW = 22;
+  constexpr int kBackendW = 11;
+  constexpr int kRequestedW = 11;
+  constexpr int kProviderW = 11;
+  constexpr int kFallbackW = 10;
   constexpr int kFormatW = 14;
   constexpr int kReadyW = 8;
-  constexpr int kSourceW = 44;
-  constexpr int kEffectiveW = 44;
+  constexpr int kSourceW = 34;
+  constexpr int kEffectiveW = 34;
 
   std::cout << std::left << std::setw(kDefaultW) << "DEF" << std::setw(kIdW)
-            << "ID" << std::setw(kBackendW) << "BACKEND" << std::setw(kFormatW)
-            << "FORMAT" << std::setw(kReadyW) << "READY" << std::setw(kSourceW)
-            << "SOURCE-PATH" << "EFFECTIVE-LOAD-PATH\n";
+            << "ID" << std::setw(kBackendW) << "EXPOSED-BE"
+            << std::setw(kRequestedW) << "REQ-BE" << std::setw(kProviderW)
+            << "PROVIDER" << std::setw(kFallbackW) << "FALLBACK"
+            << std::setw(kFormatW) << "FORMAT" << std::setw(kReadyW)
+            << "READY" << std::setw(kSourceW) << "SOURCE-PATH"
+            << "EFFECTIVE-LOAD-PATH\n";
   std::cout << std::string(kDefaultW + kIdW + kBackendW + kFormatW + kReadyW +
+                               kRequestedW + kProviderW + kFallbackW +
                                kSourceW + kEffectiveW,
                            '-')
             << "\n";
 
   for (const auto &model : models) {
     const std::string id = model.value("id", "");
-    const std::string backend = model.value("backend", "");
+    const auto exposure = ParseBackendExposure(model);
     const std::string format = model.value("format", "");
     const std::string source_path =
         model.value("source_path", model.value("path", ""));
@@ -247,7 +342,13 @@ void PrintAdminModelsTable(const json &payload) {
 
     std::cout << std::left << std::setw(kDefaultW) << (is_default ? "*" : "")
               << std::setw(kIdW) << TruncateCell(id, kIdW - 1)
-              << std::setw(kBackendW) << TruncateCell(backend, kBackendW - 1)
+              << std::setw(kBackendW)
+              << TruncateCell(exposure.exposed_backend, kBackendW - 1)
+              << std::setw(kRequestedW)
+              << TruncateCell(exposure.requested_backend, kRequestedW - 1)
+              << std::setw(kProviderW)
+              << TruncateCell(exposure.provider, kProviderW - 1)
+              << std::setw(kFallbackW) << (exposure.fallback ? "yes" : "no")
               << std::setw(kFormatW) << TruncateCell(format, kFormatW - 1)
               << std::setw(kReadyW) << (ready ? "yes" : "no")
               << std::setw(kSourceW) << TruncateCell(source_path, kSourceW - 1)
@@ -2028,22 +2129,7 @@ int main(int argc, char **argv) {
           std::cout << resp.body << std::endl;
           return 0;
         }
-        const auto &data = j["data"];
-        if (data.empty()) {
-          std::cout << "(no models loaded)\n";
-          return 0;
-        }
-        // Print a simple table: ID | owned_by | created
-        std::cout << std::left << std::setw(36) << "ID" << std::setw(20)
-                  << "OWNED-BY" << "CREATED\n";
-        std::cout << std::string(70, '-') << "\n";
-        for (const auto &m : data) {
-          std::string id = m.value("id", "");
-          std::string owned_by = m.value("owned_by", "");
-          int64_t created = m.value("created", int64_t{0});
-          std::cout << std::left << std::setw(36) << id << std::setw(20)
-                    << owned_by << created << "\n";
-        }
+        PrintModelsTable(j);
       } catch (const json::exception &) {
         std::cout << resp.body << std::endl;
       }

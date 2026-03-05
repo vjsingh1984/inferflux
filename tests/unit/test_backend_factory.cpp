@@ -37,6 +37,7 @@ TEST_CASE("BackendFactory stores and returns exposure policy",
   auto policy = BackendFactory::ExposurePolicy();
   REQUIRE_FALSE(policy.prefer_native);
   REQUIRE(policy.allow_universal_fallback);
+  REQUIRE_FALSE(policy.strict_native_request);
   BackendFactory::SetExposurePolicy({true, true});
 }
 
@@ -78,8 +79,9 @@ TEST_CASE("BackendFactory cuda hint resolves predictably",
 #endif
 }
 
-TEST_CASE("BackendFactory explicit cuda_universal hint forces universal provider",
-          "[backend_factory]") {
+TEST_CASE(
+    "BackendFactory explicit cuda_universal hint forces universal provider",
+    "[backend_factory]") {
   BackendFactory::SetExposurePolicy({true, false});
   auto selection = BackendFactory::Create("cuda_universal");
 
@@ -110,13 +112,34 @@ TEST_CASE("BackendFactory explicit cuda_native hint requires native provider",
   REQUIRE(dynamic_cast<NativeCudaBackend *>(selection.backend.get()) !=
           nullptr);
   REQUIRE(selection.used_fallback);
-  REQUIRE(selection.fallback_reason.find("scaffold mode") !=
-          std::string::npos);
+  REQUIRE(selection.fallback_reason.find("scaffold mode") != std::string::npos);
 #else
   REQUIRE(selection.backend == nullptr);
   REQUIRE(selection.fallback_reason.find("explicitly requested") !=
           std::string::npos);
 #endif
+}
+
+TEST_CASE(
+    "BackendFactory strict native policy rejects explicit cuda_native when"
+    " native kernels are not ready",
+    "[backend_factory]") {
+  if (NativeCudaBackend::NativeKernelsReady()) {
+    SUCCEED("native kernels ready; strict rejection no longer applies");
+    return;
+  }
+
+  BackendFactory::SetExposurePolicy({true, true, true});
+  auto selection = BackendFactory::Create("cuda_native");
+
+  REQUIRE(selection.provider == BackendProvider::kNative);
+  REQUIRE(selection.backend == nullptr);
+  REQUIRE(selection.fallback_reason.find("backend_policy_violation") !=
+          std::string::npos);
+  REQUIRE(selection.fallback_reason.find("strict_native_request") !=
+          std::string::npos);
+
+  BackendFactory::SetExposurePolicy({true, true, false});
 }
 
 TEST_CASE("BackendFactory auto hint follows compiled accelerators",

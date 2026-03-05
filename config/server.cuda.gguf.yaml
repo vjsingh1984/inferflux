@@ -1,0 +1,165 @@
+# InferFlux GGUF Native Kernel Configuration
+#
+# This configuration demonstrates running GGUF quantized models
+# with native CUDA kernels, enabling phase overlap functionality
+# while maintaining memory efficiency.
+#
+# Key benefits:
+# - 3-4x lower memory usage vs safetensors (Q4_K_M)
+# - Phase overlap support (1.5-2x throughput on mixed workloads)
+# - Native CUDA kernels with FlashAttention-2
+# - Compatible with llama.cpp GGUF models
+
+# Server configuration
+server:
+  host: "0.0.0.0"
+  port: 8080
+  workers: 4
+
+# Authentication
+auth:
+  api_key:
+    enabled: true
+    keys:
+      - "dev-key-123"  # Default development key
+
+  oidc:
+    enabled: false
+    # issuer: "https://auth.example.com"
+    # audiences: ["inferflux-api"]
+
+  rate_limit:
+    enabled: false
+    # requests_per_minute: 60
+
+# Model configuration
+models:
+  # Example Qwen2.5 3B GGUF model
+  - id: qwen2.5-3b-gguf
+    path: "models/qwen2.5-3b-instruct-q4_k_m.gguf"
+    format: gguf                    # Explicitly specify GGUF format
+    backend: cuda_native            # Use native CUDA kernels
+    default: true
+
+    # Optional: Override model metadata if not in GGUF
+    metadata:
+      name: "Qwen2.5 3B Instruct (GGUF Q4_K_M)"
+      max_sequence_length: 32768
+
+  # Example for multiple GGUF models
+  # - id: qwen2.5-7b-gguf
+  #   path: "models/qwen2.5-7b-instruct-q5_k_m.gguf"
+  #   format: gguf
+  #   backend: cuda_native
+  #   default: false
+
+  # Example for mixing GGUF and safetensors
+  # - id: tinyllama-safetensors
+  #   path: "models/tinyllama-safetensors"
+  #   format: auto  # Auto-detect from directory
+  #   backend: cuda_native
+  #   default: false
+
+# Runtime configuration
+runtime:
+  # Backend selection
+  backend_priority: "cuda_native,cuda_universal,cpu"
+  capability_routing:
+    enabled: true
+
+  # CUDA configuration
+  cuda:
+    enabled: true
+    device_id: 0
+
+    # Native CUDA executor mode
+    # Options:
+    #   - "native_kernel": Use custom CUDA kernels (requires safetensors or GGUF)
+    #   - "delegate": Delegate to llama.cpp (fallback)
+    native_executor_mode: "native_kernel"
+
+    # FlashAttention-2 configuration
+    flash_attention:
+      enabled: true
+      kernel: fa2  # Options: auto, fa2, standard
+
+    # Phase overlap (concurrent prefill/decode)
+    phase_overlap:
+      enabled: true                 # Enable concurrent execution
+      min_prefill_tokens: 256       # Minimum tokens for prefill lane
+      decode_batch_size: 32         # Decode batch size
+
+    # CUDA graph optimization
+    cuda_graphs:
+      enabled: false                # Experimental
+
+    # Memory configuration
+    memory:
+      # Fraction of GPU memory to use (0.0-1.0)
+      fraction: 0.9
+
+      # KV cache configuration
+      kv_cache:
+        type: paged                 # Options: paged, simple
+        max_tokens: 8192            # Total KV cache size
+        block_size: 512             # Paged KV cache block size
+
+  # Sampling configuration
+  sampling:
+    temperature: 1.0
+    top_p: 0.9
+    top_k: 40
+    repetition_penalty: 1.0
+
+    # Token streaming
+    stream:
+      enabled: true
+      batch_size: 10
+
+# Metrics configuration
+metrics:
+  enabled: true
+  path: "/metrics"
+  labels:
+    env: "development"
+
+# Logging configuration
+logging:
+  level: "info"  # Options: trace, debug, info, warn, error
+  format: "json"
+
+  # File logging
+  file:
+    enabled: true
+    path: "logs/server.log"
+    max_size_mb: 100
+    max_files: 10
+
+# Health probes
+health:
+  enabled: true
+  endpoints:
+    livez: "/healthz"
+    readyz: "/readyz"
+    startupz: "/livez"
+
+# Policy enforcement (optional)
+policy:
+  guardrails:
+    enabled: false
+    # rules:
+    #   - type: "content_filter"
+    #     pattern: "malicious"
+
+  # audit logging
+  audit:
+    enabled: true
+    log_path: "logs/audit.log"
+
+# Environment-specific overrides
+# These can be overridden via environment variables:
+# - INFERFLUX_MODEL_PATH: Override model path
+# - INFERFLUX_MODELS: Multi-model configuration string
+# - INFERFLUX_NATIVE_CUDA_EXECUTOR: Override executor mode
+# - INFERFLUX_CUDA_PHASE_OVERLAP: Enable/disable phase overlap
+# - INFERFLUX_PORT_OVERRIDE: Override server port

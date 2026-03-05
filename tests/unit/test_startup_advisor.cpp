@@ -28,11 +28,12 @@ static inferflux::StartupAdvisorContext WellTunedCudaContext() {
 
   inferflux::AdvisorModelInfo m;
   m.id = "llama3-8b";
-  m.path = "/models/llama3-8b.gguf";
+  m.path = "/models/llama3-8b-q4_k_m.gguf";  // Include quantization to avoid recommendation
   m.format = "gguf";
   m.backend = "cuda";
   m.backend_provider = "native";
   m.file_size_bytes = 4ULL * 1024 * 1024 * 1024;
+  m.quantization = inferflux::DetectQuantization(m.path, m.format);  // Detect from filename
   ctx.models.push_back(m);
 
   return ctx;

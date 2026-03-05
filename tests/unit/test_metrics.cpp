@@ -131,6 +131,32 @@ TEST_CASE("MetricsRegistry scheduler batch limits and token-budget skips",
                       "backend=\"cpu\"} 2") != std::string::npos);
 }
 
+TEST_CASE("MetricsRegistry records scheduler iteration composition",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordSchedulerIteration(/*prefill_requests=*/2,
+                                    /*decode_requests=*/0,
+                                    /*token_count=*/12);
+  registry.RecordSchedulerIteration(/*prefill_requests=*/0,
+                                    /*decode_requests=*/3,
+                                    /*token_count=*/7);
+  registry.RecordSchedulerIteration(/*prefill_requests=*/1,
+                                    /*decode_requests=*/1,
+                                    /*token_count=*/9);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_scheduler_iterations_total{backend=\"cpu\","
+                      "phase=\"prefill\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_iterations_total{backend=\"cpu\","
+                      "phase=\"decode\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_iterations_total{backend=\"cpu\","
+                      "phase=\"mixed\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_iteration_requests_total{"
+                      "backend=\"cpu\"} 7") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_iteration_tokens_total{"
+                      "backend=\"cpu\"} 28") != std::string::npos);
+}
+
 TEST_CASE("MetricsRegistry records per-model token counters", "[metrics]") {
   inferflux::MetricsRegistry registry;
   registry.RecordModelRoute("llama3-8b", "cuda", true);

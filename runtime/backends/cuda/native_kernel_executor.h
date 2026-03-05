@@ -270,6 +270,12 @@ private:
   cudaEvent_t sampling_start_{nullptr};
   cudaEvent_t sampling_stop_{nullptr};
 
+  // Phase overlap tracking events
+  cudaEvent_t prefill_start_event_{nullptr};
+  cudaEvent_t prefill_end_event_{nullptr};
+  cudaEvent_t decode_start_event_{nullptr};
+  cudaEvent_t decode_end_event_{nullptr};
+
   struct NativePerfAccumulator {
     std::atomic<double> prefill_ms{0.0};
     std::atomic<double> decode_ms{0.0};
@@ -277,6 +283,10 @@ private:
     std::atomic<int32_t> generated_tokens{0};
   };
   NativePerfAccumulator perf_accum_;
+
+  // Phase overlap configuration
+  bool overlap_enabled_{true};
+  int min_prefill_tokens_{256};
 #endif
 
   // Internal helpers
@@ -285,6 +295,17 @@ private:
   void FreeDeviceMemory();
   bool RunNativeInference(const std::vector<UnifiedBatchInput> &inputs,
                           std::vector<UnifiedBatchOutput> *outputs);
+
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  // Phase overlap helpers
+  bool HasMixedWorkload(const std::vector<UnifiedBatchInput> &inputs) const;
+  void SplitBatchByType(const std::vector<UnifiedBatchInput> &inputs,
+                        std::vector<size_t> &prefill_indices,
+                        std::vector<size_t> &decode_indices) const;
+  bool IsPrefillLikeInput(const UnifiedBatchInput &input) const;
+  std::vector<UnifiedBatchOutput> ExecuteUnifiedBatchWithOverlap(
+      const std::vector<UnifiedBatchInput> &inputs);
+#endif
 };
 
 } // namespace inferflux

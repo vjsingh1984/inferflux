@@ -6,11 +6,10 @@ We've set up a complete FlashAttention integration and testing framework for you
 
 ### ✅ Files Created
 
-1. **Implementation Guide** (`docs/FLASHATTENTION_IMPLEMENTATION_GUIDE.md`)
-   - Complete learning path (8 weeks)
-   - Integration steps for llama.cpp's FlashAttention
-   - Optimization strategies
-   - Troubleshooting guide
+1. **Archive Evidence Index** (`docs/ARCHIVE_INDEX.md`)
+   - Curated historical FlashAttention and CUDA investigation references
+   - Benchmark and profiling evidence pointers
+   - Use canonical docs for current contracts and workflows
 
 2. **FlashAttention Header** (`runtime/backends/cuda/kernels/flash_attention.h`)
    - Interface for FlashAttention integration
@@ -280,9 +279,9 @@ You'll know you've succeeded when:
    ./build/test_flash_attention
    ```
 
-2. **Read the implementation guide:**
+2. **Review the archive evidence index:**
    ```bash
-   cat docs/FLASHATTENTION_IMPLEMENTATION_GUIDE.md
+   cat docs/ARCHIVE_INDEX.md
    ```
 
 3. **Check llama.cpp FlashAttention code:**

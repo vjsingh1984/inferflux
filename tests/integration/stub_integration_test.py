@@ -10,6 +10,7 @@ import http.client
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 18081
 SERVER_FAIL_PORT = 18082
+SERVER_STRICT_PORT = 18083
 SERVER_BIN = os.environ.get("INFERFLUX_SERVER_BIN", "./build/inferfluxd")
 INFERCTL_BIN = os.environ.get("INFERCTL_BIN", "./build/inferctl")
 
@@ -228,6 +229,13 @@ class StubIntegrationTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertIn("data", payload)
         self.assertIsInstance(payload["data"], list)
+        for model in payload["data"]:
+            self.assertIn("backend_exposure", model)
+            self.assertIsInstance(model["backend_exposure"], dict)
+            self.assertIn("requested_backend", model["backend_exposure"])
+            self.assertIn("exposed_backend", model["backend_exposure"])
+            self.assertIn("provider", model["backend_exposure"])
+            self.assertIn("fallback", model["backend_exposure"])
 
     def test_inferctl_models_id_not_found_json(self):
         result = self._run_inferctl(["models", "--id", "explicit-model", "--json"])
@@ -725,6 +733,11 @@ class StubIntegrationTests(unittest.TestCase):
             lines[0] == "(no models loaded)" or lines[0].startswith("ID"),
             msg=f"unexpected inferctl models output: {result.stdout!r}",
         )
+        if lines[0] != "(no models loaded)":
+            self.assertIn("EXPOSED-BE", lines[0])
+            self.assertIn("REQ-BE", lines[0])
+            self.assertIn("PROVIDER", lines[0])
+            self.assertIn("FALLBACK", lines[0])
 
     def test_inferctl_admin_models_list_json(self):
         result = self._run_inferctl(["admin", "models", "--list", "--json"])
@@ -736,6 +749,32 @@ class StubIntegrationTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertIn("models", payload)
         self.assertIsInstance(payload["models"], list)
+        for model in payload["models"]:
+            self.assertIn("backend_exposure", model)
+            self.assertIsInstance(model["backend_exposure"], dict)
+            self.assertIn("requested_backend", model["backend_exposure"])
+            self.assertIn("exposed_backend", model["backend_exposure"])
+            self.assertIn("provider", model["backend_exposure"])
+            self.assertIn("fallback", model["backend_exposure"])
+
+    def test_inferctl_admin_models_list_default_output(self):
+        result = self._run_inferctl(["admin", "models", "--list"])
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
+        )
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines, msg=f"stdout was empty: {result.stdout!r}")
+        self.assertTrue(
+            lines[0] == "(no models loaded)" or lines[0].startswith("DEF"),
+            msg=f"unexpected inferctl admin models output: {result.stdout!r}",
+        )
+        if lines[0] != "(no models loaded)":
+            self.assertIn("EXPOSED-BE", lines[0])
+            self.assertIn("REQ-BE", lines[0])
+            self.assertIn("PROVIDER", lines[0])
+            self.assertIn("FALLBACK", lines[0])
 
     def test_inferctl_models_json_auth_failure(self):
         result = self._run_inferctl(["models", "--json"], api_key="invalid-key")
@@ -931,6 +970,81 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
 
         resp, body = self._get("/v1/admin/rate_limit")
         self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
+
+
+class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        env = os.environ.copy()
+        env["INFERFLUX_HOST_OVERRIDE"] = SERVER_HOST
+        env["INFERFLUX_PORT_OVERRIDE"] = str(SERVER_STRICT_PORT)
+        env["INFERFLUX_BACKEND_STRICT_NATIVE_REQUEST"] = "true"
+        cls.server_proc = subprocess.Popen(
+            [SERVER_BIN, "--config", "config/server.yaml"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid
+        )
+        deadline = time.time() + 20.0
+        ready = False
+        while time.time() < deadline:
+            if cls.server_proc.poll() is not None:
+                break
+            try:
+                conn = http.client.HTTPConnection(SERVER_HOST, SERVER_STRICT_PORT, timeout=1)
+                conn.request("GET", "/livez", headers={"Authorization": "Bearer dev-key-123"})
+                resp = conn.getresponse()
+                resp.read()
+                conn.close()
+                if resp.status in (200, 401):
+                    ready = True
+                    break
+            except Exception:
+                time.sleep(0.1)
+        if not ready:
+            try:
+                out, err = cls.server_proc.communicate(timeout=1)
+            except Exception:
+                out, err = ("", "")
+            raise RuntimeError(
+                "inferfluxd did not become ready in time; "
+                f"stdout={out[-400:] if out else ''} stderr={err[-400:] if err else ''}"
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, 'server_proc') and cls.server_proc:
+            try:
+                os.killpg(os.getpgid(cls.server_proc.pid), signal.SIGTERM)
+                cls.server_proc.wait(timeout=5)
+            except:
+                pass
+
+    def _post(self, path, data):
+        conn = http.client.HTTPConnection(SERVER_HOST, SERVER_STRICT_PORT, timeout=10)
+        headers = {"Content-Type": "application/json", "Authorization": "Bearer dev-key-123"}
+        conn.request("POST", path, body=json.dumps(data), headers=headers)
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        conn.close()
+        return resp, body
+
+    def test_admin_models_load_explicit_native_rejected_in_strict_mode(self):
+        resp, body = self._post(
+            "/v1/admin/models",
+            {
+                "id": "strict-native-test",
+                "path": "/tmp/strict-native-test.gguf",
+                "backend": "cuda_native",
+                "format": "gguf",
+            },
+        )
+        self.assertEqual(resp.status, 422, msg=f"Status: {resp.status}, Body: {body}")
+        payload = json.loads(body)
+        self.assertEqual(payload.get("error"), "backend_policy_violation")
+        reason = payload.get("reason", "")
+        self.assertIn("strict_native_request", reason)
 
 if __name__ == "__main__":
     unittest.main()

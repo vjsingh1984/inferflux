@@ -214,6 +214,13 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
 
   if (hint == "cuda" || hint == "mps" || hint == "rocm" || hint == "vulkan") {
     if (force_native) {
+      if (policy.strict_native_request && !SupportsNativeBackend(target)) {
+        return NativeUnavailableResult(
+            target, traits,
+            "backend_policy_violation: strict_native_request enabled; "
+            "native backend explicitly requested but native kernels are not "
+            "ready");
+      }
       auto backend = CreateNativeBackendForTarget(target);
       if (backend) {
         BackendFactoryResult out;

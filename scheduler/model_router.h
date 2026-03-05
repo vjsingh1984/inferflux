@@ -64,6 +64,10 @@ public:
                                 const std::string &requested_id = "",
                                 const std::string &model_format = "auto") = 0;
 
+  // Optional diagnostics for the last LoadModel failure. Empty on success or
+  // when unavailable in a specific router implementation.
+  virtual std::string LastLoadError() const { return ""; }
+
   // Unload a model by ID. Returns false if the model was not found.
   virtual bool UnloadModel(const std::string &id) = 0;
 

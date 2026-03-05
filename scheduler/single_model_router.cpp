@@ -152,6 +152,7 @@ bool SingleModelRouter::RegisterModel(
   if (default_model_id_.empty()) {
     default_model_id_ = entry.info.id;
   }
+  last_load_error_.clear();
   GlobalMetrics().RecordModelLoad(entry.info.id, entry.info.backend, 0.0);
   GlobalMetrics().RecordBackendExposure(
       entry.info.requested_backend, entry.info.backend,
@@ -176,20 +177,30 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
                                          const std::string &backend_hint,
                                          const std::string &requested_id,
                                          const std::string &model_format) {
+  const auto set_last_load_error = [&](const std::string &error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_load_error_ = error;
+  };
+  set_last_load_error("");
+
   std::string normalized_requested_format = NormalizeModelFormat(model_format);
   if (normalized_requested_format.empty()) {
     normalized_requested_format = model_format.empty() ? "auto" : "";
   }
   if (normalized_requested_format.empty()) {
-    log::Error("single_model_router", "invalid model format '" + model_format +
-                                          "' for path '" + path + "'");
+    const std::string error =
+        "invalid model format '" + model_format + "' for path '" + path + "'";
+    log::Error("single_model_router", error);
+    set_last_load_error(error);
     return "";
   }
   const std::string resolved_format =
       ResolveModelFormat(path, normalized_requested_format);
   if (resolved_format == "unknown") {
-    log::Error("single_model_router",
-               "failed to resolve model format for path '" + path + "'");
+    const std::string error =
+        "failed to resolve model format for path '" + path + "'";
+    log::Error("single_model_router", error);
+    set_last_load_error(error);
     return "";
   }
 
@@ -278,6 +289,8 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
     if (!failure_reason.empty()) {
       log::Error("single_model_router", failure_reason);
     }
+    set_last_load_error(failure_reason.empty() ? "model load failed"
+                                               : failure_reason);
     return "";
   }
 
@@ -335,6 +348,7 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
   if (default_model_id_.empty()) {
     default_model_id_ = info.id;
   }
+  last_load_error_.clear();
   GlobalMetrics().RecordModelLoad(info.id, info.backend, load_seconds);
   GlobalMetrics().RecordBackendExposure(info.requested_backend, info.backend,
                                         info.backend_provider,
@@ -414,6 +428,11 @@ bool SingleModelRouter::SetDefaultModel(const std::string &model_id) {
   }
   default_model_id_ = model_id;
   return true;
+}
+
+std::string SingleModelRouter::LastLoadError() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return last_load_error_;
 }
 
 std::string SingleModelRouter::DefaultModelId() const {

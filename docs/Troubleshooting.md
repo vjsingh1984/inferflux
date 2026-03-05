@@ -1,29 +1,107 @@
-# Troubleshooting
+# Troubleshooting (Canonical OSS)
 
-Common issues when running InferFlux locally.
+**Status:** Canonical
 
-## WebUI issues
+## 1) Triage Flow
 
-- **Blank page:** the binary must be built with `-DENABLE_WEBUI=ON` and started via `inferctl serve` (which passes `--ui`). Rebuild and relaunch.
-- **Stale API key:** click “Save” after updating the API key field, or clear localStorage in the browser.
-- **Model list empty:** ensure at least one model is loaded (`inferctl admin models --list`). The WebUI calls `/v1/models` using the configured API key.
+```mermaid
+flowchart TD
+    A[Request fails or performance drops] --> B{Server up?}
+    B -->|No| C[Check inferfluxd startup logs and config path]
+    B -->|Yes| D{Auth/scope issue?}
+    D -->|Yes| E[Verify API key and required scope]
+    D -->|No| F{Model/routing issue?}
+    F -->|Yes| G[Check /v1/models and admin routing]
+    F -->|No| H{Throughput/latency issue?}
+    H -->|Yes| I[Inspect /metrics batching and backend counters]
+    H -->|No| J[Check platform-specific section below]
+```
 
-## CLI quickstart/serve
+## 2) Symptom Matrix
 
-- **Config not found:** `inferctl serve` defaults to `~/.inferflux/config.yaml`. Override via `--config` if you generated multiple profiles.
-- **API key errors:** set `INFERCTL_API_KEY=<key>` or pass `--api-key` to each command (guardrails/models admin require it).
-- **Model not found at launch:** `inferctl pull <repo>` downloads to `~/.inferflux/models/<owner>/<file.gguf>` — ensure that file exists (the command prints the resolved path) and matches the path inside `~/.inferflux/config.yaml`.
-- **Metal command-queue failure on macOS:** export `GGML_METAL_DISABLE=1` before running `inferctl serve` to force pure CPU mode. The quickstart config already pins the server to `127.0.0.1`, so CLI/WebUI still work once the CPU backend loads.
-- **Backend mismatch:** If you scaffolded `backend: mlx` (or `cuda`/`rocm`) but the binary was compiled without the corresponding `-DENABLE_*` flag, InferFlux falls back to CPU and logs a warning. Rebuild with `cmake -DENABLE_MLX=ON` (or the relevant flag) before loading the model.
+| Symptom | First command | Likely cause | Fast fix |
+|---|---|---|---|
+| Server not reachable | `curl -s http://127.0.0.1:8080/livez` | process not started or wrong port | start `inferfluxd`, verify `server.http_port` |
+| Not ready | `curl -s http://127.0.0.1:8080/readyz` | model/backend not ready | fix model path/backend config; re-check logs |
+| `401` / `403` | run same request with known key | missing/invalid key or insufficient scope | pass bearer key with required scope |
+| `404 model_not_found` | `./build/inferctl models --api-key <KEY>` | wrong model id/default model missing | use valid model id or set default model |
+| `422 backend_policy_violation` | inspect routing + backend exposure | strict native request policy blocked fallback | disable strict native policy or request compatible backend |
+| high latency / low throughput | `curl -s .../metrics | head -120` | under-sized batches or backend mismatch | tune scheduler/KV/cuda settings in config |
+| WebUI blank/empty | verify binary + model list | UI not built or no model loaded | build with `-DENABLE_WEBUI=ON` and load model |
 
-## Docker deployment
+## 3) Startup and Config Issues
 
-- **Build:** `docker build -t inferflux:latest -f docker/Dockerfile .`
-- **Run (with UI):** `docker run --rm -p 8080:8080 inferflux:latest --ui`
-- **Compose:** `docker compose -f docker/docker-compose.yaml up`
-- **Volume permissions:** map `~/.inferflux` into the container via `-v ~/.inferflux:/app/config` for persistent models/config.
+| Problem | Check | Fix |
+|---|---|---|
+| Config file not found | path passed to `--config` | use absolute path or correct profile |
+| Model path invalid | `models[].path` exists | fix path; verify file permissions |
+| Backend unavailable | build flags vs selected backend | rebuild with matching `-DENABLE_*` flags |
+| CPU fallback unexpected | server logs for backend selection | update `runtime.backend_priority` and model backend |
 
-## Installer targets (coming soon)
+## 4) Auth and Scope Issues
 
-- **Homebrew tap:** `brew tap inferencial/cli` then `brew install inferflux` once the tap is published.
-- **winget:** manifests under `installers/winget` describe the package layout; submit after tagging a release.
+| Endpoint family | Required scope |
+|---|---|
+| `/v1/completions`, `/v1/chat/completions` | `generate` |
+| `/v1/models`, `/v1/models/{id}`, `/v1/embeddings` | `read` |
+| `/v1/admin/*` | `admin` |
+
+Common checks:
+
+```bash
+./build/inferctl models --api-key <KEY>
+./build/inferctl admin models --list --api-key <ADMIN_KEY>
+```
+
+## 5) Model, Routing, and Backend Issues
+
+```bash
+./build/inferctl models --json --api-key <KEY>
+./build/inferctl admin routing --get --api-key <ADMIN_KEY>
+./build/inferctl admin pools --get --api-key <ADMIN_KEY>
+```
+
+Look for:
+- incompatible capability requests (e.g., embeddings/streaming against unsupported backend)
+- fallback behavior in `backend_exposure.*` fields
+- backend readiness state in pools/routing outputs
+
+## 6) Performance and Capacity Issues
+
+| Signal | Where | Action |
+|---|---|---|
+| small effective batches | `/metrics` batch size counters | raise `runtime.scheduler.max_batch_size` and accumulation window |
+| token-budget skips high | `/metrics` skip counters | adjust `max_batch_tokens` and decode slicing |
+| low reuse/hit rate | cache metrics | increase KV pages and validate prefix reuse path |
+| CUDA underutilization | backend metrics + logs | enable/tune FA2 and phase overlap when supported |
+
+## 7) Platform-Specific Notes
+
+| Platform | Issue | Fix |
+|---|---|---|
+| macOS | Metal command queue failures | set `GGML_METAL_DISABLE=1` for CPU fallback |
+| NVIDIA CUDA | explicit `cuda_native` rejected | adjust strict mode or use `cuda_universal` until native ready |
+| Docker | config/model persistence | mount config/models volumes and verify permissions |
+
+Docker quick commands:
+
+```bash
+docker build -t inferflux:latest -f docker/Dockerfile .
+docker run --rm -p 8080:8080 inferflux:latest --ui
+docker compose -f docker/docker-compose.yaml up
+```
+
+## 8) Escalation Data to Collect
+
+1. `inferfluxd` startup log section (model + backend selection).
+2. `/readyz` and `/metrics` snapshots.
+3. failing request payload (without secrets) and response status/body.
+4. active config file and relevant `INFERFLUX_*` overrides.
+
+## 9) Related Docs
+
+- [Quickstart](Quickstart.md)
+- [User Guide](UserGuide.md)
+- [API Surface](API_SURFACE.md)
+- [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
+- [Admin Guide](AdminGuide.md)

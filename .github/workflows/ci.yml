@@ -82,6 +82,14 @@ jobs:
       - name: Build
         run: cmake --build build -j$(nproc)
 
+      # ------------------------------------------------------------------
+      # Focused assertion: canonical OSS docs contract
+      # Fails fast on missing canonical docs, broken local links, API/CLI
+      # surface drift, or infographic-first contract violations.
+      # ------------------------------------------------------------------
+      - name: Assert docs contract gate
+        run: python3 scripts/check_docs_contract.py
+
       - name: ccache stats
         run: ccache --show-stats
 
@@ -137,6 +145,37 @@ jobs:
             exit 1
           fi
           ctest --test-dir build -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
+      # Focused assertion: throughput gate batching contract
+      # Keeps run_throughput_gate.py argument + metrics parsing stable so
+      # CI throughput checks remain trustworthy.
+      # ------------------------------------------------------------------
+      - name: Assert throughput gate batching contract
+        run: |
+          EXPECTED_TP_GATE_CONTRACT_TESTS=4
+          ACTUAL_TP_GATE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_contract_test.py | wc -l | tr -d ' ')
+          echo "ThroughputGateContractTests method count: expected=${EXPECTED_TP_GATE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_CONTRACT_TESTS}"
+          if [ "${ACTUAL_TP_GATE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_CONTRACT_TESTS}" ]; then
+            echo "::error::ThroughputGateContractTests method count drifted; update EXPECTED_TP_GATE_CONTRACT_TESTS in .github/workflows/ci.yml"
+            exit 1
+          fi
+          ctest --test-dir build -R ThroughputGateContractTests --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
+      # Focused assertion: throughput gate batching failure diagnostics
+      # Ensures threshold failures keep stable, actionable stderr messages.
+      # ------------------------------------------------------------------
+      - name: Assert throughput gate batching failure diagnostics
+        run: |
+          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=4
+          ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_failure_contract_test.py | wc -l | tr -d ' ')
+          echo "ThroughputGateFailureContractTests method count: expected=${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}"
+          if [ "${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS}" ]; then
+            echo "::error::ThroughputGateFailureContractTests method count drifted; update EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS in .github/workflows/ci.yml"
+            exit 1
+          fi
+          ctest --test-dir build -R ThroughputGateFailureContractTests --output-on-failure --timeout 90 -V
 
       # ------------------------------------------------------------------
       # SBOM — CycloneDX 1.5 JSON + SPDX 2.3 tag-value
@@ -323,6 +362,10 @@ jobs:
   #   INFERFLUX_TP_MIN_SUCCESS_RATE  default 1.0
   #   INFERFLUX_TP_MIN_OVERLAP_MS    default -1.0 (disabled)
   #   INFERFLUX_TP_MAX_ATTN_FALLBACKS default -1.0 (disabled)
+  #   INFERFLUX_TP_MIN_BATCH_SIZE_MAX default 2.0
+  #   INFERFLUX_TP_MIN_BATCH_UTILIZATION default 0.06
+  #   INFERFLUX_TP_MAX_BATCH_TOKEN_BUDGET_SKIPS default -1.0 (disabled)
+  #   INFERFLUX_TP_MAX_BATCH_TOKEN_BUDGET_SKIP_RATIO default -1.0 (disabled)
   #   INFERFLUX_TP_ATTN_MODE         default auto
   #   INFERFLUX_TP_EXPECT_ATTN       default "" (disabled)
   #   INFERFLUX_TP_TARGET_PREFILL_TOKENS default 4096
@@ -342,6 +385,10 @@ jobs:
       INFERFLUX_TP_MIN_SUCCESS_RATE: ${{ vars.INFERFLUX_TP_MIN_SUCCESS_RATE || '1.0' }}
       INFERFLUX_TP_MIN_OVERLAP_MS: ${{ vars.INFERFLUX_TP_MIN_OVERLAP_MS || '-1.0' }}
       INFERFLUX_TP_MAX_ATTN_FALLBACKS: ${{ vars.INFERFLUX_TP_MAX_ATTN_FALLBACKS || '-1.0' }}
+      INFERFLUX_TP_MIN_BATCH_SIZE_MAX: ${{ vars.INFERFLUX_TP_MIN_BATCH_SIZE_MAX || '2.0' }}
+      INFERFLUX_TP_MIN_BATCH_UTILIZATION: ${{ vars.INFERFLUX_TP_MIN_BATCH_UTILIZATION || '0.06' }}
+      INFERFLUX_TP_MAX_BATCH_TOKEN_BUDGET_SKIPS: ${{ vars.INFERFLUX_TP_MAX_BATCH_TOKEN_BUDGET_SKIPS || '-1.0' }}
+      INFERFLUX_TP_MAX_BATCH_TOKEN_BUDGET_SKIP_RATIO: ${{ vars.INFERFLUX_TP_MAX_BATCH_TOKEN_BUDGET_SKIP_RATIO || '-1.0' }}
       INFERFLUX_TP_ATTN_MODE: ${{ vars.INFERFLUX_TP_ATTN_MODE || 'auto' }}
       INFERFLUX_TP_EXPECT_ATTN: ${{ vars.INFERFLUX_TP_EXPECT_ATTN || '' }}
       INFERFLUX_TP_TARGET_PREFILL_TOKENS: ${{ vars.INFERFLUX_TP_TARGET_PREFILL_TOKENS || '4096' }}
@@ -407,6 +454,10 @@ jobs:
             --require-cuda-overlap \
             --min-cuda-overlap-duration-ms "${INFERFLUX_TP_MIN_OVERLAP_MS}" \
             --max-cuda-attention-fallbacks "${INFERFLUX_TP_MAX_ATTN_FALLBACKS}" \
+            --min-batch-size-max "${INFERFLUX_TP_MIN_BATCH_SIZE_MAX}" \
+            --min-batch-size-utilization "${INFERFLUX_TP_MIN_BATCH_UTILIZATION}" \
+            --max-batch-token-budget-skips "${INFERFLUX_TP_MAX_BATCH_TOKEN_BUDGET_SKIPS}" \
+            --max-batch-token-budget-skip-ratio "${INFERFLUX_TP_MAX_BATCH_TOKEN_BUDGET_SKIP_RATIO}" \
             --server-log-path build/throughput_gate_server.log \
             --server-env "INFERFLUX_CUDA_ATTENTION_KERNEL=${INFERFLUX_TP_ATTN_MODE}" \
             --server-env "INFERFLUX_MODELS=id=tinyllama,path=${INFERFLUX_TP_MODEL_PATH},backend=cuda,default=true" \
@@ -471,6 +522,14 @@ jobs:
         run: cmake --build build-cov -j$(nproc)
 
       # ------------------------------------------------------------------
+      # Focused assertion: canonical OSS docs contract
+      # Fails fast on missing canonical docs, broken local links, API/CLI
+      # surface drift, or infographic-first contract violations.
+      # ------------------------------------------------------------------
+      - name: Assert docs contract gate
+        run: python3 scripts/check_docs_contract.py
+
+      # ------------------------------------------------------------------
       # Focused assertion: inferctl model-list output modes
       # Keep these checks explicit in logs to prevent accidental regressions
       # in script-facing JSON output or default table formatting behavior.
@@ -507,6 +566,34 @@ jobs:
             exit 1
           fi
           ctest --test-dir build-cov -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
+      # Focused assertion: throughput gate batching contract
+      # ------------------------------------------------------------------
+      - name: Assert throughput gate batching contract
+        run: |
+          EXPECTED_TP_GATE_CONTRACT_TESTS=4
+          ACTUAL_TP_GATE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_contract_test.py | wc -l | tr -d ' ')
+          echo "ThroughputGateContractTests method count: expected=${EXPECTED_TP_GATE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_CONTRACT_TESTS}"
+          if [ "${ACTUAL_TP_GATE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_CONTRACT_TESTS}" ]; then
+            echo "::error::ThroughputGateContractTests method count drifted; update EXPECTED_TP_GATE_CONTRACT_TESTS in .github/workflows/ci.yml"
+            exit 1
+          fi
+          ctest --test-dir build-cov -R ThroughputGateContractTests --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
+      # Focused assertion: throughput gate batching failure diagnostics
+      # ------------------------------------------------------------------
+      - name: Assert throughput gate batching failure diagnostics
+        run: |
+          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=4
+          ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_failure_contract_test.py | wc -l | tr -d ' ')
+          echo "ThroughputGateFailureContractTests method count: expected=${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}"
+          if [ "${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS}" ]; then
+            echo "::error::ThroughputGateFailureContractTests method count drifted; update EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS in .github/workflows/ci.yml"
+            exit 1
+          fi
+          ctest --test-dir build-cov -R ThroughputGateFailureContractTests --output-on-failure --timeout 90 -V
 
       # ------------------------------------------------------------------
       # Run tests + collect coverage in one CMake target
