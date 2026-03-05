@@ -15,7 +15,10 @@ public:
 
 } // namespace inferflux
 
-#define NVTX_SCOPE(name) ::inferflux::NvtxRange nvtx_scope_##__LINE__(name)
+#define INFERFLUX_NVTX_CONCAT_IMPL(x, y) x##y
+#define INFERFLUX_NVTX_CONCAT(x, y) INFERFLUX_NVTX_CONCAT_IMPL(x, y)
+#define NVTX_SCOPE(name)                                                       \
+  ::inferflux::NvtxRange INFERFLUX_NVTX_CONCAT(nvtx_scope_, __COUNTER__)(name)
 #else
 #define NVTX_SCOPE(name) ((void)0)
 #endif

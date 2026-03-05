@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -26,6 +27,10 @@
 #include <nlohmann/json.hpp>
 
 namespace {
+
+constexpr std::size_t kKiB = 1024ULL;
+constexpr std::size_t kMiB = kKiB * kKiB;
+constexpr std::size_t kGiB = kMiB * kKiB;
 
 // BFloat16 → Float16 conversion (CPU-side)
 // BF16: 1 sign + 8 exponent + 7 mantissa
@@ -81,6 +86,17 @@ void ConvertBF16ToFP16(const void *src, void *dst, size_t num_elements) {
   for (size_t i = 0; i < num_elements; ++i) {
     out[i] = bf16_to_fp16(in[i]);
   }
+}
+
+bool CheckedMulSize(std::size_t a, std::size_t b, std::size_t *out) {
+  if (!out) {
+    return false;
+  }
+  if (a != 0U && b > (std::numeric_limits<std::size_t>::max() / a)) {
+    return false;
+  }
+  *out = a * b;
+  return true;
 }
 
 } // namespace
@@ -210,8 +226,8 @@ bool SafetensorsLoader::LoadModel(const std::string &model_path) {
       shape_str += "]";
       log::Info("safetensors_loader",
                 "  Tensor: " + tensor + " dtype=" + info->dtype +
-                    " shape=" + shape_str + " size=" +
-                    std::to_string(info->size / (1024 * 1024)) + " MB");
+                    " shape=" + shape_str +
+                    " size=" + std::to_string(info->size / kMiB) + " MB");
     }
   }
 
@@ -267,7 +283,8 @@ bool SafetensorsLoader::LoadIndex(const std::string &index_path) {
       log::Info("safetensors_loader",
                 "Shard " + shard_file + ": " +
                     std::to_string(tensor_names.size()) + " tensors, " +
-                    std::to_string(st.st_size / (1024 * 1024 * 1024)) + " GB");
+                    std::to_string(st.st_size / static_cast<off_t>(kGiB)) +
+                    " GB");
     }
 
     return true;
@@ -390,8 +407,8 @@ bool SafetensorsLoader::UploadToGPU(cudaStream_t stream,
   }
 
   log::Info("safetensors_loader",
-            "Total GPU memory needed: " +
-                std::to_string(total_size / (1024 * 1024 * 1024)) + " GB");
+            "Total GPU memory needed: " + std::to_string(total_size / kGiB) +
+                " GB");
 
   cudaError_t err = cudaMalloc(&d_weights_buffer_, total_size);
   if (err != cudaSuccess) {
@@ -453,8 +470,8 @@ bool SafetensorsLoader::UploadToGPU(cudaStream_t stream,
     if (uploaded <= 10 || uploaded % 50 == 0) {
       log::Info("safetensors_loader",
                 "  Uploaded " + name + " (" +
-                    std::to_string(tensor.size / (1024 * 1024)) +
-                    " MB) -> GPU offset " + std::to_string(tensor.gpu_offset) +
+                    std::to_string(tensor.size / kMiB) + " MB) -> GPU offset " +
+                    std::to_string(tensor.gpu_offset) +
                     (needs_conversion ? " [BF16→FP16]" : ""));
     }
   }
@@ -507,9 +524,9 @@ void SafetensorsLoader::FreeCPUMemory() {
 
 void SafetensorsLoader::FreeGPUMemory() {
   if (d_weights_buffer_) {
-    log::Info("safetensors_loader",
-              "Freeing GPU buffer (" +
-                  std::to_string(total_gpu_size_ / (1024 * 1024)) + " MB)");
+    log::Info("safetensors_loader", "Freeing GPU buffer (" +
+                                        std::to_string(total_gpu_size_ / kMiB) +
+                                        " MB)");
     cudaFree(d_weights_buffer_);
     d_weights_buffer_ = nullptr;
     total_gpu_size_ = 0;
@@ -562,7 +579,9 @@ NativeKernelExecutor::~NativeKernelExecutor() {
   gemm_.reset();
   weight_map_.reset();
   if (d_logits_) {
-    cudaFree(d_logits_);
+    if (cudaFree(d_logits_) != cudaSuccess) {
+      log::Warn("native_kernel_executor", "cudaFree(d_logits_) failed");
+    }
     d_logits_ = nullptr;
   }
   if (forward_start_)
@@ -612,11 +631,25 @@ NativeKernelExecutor::~NativeKernelExecutor() {
 
 namespace {
 
+bool CheckCudaStatus(cudaError_t status, const std::string &operation) {
+  if (status == cudaSuccess) {
+    return true;
+  }
+  log::Error("native_kernel_executor",
+             operation + " failed: " + cudaGetErrorString(status));
+  return false;
+}
+
 bool CheckBF16Support() {
   int device = 0;
-  cudaGetDevice(&device);
+  if (!CheckCudaStatus(cudaGetDevice(&device), "cudaGetDevice")) {
+    return false;
+  }
   cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, device);
+  if (!CheckCudaStatus(cudaGetDeviceProperties(&prop, device),
+                       "cudaGetDeviceProperties")) {
+    return false;
+  }
   return prop.major >= 8;
 }
 
@@ -751,9 +784,21 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   }
 
   // 7. Allocate device logits buffer (sized for batched decode)
-  cudaError_t err =
-      cudaMalloc(&d_logits_, static_cast<size_t>(max_batch) *
-                                 config.vocab_size * sizeof(float));
+  if (config.vocab_size <= 0) {
+    log::Error("native_kernel_executor",
+               "Invalid vocab_size for logits buffer");
+    return false;
+  }
+  std::size_t logits_elements = 0;
+  std::size_t logits_bytes = 0;
+  if (!CheckedMulSize(static_cast<std::size_t>(max_batch),
+                      static_cast<std::size_t>(config.vocab_size),
+                      &logits_elements) ||
+      !CheckedMulSize(logits_elements, sizeof(float), &logits_bytes)) {
+    log::Error("native_kernel_executor", "Logits buffer size overflow");
+    return false;
+  }
+  cudaError_t err = cudaMalloc(&d_logits_, logits_bytes);
   if (err != cudaSuccess) {
     log::Error("native_kernel_executor", "Failed to allocate logits buffer");
     return false;
@@ -767,20 +812,38 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   }
 
   // 9. Create cudaEvent pairs for forward/sampling timing
-  cudaEventCreate(&forward_start_);
-  cudaEventCreate(&forward_stop_);
-  cudaEventCreate(&sampling_start_);
-  cudaEventCreate(&sampling_stop_);
+  if (!CheckCudaStatus(cudaEventCreate(&forward_start_),
+                       "cudaEventCreate(forward_start_)") ||
+      !CheckCudaStatus(cudaEventCreate(&forward_stop_),
+                       "cudaEventCreate(forward_stop_)") ||
+      !CheckCudaStatus(cudaEventCreate(&sampling_start_),
+                       "cudaEventCreate(sampling_start_)") ||
+      !CheckCudaStatus(cudaEventCreate(&sampling_stop_),
+                       "cudaEventCreate(sampling_stop_)")) {
+    return false;
+  }
 
   // 9.5. Create cudaEvent pairs for phase overlap tracking
-  cudaEventCreate(&prefill_start_event_);
-  cudaEventCreate(&prefill_end_event_);
-  cudaEventCreate(&decode_start_event_);
-  cudaEventCreate(&decode_end_event_);
+  if (!CheckCudaStatus(cudaEventCreate(&prefill_start_event_),
+                       "cudaEventCreate(prefill_start_event_)") ||
+      !CheckCudaStatus(cudaEventCreate(&prefill_end_event_),
+                       "cudaEventCreate(prefill_end_event_)") ||
+      !CheckCudaStatus(cudaEventCreate(&decode_start_event_),
+                       "cudaEventCreate(decode_start_event_)") ||
+      !CheckCudaStatus(cudaEventCreate(&decode_end_event_),
+                       "cudaEventCreate(decode_end_event_)")) {
+    return false;
+  }
 
   // 10. Create lane-specific streams for async overlap
-  cudaStreamCreateWithFlags(&decode_stream_, cudaStreamNonBlocking);
-  cudaStreamCreateWithFlags(&prefill_stream_, cudaStreamNonBlocking);
+  if (!CheckCudaStatus(
+          cudaStreamCreateWithFlags(&decode_stream_, cudaStreamNonBlocking),
+          "cudaStreamCreateWithFlags(decode_stream_)") ||
+      !CheckCudaStatus(
+          cudaStreamCreateWithFlags(&prefill_stream_, cudaStreamNonBlocking),
+          "cudaStreamCreateWithFlags(prefill_stream_)")) {
+    return false;
+  }
 
   log::Info("native_kernel_executor",
             "Native inference pipeline initialized successfully");
@@ -803,7 +866,8 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   overlap_enabled_ = config.cuda_phase_overlap_scaffold;
   min_prefill_tokens_ = config.cuda_phase_overlap_min_prefill_tokens;
   log::Info("native_kernel_executor",
-            "Phase overlap: " + std::string(overlap_enabled_ ? "enabled" : "disabled") +
+            "Phase overlap: " +
+                std::string(overlap_enabled_ ? "enabled" : "disabled") +
                 ", min_prefill_tokens=" + std::to_string(min_prefill_tokens_));
 
   // Initialize CUDA
@@ -934,7 +998,8 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
       decode_indices.empty()) {
     // Fall back to standard execution
     log::Debug("native_kernel_executor",
-               "Skipping overlap: prefill_tokens=" + std::to_string(total_prefill_tokens) +
+               "Skipping overlap: prefill_tokens=" +
+                   std::to_string(total_prefill_tokens) +
                    ", min=" + std::to_string(min_prefill_tokens_) +
                    ", prefill_count=" + std::to_string(prefill_indices.size()) +
                    ", decode_count=" + std::to_string(decode_indices.size()));
@@ -945,11 +1010,16 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
             "Using async overlap for mixed batch (prefill=" +
                 std::to_string(prefill_indices.size()) +
                 ", decode=" + std::to_string(decode_indices.size()) +
-                ", prefill_tokens=" + std::to_string(total_prefill_tokens) + ")");
+                ", prefill_tokens=" + std::to_string(total_prefill_tokens) +
+                ")");
 
   // Record start events on both streams
-  cudaEventRecord(prefill_start_event_, prefill_stream_);
-  cudaEventRecord(decode_start_event_, decode_stream_);
+  if (!CheckCudaStatus(cudaEventRecord(prefill_start_event_, prefill_stream_),
+                       "cudaEventRecord(prefill_start_event_)") ||
+      !CheckCudaStatus(cudaEventRecord(decode_start_event_, decode_stream_),
+                       "cudaEventRecord(decode_start_event_)")) {
+    return outputs;
+  }
 
   // Execute decode on decode_stream_ (concurrently with prefill)
   struct DecodeEntry {
@@ -967,9 +1037,10 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
 
   for (size_t idx : decode_indices) {
     const auto &input = inputs[idx];
-    decode_group.push_back({idx, input.tokens[0], input.n_past, input.sequence_id,
-                            input.sampling.temperature, input.sampling.top_k,
-                            input.sampling.top_p, input.sampling.seed});
+    decode_group.push_back({idx, input.tokens[0], input.n_past,
+                            input.sequence_id, input.sampling.temperature,
+                            input.sampling.top_k, input.sampling.top_p,
+                            input.sampling.seed});
   }
 
   // Switch to decode stream and launch decode kernels
@@ -1034,7 +1105,6 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
     output.ok = false;
     output.token = -1;
 
-    bool is_decode = (input.tokens.size() == 1);
     int batch_tokens = static_cast<int>(input.tokens.size());
 
     // Forward pass on prefill stream (non-blocking)
@@ -1046,38 +1116,52 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
 
     if (input.request_logits) {
       // Sampling on prefill stream (non-blocking)
-      int token_id = sampler_->Sample(d_logits_, input.sampling.temperature,
-                                       input.sampling.top_k, input.sampling.top_p,
-                                       input.sampling.seed);
+      int token_id = sampler_->Sample(
+          d_logits_, input.sampling.temperature, input.sampling.top_k,
+          input.sampling.top_p, input.sampling.seed);
       output.token = token_id;
-      output.piece =
-          tokenizer_ ? tokenizer_->IdToString(token_id) : "";
+      output.piece = tokenizer_ ? tokenizer_->IdToString(token_id) : "";
       perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
     }
 
-    perf_accum_.prompt_tokens.fetch_add(batch_tokens, std::memory_order_relaxed);
+    perf_accum_.prompt_tokens.fetch_add(batch_tokens,
+                                        std::memory_order_relaxed);
     output.ok = true;
   }
 
   // Record end events on both streams
-  cudaEventRecord(prefill_end_event_, prefill_stream_);
-  cudaEventRecord(decode_end_event_, decode_stream_);
+  if (!CheckCudaStatus(cudaEventRecord(prefill_end_event_, prefill_stream_),
+                       "cudaEventRecord(prefill_end_event_)") ||
+      !CheckCudaStatus(cudaEventRecord(decode_end_event_, decode_stream_),
+                       "cudaEventRecord(decode_end_event_)")) {
+    return outputs;
+  }
 
   // Synchronize both streams before returning
-  cudaStreamSynchronize(prefill_stream_);
-  cudaStreamSynchronize(decode_stream_);
+  if (!CheckCudaStatus(cudaStreamSynchronize(prefill_stream_),
+                       "cudaStreamSynchronize(prefill_stream_)") ||
+      !CheckCudaStatus(cudaStreamSynchronize(decode_stream_),
+                       "cudaStreamSynchronize(decode_stream_)")) {
+    return outputs;
+  }
 
   // Calculate overlap duration
   float prefill_ms = 0.0f;
   float decode_ms = 0.0f;
-  cudaEventElapsedTime(&prefill_ms, prefill_start_event_, prefill_end_event_);
-  cudaEventElapsedTime(&decode_ms, decode_start_event_, decode_end_event_);
+  if (!CheckCudaStatus(cudaEventElapsedTime(&prefill_ms, prefill_start_event_,
+                                            prefill_end_event_),
+                       "cudaEventElapsedTime(prefill)") ||
+      !CheckCudaStatus(cudaEventElapsedTime(&decode_ms, decode_start_event_,
+                                            decode_end_event_),
+                       "cudaEventElapsedTime(decode)")) {
+    return outputs;
+  }
 
   // Record metrics
   GlobalMetrics().RecordNativeForwardPass(/*is_decode=*/false,
                                           total_prefill_tokens, prefill_ms);
-  GlobalMetrics().RecordNativeForwardPass(/*is_decode=*/true,
-                                          static_cast<int>(decode_indices.size()), decode_ms);
+  GlobalMetrics().RecordNativeForwardPass(
+      /*is_decode=*/true, static_cast<int>(decode_indices.size()), decode_ms);
   perf_accum_.prefill_ms.store(
       perf_accum_.prefill_ms.load(std::memory_order_relaxed) + prefill_ms,
       std::memory_order_relaxed);
@@ -1094,7 +1178,8 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
     GlobalMetrics().RecordCudaLaneOverlap(overlap_ms);
     log::Info("native_kernel_executor",
               "Phase overlap: " + std::to_string(overlap_ms) + "ms saved (" +
-                  std::to_string(static_cast<int>(100.0 * overlap_ms / total_sequential_ms)) +
+                  std::to_string(static_cast<int>(100.0 * overlap_ms /
+                                                  total_sequential_ms)) +
                   "% reduction)");
   }
 
@@ -1181,13 +1266,36 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
     }
 
     // Batched forward pass
-    cudaEventRecord(forward_start_, compute_stream_);
+    if (!CheckCudaStatus(cudaEventRecord(forward_start_, compute_stream_),
+                         "cudaEventRecord(forward_start_,decode_batch)")) {
+      for (const auto &de : decode_group) {
+        outputs[de.input_idx].ok = false;
+        outputs[de.input_idx].token = -1;
+      }
+      return outputs;
+    }
     bool fwd_ok = model_forward_->BatchForward(batch_tokens, batch_n_past,
                                                batch_seq_ids, d_logits_, B);
-    cudaEventRecord(forward_stop_, compute_stream_);
-    cudaEventSynchronize(forward_stop_);
+    if (!CheckCudaStatus(cudaEventRecord(forward_stop_, compute_stream_),
+                         "cudaEventRecord(forward_stop_,decode_batch)") ||
+        !CheckCudaStatus(cudaEventSynchronize(forward_stop_),
+                         "cudaEventSynchronize(forward_stop_,decode_batch)")) {
+      for (const auto &de : decode_group) {
+        outputs[de.input_idx].ok = false;
+        outputs[de.input_idx].token = -1;
+      }
+      return outputs;
+    }
     float fwd_ms = 0.0f;
-    cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_);
+    if (!CheckCudaStatus(
+            cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
+            "cudaEventElapsedTime(forward,decode_batch)")) {
+      for (const auto &de : decode_group) {
+        outputs[de.input_idx].ok = false;
+        outputs[de.input_idx].token = -1;
+      }
+      return outputs;
+    }
     GlobalMetrics().RecordNativeForwardPass(/*is_decode=*/true, B, fwd_ms);
     perf_accum_.decode_ms.store(
         perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
@@ -1201,14 +1309,38 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       }
     } else {
       // Batched sampling
-      cudaEventRecord(sampling_start_, compute_stream_);
+      if (!CheckCudaStatus(cudaEventRecord(sampling_start_, compute_stream_),
+                           "cudaEventRecord(sampling_start_,decode_batch)")) {
+        for (const auto &de : decode_group) {
+          outputs[de.input_idx].ok = false;
+          outputs[de.input_idx].token = -1;
+        }
+        return outputs;
+      }
       std::vector<int> sampled_tokens;
       sampler_->SampleBatch(d_logits_, B, batch_temps, batch_top_ks,
                             batch_top_ps, &sampled_tokens);
-      cudaEventRecord(sampling_stop_, compute_stream_);
-      cudaEventSynchronize(sampling_stop_);
+      if (!CheckCudaStatus(cudaEventRecord(sampling_stop_, compute_stream_),
+                           "cudaEventRecord(sampling_stop_,decode_batch)") ||
+          !CheckCudaStatus(
+              cudaEventSynchronize(sampling_stop_),
+              "cudaEventSynchronize(sampling_stop_,decode_batch)")) {
+        for (const auto &de : decode_group) {
+          outputs[de.input_idx].ok = false;
+          outputs[de.input_idx].token = -1;
+        }
+        return outputs;
+      }
       float samp_ms = 0.0f;
-      cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_);
+      if (!CheckCudaStatus(
+              cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_),
+              "cudaEventElapsedTime(sampling,decode_batch)")) {
+        for (const auto &de : decode_group) {
+          outputs[de.input_idx].ok = false;
+          outputs[de.input_idx].token = -1;
+        }
+        return outputs;
+      }
       GlobalMetrics().RecordNativeSampling(B, samp_ms);
 
       // Fill outputs
@@ -1241,15 +1373,29 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
 
     if (!input.request_logits) {
       NVTX_SCOPE("ForwardPass");
-      cudaEventRecord(forward_start_, compute_stream_);
+      if (!CheckCudaStatus(
+              cudaEventRecord(forward_start_, compute_stream_),
+              "cudaEventRecord(forward_start_,prefill_no_logits)")) {
+        continue;
+      }
       if (!model_forward_->Forward(input.tokens, input.n_past,
                                    input.sequence_id, d_logits_)) {
         log::Error("native_kernel_executor", "Forward pass failed");
       }
-      cudaEventRecord(forward_stop_, compute_stream_);
-      cudaEventSynchronize(forward_stop_);
+      if (!CheckCudaStatus(
+              cudaEventRecord(forward_stop_, compute_stream_),
+              "cudaEventRecord(forward_stop_,prefill_no_logits)") ||
+          !CheckCudaStatus(
+              cudaEventSynchronize(forward_stop_),
+              "cudaEventSynchronize(forward_stop_,prefill_no_logits)")) {
+        continue;
+      }
       float fwd_ms = 0.0f;
-      cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_);
+      if (!CheckCudaStatus(
+              cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
+              "cudaEventElapsedTime(forward,prefill_no_logits)")) {
+        continue;
+      }
       GlobalMetrics().RecordNativeForwardPass(is_decode, batch_tokens, fwd_ms);
       perf_accum_.prefill_ms.store(
           perf_accum_.prefill_ms.load(std::memory_order_relaxed) + fwd_ms,
@@ -1263,16 +1409,28 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
     // Forward pass
     {
       NVTX_SCOPE("ForwardPass");
-      cudaEventRecord(forward_start_, compute_stream_);
+      if (!CheckCudaStatus(cudaEventRecord(forward_start_, compute_stream_),
+                           "cudaEventRecord(forward_start_,prefill_logits)")) {
+        continue;
+      }
       if (!model_forward_->Forward(input.tokens, input.n_past,
                                    input.sequence_id, d_logits_)) {
         log::Error("native_kernel_executor", "Forward pass failed");
         continue;
       }
-      cudaEventRecord(forward_stop_, compute_stream_);
-      cudaEventSynchronize(forward_stop_);
+      if (!CheckCudaStatus(cudaEventRecord(forward_stop_, compute_stream_),
+                           "cudaEventRecord(forward_stop_,prefill_logits)") ||
+          !CheckCudaStatus(
+              cudaEventSynchronize(forward_stop_),
+              "cudaEventSynchronize(forward_stop_,prefill_logits)")) {
+        continue;
+      }
       float fwd_ms = 0.0f;
-      cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_);
+      if (!CheckCudaStatus(
+              cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
+              "cudaEventElapsedTime(forward,prefill_logits)")) {
+        continue;
+      }
       GlobalMetrics().RecordNativeForwardPass(is_decode, batch_tokens, fwd_ms);
       if (is_decode) {
         perf_accum_.decode_ms.store(
@@ -1290,14 +1448,26 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
     // Sample
     {
       NVTX_SCOPE("Sampling");
-      cudaEventRecord(sampling_start_, compute_stream_);
+      if (!CheckCudaStatus(cudaEventRecord(sampling_start_, compute_stream_),
+                           "cudaEventRecord(sampling_start_,prefill_logits)")) {
+        continue;
+      }
       int token_id = sampler_->Sample(
           d_logits_, input.sampling.temperature, input.sampling.top_k,
           input.sampling.top_p, input.sampling.seed);
-      cudaEventRecord(sampling_stop_, compute_stream_);
-      cudaEventSynchronize(sampling_stop_);
+      if (!CheckCudaStatus(cudaEventRecord(sampling_stop_, compute_stream_),
+                           "cudaEventRecord(sampling_stop_,prefill_logits)") ||
+          !CheckCudaStatus(
+              cudaEventSynchronize(sampling_stop_),
+              "cudaEventSynchronize(sampling_stop_,prefill_logits)")) {
+        continue;
+      }
       float samp_ms = 0.0f;
-      cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_);
+      if (!CheckCudaStatus(
+              cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_),
+              "cudaEventElapsedTime(sampling,prefill_logits)")) {
+        continue;
+      }
       GlobalMetrics().RecordNativeSampling(1, samp_ms);
 
       if (tokenizer_ && token_id == tokenizer_->EosTokenId()) {
@@ -1352,8 +1522,15 @@ UnifiedBatchHandle NativeKernelExecutor::SubmitUnifiedBatchAsync(
 
   // Record completion event
   cudaEvent_t event;
-  cudaEventCreate(&event);
-  cudaEventRecord(event, target_stream);
+  if (!CheckCudaStatus(cudaEventCreate(&event),
+                       "cudaEventCreate(async_completion_event)")) {
+    return 0;
+  }
+  if (!CheckCudaStatus(cudaEventRecord(event, target_stream),
+                       "cudaEventRecord(async_completion_event)")) {
+    cudaEventDestroy(event);
+    return 0;
+  }
 
   UnifiedBatchHandle handle = next_handle_.fetch_add(1);
   {
@@ -1382,13 +1559,25 @@ bool NativeKernelExecutor::TryCollectUnifiedBatchAsync(
   if (status == cudaErrorNotReady) {
     return false;
   }
+  if (status != cudaSuccess) {
+    log::Error("native_kernel_executor",
+               "cudaEventQuery(async_completion_event) failed: " +
+                   std::string(cudaGetErrorString(status)));
+    cudaEventDestroy(it->second.completion_event);
+    async_batches_.erase(it);
+    return false;
+  }
 
   // Completed
   if (outputs) {
     *outputs = std::move(it->second.outputs);
   }
   GlobalMetrics().RecordCudaLaneCompletion(it->second.is_decode);
-  cudaEventDestroy(it->second.completion_event);
+  if (!CheckCudaStatus(cudaEventDestroy(it->second.completion_event),
+                       "cudaEventDestroy(async_completion_event)")) {
+    async_batches_.erase(it);
+    return false;
+  }
   async_batches_.erase(it);
   return true;
 #else
@@ -1402,10 +1591,11 @@ bool NativeKernelExecutor::RunNativeInference(
     const std::vector<UnifiedBatchInput> &inputs,
     std::vector<UnifiedBatchOutput> *outputs) {
   auto results = ExecuteUnifiedBatch(inputs);
+  const bool has_results = !results.empty();
   if (outputs) {
     *outputs = std::move(results);
   }
-  return !results.empty();
+  return has_results;
 }
 
 #else // !INFERFLUX_HAS_CUDA

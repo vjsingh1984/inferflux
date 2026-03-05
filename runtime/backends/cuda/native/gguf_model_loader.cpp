@@ -1,12 +1,46 @@
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
 #include "server/logging/logger.h"
+#include <climits>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace inferflux {
 namespace runtime {
 namespace cuda {
 namespace native {
+namespace {
+
+constexpr std::size_t kMiB = 1024ULL * 1024ULL;
+
+bool SizeToLong(std::size_t value, long *out) {
+  if (!out) {
+    return false;
+  }
+  if (value > static_cast<std::size_t>(LONG_MAX)) {
+    return false;
+  }
+  *out = static_cast<long>(value);
+  return true;
+}
+
+int SaturatingToInt(std::size_t value) {
+  if (value > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return std::numeric_limits<int>::max();
+  }
+  return static_cast<int>(value);
+}
+
+bool CheckCudaStatus(cudaError_t status, const char *component,
+                     const std::string &operation) {
+  if (status == cudaSuccess) {
+    return true;
+  }
+  log::Error(component, operation + " failed: " + cudaGetErrorString(status));
+  return false;
+}
+
+} // namespace
 
 //==============================================================================
 // GGUFTensorData Implementation
@@ -82,12 +116,22 @@ half *GGUFWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
   }
 
   // Allocate dequantized buffer
-  half *d_dequantized;
-  cudaMalloc(reinterpret_cast<void **>(&d_dequantized), num_elements * sizeof(half));
+  half *d_dequantized = nullptr;
+  if (!CheckCudaStatus(cudaMalloc(reinterpret_cast<void **>(&d_dequantized),
+                                  num_elements * sizeof(half)),
+                       "gguf_weight_accessor",
+                       "cudaMalloc(dequantized buffer)")) {
+    return nullptr;
+  }
 
   // Dequantize
   handler->DequantizeGpuToGpu(tensor_->gpu_data, d_dequantized, num_elements,
                               stream);
+  if (!CheckCudaStatus(cudaGetLastError(), "gguf_weight_accessor",
+                       "DequantizeGpuToGpu launch")) {
+    cudaFree(d_dequantized);
+    return nullptr;
+  }
 
   // Cache result
   tensor_->dequantized_gpu = d_dequantized;
@@ -109,9 +153,7 @@ bool GGUFWeightAccessor::IsDequantizedCached() const {
 
 GGUFModelLoader::GGUFModelLoader() = default;
 
-GGUFModelLoader::~GGUFModelLoader() {
-  FreeGPUMemory();
-}
+GGUFModelLoader::~GGUFModelLoader() { FreeGPUMemoryImpl(); }
 
 bool GGUFModelLoader::Load(const std::filesystem::path &model_path) {
   model_path_ = model_path;
@@ -162,7 +204,9 @@ bool GGUFModelLoader::Load(const std::filesystem::path &model_path) {
   // Detect quantization
   for (const auto &[name, tensor] : tensors_) {
     if (tensor.info.is_quantized()) {
-      quantization_type_ = ::inferflux::runtime::cuda::native::GetQuantizationType(tensor.info.type);
+      quantization_type_ =
+          ::inferflux::runtime::cuda::native::GetQuantizationType(
+              tensor.info.type);
       if (!quantization_type_.empty()) {
         break;
       }
@@ -170,8 +214,8 @@ bool GGUFModelLoader::Load(const std::filesystem::path &model_path) {
   }
 
   log::Info("gguf_loader",
-            "Model loaded: " + model_type_ + " tensors=" +
-                std::to_string(tensors_.size()) +
+            "Model loaded: " + model_type_ +
+                " tensors=" + std::to_string(tensors_.size()) +
                 " quantization=" + quantization_type_ +
                 " layers=" + std::to_string(model_info_.num_hidden_layers));
 
@@ -199,7 +243,7 @@ bool GGUFModelLoader::ParseHeader(FILE *file) {
 
 bool GGUFModelLoader::ParseKeyValuePairs(FILE *file) {
   log::Debug("gguf_loader", "Parsing " + std::to_string(header_.kv_count) +
-                               " key-value pairs");
+                                " key-value pairs");
 
   for (uint32_t i = 0; i < header_.kv_count; ++i) {
     std::string key;
@@ -236,7 +280,7 @@ bool GGUFModelLoader::ParseKeyValuePairs(FILE *file) {
 
 bool GGUFModelLoader::ParseTensorInfo(FILE *file) {
   log::Debug("gguf_loader", "Parsing " + std::to_string(header_.tensor_count) +
-                               " tensor info entries");
+                                " tensor info entries");
 
   for (uint32_t i = 0; i < header_.tensor_count; ++i) {
     GGUFTensorData tensor;
@@ -295,7 +339,12 @@ bool GGUFModelLoader::LoadTensorData(FILE *file) {
 
   for (auto &[name, tensor] : tensors_) {
     // Seek to tensor data
-    if (fseek(file, tensor.info.offset, SEEK_SET) != 0) {
+    long seek_offset = 0;
+    if (!SizeToLong(tensor.info.offset, &seek_offset)) {
+      log::Error("gguf_loader", "Tensor offset exceeds seek range: " + name);
+      return false;
+    }
+    if (fseek(file, seek_offset, SEEK_SET) != 0) {
       log::Error("gguf_loader", "Failed to seek to tensor: " + name);
       return false;
     }
@@ -316,9 +365,9 @@ bool GGUFModelLoader::LoadTensorData(FILE *file) {
     total_size += tensor.info.byte_size;
   }
 
-  log::Info("gguf_loader",
-            "Loaded " + std::to_string(tensors_.size()) + " tensors, " +
-                std::to_string(total_size / (1024 * 1024)) + " MB");
+  log::Info("gguf_loader", "Loaded " + std::to_string(tensors_.size()) +
+                               " tensors, " +
+                               std::to_string(total_size / kMiB) + " MB");
 
   return true;
 }
@@ -347,7 +396,8 @@ bool GGUFModelLoader::ExtractModelInfo() {
   }
   if (tok_emb_it != tensors_.end()) {
     if (tok_emb_it->second.info.shape.size() >= 1) {
-      model_info_.vocab_size = tok_emb_it->second.info.shape[0];
+      model_info_.vocab_size =
+          SaturatingToInt(tok_emb_it->second.info.shape[0]);
     }
   }
 
@@ -355,8 +405,8 @@ bool GGUFModelLoader::ExtractModelInfo() {
   for (const auto &[name, tensor] : tensors_) {
     if (name.find("attn_q.weight") != std::string::npos ||
         name.find("attn_q.bias") != std::string::npos) {
-      if (tensor.info.shape.size() >= 1) {
-        model_info_.hidden_size = tensor.info.shape[1];
+      if (tensor.info.shape.size() >= 2) {
+        model_info_.hidden_size = SaturatingToInt(tensor.info.shape[1]);
         break;
       }
     }
@@ -387,27 +437,41 @@ bool GGUFModelLoader::UploadToGPU(cudaStream_t stream) {
   quantized_buffer_size_ = CalcGPUBufferSize();
 
   // Allocate unified buffer
-  cudaMalloc(&d_quantized_buffer_, quantized_buffer_size_);
+  if (!CheckCudaStatus(cudaMalloc(&d_quantized_buffer_, quantized_buffer_size_),
+                       "gguf_loader", "cudaMalloc(quantized buffer)")) {
+    d_quantized_buffer_ = nullptr;
+    return false;
+  }
 
   // Copy quantized weights
   size_t offset = 0;
   uint8_t *buffer_base = static_cast<uint8_t *>(d_quantized_buffer_);
   for (auto &[name, tensor] : tensors_) {
     size_t size = tensor.cpu_data.size();
-    cudaMemcpyAsync(buffer_base + offset, tensor.cpu_data.data(), size,
-                    cudaMemcpyHostToDevice, stream);
+    if (!CheckCudaStatus(cudaMemcpyAsync(buffer_base + offset,
+                                         tensor.cpu_data.data(), size,
+                                         cudaMemcpyHostToDevice, stream),
+                         "gguf_loader", "cudaMemcpyAsync(" + name + ")")) {
+      cudaFree(d_quantized_buffer_);
+      d_quantized_buffer_ = nullptr;
+      return false;
+    }
 
     tensor.gpu_data = buffer_base + offset;
     tensor.gpu_offset = offset;
     offset += size;
   }
 
-  cudaStreamSynchronize(stream);
+  if (!CheckCudaStatus(cudaStreamSynchronize(stream), "gguf_loader",
+                       "cudaStreamSynchronize(upload)")) {
+    cudaFree(d_quantized_buffer_);
+    d_quantized_buffer_ = nullptr;
+    return false;
+  }
 
-  log::Info("gguf_loader",
-            "Upload complete: " +
-                std::to_string(quantized_buffer_size_ / (1024 * 1024)) +
-                " MB");
+  log::Info("gguf_loader", "Upload complete: " +
+                               std::to_string(quantized_buffer_size_ / kMiB) +
+                               " MB");
 
   // Free CPU memory
   FreeCPUMemory();
@@ -421,18 +485,23 @@ void GGUFModelLoader::FreeCPUMemory() {
   }
 }
 
-void GGUFModelLoader::FreeGPUMemory() {
+void GGUFModelLoader::FreeGPUMemory() { FreeGPUMemoryImpl(); }
+
+void GGUFModelLoader::FreeGPUMemoryImpl() {
   if (d_quantized_buffer_) {
-    cudaFree(d_quantized_buffer_);
+    CheckCudaStatus(cudaFree(d_quantized_buffer_), "gguf_loader",
+                    "cudaFree(quantized buffer)");
     d_quantized_buffer_ = nullptr;
   }
   if (d_dequantized_buffer_) {
-    cudaFree(d_dequantized_buffer_);
+    CheckCudaStatus(cudaFree(d_dequantized_buffer_), "gguf_loader",
+                    "cudaFree(dequantized buffer)");
     d_dequantized_buffer_ = nullptr;
   }
   for (auto &[name, tensor] : tensors_) {
     if (tensor.dequantized_gpu) {
-      cudaFree(tensor.dequantized_gpu);
+      CheckCudaStatus(cudaFree(tensor.dequantized_gpu), "gguf_loader",
+                      "cudaFree(tensor.dequantized_gpu:" + name + ")");
       tensor.dequantized_gpu = nullptr;
     }
   }
@@ -446,7 +515,9 @@ const ModelInfo &GGUFModelLoader::GetModelInfo() const { return model_info_; }
 
 std::string GGUFModelLoader::GetFormat() const { return "gguf"; }
 
-bool GGUFModelLoader::IsQuantized() const { return !quantization_type_.empty(); }
+bool GGUFModelLoader::IsQuantized() const {
+  return !quantization_type_.empty();
+}
 
 std::string GGUFModelLoader::GetQuantizationType() const {
   return quantization_type_;

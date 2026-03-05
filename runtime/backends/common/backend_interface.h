@@ -66,6 +66,8 @@ public:
   virtual UnifiedBatchHandle
   SubmitUnifiedBatchAsync(const std::vector<UnifiedBatchInput> &inputs,
                           UnifiedBatchLane lane = UnifiedBatchLane::kAuto) {
+    (void)inputs;
+    (void)lane;
     return 0; // Default: not supported
   }
 
@@ -77,6 +79,8 @@ public:
   virtual bool
   TryCollectUnifiedBatchAsync(UnifiedBatchHandle handle,
                               std::vector<UnifiedBatchOutput> *outputs) {
+    (void)handle;
+    (void)outputs;
     return false; // Default: not supported
   }
 

@@ -3,15 +3,60 @@
 #include "server/logging/logger.h"
 
 #include <cstring>
+#include <limits>
 
 namespace inferflux {
+namespace {
 
-QuantizedForward::~QuantizedForward() { FreeScratchBuffers(); }
+bool CheckedMul(std::size_t a, std::size_t b, std::size_t *out) {
+  if (!out) {
+    return false;
+  }
+  if (a != 0U && b > (std::numeric_limits<std::size_t>::max() / a)) {
+    return false;
+  }
+  *out = a * b;
+  return true;
+}
+
+bool CheckedBytesForCount(int count, std::size_t element_size,
+                          std::size_t *out) {
+  if (count < 0) {
+    return false;
+  }
+  return CheckedMul(static_cast<std::size_t>(count), element_size, out);
+}
+
+bool CheckedBytesForProduct(int a, int b, std::size_t element_size,
+                            std::size_t *out) {
+  if (a < 0 || b < 0) {
+    return false;
+  }
+  std::size_t elements = 0;
+  if (!CheckedMul(static_cast<std::size_t>(a), static_cast<std::size_t>(b),
+                  &elements)) {
+    return false;
+  }
+  return CheckedMul(elements, element_size, out);
+}
+
+bool CheckCudaStatus(cudaError_t status, const std::string &operation) {
+  if (status == cudaSuccess) {
+    return true;
+  }
+  log::Error("quantized_forward",
+             operation + " failed: " + cudaGetErrorString(status));
+  return false;
+}
+
+} // namespace
+
+QuantizedForward::~QuantizedForward() { FreeScratchBuffersImpl(); }
 
 bool QuantizedForward::Initialize(const ModelInfo &config,
-                                   QuantizedWeightMap *weights,
-                                   IKvCacheGpu *kv_cache, CublasGemm *gemm,
-                                   cudaStream_t stream) {
+                                  QuantizedWeightMap *weights,
+                                  IKvCacheGpu *kv_cache, CublasGemm *gemm,
+                                  cudaStream_t stream) {
   if (!weights || !kv_cache || !gemm) {
     log::Error("quantized_forward", "Null dependency");
     return false;
@@ -33,6 +78,13 @@ bool QuantizedForward::Initialize(const ModelInfo &config,
   rms_norm_eps_ = config.rms_norm_eps;
   model_type_ = config.model_type;
 
+  if (hidden_size_ <= 0 || num_layers_ <= 0 || num_heads_ <= 0 ||
+      num_kv_heads_ <= 0 || intermediate_size_ <= 0 || vocab_size_ <= 0 ||
+      max_seq_len_ <= 0) {
+    log::Error("quantized_forward", "Invalid model dimensions in config");
+    return false;
+  }
+
   // Store references
   weights_ = weights;
   kv_cache_ = kv_cache;
@@ -44,7 +96,8 @@ bool QuantizedForward::Initialize(const ModelInfo &config,
   quantization_type_ = weights->GetQuantizationType();
 
   log::Info("quantized_forward",
-            "Initializing: " + model_type_ + " layers=" + std::to_string(num_layers_) +
+            "Initializing: " + model_type_ +
+                " layers=" + std::to_string(num_layers_) +
                 " hidden=" + std::to_string(hidden_size_) +
                 " quantized=" + (is_quantized_ ? quantization_type_ : "false"));
 
@@ -59,8 +112,9 @@ bool QuantizedForward::Initialize(const ModelInfo &config,
 
 // Compatibility shim for ModelForward interface
 bool QuantizedForward::Initialize(const SafetensorsLoader::ModelConfig &config,
-                                   const WeightMap &weights, IKvCacheGpu *kv_cache,
-                                   CublasGemm *gemm, cudaStream_t stream) {
+                                  const WeightMap &weights,
+                                  IKvCacheGpu *kv_cache, CublasGemm *gemm,
+                                  cudaStream_t stream) {
   // This should not be called for quantized models
   log::Warn("quantized_forward",
             "Initialize() called with non-quantized types - not supported");
@@ -68,22 +122,24 @@ bool QuantizedForward::Initialize(const SafetensorsLoader::ModelConfig &config,
 }
 
 bool QuantizedForward::Forward(const std::vector<int> &token_ids, int n_past,
-                                int sequence_id, float *d_logits) {
+                               int sequence_id, float *d_logits) {
   NVTX_SCOPE("QuantizedForward::Forward");
 
   return RunForwardPass(token_ids, n_past, sequence_id, d_logits);
 }
 
 bool QuantizedForward::BatchForward(const std::vector<int> &token_ids,
-                                     const std::vector<int> &n_past,
-                                     const std::vector<int> &sequence_ids,
-                                     float *d_logits, int batch_size) {
+                                    const std::vector<int> &n_past,
+                                    const std::vector<int> &sequence_ids,
+                                    float *d_logits, int batch_size) {
   // For now, fall back to sequential calls
   // TODO: Implement true batched forward for quantized models
   for (int i = 0; i < batch_size; ++i) {
     std::vector<int> single_token = {token_ids[i]};
+    const std::size_t logits_offset =
+        static_cast<std::size_t>(i) * static_cast<std::size_t>(vocab_size_);
     if (!Forward(single_token, n_past[i], sequence_ids[i],
-                 d_logits + i * vocab_size_)) {
+                 d_logits + logits_offset)) {
       return false;
     }
   }
@@ -97,13 +153,19 @@ void QuantizedForward::SetStream(cudaStream_t stream) {
   }
 }
 
-void QuantizedForward::FreeScratchBuffers() {
-#define CUDA_FREE(ptr)                                                             \
-  do {                                                                               \
-    if (ptr) {                                                                      \
-      cudaFree(ptr);                                                                \
-      ptr = nullptr;                                                                \
-    }                                                                                \
+void QuantizedForward::FreeScratchBuffers() { FreeScratchBuffersImpl(); }
+
+void QuantizedForward::FreeScratchBuffersImpl() {
+#define CUDA_FREE(ptr)                                                         \
+  do {                                                                         \
+    if (ptr) {                                                                 \
+      if (!CheckCudaStatus(cudaFree(ptr),                                      \
+                           std::string("cudaFree(" #ptr ")"))) {               \
+        log::Warn("quantized_forward",                                         \
+                  "Continuing cleanup after cudaFree failure for " #ptr);      \
+      }                                                                        \
+      ptr = nullptr;                                                           \
+    }                                                                          \
   } while (0)
 
   CUDA_FREE(d_hidden_);
@@ -122,31 +184,48 @@ void QuantizedForward::FreeScratchBuffers() {
 }
 
 bool QuantizedForward::AllocateScratch() {
-  size_t hidden_bytes = hidden_size_ * sizeof(half);
-  size_t intermediate_bytes = intermediate_size_ * sizeof(half);
+  std::size_t hidden_bytes = 0;
+  std::size_t intermediate_bytes = 0;
+  std::size_t q_bytes = 0;
+  std::size_t kv_bytes = 0;
+  std::size_t token_ids_bytes = 0;
 
-#define CUDA_ALLOC(ptr, size)                                                        \
-  do {                                                                               \
-    cudaError_t err = cudaMalloc(&ptr, size);                                       \
-    if (err != cudaSuccess) {                                                       \
-      log::Error("quantized_forward",                                               \
-                 "Failed to allocate " #ptr ": " +                                  \
-                     std::string(cudaGetErrorString(err)));                        \
-      return false;                                                                 \
-    }                                                                                \
+  if (!CheckedBytesForCount(hidden_size_, sizeof(half), &hidden_bytes) ||
+      !CheckedBytesForCount(intermediate_size_, sizeof(half),
+                            &intermediate_bytes) ||
+      !CheckedBytesForProduct(hidden_size_, num_heads_, sizeof(half),
+                              &q_bytes) ||
+      !CheckedBytesForProduct(hidden_size_, num_kv_heads_, sizeof(half),
+                              &kv_bytes) ||
+      !CheckedBytesForCount(max_seq_len_, sizeof(int), &token_ids_bytes)) {
+    log::Error("quantized_forward",
+               "Scratch buffer size overflow or invalid dimensions");
+    return false;
+  }
+
+#define CUDA_ALLOC(ptr, size)                                                  \
+  do {                                                                         \
+    cudaError_t err = cudaMalloc(&ptr, size);                                  \
+    if (err != cudaSuccess) {                                                  \
+      log::Error("quantized_forward",                                          \
+                 "Failed to allocate " #ptr ": " +                             \
+                     std::string(cudaGetErrorString(err)));                    \
+      FreeScratchBuffersImpl();                                                \
+      return false;                                                            \
+    }                                                                          \
   } while (0)
 
   CUDA_ALLOC(d_hidden_, hidden_bytes);
   CUDA_ALLOC(d_residual_, hidden_bytes);
   CUDA_ALLOC(d_norm_out_, hidden_bytes);
-  CUDA_ALLOC(d_q_, hidden_size_ * num_heads_ * sizeof(half));
-  CUDA_ALLOC(d_k_new_, hidden_size_ * num_kv_heads_ * sizeof(half));
-  CUDA_ALLOC(d_v_new_, hidden_size_ * num_kv_heads_ * sizeof(half));
+  CUDA_ALLOC(d_q_, q_bytes);
+  CUDA_ALLOC(d_k_new_, kv_bytes);
+  CUDA_ALLOC(d_v_new_, kv_bytes);
   CUDA_ALLOC(d_attn_out_, hidden_bytes);
   CUDA_ALLOC(d_ffn_gate_, intermediate_bytes);
   CUDA_ALLOC(d_ffn_up_, intermediate_bytes);
   CUDA_ALLOC(d_ffn_down_, hidden_bytes);
-  CUDA_ALLOC(d_token_ids_, max_seq_len_ * sizeof(int));
+  CUDA_ALLOC(d_token_ids_, token_ids_bytes);
 
 #undef CUDA_ALLOC
 
@@ -162,11 +241,24 @@ bool QuantizedForward::RunForwardPass(const std::vector<int> &token_ids,
     return false;
   }
 
-  int num_tokens = token_ids.size();
+  if (token_ids.size() >
+      static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    log::Error("quantized_forward", "token_ids size exceeds int range");
+    return false;
+  }
+  std::size_t token_copy_bytes = 0;
+  if (!CheckedMul(token_ids.size(), sizeof(int), &token_copy_bytes)) {
+    log::Error("quantized_forward", "token_ids byte-size overflow");
+    return false;
+  }
 
   // Copy token IDs to GPU
-  cudaMemcpyAsync(d_token_ids_, token_ids.data(), num_tokens * sizeof(int),
-                  cudaMemcpyHostToDevice, stream_);
+  if (!CheckCudaStatus(cudaMemcpyAsync(d_token_ids_, token_ids.data(),
+                                       token_copy_bytes, cudaMemcpyHostToDevice,
+                                       stream_),
+                       "cudaMemcpyAsync(token_ids)")) {
+    return false;
+  }
 
   // Embed tokens
   const half *embed_weights = weights_->EmbedTokens();
@@ -230,15 +322,16 @@ bool QuantizedForward::RunForwardPass(const std::vector<int> &token_ids,
   return true;
 }
 
-bool QuantizedForward::ComputeAttention(int layer, int n_past, int sequence_id) {
+bool QuantizedForward::ComputeAttention(int layer, int n_past,
+                                        int sequence_id) {
   const half *q_proj = weights_->LayerQProj(layer);
   const half *k_proj = weights_->LayerKProj(layer);
   const half *v_proj = weights_->LayerVProj(layer);
   const half *o_proj = weights_->LayerOProj(layer);
 
   if (!q_proj || !k_proj || !v_proj || !o_proj) {
-    log::Error("quantized_forward", "Missing attention weights for layer " +
-                                         std::to_string(layer));
+    log::Error("quantized_forward",
+               "Missing attention weights for layer " + std::to_string(layer));
     return false;
   }
 
@@ -268,8 +361,8 @@ bool QuantizedForward::ComputeFFN(int layer) {
   const half *down_proj = weights_->LayerDownProj(layer);
 
   if (!gate_proj || !up_proj || !down_proj) {
-    log::Error("quantized_forward", "Missing FFN weights for layer " +
-                                         std::to_string(layer));
+    log::Error("quantized_forward",
+               "Missing FFN weights for layer " + std::to_string(layer));
     return false;
   }
 
