@@ -1,7 +1,7 @@
 # InferFlux Roadmap
 
 **Snapshot date:** March 5, 2026  
-**Current overall grade:** C+ (revalidated March 5, 2026 after commit-history + gate reruns)  
+**Current overall grade:** C+ (revalidated March 5, 2026 after commit-history refresh + regression reruns)  
 **Target overall grade:** B- (2026), B (2027)
 
 ## 1) One-Screen Plan
@@ -27,8 +27,8 @@ flowchart LR
 
 | Dimension | Current | Target | Primary Blocker | Primary Issues |
 |---|---|---|---|---|
-| Throughput | C+ | B | Native CUDA kernels + overlap/FA maturity still below target | [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#4](https://github.com/vjsingh1984/inferflux/issues/4), [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
-| Continuous batching | C- | B | No full GPU iteration scheduler yet | [#3](https://github.com/vjsingh1984/inferflux/issues/3) |
+| Throughput | C+ | B | Native CUDA lanes/overlap still inactive in default `backend=cuda` despite request-layer concurrency mitigation | [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#4](https://github.com/vjsingh1984/inferflux/issues/4), [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
+| Continuous batching | C | B | HTTP worker bottleneck was reduced (4→16), but no full GPU iteration scheduler yet | [#3](https://github.com/vjsingh1984/inferflux/issues/3) |
 | Resource economy | B- | B | Memory-pressure telemetry export and autoscaling SLO set remain partial | [#9](https://github.com/vjsingh1984/inferflux/issues/9) |
 | CI/TDD enforcement | B+ | A- | GPU behavior lane remains conditional on self-hosted availability | [#5](https://github.com/vjsingh1984/inferflux/issues/5), [#10](https://github.com/vjsingh1984/inferflux/issues/10) |
 | Distributed runtime | C- | C+ | Failure-path/fault-matrix coverage still incomplete | [#11](https://github.com/vjsingh1984/inferflux/issues/11) |
@@ -39,19 +39,23 @@ flowchart LR
 
 | Check | Result | Grade impact |
 |---|---|---|
-| Focused contract smoke (`ModelIdentity`, `EmbeddingsRouting`, CLI/admin contracts, throughput contract suites) | 8/8 pass | Raised confidence in capability identity and CI/TDD dimensions |
-| Startup/slot coverage (`StartupAdvisorTests`, `SequenceSlotManagerTests`) | 2/2 pass | Confirms recent memory-pressure handling and advisor behavior landed with regression coverage |
+| Contract + native-regression suites (`NativeForward`, `NativeBatch`, `GGUF`, `Quantization`, `ModelIdentity`, `EmbeddingsRouting`, integration contract checks, native metrics) | 12/12 pass | Raised confidence in capability identity and CI/TDD dimensions while hardening native runtime paths |
+| Startup/policy safety coverage (`StartupAdvisor`, `policy`) | 2/2 pass | Confirms memory-pressure handling and policy persistence safety landed with regression coverage |
+| HTTP worker pool default (`a18ca46`) | 4→16 workers in `server/main.cpp` | Mitigates non-streaming queue saturation at request layer; does not close kernel-level throughput gap |
 | CUDA throughput gate (`gpu_profile=ada_rtx_4000`, `--require-cuda-lanes`) | Failed (`137.33` completion tok/s; lane + overlap + mixed-iteration counters stayed `0`; fallback=`true`; provider=`universal`) | Keeps throughput + continuous batching below target and confirms native CUDA path is still inactive in default `backend=cuda` flow |
 | CUDA throughput gate (relaxed lane requirement) | Passed (`265.675` completion tok/s, `1.0` success rate, fallback=`true`, provider=`universal`) | Confirms stable universal baseline while native CUDA path remains incomplete |
-| Canonical docs contract (`scripts/check_docs_contract.py`) | Passed after consolidation/index refresh | Raises confidence in OSS docs/operator clarity dimension |
+| Focused static-analysis tranche (`bugprone-empty-catch`, `narrowing`, `implicit-widening`) across runtime/http/policy hot paths | Clean on targeted files | Improves implementation quality and lowers latent runtime-failure risk |
+| Canonical docs contract (`scripts/check_docs_contract.py`) | Passed | Raises confidence in OSS docs/operator clarity dimension |
 
 ## 2.2) Latest Commit-History Findings (March 5, 2026)
 
 | Commit | Finding | Grade implication |
 |---|---|---|
-| `707138b` | Landed FP16 OOM handling path: pre-flight memory checks, graceful degradation, quantization-detection wiring, and `INFERFLUX_MODEL_PATH` override fixes | Improves resource-economy reliability confidence; does not yet resolve throughput-core blockers |
-| `4230fcd` | Consolidated docs taxonomy + archive evidence map | Improves OSS docs/operator clarity and reduces duplicated guidance |
-| `44a9a70` | Native GGUF CUDA scaffolding and exposure plumbing landed | Raises implementation readiness, but still below required native throughput contract gates |
+| `a8cee5b` | Hardened native CUDA runtime error handling (event/stream/malloc/copy checks) | Improves reliability and failure diagnosability in throughput-critical paths |
+| `a18ca46` | Increased default HTTP worker pool from 4 to 16 | Reduces request-layer concurrency collapse risk for non-streaming loads |
+| `307bc12` / `24412c2` | Hardened policy/HTTP parse and size-conversion safety paths | Lowers correctness and operational-risk debt for control-plane endpoints |
+| `f795f31` / `2eaa66b` | Hardened startup-advisor and runtime conversion/math safety | Improves resource-planning robustness and reduces conversion-overflow risk |
+| `5d284f6` / `b22d4d5` | Added and hardened concurrent/quick streaming benchmark scripts | Improves repeatability of throughput investigations and operator benchmarking |
 
 ## 3) Foundational Program (Priority Order)
 

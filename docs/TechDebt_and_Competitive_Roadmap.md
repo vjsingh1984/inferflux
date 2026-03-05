@@ -1,7 +1,7 @@
 # InferFlux Tech Debt and Competitive Roadmap
 
 **Snapshot date:** March 5, 2026  
-**Current overall grade:** C+ (revalidated March 5, 2026 after commit-history + gate reruns; aligned with [Roadmap](Roadmap.md))  
+**Current overall grade:** C+ (revalidated March 5, 2026 after commit-history refresh + regression reruns; aligned with [Roadmap](Roadmap.md))  
 **Purpose:** Single-page debt heatmap tied to issue-backed retirement gates.
 
 ## 1) Grade Heatmap
@@ -23,7 +23,7 @@ flowchart TB
 |---|---|---|---|
 | Vision and product coherence | B | Clear OSS identity, OpenAI-compatible API, enterprise posture | Throughput narrative is still ahead of full native CUDA delivery |
 | Capabilities | B | Strong explicit-ID and admin/CLI argument contracts with embeddings/model identity gates | Native provider still scaffold/fallback in main CUDA path |
-| Scalability and economy | C | Fairness + phased execution + prefix cache foundation | No full GPU iteration scheduler or KV page allocator |
+| Scalability and economy | C+ | Fairness + phased execution + prefix cache foundation plus HTTP worker-pool mitigation (4→16) | No full GPU iteration scheduler or KV page allocator |
 | Resource efficiency | B- | Pre-flight memory checks, graceful degradation, and slot/advisor test coverage now protect FP16 memory pressure paths | Memory-pressure metrics export and autoscaling SLO wiring are still partial |
 | Design and implementation quality | B | Strong capability/policy abstractions and backend identity wiring | Transitional dual-path complexity remains in CUDA backend stack |
 | TDD and CI maturity | B+ | Focused contract suites mirrored in CI + coverage with drift-count assertions | Merge-blocking GPU behavioral coverage still depends on self-hosted availability |
@@ -33,19 +33,23 @@ flowchart TB
 
 | Evidence | Result | Implication |
 |---|---|---|
-| `ctest -R "EmbeddingsRoutingTests|ModelIdentityTests|IntegrationCLIModelListContract|IntegrationEmbeddingsRoutingContract|IntegrationModelIdentityContract|IntegrationCLIAdminArgContract|ThroughputGateContractTests|ThroughputGateFailureContractTests"` | 8/8 passed | Capability identity + admin contract maturity increased |
-| `ctest -R "StartupAdvisorTests|SequenceSlotManagerTests"` | 2/2 passed | Confirms OOM-handling and slot-manager regression coverage for recent FP16 stability changes |
+| `ctest -R "NativeForwardTests|NativeBatchTests|GGUFTests|QuantizationTests|ModelIdentityTests|EmbeddingsRoutingTests|IntegrationEmbeddingsRoutingContract|IntegrationModelIdentityContract|IntegrationCLIAdminArgContract|IntegrationNativeMetrics"` | 10/10 passed | Capability identity + native-runtime regression confidence increased |
+| `./build/inferflux_tests "[startup_advisor]"` and `./build/inferflux_tests "[policy]"` | 2/2 passed | Confirms advisor/policy hardening landed with regression coverage |
+| `server/main.cpp` worker default (`a18ca46`) | `http_workers` increased 4→16 | Mitigates request-layer queue saturation for non-streaming concurrency |
 | `run_throughput_gate.py` (CUDA, `gpu_profile=ada_rtx_4000`, strict lane/overlap/mixed requirements) | Failed (`137.33` completion tok/s; lane + overlap + mixed-iteration deltas remained `0`; fallback=`true`; provider=`universal`) | Native CUDA lane/overlap path is still not active in default `backend=cuda` runs |
 | `run_throughput_gate.py` (CUDA, relaxed lane requirements) | Passed (`265.675` completion tok/s, `1.0` success rate, fallback=`true`, provider=`universal`) | Throughput baseline is stable, but still universal fallback instead of native path |
+| Focused static analysis (`bugprone-empty-catch`, narrowing, widening) on runtime/http/policy hot paths | Clean on targeted files | Lowers latent crash/undefined-behavior risk in core paths |
 | `python3 scripts/check_docs_contract.py` | Passed | Confirms canonical docs coherence after consolidation |
 
 ## 1.2) Recent Commit-History Findings
 
 | Commit | What landed | Debt impact |
 |---|---|---|
-| `707138b` | FP16 OOM handling path (`CanAcceptRequest`, graceful degradation, quantization detection wiring, model-path override fixes) | Reduces immediate FP16 memory-failure risk but does not close throughput-kernel gaps |
-| `4230fcd` | Docs taxonomy + archive evidence consolidation | Lowers docs duplication debt and improves operator discoverability |
-| `44a9a70` | Native GGUF CUDA scaffolding and docs integration | Improves foundation readiness while keeping top throughput debt items open |
+| `a8cee5b` | Native CUDA runtime error-handling hardening across event/stream/allocation paths | Reduces reliability debt in throughput-critical execution surfaces |
+| `a18ca46` | Default HTTP worker pool increased to 16 | Reduces request-layer concurrency bottlenecks for non-streaming workloads |
+| `307bc12` / `24412c2` | Policy/HTTP parse and conversion safety hardening | Reduces control-plane correctness and operational-risk debt |
+| `f795f31` / `2eaa66b` | Startup-advisor + runtime conversion/math safety hardening | Improves resource-planning safety and implementation quality |
+| `5d284f6` / `b22d4d5` | Concurrent + quick streaming benchmark script hardening | Improves investigation repeatability and throughput observability |
 
 ## 2) Debt Register (Actionable)
 
