@@ -196,11 +196,26 @@ MemoryAllocationRecommendation CalculateOptimalSlotAllocation(
   std::uint64_t target_vram = static_cast<std::uint64_t>(
       ctx.gpu.total_vram_bytes * target_utilization);
 
-  // Step 3: Estimate overhead (CUDA context, fragmentation, activation tensors, etc.)
-  // Configurable via INFERFLUX_OVERHEAD_GB (default: 1 GB)
-  constexpr std::uint64_t kDefaultOverheadBytes = 1024ULL * 1024 * 1024;  // 1 GB
-  std::uint64_t overhead_bytes = kDefaultOverheadBytes;
+  // Step 3: Estimate overhead with activation tensors
+  // Base overhead: CUDA context, fragmentation (configurable via INFERFLUX_OVERHEAD_GB)
+  // Activation overhead: 1.5x model size for FP16, 1.2x for quantized, 1.0x for FP32
+  constexpr std::uint64_t kDefaultOverheadBytes = 1024ULL * 1024 * 1024;  // 1 GB base
 
+  // Determine activation multiplier based on quantization
+  double activation_multiplier = 1.0;  // Default for FP32
+  if (model.quantization == QuantizationType::kFp16 ||
+      model.quantization == QuantizationType::kBf16) {
+    activation_multiplier = 1.5;  // FP16 needs more activation memory
+  } else if (model.quantization >= QuantizationType::kQ8_0) {
+    activation_multiplier = 1.2;  // Quantized needs less
+  }
+
+  // Calculate activation memory
+  std::uint64_t activation_memory = static_cast<std::uint64_t>(
+      rec.model_size_bytes * (activation_multiplier - 1.0));
+
+  // Base overhead (configurable)
+  std::uint64_t overhead_bytes = kDefaultOverheadBytes;
   if (const char* env_overhead = std::getenv("INFERFLUX_OVERHEAD_GB")) {
     try {
       int overhead_gb = std::stoi(env_overhead);
@@ -212,7 +227,22 @@ MemoryAllocationRecommendation CalculateOptimalSlotAllocation(
     }
   }
 
-  rec.overhead_bytes = overhead_bytes;
+  // Total overhead = base + activation + fragmentation allowance
+  constexpr double kFragmentationAllowance = 1.1;  // 10% for fragmentation
+  rec.overhead_bytes = static_cast<std::uint64_t>(
+      (overhead_bytes + activation_memory) * kFragmentationAllowance);
+
+  // Log memory breakdown if verbose
+  if (std::getenv("INFERFLUX_STARTUP_ADVISOR_VERBOSE")) {
+    std::string breakdown = "Memory calculation:\n" +
+        std::string("  Model size: ") + FormatBytes(rec.model_size_bytes) + "\n" +
+        "  Activation overhead: " + FormatBytes(activation_memory) +
+        " (multiplier: " + std::to_string(activation_multiplier) + ")\n" +
+        "  Base overhead: " + FormatBytes(overhead_bytes) + "\n" +
+        "  Fragmentation allowance: 10%\n" +
+        "  Total overhead: " + FormatBytes(rec.overhead_bytes);
+    log::Info(kComponent, breakdown);
+  }
 
   // Step 4: Calculate memory available for KV cache
   std::uint64_t available_for_kv = target_vram - rec.model_size_bytes - rec.overhead_bytes;

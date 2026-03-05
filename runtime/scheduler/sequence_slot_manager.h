@@ -142,6 +142,24 @@ public:
    */
   size_t GetMaxSlots() const { return max_slots_; }
 
+  /**
+   * @brief Check if we can accept a new request based on memory pressure
+   * @return true if there's sufficient memory, false if we should reject/degrade
+   */
+  bool CanAcceptRequest() const;
+
+  /**
+   * @brief Get current memory pressure status
+   * @return Memory pressure as percentage (0-100), or -1 if unavailable
+   */
+  int GetMemoryPressure() const;
+
+  /**
+   * @brief Perform graceful degradation if under memory pressure
+   * @return true if degradation was performed, false otherwise
+   */
+  bool PerformGracefulDegradation();
+
 private:
   mutable std::shared_mutex mutex_;
   std::vector<SequenceSlot> slots_;

@@ -64,6 +64,8 @@ Example snapshot evidence (TinyLlama 1.1B Q4_K_M, March 5, 2026):
 
 Treat these as snapshot measurements, not guaranteed universal ordering.
 
+FP16-specific deployment status and memory-concurrency cautions are tracked in [FP16_STATUS](FP16_STATUS.md).
+
 ## 5) Throughput Gate Contract
 
 Use gate checks as release-quality guardrails:

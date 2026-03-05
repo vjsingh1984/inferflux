@@ -26,6 +26,13 @@ flowchart LR
 | [GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05](archive/evidence/GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05.md) | Reference-Evidence | GGUF concurrent throughput snapshot |
 | [GGUF_PROFILING_QUICK_REFERENCE_2026_03_05](archive/evidence/GGUF_PROFILING_QUICK_REFERENCE_2026_03_05.md) | Reference-Evidence | GGUF quick tuning snapshot |
 | [FLASHATTENTION_LIVE_TEST_RESULTS_2025_03_02](archive/evidence/FLASHATTENTION_LIVE_TEST_RESULTS_2025_03_02.md) | Reference-Evidence | FlashAttention validation snapshot |
+| [FP16_MODEL_GUIDE_2026_03_05](archive/evidence/FP16_MODEL_GUIDE_2026_03_05.md) | Reference-Evidence | FP16 sizing and backend guidance snapshot |
+| [FP16_BENCHMARK_RESULTS_FINAL_2026_03_05](archive/evidence/FP16_BENCHMARK_RESULTS_FINAL_2026_03_05.md) | Reference-Evidence | FP16 benchmark results snapshot |
+| [FP16_CONCURRENT_BENCHMARK_FINAL_2026_03_05](archive/evidence/FP16_CONCURRENT_BENCHMARK_FINAL_2026_03_05.md) | Reference-Evidence | FP16 concurrent benchmark snapshot |
+| [FP16_OOM_FIX_VALIDATION_2026_03_05](archive/evidence/FP16_OOM_FIX_VALIDATION_2026_03_05.md) | Reference-Evidence | FP16 OOM-fix validation snapshot |
+| [FP16_OOM_FIX_FINAL_SUMMARY_2026_03_05](archive/evidence/FP16_OOM_FIX_FINAL_SUMMARY_2026_03_05.md) | Reference-Evidence | FP16 OOM-fix implementation summary snapshot |
+| [FP16_OOM_ROOT_CAUSE_ANALYSIS_2026_03_05](archive/evidence/FP16_OOM_ROOT_CAUSE_ANALYSIS_2026_03_05.md) | Reference-Evidence | FP16 OOM root-cause analysis snapshot |
+| [PERFORMANCE_OPTIMIZATION_SUMMARY_2026_03_05](archive/evidence/PERFORMANCE_OPTIMIZATION_SUMMARY_2026_03_05.md) | Reference-Evidence | Consolidated performance notes snapshot |
 | [NSIGHT_QWEN3_VS_TINYLLAMA_COMPARISON](archive/evidence/NSIGHT_QWEN3_VS_TINYLLAMA_COMPARISON.md) | Reference-Evidence | Nsight comparison |
 | [GPU_OPTIMIZATION_FINDINGS_2026_03_03](archive/evidence/GPU_OPTIMIZATION_FINDINGS_2026_03_03.md) | Reference-Evidence | optimization findings |
 | [ROCM_BACKEND_IMPLEMENTATION_PLAN](archive/evidence/ROCM_BACKEND_IMPLEMENTATION_PLAN.md) | Reference-Evidence | ROCm planning context |

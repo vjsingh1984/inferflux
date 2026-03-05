@@ -1,7 +1,7 @@
 # InferFlux Roadmap
 
 **Snapshot date:** March 5, 2026  
-**Current overall grade:** C+ (revalidated March 5, 2026)  
+**Current overall grade:** C+ (revalidated March 5, 2026 after contract + throughput gate reruns)  
 **Target overall grade:** B- (2026), B (2027)
 
 ## 1) One-Screen Plan
@@ -33,14 +33,16 @@ flowchart LR
 | CI/TDD enforcement | B+ | A- | GPU behavior lane remains conditional on self-hosted availability | [#5](https://github.com/vjsingh1984/inferflux/issues/5), [#10](https://github.com/vjsingh1984/inferflux/issues/10) |
 | Distributed runtime | C- | C+ | Failure-path/fault-matrix coverage still incomplete | [#11](https://github.com/vjsingh1984/inferflux/issues/11) |
 | Capability identity | B | B+ | Native path still scaffolded even with strict policy contracts in place | [#1](https://github.com/vjsingh1984/inferflux/issues/1), [#2](https://github.com/vjsingh1984/inferflux/issues/2) |
+| OSS docs and operator clarity | B+ | A- | Full-repo link freshness is not merge-gated outside canonical docs | docs consolidation + docs contract gate baseline |
 
 ## 2.1) Evidence Behind Current Grade
 
 | Check | Result | Grade impact |
 |---|---|---|
 | Focused contract smoke (`ModelIdentity`, `EmbeddingsRouting`, CLI/admin contracts, throughput contract suites) | 8/8 pass | Raised confidence in capability identity and CI/TDD dimensions |
-| CUDA throughput gate with `--require-cuda-lanes` | Failed (lane submissions remained `0`) | Keeps throughput + continuous batching below target |
-| CUDA throughput gate (relaxed lane requirement) | Passed (`240.252` completion tok/s, fallback=`true`, provider=`universal`) | Confirms stable baseline while native CUDA path remains incomplete |
+| CUDA throughput gate (`gpu_profile=ada_rtx_4000`, `--require-cuda-lanes`) | Failed (`113.346` completion tok/s; lane + overlap + mixed-iteration counters stayed `0`; fallback=`true`; provider=`universal`) | Keeps throughput + continuous batching below target and confirms native CUDA path is still inactive in default `backend=cuda` flow |
+| CUDA throughput gate (relaxed lane requirement) | Passed (`161.117` completion tok/s, `1.0` success rate, fallback=`true`, provider=`universal`) | Confirms stable universal baseline while native CUDA path remains incomplete |
+| Canonical docs contract (`scripts/check_docs_contract.py`) | Passed after consolidation/index refresh | Raises confidence in OSS docs/operator clarity dimension |
 
 ## 3) Foundational Program (Priority Order)
 

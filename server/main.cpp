@@ -832,7 +832,19 @@ int main(int argc, char **argv) {
     default_model_override = env_default_model;
   }
 
-  if (configured_models.empty() && !model_path.empty()) {
+  // INFERFLUX_MODEL_PATH overrides config file models (for testing/flexibility)
+  if (!model_path.empty()) {
+    inferflux::log::Info("server",
+        "INFERFLUX_MODEL_PATH is set, overriding config file model path: " +
+        model_path + " (original config will be ignored)");
+
+    ModelConfig cfg;
+    cfg.path = model_path;
+    cfg.format = legacy_model_format;
+    cfg.make_default = true;
+    configured_models.clear();  // Clear any models from config file
+    configured_models.push_back(cfg);
+  } else if (configured_models.empty() && !model_path.empty()) {
     ModelConfig cfg;
     cfg.path = model_path;
     cfg.format = legacy_model_format;
@@ -1302,6 +1314,8 @@ int main(int argc, char **argv) {
       auto fsize = std::filesystem::file_size(mi.path, ec);
       if (!ec)
         am.file_size_bytes = static_cast<std::uint64_t>(fsize);
+      // Detect quantization from filename for accurate memory calculations
+      am.quantization = inferflux::DetectQuantization(am.path, am.format);
       advisor_ctx.models.push_back(am);
     }
     // Probe GPU (post-model-load to get real free VRAM).

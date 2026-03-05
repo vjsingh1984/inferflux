@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <numeric>
 
+#ifdef ENABLE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 namespace inferflux {
 namespace scheduler {
 
@@ -237,6 +241,116 @@ size_t SequenceSlotManager::GetUsedSlotCountLocked() const {
                          return s.state == SequenceState::kPrefilling ||
                                 s.state == SequenceState::kDecoding;
                        });
+}
+
+bool SequenceSlotManager::CanAcceptRequest() const {
+#ifdef ENABLE_CUDA
+  // Get available GPU memory
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
+
+  if (err != cudaSuccess) {
+    log::Warn("slot_manager",
+              "Failed to query GPU memory: " + std::string(cudaGetErrorString(err)) +
+              ", allowing request (fallback behavior)");
+    return true;  // Allow request if we can't check memory
+  }
+
+  // Calculate memory pressure
+  size_t used_bytes = total_bytes - free_bytes;
+  double pressure_pct = (static_cast<double>(used_bytes) / total_bytes) * 100.0;
+
+  // Log memory status periodically
+  log::Debug("slot_manager",
+             "GPU memory: " + std::to_string(free_bytes / 1024 / 1024) + " MB free, " +
+             std::to_string(total_bytes / 1024 / 1024) + " MB total (" +
+             std::to_string(static_cast<int>(pressure_pct)) + "% used)");
+
+  // Reject if memory pressure > 90%
+  if (pressure_pct > 90.0) {
+    log::Warn("slot_manager",
+              "Rejecting request: memory pressure too high (" +
+              std::to_string(static_cast<int>(pressure_pct)) + "% > 90%)");
+    return false;
+  }
+
+  // Allow request if memory is available
+  return true;
+#else
+  // Non-CUDA builds: always allow (no GPU memory to check)
+  return true;
+#endif
+}
+
+int SequenceSlotManager::GetMemoryPressure() const {
+#ifdef ENABLE_CUDA
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
+
+  if (err != cudaSuccess) {
+    return -1;  // Error: unavailable
+  }
+
+  size_t used_bytes = total_bytes - free_bytes;
+  return static_cast<int>((static_cast<double>(used_bytes) / total_bytes) * 100.0);
+#else
+  return -1;  // Not available on non-CUDA builds
+#endif
+}
+
+bool SequenceSlotManager::PerformGracefulDegradation() {
+#ifdef ENABLE_CUDA
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+
+  int pressure = GetMemoryPressure();
+  if (pressure < 0) {
+    return false;  // Can't check memory pressure
+  }
+
+  // Degradation thresholds
+  constexpr int kWarningThreshold = 80;    // 80% - log warning
+  constexpr int kDegradeThreshold = 85;    // 85% - reduce slots
+  constexpr int kCriticalThreshold = 90;   // 90% - aggressive reduction
+
+  if (pressure >= kCriticalThreshold) {
+    // Aggressive degradation: reduce to half or minimum
+    size_t old_max = max_slots_;
+    size_t new_max = std::max(8UL, old_max / 2);
+
+    if (new_max < old_max) {
+      max_slots_ = new_max;
+      log::Warn("slot_manager",
+                "CRITICAL memory pressure (" + std::to_string(pressure) +
+                "%): reducing max_slots from " + std::to_string(old_max) +
+                " to " + std::to_string(max_slots_));
+      return true;
+    }
+  } else if (pressure >= kDegradeThreshold) {
+    // Moderate degradation: reduce by 25%
+    size_t old_max = max_slots_;
+    size_t new_max = std::max(16UL, (old_max * 3) / 4);
+
+    if (new_max < old_max) {
+      max_slots_ = new_max;
+      log::Warn("slot_manager",
+                "High memory pressure (" + std::to_string(pressure) +
+                "%): reducing max_slots from " + std::to_string(old_max) +
+                " to " + std::to_string(max_slots_));
+      return true;
+    }
+  } else if (pressure >= kWarningThreshold) {
+    // Warning only: no degradation yet
+    log::Warn("slot_manager",
+              "Elevated memory pressure (" + std::to_string(pressure) +
+              "%), monitoring but not degrading yet");
+  }
+
+  return false;  // No degradation performed
+#else
+  return false;  // Not available on non-CUDA builds
+#endif
 }
 
 } // namespace scheduler

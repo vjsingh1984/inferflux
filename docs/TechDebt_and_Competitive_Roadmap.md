@@ -1,7 +1,7 @@
 # InferFlux Tech Debt and Competitive Roadmap
 
 **Snapshot date:** March 5, 2026  
-**Current overall grade:** C+ (aligned with [Roadmap](Roadmap.md))  
+**Current overall grade:** C+ (revalidated March 5, 2026; aligned with [Roadmap](Roadmap.md))  
 **Purpose:** Single-page debt heatmap tied to issue-backed retirement gates.
 
 ## 1) Grade Heatmap
@@ -27,14 +27,16 @@ flowchart TB
 | Resource efficiency | C+ | Batch token-budget skip metrics and throughput-contract diagnostics are in place | Economy SLO set for autoscaling is still partial |
 | Design and implementation quality | B | Strong capability/policy abstractions and backend identity wiring | Transitional dual-path complexity remains in CUDA backend stack |
 | TDD and CI maturity | B+ | Focused contract suites mirrored in CI + coverage with drift-count assertions | Merge-blocking GPU behavioral coverage still depends on self-hosted availability |
+| OSS docs and operator clarity | B+ | Canonical docs were consolidated and contract-checked | Link freshness is merge-gated only for canonical docs, not all reference docs |
 
 ## 1.1) Evidence Snapshot (Revalidated)
 
 | Evidence | Result | Implication |
 |---|---|---|
 | `ctest -R "EmbeddingsRoutingTests|ModelIdentityTests|IntegrationCLIModelListContract|IntegrationEmbeddingsRoutingContract|IntegrationModelIdentityContract|IntegrationCLIAdminArgContract|ThroughputGateContractTests|ThroughputGateFailureContractTests"` | 8/8 passed | Capability identity + admin contract maturity increased |
-| `run_throughput_gate.py` (CUDA, mixed workload, `--require-cuda-lanes`) | Failed lane activity assertions | Native CUDA lane/overlap path is still not active in default `backend=cuda` runs |
-| `run_throughput_gate.py` (CUDA, relaxed lane requirement) | Passed (`240.252` completion tok/s, `1.0` success rate, fallback=`true`, provider=`universal`) | Throughput baseline is stable, but still universal fallback instead of native path |
+| `run_throughput_gate.py` (CUDA, `gpu_profile=ada_rtx_4000`, strict lane/overlap/mixed requirements) | Failed (`113.346` completion tok/s; lane + overlap + mixed-iteration deltas remained `0`; fallback=`true`; provider=`universal`) | Native CUDA lane/overlap path is still not active in default `backend=cuda` runs |
+| `run_throughput_gate.py` (CUDA, relaxed lane requirements) | Passed (`161.117` completion tok/s, `1.0` success rate, fallback=`true`, provider=`universal`) | Throughput baseline is stable, but still universal fallback instead of native path |
+| `python3 scripts/check_docs_contract.py` | Passed | Confirms canonical docs coherence after consolidation |
 
 ## 2) Debt Register (Actionable)
 
@@ -48,6 +50,7 @@ flowchart TB
 | P1 | Economy metrics insufficient for autoscaling | Cost control and SLO blind spots | Observability | Efficiency metrics documented and consumed by policies | [#9](https://github.com/vjsingh1984/inferflux/issues/9) |
 | P2 | GPU CI behavioral lane not fully mandatory | Regressions can slip by environment variance | QA + Runtime | Merge-blocking GPU behavior lane in CI | [#5](https://github.com/vjsingh1984/inferflux/issues/5), [#10](https://github.com/vjsingh1984/inferflux/issues/10) |
 | P2 | Distributed failure-path contract coverage incomplete | Enterprise resilience risk | Distributed Runtime | Fault matrix tests for transport/prefill/decode failures | [#11](https://github.com/vjsingh1984/inferflux/issues/11) |
+| P2 | Model weight unloading not implemented | Memory pressure prevents model swapping, long-running servers accumulate GPU memory | Runtime + Backend | Implement model unload/swap with proper weight deallocation and KV cache cleanup | Future issue |
 
 ## 3) Competitive Position (Concise)
 
@@ -66,6 +69,7 @@ flowchart TB
 3. Lock in mandatory GPU CI and coverage symmetry (`#5`, `#10`).
 4. Complete kernel maturity and scheduler contention items (`#6`, `#7`, `#8`).
 5. Finish economy metrics and distributed failure contracts (`#9`, `#11`).
+6. Implement model unload/swap for dynamic multi-model serving (P2 item).
 
 ## 5) Evidence Anchors (Code-Backed)
 

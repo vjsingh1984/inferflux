@@ -26,6 +26,7 @@ flowchart TD
 | `401` / `403` | run same request with known key | missing/invalid key or insufficient scope | pass bearer key with required scope |
 | `404 model_not_found` | `./build/inferctl models --api-key <KEY>` | wrong model id/default model missing | use valid model id or set default model |
 | `422 backend_policy_violation` | inspect routing + backend exposure | strict native request policy blocked fallback | disable strict native policy or request compatible backend |
+| `std::bad_alloc` / CUDA OOM | check startup advisor + slot settings + model size | FP16 or large model exceeds practical VRAM budget at current concurrency | reduce `max_parallel_sequences`/context, switch to quantized model, or use larger VRAM GPU |
 | high latency / low throughput | `curl -s .../metrics | head -120` | under-sized batches or backend mismatch | tune scheduler/KV/cuda settings in config |
 | WebUI blank/empty | verify binary + model list | UI not built or no model loaded | build with `-DENABLE_WEBUI=ON` and load model |
 
@@ -105,3 +106,4 @@ docker compose -f docker/docker-compose.yaml up
 - [API Surface](API_SURFACE.md)
 - [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 - [Admin Guide](AdminGuide.md)
+- [FP16_STATUS](FP16_STATUS.md)

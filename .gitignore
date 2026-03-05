@@ -1,5 +1,6 @@
 build/
 build_*/
+build-*/
 *.log
 .DS_Store
 models/
@@ -20,3 +21,7 @@ external/mlx-lm/
 # Python test/runtime cache artifacts.
 __pycache__/
 *.pyc
+
+# Local profiling outputs and backup scratch files.
+nsys_reports/
+*.old
