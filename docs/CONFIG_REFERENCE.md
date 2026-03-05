@@ -202,6 +202,32 @@ When strict mode is enabled, unsupported explicit native requests fail with `422
 | `runtime.cuda.phase_overlap.enabled` | `true` for mixed workloads | prefill/decode overlap |
 | `runtime.cuda.phase_overlap.min_prefill_tokens` | `256` | overlap trigger threshold |
 
+### HTTP Server
+
+| Key | Default pattern | Tuning intent |
+|---|---|---|
+| `INFERFLUX_HTTP_WORKERS` | `16` | increase for high concurrency non-streaming workloads |
+
+**Performance notes**:
+- Non-streaming requests block worker threads via `future.get()` until completion
+- More workers = more concurrent non-streaming capacity (4 workers → 2 tok/s, 16 workers → ~8 tok/s for 8 concurrent requests)
+- Streaming requests are async and don't block workers (unlimited concurrent capacity)
+- Formula: `workers >= expected_concurrent_non_streaming_requests`
+
+**Trade-offs**:
+- Each worker thread requires stack memory (~8 MB default)
+- More workers = higher memory footprint
+- Context switching overhead with very high worker counts (>64)
+
+**Example usage**:
+```bash
+# High concurrency non-streaming workload
+INFERFLUX_HTTP_WORKERS=32 ./build/inferfluxd --config config/server.yaml
+
+# Memory-constrained environment
+INFERFLUX_HTTP_WORKERS=8 ./build/inferfluxd --config config/server.yaml
+```
+
 ## 8) Auth + Policy Contract
 
 | Area | Key(s) | Minimal production stance |
@@ -242,6 +268,7 @@ Scope contract:
 | `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` | `runtime.backend_exposure.allow_universal_fallback` |
 | `INFERFLUX_BACKEND_STRICT_NATIVE_REQUEST` | `runtime.backend_exposure.strict_native_request` |
 | `INFERFLUX_DISABLE_STARTUP_ADVISOR` | suppress startup recommendations |
+| `INFERFLUX_HTTP_WORKERS` | HTTP server thread pool size (default: 16) |
 | `INFERCTL_API_KEY` | CLI auth token |
 
 ## 11) Startup Advisor Alignment
