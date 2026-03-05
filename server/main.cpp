@@ -1344,7 +1344,7 @@ int main(int argc, char **argv) {
     inferflux::RunStartupAdvisor(advisor_ctx);
   }
 
-  int http_workers = 4;
+  int http_workers = 16;  // Increased from 4 for better concurrent throughput
   if (const char *env_workers = std::getenv("INFERFLUX_HTTP_WORKERS")) {
     try {
       http_workers = std::stoi(env_workers);
