@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 #include <cctype>
@@ -14,6 +15,17 @@
 namespace inferflux {
 
 namespace {
+bool SizeToInt(std::size_t value, int *out) {
+  if (!out) {
+    return false;
+  }
+  if (value > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+  *out = static_cast<int>(value);
+  return true;
+}
+
 std::string Trim(const std::string &input) {
   auto start = input.find_first_not_of(" \t");
   auto end = input.find_last_not_of(" \t\r\n");
@@ -174,7 +186,7 @@ bool PolicyStore::Load() {
       } else if (section == "rate_limit" && key == "tokens") {
         try {
           loaded_rate_limit = std::stoi(value);
-        } catch (...) {
+        } catch (const std::exception &) {
           loaded_rate_limit = 0;
         }
       } else if (section == "routing" && key == "allow_default_fallback") {
@@ -367,11 +379,20 @@ bool PolicyStore::Encrypt(const std::string &plaintext,
   }
   bool ok = false;
   do {
+    std::array<unsigned char, 16> tag{};
+    int nonce_len = 0;
+    int plaintext_len = 0;
+    int tag_len = 0;
+    if (!SizeToInt(nonce.size(), &nonce_len) ||
+        !SizeToInt(plaintext.size(), &plaintext_len) ||
+        !SizeToInt(tag.size(), &tag_len)) {
+      break;
+    }
     if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) !=
         1)
       break;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, nonce.size(),
-                            nullptr) != 1)
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, nonce_len, nullptr) !=
+        1)
       break;
     if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key_.data(), nonce.data()) !=
         1)
@@ -380,7 +401,7 @@ bool PolicyStore::Encrypt(const std::string &plaintext,
     if (EVP_EncryptUpdate(
             ctx, ciphertext.data(), &out_len,
             reinterpret_cast<const unsigned char *>(plaintext.data()),
-            plaintext.size()) != 1) {
+            plaintext_len) != 1) {
       break;
     }
     int final_len = 0;
@@ -388,9 +409,8 @@ bool PolicyStore::Encrypt(const std::string &plaintext,
       break;
     out_len += final_len;
     ciphertext.resize(out_len);
-    std::array<unsigned char, 16> tag{};
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, tag.size(),
-                            tag.data()) != 1)
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, tag_len, tag.data()) !=
+        1)
       break;
     std::ostringstream result;
     result << "ENC\n";
@@ -450,22 +470,30 @@ bool PolicyStore::Decrypt(const std::string &encrypted,
   }
   bool ok = false;
   do {
+    int nonce_len = 0;
+    int data_len = 0;
+    int tag_len = 0;
+    if (!SizeToInt(nonce.size(), &nonce_len) ||
+        !SizeToInt(data.size(), &data_len) ||
+        !SizeToInt(tag.size(), &tag_len)) {
+      break;
+    }
     if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) !=
         1)
       break;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, nonce.size(),
-                            nullptr) != 1)
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, nonce_len, nullptr) !=
+        1)
       break;
     if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, key_.data(), nonce.data()) !=
         1)
       break;
     std::vector<unsigned char> plain(data.size());
     int out_len = 0;
-    if (EVP_DecryptUpdate(ctx, plain.data(), &out_len, data.data(),
-                          data.size()) != 1)
+    if (EVP_DecryptUpdate(ctx, plain.data(), &out_len, data.data(), data_len) !=
+        1)
       break;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, tag.size(),
-                            tag.data()) != 1)
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, tag_len, tag.data()) !=
+        1)
       break;
     int final_len = 0;
     if (EVP_DecryptFinal_ex(ctx, plain.data() + out_len, &final_len) != 1)

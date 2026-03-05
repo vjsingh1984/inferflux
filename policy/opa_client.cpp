@@ -33,8 +33,12 @@ void ParseOPAResponse(const std::string &body, OPAResult *result) {
         result->reason = r["reason"].get<std::string>();
       }
     }
-  } catch (const json::exception &) {
-    // Leave result unchanged on parse failure.
+  } catch (const json::exception &ex) {
+    // OPA integration is fail-open; preserve allow=true and surface parse
+    // issue.
+    if (result->reason.empty()) {
+      result->reason = std::string("OPA parse failure: ") + ex.what();
+    }
   }
 }
 } // namespace
