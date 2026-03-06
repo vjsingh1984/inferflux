@@ -20,6 +20,7 @@ Registered as ctest target ShmSmokeTest in CMakeLists.txt.
 import http.client
 import json
 import os
+import signal
 import subprocess
 import time
 import unittest
@@ -41,6 +42,7 @@ def start_server(env: dict) -> subprocess.Popen:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        preexec_fn=os.setsid,
     )
 
 
@@ -90,8 +92,12 @@ class ShmSmokeTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if cls.proc:
-            cls.proc.terminate()
-            cls.proc.wait(timeout=5)
+            try:
+                os.killpg(os.getpgid(cls.proc.pid), signal.SIGTERM)
+                cls.proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(cls.proc.pid), signal.SIGKILL)
+                cls.proc.wait(timeout=5)
 
     # ------------------------------------------------------------------
     # Helpers

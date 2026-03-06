@@ -174,6 +174,8 @@ private:
   std::unique_ptr<scheduler::SessionHandleManager> session_handle_manager_;
   std::thread eviction_thread_;
   std::atomic<bool> eviction_running_{false};
+  std::mutex eviction_mutex_;
+  std::condition_variable eviction_cv_;
   void EvictionWorkerLoop();
 };
 

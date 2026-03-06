@@ -262,6 +262,7 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
 Scheduler::~Scheduler() {
   // Stop eviction worker thread first.
   eviction_running_ = false;
+  eviction_cv_.notify_all();
   if (eviction_thread_.joinable()) {
     eviction_thread_.join();
   }
@@ -1551,12 +1552,17 @@ void Scheduler::FinalizeSessionLease(PendingRequest *pending,
 
 void Scheduler::EvictionWorkerLoop() {
   // Periodically evict idle sequences to prevent slot exhaustion.
-  // Runs in a separate thread with 30-second check intervals.
+  // Runs in a separate thread with wakeable 30-second check intervals so
+  // teardown doesn't block waiting on sleep_for.
+  std::unique_lock<std::mutex> wait_lock(eviction_mutex_);
   while (eviction_running_) {
-    std::this_thread::sleep_for(std::chrono::seconds(30));
-
-    if (!eviction_running_)
+    const bool stop_requested = eviction_cv_.wait_for(
+        wait_lock, std::chrono::seconds(30),
+        [this] { return !eviction_running_.load(); });
+    if (stop_requested || !eviction_running_) {
       break;
+    }
+    wait_lock.unlock();
 
     // Evict slots idle for >5 minutes
     // Returns vector of (slot_id, sequence_id) pairs for evicted slots
@@ -1600,6 +1606,7 @@ void Scheduler::EvictionWorkerLoop() {
                                    " expired session handle(s)");
       }
     }
+    wait_lock.lock();
   }
 }
 
