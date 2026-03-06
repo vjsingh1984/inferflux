@@ -10,24 +10,24 @@ namespace inferflux {
 // Quantization type detection
 enum class QuantizationType {
   kUnknown,
-  kFp32,    // 32-bit float
-  kFp16,    // 16-bit float
-  kBf16,    // 16-bit bfloat
-  kQ8_1,    // 8-bit quantization (Q8_1)
-  kQ8_0,    // 8-bit quantization
-  kQ8_K,    // 8-bit K-block quantization
-  kQ6_K,    // 6-bit quantization
-  kQ5_1,    // 5-bit quantization (Q5_1)
-  kQ5_0,    // 5-bit quantization (Q5_0)
-  kQ5_K_M,  // 5-bit quantization (medium)
-  kQ5_K,    // 5-bit quantization
-  kQ4_1,    // 4-bit quantization (Q4_1)
-  kQ4_0,    // 4-bit quantization (Q4_0)
-  kQ4_K_M,  // 4-bit quantization (medium)
-  kQ4_K,    // 4-bit quantization
-  kQ3_K,    // 3-bit quantization
-  kQ3_K_M,  // 3-bit quantization (medium)
-  kQ2_K,    // 2-bit quantization
+  kFp32,   // 32-bit float
+  kFp16,   // 16-bit float
+  kBf16,   // 16-bit bfloat
+  kQ8_1,   // 8-bit quantization (Q8_1)
+  kQ8_0,   // 8-bit quantization
+  kQ8_K,   // 8-bit K-block quantization
+  kQ6_K,   // 6-bit quantization
+  kQ5_1,   // 5-bit quantization (Q5_1)
+  kQ5_0,   // 5-bit quantization (Q5_0)
+  kQ5_K_M, // 5-bit quantization (medium)
+  kQ5_K,   // 5-bit quantization
+  kQ4_1,   // 4-bit quantization (Q4_1)
+  kQ4_0,   // 4-bit quantization (Q4_0)
+  kQ4_K_M, // 4-bit quantization (medium)
+  kQ4_K,   // 4-bit quantization
+  kQ3_K,   // 3-bit quantization
+  kQ3_K_M, // 3-bit quantization (medium)
+  kQ2_K,   // 2-bit quantization
 };
 
 // Pure-data snapshot of a loaded model for advisor inspection.
@@ -45,13 +45,13 @@ struct AdvisorModelInfo {
 
   // NEW: Memory and quantization info
   QuantizationType quantization{QuantizationType::kUnknown};
-  std::string quantization_string;  // e.g., "Q4_K_M", "Q5_K_M"
+  std::string quantization_string; // e.g., "Q4_K_M", "Q5_K_M"
   int n_params{0};                 // Parameter count (billions)
   int n_layers{0};                 // Transformer layers
   int hidden_dim{0};               // Hidden dimension
   int n_ctx_max{0};                // Maximum context window supported
-  std::uint64_t estimated_loaded_size_bytes{0};  // Actual GPU memory when loaded
-  double compression_ratio{1.0};    // Quantization compression ratio
+  std::uint64_t estimated_loaded_size_bytes{0}; // Actual GPU memory when loaded
+  double compression_ratio{1.0}; // Quantization compression ratio
 };
 
 // GPU hardware snapshot (populated by ProbeCudaGpu / ProbeRocmGpu).
@@ -66,8 +66,8 @@ struct AdvisorGpuInfo {
   std::uint64_t free_vram_bytes{0};
 
   // NEW: Detailed memory breakdown
-  std::uint64_t recommended_reserve_bytes{0};  // Memory to keep free (15%)
-  std::uint64_t usable_vram_bytes{0};          // Total - reserve
+  std::uint64_t recommended_reserve_bytes{0}; // Memory to keep free (15%)
+  std::uint64_t usable_vram_bytes{0};         // Total - reserve
 };
 
 // Effective config snapshot taken at startup.
@@ -87,8 +87,8 @@ struct AdvisorConfig {
   bool speculative_enabled{false};
 
   // NEW: Sequence slot configuration
-  int max_parallel_sequences{128};     // Current configured value
-  int n_ctx{2048};                     // Current context window
+  int max_parallel_sequences{128};      // Current configured value
+  int n_ctx{2048};                      // Current context window
   std::uint64_t sequence_slot_bytes{0}; // Actual KV per slot
 };
 
@@ -136,23 +136,21 @@ AdvisorGpuInfo ProbeCudaGpu();
 AdvisorGpuInfo ProbeRocmGpu();
 
 // NEW: Model size detection and slot allocation
-MemoryAllocationRecommendation CalculateOptimalSlotAllocation(
-    const StartupAdvisorContext &ctx);
+MemoryAllocationRecommendation
+CalculateOptimalSlotAllocation(const StartupAdvisorContext &ctx);
 
 // NEW: Quantization detection from model path/metadata
-QuantizationType DetectQuantization(const std::string& model_path, const std::string& format);
+QuantizationType DetectQuantization(const std::string &model_path,
+                                    const std::string &format);
 std::string GetQuantizationString(QuantizationType q);
 
 // NEW: Estimate loaded model size from file size and quantization
-std::uint64_t EstimateLoadedModelSize(const AdvisorModelInfo& model);
+std::uint64_t EstimateLoadedModelSize(const AdvisorModelInfo &model);
 
 // NEW: Calculate per-slot KV cache size
-std::uint64_t CalculatePerSlotKvSize(
-    int n_ctx,
-    int hidden_dim,
-    int n_layers,
-    int n_heads,
-    size_t element_size = sizeof(float) * 2  // K + V
+std::uint64_t
+CalculatePerSlotKvSize(int n_ctx, int hidden_dim, int n_layers, int n_heads,
+                       size_t element_size = sizeof(float) * 2 // K + V
 );
 
 } // namespace inferflux

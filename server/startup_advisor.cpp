@@ -129,8 +129,8 @@ std::filesystem::path ResolveGgufPath(const std::filesystem::path &path) {
   return first_gguf;
 }
 
-QuantizationType DetectQuantizationFromGgufMetadata(
-    const std::filesystem::path &path) {
+QuantizationType
+DetectQuantizationFromGgufMetadata(const std::filesystem::path &path) {
   const std::filesystem::path gguf_path = ResolveGgufPath(path);
   if (gguf_path.empty()) {
     return QuantizationType::kUnknown;
@@ -159,7 +159,8 @@ QuantizationType DetectQuantizationFromGgufMetadata(
 
   for (int64_t i = 0; i < header.kv_count; ++i) {
     std::string key;
-    if (!::inferflux::runtime::cuda::native::GGUFReader::ReadString(file, &key)) {
+    if (!::inferflux::runtime::cuda::native::GGUFReader::ReadString(file,
+                                                                    &key)) {
       fclose(file);
       return QuantizationType::kUnknown;
     }
@@ -168,8 +169,11 @@ QuantizationType DetectQuantizationFromGgufMetadata(
       fclose(file);
       return QuantizationType::kUnknown;
     }
-    const auto value_type = static_cast<::inferflux::runtime::cuda::native::GGUF::ValueType>(type_raw);
-    if (!::inferflux::runtime::cuda::native::GGUFReader::SkipValue(file, value_type)) {
+    const auto value_type =
+        static_cast<::inferflux::runtime::cuda::native::GGUF::ValueType>(
+            type_raw);
+    if (!::inferflux::runtime::cuda::native::GGUFReader::SkipValue(
+            file, value_type)) {
       fclose(file);
       return QuantizationType::kUnknown;
     }
@@ -181,8 +185,8 @@ QuantizationType DetectQuantizationFromGgufMetadata(
 
   for (int64_t i = 0; i < header.tensor_count; ++i) {
     std::string tensor_name;
-    if (!::inferflux::runtime::cuda::native::GGUFReader::ReadString(file,
-                                                                     &tensor_name)) {
+    if (!::inferflux::runtime::cuda::native::GGUFReader::ReadString(
+            file, &tensor_name)) {
       fclose(file);
       return QuantizationType::kUnknown;
     }
@@ -193,7 +197,8 @@ QuantizationType DetectQuantizationFromGgufMetadata(
     }
     for (uint32_t dim_idx = 0; dim_idx < n_dims; ++dim_idx) {
       int64_t dim = 0;
-      if (!::inferflux::runtime::cuda::native::GGUFReader::ReadInt64(file, &dim)) {
+      if (!::inferflux::runtime::cuda::native::GGUFReader::ReadInt64(file,
+                                                                     &dim)) {
         fclose(file);
         return QuantizationType::kUnknown;
       }
@@ -206,7 +211,7 @@ QuantizationType DetectQuantizationFromGgufMetadata(
     }
     uint64_t offset = 0;
     if (!::inferflux::runtime::cuda::native::GGUFReader::ReadUint64(file,
-                                                                     &offset)) {
+                                                                    &offset)) {
       fclose(file);
       return QuantizationType::kUnknown;
     }

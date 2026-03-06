@@ -5,8 +5,8 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
-#include <vector>
 #include <string>
+#include <vector>
 
 namespace inferflux {
 namespace scheduler {
@@ -16,7 +16,7 @@ namespace scheduler {
  */
 enum class SequenceState {
   kIdle,       // Available for new requests
-  kPrefilling,  // Processing prompt (prefill phase)
+  kPrefilling, // Processing prompt (prefill phase)
   kDecoding,   // Generating tokens (decode phase)
   kCompleted,  // Finished, waiting for cleanup
   kEvicted     // Timed out and evicted
@@ -26,13 +26,13 @@ enum class SequenceState {
  * @brief Represents a single KV cache slot for one sequence
  */
 struct SequenceSlot {
-  int slot_id;                           // Slot number (0 to max_slots-1)
-  int64_t request_id;                     // Associated request ID
-  int sequence_id;                       // Backend sequence ID
+  int slot_id;        // Slot number (0 to max_slots-1)
+  int64_t request_id; // Associated request ID
+  int sequence_id;    // Backend sequence ID
   SequenceState state;
   std::chrono::steady_clock::time_point last_access;
   std::chrono::steady_clock::time_point acquired_at;
-  int token_count;                       // Tokens processed in this sequence
+  int token_count; // Tokens processed in this sequence
 
   /**
    * @brief Check if slot has been idle longer than timeout
@@ -40,14 +40,16 @@ struct SequenceSlot {
    * @return true if slot is idle (not actively generating or past timeout)
    */
   bool IsIdle(std::chrono::milliseconds timeout) const {
-    if (state != SequenceState::kDecoding) return true;  // Not actively generating
+    if (state != SequenceState::kDecoding)
+      return true; // Not actively generating
     auto idle = std::chrono::steady_clock::now() - last_access;
     return idle > timeout;
   }
 };
 
 /**
- * @brief Manages KV cache slots for both cuda_native and cuda_llama_cpp backends
+ * @brief Manages KV cache slots for both cuda_native and cuda_llama_cpp
+ * backends
  *
  * This provides universal sequence slot management at the orchestration layer,
  * above both backend implementations. Each backend maintains its own private
@@ -85,7 +87,8 @@ public:
    * @param timeout Idle timeout threshold
    * @return Vector of evicted slot IDs with their sequence IDs
    */
-  std::vector<std::pair<int, int>> EvictIdleSlots(std::chrono::milliseconds timeout);
+  std::vector<std::pair<int, int>>
+  EvictIdleSlots(std::chrono::milliseconds timeout);
 
   /**
    * @brief Mark slot as actively processing (update last_access time)
@@ -144,7 +147,8 @@ public:
 
   /**
    * @brief Check if we can accept a new request based on memory pressure
-   * @return true if there's sufficient memory, false if we should reject/degrade
+   * @return true if there's sufficient memory, false if we should
+   * reject/degrade
    */
   bool CanAcceptRequest() const;
 
@@ -164,7 +168,7 @@ private:
   mutable std::shared_mutex mutex_;
   std::vector<SequenceSlot> slots_;
   size_t max_slots_;
-  std::chrono::milliseconds idle_timeout_{300000};  // 5 minutes default
+  std::chrono::milliseconds idle_timeout_{300000}; // 5 minutes default
 
   /**
    * @brief Find available slot
@@ -189,7 +193,8 @@ private:
    * @param timeout Idle timeout threshold
    * @return Vector of evicted slot IDs with their sequence IDs
    */
-  std::vector<std::pair<int, int>> EvictIdleSlotsLocked(std::chrono::milliseconds timeout);
+  std::vector<std::pair<int, int>>
+  EvictIdleSlotsLocked(std::chrono::milliseconds timeout);
 
   /**
    * @brief Internal free slot count (assumes lock already held)

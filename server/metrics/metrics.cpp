@@ -644,8 +644,7 @@ std::string MetricsRegistry::RenderPrometheus() const {
       << "\",phase=\"prefill\"} " << scheduler_iterations_prefill_.load()
       << "\n";
   out << "inferflux_scheduler_iterations_total{backend=\"" << backend
-      << "\",phase=\"decode\"} " << scheduler_iterations_decode_.load()
-      << "\n";
+      << "\",phase=\"decode\"} " << scheduler_iterations_decode_.load() << "\n";
   out << "inferflux_scheduler_iterations_total{backend=\"" << backend
       << "\",phase=\"mixed\"} " << scheduler_iterations_mixed_.load() << "\n";
 

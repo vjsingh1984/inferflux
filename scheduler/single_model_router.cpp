@@ -322,8 +322,8 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
     bool native_executor_fallback = false;
     std::string native_executor_fallback_reason;
     if (candidate_selection.provider == BackendProvider::kNative) {
-      auto native_backend =
-          std::dynamic_pointer_cast<NativeCudaBackend>(candidate_selection.backend);
+      auto native_backend = std::dynamic_pointer_cast<NativeCudaBackend>(
+          candidate_selection.backend);
       if (native_backend && native_backend->IsFallbackExecutor()) {
         native_executor_fallback = true;
         native_executor_fallback_reason = native_backend->FallbackReason();

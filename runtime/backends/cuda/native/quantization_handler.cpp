@@ -8,12 +8,86 @@ namespace runtime {
 namespace cuda {
 namespace native {
 
+namespace {
+
+#ifndef INFERFLUX_HAS_CUDA
+class StaticQuantizationHandler final : public IQuantizationHandler {
+public:
+  StaticQuantizationHandler(std::string type, double bits_per_value,
+                            size_t block_size, size_t block_bytes)
+      : type_(std::move(type)), bits_per_value_(bits_per_value),
+        block_size_(block_size), block_bytes_(block_bytes) {}
+
+  void DequantizeGpuToGpu(const void *, half *, size_t, cudaStream_t) override {
+    // CPU-only build: no CUDA kernels available.
+  }
+
+  std::string GetType() const override { return type_; }
+
+  size_t GetDequantizedSize(size_t quantized_size) const override {
+    if (block_bytes_ == 0) {
+      return 0;
+    }
+    const size_t blocks = quantized_size / block_bytes_;
+    return blocks * block_size_ * sizeof(half);
+  }
+
+  double GetBitsPerValue() const override { return bits_per_value_; }
+
+private:
+  std::string type_;
+  double bits_per_value_{0.0};
+  size_t block_size_{0};
+  size_t block_bytes_{0};
+};
+
+void EnsureCpuQuantizationHandlersRegistered(
+    QuantizationHandlerRegistry *registry) {
+  if (!registry) {
+    return;
+  }
+
+  registry->Register("q4_k_m", []() {
+    return std::make_shared<StaticQuantizationHandler>("q4_k_m", 4.5, 256,
+                                                       144);
+  });
+  registry->Register("q4_k", []() {
+    return std::make_shared<StaticQuantizationHandler>("q4_k_m", 4.5, 256,
+                                                       144);
+  });
+  registry->Register("q5_k_m", []() {
+    return std::make_shared<StaticQuantizationHandler>("q5_k_m", 5.5, 256,
+                                                       176);
+  });
+  registry->Register("q5_k", []() {
+    return std::make_shared<StaticQuantizationHandler>("q5_k_m", 5.5, 256,
+                                                       176);
+  });
+  registry->Register("q6_k", []() {
+    return std::make_shared<StaticQuantizationHandler>("q6_k", 6.5625, 256,
+                                                       210);
+  });
+  registry->Register("q8_0", []() {
+    return std::make_shared<StaticQuantizationHandler>("q8_0", 8.5, 32, 34);
+  });
+}
+#endif
+
+} // namespace
+
 //==============================================================================
 // QuantizationHandlerRegistry Implementation
 //==============================================================================
 
 QuantizationHandlerRegistry &QuantizationHandlerRegistry::Instance() {
   static QuantizationHandlerRegistry instance;
+#ifndef INFERFLUX_HAS_CUDA
+  static const bool kRegistered = []() {
+    EnsureCpuQuantizationHandlersRegistered(&instance);
+    return true;
+  }();
+  (void)kRegistered;
+#endif
   return instance;
 }
 

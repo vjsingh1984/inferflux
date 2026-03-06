@@ -13,9 +13,10 @@ namespace scheduler {
 SequenceSlotManager::SequenceSlotManager(size_t max_slots)
     : max_slots_(max_slots) {
   InitializeSlots();
-  log::Info("slot_manager", "Initialized SequenceSlotManager with " +
-            std::to_string(max_slots_) + " slots (timeout: " +
-            std::to_string(idle_timeout_.count()) + "ms)");
+  log::Info(
+      "slot_manager",
+      "Initialized SequenceSlotManager with " + std::to_string(max_slots_) +
+          " slots (timeout: " + std::to_string(idle_timeout_.count()) + "ms)");
 }
 
 void SequenceSlotManager::InitializeSlots() {
@@ -41,10 +42,10 @@ std::optional<int> SequenceSlotManager::AcquireSlot(int64_t request_id) {
   // Find free slot
   auto slot = FindFreeSlot();
   if (!slot) {
-    log::Warn("slot_manager", "No free slots available (request " +
-              std::to_string(request_id) + ", used: " +
-              std::to_string(GetUsedSlotCountLocked()) + "/" +
-              std::to_string(max_slots_) + ")");
+    log::Warn("slot_manager",
+              "No free slots available (request " + std::to_string(request_id) +
+                  ", used: " + std::to_string(GetUsedSlotCountLocked()) + "/" +
+                  std::to_string(max_slots_) + ")");
     return std::nullopt;
   }
 
@@ -52,14 +53,15 @@ std::optional<int> SequenceSlotManager::AcquireSlot(int64_t request_id) {
   auto now = std::chrono::steady_clock::now();
   slots_[*slot].state = SequenceState::kPrefilling;
   slots_[*slot].request_id = request_id;
-  slots_[*slot].sequence_id = -1;  // Will be set by backend
+  slots_[*slot].sequence_id = -1; // Will be set by backend
   slots_[*slot].acquired_at = now;
   slots_[*slot].last_access = now;
   slots_[*slot].token_count = 0;
 
-  log::Debug("slot_manager", "Acquired slot " + std::to_string(*slot) +
-             " for request " + std::to_string(request_id) +
-             " (free slots: " + std::to_string(GetFreeSlotCountLocked()) + ")");
+  log::Debug("slot_manager",
+             "Acquired slot " + std::to_string(*slot) + " for request " +
+                 std::to_string(request_id) + " (free slots: " +
+                 std::to_string(GetFreeSlotCountLocked()) + ")");
 
   return slot;
 }
@@ -74,9 +76,10 @@ void SequenceSlotManager::ReleaseSlot(int slot_id) {
 
   auto &slot = slots_[slot_id];
 
-  log::Debug("slot_manager", "Releasing slot " + std::to_string(slot_id) +
-             " (request " + std::to_string(slot.request_id) +
-             ", tokens: " + std::to_string(slot.token_count) + ")");
+  log::Debug("slot_manager",
+             "Releasing slot " + std::to_string(slot_id) + " (request " +
+                 std::to_string(slot.request_id) +
+                 ", tokens: " + std::to_string(slot.token_count) + ")");
 
   // Mark as idle
   slot.state = SequenceState::kIdle;
@@ -86,17 +89,19 @@ void SequenceSlotManager::ReleaseSlot(int slot_id) {
 }
 
 // Internal version - assumes lock is already held
-std::vector<std::pair<int, int>> SequenceSlotManager::EvictIdleSlotsLocked(std::chrono::milliseconds timeout) {
+std::vector<std::pair<int, int>>
+SequenceSlotManager::EvictIdleSlotsLocked(std::chrono::milliseconds timeout) {
   // Note: mutex_ should already be locked by caller
   std::vector<std::pair<int, int>> evicted_slots;
 
   for (auto &slot : slots_) {
     if (slot.state == SequenceState::kDecoding && slot.IsIdle(timeout)) {
-      log::Info("slot_manager", "Evicting idle slot " + std::to_string(slot.slot_id) +
-                " (request " + std::to_string(slot.request_id) +
-                ", seq_id " + std::to_string(slot.sequence_id) +
-                ", idle for >" + std::to_string(timeout.count()) + "ms, " +
-                std::to_string(slot.token_count) + " tokens)");
+      log::Info("slot_manager",
+                "Evicting idle slot " + std::to_string(slot.slot_id) +
+                    " (request " + std::to_string(slot.request_id) +
+                    ", seq_id " + std::to_string(slot.sequence_id) +
+                    ", idle for >" + std::to_string(timeout.count()) + "ms, " +
+                    std::to_string(slot.token_count) + " tokens)");
 
       // Record evicted slot with its sequence ID for backend cleanup
       evicted_slots.push_back({slot.slot_id, slot.sequence_id});
@@ -107,15 +112,18 @@ std::vector<std::pair<int, int>> SequenceSlotManager::EvictIdleSlotsLocked(std::
   }
 
   if (!evicted_slots.empty()) {
-    log::Info("slot_manager", "Evicted " + std::to_string(evicted_slots.size()) +
-              " idle slots (timeout: " + std::to_string(timeout.count()) + "ms)");
+    log::Info("slot_manager",
+              "Evicted " + std::to_string(evicted_slots.size()) +
+                  " idle slots (timeout: " + std::to_string(timeout.count()) +
+                  "ms)");
   }
 
   return evicted_slots;
 }
 
 // Public version - acquires lock
-std::vector<std::pair<int, int>> SequenceSlotManager::EvictIdleSlots(std::chrono::milliseconds timeout) {
+std::vector<std::pair<int, int>>
+SequenceSlotManager::EvictIdleSlots(std::chrono::milliseconds timeout) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   return EvictIdleSlotsLocked(timeout);
 }
@@ -148,21 +156,19 @@ void SequenceSlotManager::UpdateTokenCount(int slot_id, int token_count) {
 size_t SequenceSlotManager::GetUsedSlotCount() const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
 
-  return std::count_if(slots_.begin(), slots_.end(),
-                       [](const SequenceSlot &s) {
-                         return s.state == SequenceState::kPrefilling ||
-                                s.state == SequenceState::kDecoding;
-                       });
+  return std::count_if(slots_.begin(), slots_.end(), [](const SequenceSlot &s) {
+    return s.state == SequenceState::kPrefilling ||
+           s.state == SequenceState::kDecoding;
+  });
 }
 
 size_t SequenceSlotManager::GetFreeSlotCount() const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
 
-  return std::count_if(slots_.begin(), slots_.end(),
-                       [](const SequenceSlot &s) {
-                         return s.state == SequenceState::kIdle ||
-                                s.state == SequenceState::kEvicted;
-                       });
+  return std::count_if(slots_.begin(), slots_.end(), [](const SequenceSlot &s) {
+    return s.state == SequenceState::kIdle ||
+           s.state == SequenceState::kEvicted;
+  });
 }
 
 std::vector<SequenceSlot> SequenceSlotManager::GetSlotStatus() const {
@@ -174,11 +180,11 @@ std::vector<SequenceSlot> SequenceSlotManager::GetSlotStatus() const {
 
 std::optional<int> SequenceSlotManager::FindFreeSlot() {
   // Note: mutex_ should already be locked by caller
-  auto it = std::find_if(slots_.begin(), slots_.end(),
-                       [](const SequenceSlot &s) {
-                         return s.state == SequenceState::kIdle ||
-                                s.state == SequenceState::kEvicted;
-                       });
+  auto it =
+      std::find_if(slots_.begin(), slots_.end(), [](const SequenceSlot &s) {
+        return s.state == SequenceState::kIdle ||
+               s.state == SequenceState::kEvicted;
+      });
 
   if (it != slots_.end()) {
     return static_cast<int>(it - slots_.begin());
@@ -187,14 +193,15 @@ std::optional<int> SequenceSlotManager::FindFreeSlot() {
   return std::nullopt;
 }
 
-std::optional<int> SequenceSlotManager::FindSlotByRequestId(int64_t request_id) {
+std::optional<int>
+SequenceSlotManager::FindSlotByRequestId(int64_t request_id) {
   // Note: mutex_ should already be locked by caller
   auto it = std::find_if(slots_.begin(), slots_.end(),
-                       [request_id](const SequenceSlot &s) {
-                         return s.request_id == request_id &&
-                                (s.state == SequenceState::kPrefilling ||
-                                 s.state == SequenceState::kDecoding);
-                       });
+                         [request_id](const SequenceSlot &s) {
+                           return s.request_id == request_id &&
+                                  (s.state == SequenceState::kPrefilling ||
+                                   s.state == SequenceState::kDecoding);
+                         });
 
   if (it != slots_.end()) {
     return static_cast<int>(it - slots_.begin());
@@ -207,11 +214,11 @@ void SequenceSlotManager::SetMaxSlots(size_t max_slots) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
 
   if (max_slots == max_slots_) {
-    return;  // No change
+    return; // No change
   }
 
   log::Info("slot_manager", "Resizing slots: " + std::to_string(max_slots_) +
-            " -> " + std::to_string(max_slots));
+                                " -> " + std::to_string(max_slots));
 
   max_slots_ = max_slots;
   InitializeSlots();
@@ -221,26 +228,24 @@ void SequenceSlotManager::SetIdleTimeout(std::chrono::milliseconds timeout) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   idle_timeout_ = timeout;
 
-  log::Info("slot_manager", "Idle timeout set to " +
-            std::to_string(timeout.count()) + "ms");
+  log::Info("slot_manager",
+            "Idle timeout set to " + std::to_string(timeout.count()) + "ms");
 }
 
 size_t SequenceSlotManager::GetFreeSlotCountLocked() const {
   // Note: mutex_ should already be locked by caller
-  return std::count_if(slots_.begin(), slots_.end(),
-                       [](const SequenceSlot &s) {
-                         return s.state == SequenceState::kIdle ||
-                                s.state == SequenceState::kEvicted;
-                       });
+  return std::count_if(slots_.begin(), slots_.end(), [](const SequenceSlot &s) {
+    return s.state == SequenceState::kIdle ||
+           s.state == SequenceState::kEvicted;
+  });
 }
 
 size_t SequenceSlotManager::GetUsedSlotCountLocked() const {
   // Note: mutex_ should already be locked by caller
-  return std::count_if(slots_.begin(), slots_.end(),
-                       [](const SequenceSlot &s) {
-                         return s.state == SequenceState::kPrefilling ||
-                                s.state == SequenceState::kDecoding;
-                       });
+  return std::count_if(slots_.begin(), slots_.end(), [](const SequenceSlot &s) {
+    return s.state == SequenceState::kPrefilling ||
+           s.state == SequenceState::kDecoding;
+  });
 }
 
 bool SequenceSlotManager::CanAcceptRequest() const {
@@ -251,10 +256,10 @@ bool SequenceSlotManager::CanAcceptRequest() const {
   cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
 
   if (err != cudaSuccess) {
-    log::Warn("slot_manager",
-              "Failed to query GPU memory: " + std::string(cudaGetErrorString(err)) +
-              ", allowing request (fallback behavior)");
-    return true;  // Allow request if we can't check memory
+    log::Warn("slot_manager", "Failed to query GPU memory: " +
+                                  std::string(cudaGetErrorString(err)) +
+                                  ", allowing request (fallback behavior)");
+    return true; // Allow request if we can't check memory
   }
 
   // Calculate memory pressure
@@ -263,15 +268,16 @@ bool SequenceSlotManager::CanAcceptRequest() const {
 
   // Log memory status periodically
   log::Debug("slot_manager",
-             "GPU memory: " + std::to_string(free_bytes / 1024 / 1024) + " MB free, " +
-             std::to_string(total_bytes / 1024 / 1024) + " MB total (" +
-             std::to_string(static_cast<int>(pressure_pct)) + "% used)");
+             "GPU memory: " + std::to_string(free_bytes / 1024 / 1024) +
+                 " MB free, " + std::to_string(total_bytes / 1024 / 1024) +
+                 " MB total (" +
+                 std::to_string(static_cast<int>(pressure_pct)) + "% used)");
 
   // Reject if memory pressure > 90%
   if (pressure_pct > 90.0) {
     log::Warn("slot_manager",
               "Rejecting request: memory pressure too high (" +
-              std::to_string(static_cast<int>(pressure_pct)) + "% > 90%)");
+                  std::to_string(static_cast<int>(pressure_pct)) + "% > 90%)");
     return false;
   }
 
@@ -290,13 +296,14 @@ int SequenceSlotManager::GetMemoryPressure() const {
   cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
 
   if (err != cudaSuccess) {
-    return -1;  // Error: unavailable
+    return -1; // Error: unavailable
   }
 
   size_t used_bytes = total_bytes - free_bytes;
-  return static_cast<int>((static_cast<double>(used_bytes) / total_bytes) * 100.0);
+  return static_cast<int>((static_cast<double>(used_bytes) / total_bytes) *
+                          100.0);
 #else
-  return -1;  // Not available on non-CUDA builds
+  return -1; // Not available on non-CUDA builds
 #endif
 }
 
@@ -306,13 +313,13 @@ bool SequenceSlotManager::PerformGracefulDegradation() {
 
   int pressure = GetMemoryPressure();
   if (pressure < 0) {
-    return false;  // Can't check memory pressure
+    return false; // Can't check memory pressure
   }
 
   // Degradation thresholds
-  constexpr int kWarningThreshold = 80;    // 80% - log warning
-  constexpr int kDegradeThreshold = 85;    // 85% - reduce slots
-  constexpr int kCriticalThreshold = 90;   // 90% - aggressive reduction
+  constexpr int kWarningThreshold = 80;  // 80% - log warning
+  constexpr int kDegradeThreshold = 85;  // 85% - reduce slots
+  constexpr int kCriticalThreshold = 90; // 90% - aggressive reduction
 
   if (pressure >= kCriticalThreshold) {
     // Aggressive degradation: reduce to half or minimum
@@ -323,8 +330,8 @@ bool SequenceSlotManager::PerformGracefulDegradation() {
       max_slots_ = new_max;
       log::Warn("slot_manager",
                 "CRITICAL memory pressure (" + std::to_string(pressure) +
-                "%): reducing max_slots from " + std::to_string(old_max) +
-                " to " + std::to_string(max_slots_));
+                    "%): reducing max_slots from " + std::to_string(old_max) +
+                    " to " + std::to_string(max_slots_));
       return true;
     }
   } else if (pressure >= kDegradeThreshold) {
@@ -336,20 +343,20 @@ bool SequenceSlotManager::PerformGracefulDegradation() {
       max_slots_ = new_max;
       log::Warn("slot_manager",
                 "High memory pressure (" + std::to_string(pressure) +
-                "%): reducing max_slots from " + std::to_string(old_max) +
-                " to " + std::to_string(max_slots_));
+                    "%): reducing max_slots from " + std::to_string(old_max) +
+                    " to " + std::to_string(max_slots_));
       return true;
     }
   } else if (pressure >= kWarningThreshold) {
     // Warning only: no degradation yet
-    log::Warn("slot_manager",
-              "Elevated memory pressure (" + std::to_string(pressure) +
-              "%), monitoring but not degrading yet");
+    log::Warn("slot_manager", "Elevated memory pressure (" +
+                                  std::to_string(pressure) +
+                                  "%), monitoring but not degrading yet");
   }
 
-  return false;  // No degradation performed
+  return false; // No degradation performed
 #else
-  return false;  // Not available on non-CUDA builds
+  return false; // Not available on non-CUDA builds
 #endif
 }
 
