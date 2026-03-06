@@ -1,12 +1,21 @@
 #pragma once
 
-#include <cuda_fp16.h>
-#include <cuda_runtime_api.h>
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#ifdef INFERFLUX_HAS_CUDA
+#include <cuda_fp16.h>
+#include <cuda_runtime_api.h>
+#else
+// Forward declarations for non-CUDA builds
+struct cudaStream_t__;
+typedef cudaStream_t__ *cudaStream_t;
+struct __half;
+typedef __half half;
+#endif
 
 namespace inferflux {
 namespace runtime {

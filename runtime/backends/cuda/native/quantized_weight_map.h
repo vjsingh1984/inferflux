@@ -1,8 +1,11 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/model_loader.h"
-#include <cuda_fp16.h>
+
+#ifdef INFERFLUX_HAS_CUDA
 #include <cuda_runtime_api.h>
+#endif
+
 #include <memory>
 #include <string>
 #include <vector>
