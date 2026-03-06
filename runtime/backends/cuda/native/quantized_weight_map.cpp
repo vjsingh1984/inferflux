@@ -8,7 +8,7 @@ QuantizedWeightMap::~QuantizedWeightMap() {
 }
 
 bool QuantizedWeightMap::Build(IModelLoader *loader, const ModelInfo &config,
-                                cudaStream_t stream) {
+                               cudaStream_t stream) {
   if (!loader) {
     log::Error("quantized_weight_map", "Null loader");
     return false;
@@ -42,15 +42,15 @@ bool QuantizedWeightMap::Build(IModelLoader *loader, const ModelInfo &config,
     lw.o_proj_accessor = loader->GetWeightAccessor(
         GetLayerTensorName(layer, "self_attn", "o_proj"));
 
-    lw.input_norm_accessor = loader->GetWeightAccessor(
-        GetLayerTensorName(layer, "input_layernorm"));
+    lw.input_norm_accessor =
+        loader->GetWeightAccessor(GetLayerTensorName(layer, "input_layernorm"));
     lw.post_attn_norm_accessor = loader->GetWeightAccessor(
         GetLayerTensorName(layer, "post_attention_layernorm"));
 
     lw.gate_proj_accessor = loader->GetWeightAccessor(
         GetLayerTensorName(layer, "mlp", "gate_proj"));
-    lw.up_proj_accessor = loader->GetWeightAccessor(
-        GetLayerTensorName(layer, "mlp", "up_proj"));
+    lw.up_proj_accessor =
+        loader->GetWeightAccessor(GetLayerTensorName(layer, "mlp", "up_proj"));
     lw.down_proj_accessor = loader->GetWeightAccessor(
         GetLayerTensorName(layer, "mlp", "down_proj"));
 
@@ -64,20 +64,27 @@ bool QuantizedWeightMap::Build(IModelLoader *loader, const ModelInfo &config,
   }
 
   // Global tensors
-  embed_tokens_accessor = loader->GetWeightAccessor("model.embed_tokens.weight");
+  embed_tokens_accessor =
+      loader->GetWeightAccessor("model.embed_tokens.weight");
   final_norm_accessor = loader->GetWeightAccessor("model.norm.weight");
   lm_head_accessor = loader->GetWeightAccessor("lm_head.weight");
+  if (!lm_head_accessor && embed_tokens_accessor) {
+    log::Info("quantized_weight_map",
+              "lm_head.weight not found, using tied embeddings");
+    lm_head_accessor = embed_tokens_accessor;
+  }
 
   log::Info("quantized_weight_map", "Weight map built successfully");
   return true;
 }
 
-std::string QuantizedWeightMap::GetLayerTensorName(
-    int layer, const std::string &component, const std::string &type,
-    const std::string &suffix) const {
+std::string
+QuantizedWeightMap::GetLayerTensorName(int layer, const std::string &component,
+                                       const std::string &type,
+                                       const std::string &suffix) const {
 
-  // HuggingFace style naming: model.layers.{layer}.{component}[.{type}].{suffix}
-  // Examples:
+  // HuggingFace style naming:
+  // model.layers.{layer}.{component}[.{type}].{suffix} Examples:
   // - model.layers.0.self_attn.q_proj.weight (with type)
   // - model.layers.0.input_layernorm.weight (without type)
   // - model.layers.0.self_attn.q_proj.bias (with bias suffix)
@@ -121,7 +128,7 @@ const half *QuantizedWeightMap::LayerQProj(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].q_proj_accessor,
-                                layers_[layer].q_proj);
+                               layers_[layer].q_proj);
 }
 
 const half *QuantizedWeightMap::LayerKProj(int layer) const {
@@ -129,7 +136,7 @@ const half *QuantizedWeightMap::LayerKProj(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].k_proj_accessor,
-                                layers_[layer].k_proj);
+                               layers_[layer].k_proj);
 }
 
 const half *QuantizedWeightMap::LayerVProj(int layer) const {
@@ -137,7 +144,7 @@ const half *QuantizedWeightMap::LayerVProj(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].v_proj_accessor,
-                                layers_[layer].v_proj);
+                               layers_[layer].v_proj);
 }
 
 const half *QuantizedWeightMap::LayerOProj(int layer) const {
@@ -145,7 +152,7 @@ const half *QuantizedWeightMap::LayerOProj(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].o_proj_accessor,
-                                layers_[layer].o_proj);
+                               layers_[layer].o_proj);
 }
 
 const half *QuantizedWeightMap::LayerInputNorm(int layer) const {
@@ -153,7 +160,7 @@ const half *QuantizedWeightMap::LayerInputNorm(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].input_norm_accessor,
-                                layers_[layer].input_norm);
+                               layers_[layer].input_norm);
 }
 
 const half *QuantizedWeightMap::LayerPostAttnNorm(int layer) const {
@@ -161,7 +168,7 @@ const half *QuantizedWeightMap::LayerPostAttnNorm(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].post_attn_norm_accessor,
-                                layers_[layer].post_attn_norm);
+                               layers_[layer].post_attn_norm);
 }
 
 const half *QuantizedWeightMap::LayerGateProj(int layer) const {
@@ -169,7 +176,7 @@ const half *QuantizedWeightMap::LayerGateProj(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].gate_proj_accessor,
-                                layers_[layer].gate_proj);
+                               layers_[layer].gate_proj);
 }
 
 const half *QuantizedWeightMap::LayerUpProj(int layer) const {
@@ -177,7 +184,7 @@ const half *QuantizedWeightMap::LayerUpProj(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].up_proj_accessor,
-                                layers_[layer].up_proj);
+                               layers_[layer].up_proj);
 }
 
 const half *QuantizedWeightMap::LayerDownProj(int layer) const {
@@ -185,7 +192,7 @@ const half *QuantizedWeightMap::LayerDownProj(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].down_proj_accessor,
-                                layers_[layer].down_proj);
+                               layers_[layer].down_proj);
 }
 
 // --- Bias accessors ---
@@ -195,7 +202,7 @@ const half *QuantizedWeightMap::LayerQProjBias(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].q_proj_bias_accessor,
-                                layers_[layer].q_proj_bias);
+                               layers_[layer].q_proj_bias);
 }
 
 const half *QuantizedWeightMap::LayerKProjBias(int layer) const {
@@ -203,7 +210,7 @@ const half *QuantizedWeightMap::LayerKProjBias(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].k_proj_bias_accessor,
-                                layers_[layer].k_proj_bias);
+                               layers_[layer].k_proj_bias);
 }
 
 const half *QuantizedWeightMap::LayerVProjBias(int layer) const {
@@ -211,7 +218,7 @@ const half *QuantizedWeightMap::LayerVProjBias(int layer) const {
     return nullptr;
   }
   return GetDequantizedWeights(layers_[layer].v_proj_bias_accessor,
-                                layers_[layer].v_proj_bias);
+                               layers_[layer].v_proj_bias);
 }
 
 // --- Global accessors ---

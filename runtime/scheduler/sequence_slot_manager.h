@@ -47,7 +47,7 @@ struct SequenceSlot {
 };
 
 /**
- * @brief Manages KV cache slots for both cuda_native and cuda_universal backends
+ * @brief Manages KV cache slots for both cuda_native and cuda_llama_cpp backends
  *
  * This provides universal sequence slot management at the orchestration layer,
  * above both backend implementations. Each backend maintains its own private

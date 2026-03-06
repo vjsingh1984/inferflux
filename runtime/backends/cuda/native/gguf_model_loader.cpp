@@ -1,5 +1,6 @@
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
 #include "server/logging/logger.h"
+#include <algorithm>
 #include <climits>
 #include <cstring>
 #include <limits>
@@ -12,6 +13,20 @@ namespace native {
 namespace {
 
 constexpr std::size_t kMiB = 1024ULL * 1024ULL;
+
+bool ReadU32(FILE *file, uint32_t *out) {
+  if (!file || !out) {
+    return false;
+  }
+  return fread(out, sizeof(uint32_t), 1, file) == 1;
+}
+
+bool ReadU64(FILE *file, uint64_t *out) {
+  if (!file || !out) {
+    return false;
+  }
+  return fread(out, sizeof(uint64_t), 1, file) == 1;
+}
 
 bool SizeToLong(std::size_t value, long *out) {
   if (!out) {
@@ -29,6 +44,21 @@ int SaturatingToInt(std::size_t value) {
     return std::numeric_limits<int>::max();
   }
   return static_cast<int>(value);
+}
+
+bool IsPowerOfTwo(size_t value) {
+  return value != 0 && (value & (value - 1)) == 0;
+}
+
+size_t AlignUp(size_t value, size_t alignment) {
+  if (alignment == 0) {
+    return value;
+  }
+  const size_t rem = value % alignment;
+  if (rem == 0) {
+    return value;
+  }
+  return value + (alignment - rem);
 }
 
 bool CheckCudaStatus(cudaError_t status, const char *component,
@@ -56,9 +86,8 @@ GGUFTensorData::GetQuantizationHandler() const {
 // GGUFWeightAccessor Implementation
 //==============================================================================
 
-GGUFWeightAccessor::GGUFWeightAccessor(GGUFTensorData *tensor,
-                                       GGUFModelLoader *loader)
-    : tensor_(tensor), loader_(loader) {
+GGUFWeightAccessor::GGUFWeightAccessor(GGUFTensorData *tensor)
+    : tensor_(tensor) {
   if (!tensor_) {
     log::Error("gguf_weight_accessor", "Null tensor");
   }
@@ -86,6 +115,7 @@ bool GGUFWeightAccessor::IsQuantized() const {
 }
 
 void *GGUFWeightAccessor::GetGpuWeights(cudaStream_t stream) {
+  (void)stream;
   if (!tensor_) {
     return nullptr;
   }
@@ -94,6 +124,76 @@ void *GGUFWeightAccessor::GetGpuWeights(cudaStream_t stream) {
 
 half *GGUFWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
   if (!tensor_) {
+    return nullptr;
+  }
+
+  if (!tensor_->info.is_quantized()) {
+    if (tensor_->info.type == GGUF::TensorType::F16) {
+      return static_cast<half *>(tensor_->gpu_data);
+    }
+    if (tensor_->info.type == GGUF::TensorType::F32) {
+      if (tensor_->dequantized_gpu) {
+        return tensor_->dequantized_gpu;
+      }
+      size_t num_elements = 1;
+      for (uint64_t dim : tensor_->info.shape) {
+        if (dim == 0 ||
+            dim > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+            num_elements >
+                std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
+          log::Error("gguf_weight_accessor",
+                     "Invalid F32 tensor shape for conversion: " +
+                         tensor_->info.name);
+          return nullptr;
+        }
+        num_elements *= static_cast<size_t>(dim);
+      }
+      if (num_elements > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        log::Error("gguf_weight_accessor",
+                   "F32 tensor too large to convert: " + tensor_->info.name);
+        return nullptr;
+      }
+
+      half *d_dequantized = nullptr;
+      if (!CheckCudaStatus(cudaMalloc(reinterpret_cast<void **>(&d_dequantized),
+                                      num_elements * sizeof(half)),
+                           "gguf_weight_accessor",
+                           "cudaMalloc(f32->f16 cache)")) {
+        return nullptr;
+      }
+
+      std::vector<float> host_f32(num_elements);
+      if (!CheckCudaStatus(
+              cudaMemcpy(host_f32.data(), tensor_->gpu_data,
+                         num_elements * sizeof(float), cudaMemcpyDeviceToHost),
+              "gguf_weight_accessor", "cudaMemcpy(f32 device->host)")) {
+        cudaFree(d_dequantized);
+        return nullptr;
+      }
+      std::vector<half> host_f16(num_elements);
+      for (size_t i = 0; i < num_elements; ++i) {
+        host_f16[i] = __float2half(host_f32[i]);
+      }
+      if (!CheckCudaStatus(cudaMemcpyAsync(d_dequantized, host_f16.data(),
+                                           num_elements * sizeof(half),
+                                           cudaMemcpyHostToDevice, stream),
+                           "gguf_weight_accessor",
+                           "cudaMemcpyAsync(f32->f16 host->device)")) {
+        cudaFree(d_dequantized);
+        return nullptr;
+      }
+      if (!CheckCudaStatus(cudaStreamSynchronize(stream),
+                           "gguf_weight_accessor",
+                           "cudaStreamSynchronize(f32->f16 cache)")) {
+        cudaFree(d_dequantized);
+        return nullptr;
+      }
+      tensor_->dequantized_gpu = d_dequantized;
+      return d_dequantized;
+    }
+    log::Error("gguf_weight_accessor",
+               "Unsupported non-quantized GGUF tensor type: " +
+                   tensor_->info.type_string());
     return nullptr;
   }
 
@@ -111,8 +211,23 @@ half *GGUFWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
 
   // Calculate dequantized size
   size_t num_elements = 1;
-  for (uint32_t dim : tensor_->info.shape) {
-    num_elements *= dim;
+  for (uint64_t dim : tensor_->info.shape) {
+    if (dim == 0 ||
+        dim > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        num_elements >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
+      log::Error("gguf_weight_accessor",
+                 "Invalid tensor shape for dequantization: " +
+                     tensor_->info.name);
+      return nullptr;
+    }
+    num_elements *= static_cast<size_t>(dim);
+  }
+  if (num_elements > std::numeric_limits<size_t>::max() / sizeof(half)) {
+    log::Error("gguf_weight_accessor",
+               "Tensor is too large to allocate dequantized buffer: " +
+                   tensor_->info.name);
+    return nullptr;
   }
 
   // Allocate dequantized buffer
@@ -223,12 +338,18 @@ bool GGUFModelLoader::Load(const std::filesystem::path &model_path) {
 }
 
 bool GGUFModelLoader::ParseHeader(FILE *file) {
-  if (fread(&header_, sizeof(GGUF::Header), 1, file) != 1) {
+  if (!ReadU32(file, &header_.magic) || !ReadU32(file, &header_.version) ||
+      !GGUFReader::ReadInt64(file, &header_.tensor_count) ||
+      !GGUFReader::ReadInt64(file, &header_.kv_count)) {
     log::Error("gguf_loader", "Failed to read header");
     return false;
   }
 
   if (!ValidateGGUFHeader(header_)) {
+    return false;
+  }
+  if (header_.tensor_count < 0 || header_.kv_count < 0) {
+    log::Error("gguf_loader", "Negative tensor/kv counts in GGUF header");
     return false;
   }
 
@@ -245,34 +366,276 @@ bool GGUFModelLoader::ParseKeyValuePairs(FILE *file) {
   log::Debug("gguf_loader", "Parsing " + std::to_string(header_.kv_count) +
                                 " key-value pairs");
 
-  for (uint32_t i = 0; i < header_.kv_count; ++i) {
+  alignment_ = 32;
+  model_info_ = ModelInfo{};
+  tokenizer_pieces_.clear();
+  tokenizer_eos_token_id_ = -1;
+  tokenizer_bos_token_id_ = -1;
+
+  for (int64_t i = 0; i < header_.kv_count; ++i) {
     std::string key;
     if (!GGUFReader::ReadString(file, &key)) {
       log::Error("gguf_loader", "Failed to read key");
       return false;
     }
 
-    uint32_t type_val;
-    if (fread(&type_val, 4, 1, file) != 1) {
+    uint32_t type_val = 0;
+    if (!ReadU32(file, &type_val)) {
       log::Error("gguf_loader", "Failed to read value type");
       return false;
     }
-
     GGUF::ValueType type = static_cast<GGUF::ValueType>(type_val);
 
-    // Skip value for now (we'll extract what we need in ExtractModelInfo)
-    std::vector<uint8_t> value;
-    if (!GGUFReader::ReadValue(file, type, &value)) {
-      log::Error("gguf_loader", "Failed to read value for key: " + key);
-      return false;
+    if (key == "general.architecture") {
+      if (type != GGUF::ValueType::STRING) {
+        log::Error("gguf_loader",
+                   "general.architecture has non-string GGUF type");
+        return false;
+      }
+      if (!GGUFReader::ReadString(file, &model_type_)) {
+        log::Error("gguf_loader", "Failed to read general.architecture");
+        return false;
+      }
+      model_info_.model_type = model_type_;
+      continue;
     }
 
-    // Store model type from metadata
-    if (key == "general.architecture") {
-      if (!value.empty()) {
-        model_type_ = std::string(value.begin(), value.end());
+    if (key == "general.alignment") {
+      uint64_t raw_alignment = 0;
+      if (type == GGUF::ValueType::UINT32) {
+        uint32_t v = 0;
+        if (!ReadU32(file, &v)) {
+          log::Error("gguf_loader", "Failed to read general.alignment");
+          return false;
+        }
+        raw_alignment = v;
+      } else if (type == GGUF::ValueType::UINT64) {
+        if (!ReadU64(file, &raw_alignment)) {
+          log::Error("gguf_loader", "Failed to read general.alignment");
+          return false;
+        }
+      } else {
+        log::Error("gguf_loader",
+                   "general.alignment has unsupported GGUF type");
+        return false;
       }
+      if (raw_alignment == 0 ||
+          raw_alignment >
+              static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        log::Error("gguf_loader", "general.alignment is out of range");
+        return false;
+      }
+      alignment_ = static_cast<size_t>(raw_alignment);
+      if (!IsPowerOfTwo(alignment_)) {
+        log::Error("gguf_loader", "general.alignment must be a power of two");
+        return false;
+      }
+      continue;
     }
+
+    const auto read_int_value = [&](int *out) -> bool {
+      if (!out) {
+        return false;
+      }
+      int64_t tmp = 0;
+      switch (type) {
+      case GGUF::ValueType::UINT32: {
+        uint32_t v = 0;
+        if (!ReadU32(file, &v)) {
+          return false;
+        }
+        tmp = static_cast<int64_t>(v);
+        break;
+      }
+      case GGUF::ValueType::INT32: {
+        int32_t v = 0;
+        if (fread(&v, sizeof(v), 1, file) != 1) {
+          return false;
+        }
+        tmp = static_cast<int64_t>(v);
+        break;
+      }
+      case GGUF::ValueType::UINT64: {
+        uint64_t v = 0;
+        if (!ReadU64(file, &v)) {
+          return false;
+        }
+        if (v > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+          return false;
+        }
+        tmp = static_cast<int64_t>(v);
+        break;
+      }
+      case GGUF::ValueType::INT64: {
+        int64_t v = 0;
+        if (!GGUFReader::ReadInt64(file, &v)) {
+          return false;
+        }
+        tmp = v;
+        break;
+      }
+      default:
+        return false;
+      }
+      if (tmp < 0 || tmp > std::numeric_limits<int>::max()) {
+        return false;
+      }
+      *out = static_cast<int>(tmp);
+      return true;
+    };
+    const auto read_float_value = [&](float *out) -> bool {
+      if (!out) {
+        return false;
+      }
+      if (type == GGUF::ValueType::FLOAT32) {
+        return fread(out, sizeof(float), 1, file) == 1;
+      }
+      if (type == GGUF::ValueType::FLOAT64) {
+        double v = 0.0;
+        if (fread(&v, sizeof(v), 1, file) != 1) {
+          return false;
+        }
+        *out = static_cast<float>(v);
+        return true;
+      }
+      return false;
+    };
+
+    // Parse a minimal subset of architecture metadata required by native
+    // pipeline initialization (KV-cache shape, heads, vocab).
+    if (key.find(".block_count") != std::string::npos) {
+      int v = 0;
+      if (!read_int_value(&v)) {
+        return false;
+      }
+      model_info_.num_hidden_layers = v;
+      continue;
+    }
+    if (key.find(".embedding_length") != std::string::npos) {
+      int v = 0;
+      if (!read_int_value(&v)) {
+        return false;
+      }
+      model_info_.hidden_size = v;
+      continue;
+    }
+    if (key.find(".feed_forward_length") != std::string::npos) {
+      int v = 0;
+      if (!read_int_value(&v)) {
+        return false;
+      }
+      model_info_.intermediate_size = v;
+      continue;
+    }
+    if (key.find(".attention.head_count_kv") != std::string::npos) {
+      int v = 0;
+      if (!read_int_value(&v)) {
+        return false;
+      }
+      model_info_.num_key_value_heads = v;
+      continue;
+    }
+    if (key.find(".attention.head_count") != std::string::npos) {
+      int v = 0;
+      if (!read_int_value(&v)) {
+        return false;
+      }
+      model_info_.num_attention_heads = v;
+      continue;
+    }
+    if (key.find(".context_length") != std::string::npos) {
+      int v = 0;
+      if (!read_int_value(&v)) {
+        return false;
+      }
+      model_info_.max_position_embeddings = v;
+      continue;
+    }
+    if (key.find(".rope.freq_base") != std::string::npos) {
+      float v = 0.0f;
+      if (!read_float_value(&v)) {
+        return false;
+      }
+      model_info_.rope_freq_base = v;
+      continue;
+    }
+    if (key.find(".attention.layer_norm_rms_epsilon") != std::string::npos) {
+      float v = 0.0f;
+      if (!read_float_value(&v)) {
+        return false;
+      }
+      model_info_.rms_norm_eps = v;
+      continue;
+    }
+    if (key == "tokenizer.ggml.eos_token_id") {
+      int v = -1;
+      if (!read_int_value(&v)) {
+        return false;
+      }
+      tokenizer_eos_token_id_ = v;
+      continue;
+    }
+    if (key == "tokenizer.ggml.bos_token_id") {
+      int v = -1;
+      if (!read_int_value(&v)) {
+        return false;
+      }
+      tokenizer_bos_token_id_ = v;
+      continue;
+    }
+    if (key == "tokenizer.ggml.tokens" && type == GGUF::ValueType::ARRAY) {
+      uint32_t elem_type_raw = 0;
+      uint64_t arr_len = 0;
+      if (!ReadU32(file, &elem_type_raw) ||
+          !GGUFReader::ReadUint64(file, &arr_len)) {
+        return false;
+      }
+      if (static_cast<GGUF::ValueType>(elem_type_raw) !=
+          GGUF::ValueType::STRING) {
+        // Unexpected tokenizer type; still skip safely.
+        for (uint64_t idx = 0; idx < arr_len; ++idx) {
+          if (!GGUFReader::SkipValue(
+                  file, static_cast<GGUF::ValueType>(elem_type_raw))) {
+            return false;
+          }
+        }
+        continue;
+      }
+      tokenizer_pieces_.reserve(static_cast<size_t>(std::min<uint64_t>(
+          arr_len, static_cast<uint64_t>(std::numeric_limits<size_t>::max()))));
+      for (uint64_t idx = 0; idx < arr_len; ++idx) {
+        std::string piece;
+        if (!GGUFReader::ReadString(file, &piece)) {
+          return false;
+        }
+        tokenizer_pieces_.push_back(std::move(piece));
+      }
+      model_info_.vocab_size = static_cast<int>(std::min<uint64_t>(
+          arr_len, static_cast<uint64_t>(std::numeric_limits<int>::max())));
+      continue;
+    }
+
+    if (!GGUFReader::SkipValue(file, type)) {
+      log::Error("gguf_loader", "Failed to skip value for key: " + key);
+      return false;
+    }
+  }
+
+  if (model_info_.num_key_value_heads <= 0 &&
+      model_info_.num_attention_heads > 0) {
+    model_info_.num_key_value_heads = model_info_.num_attention_heads;
+  }
+  if (model_info_.head_dim <= 0 && model_info_.hidden_size > 0 &&
+      model_info_.num_attention_heads > 0) {
+    model_info_.head_dim =
+        model_info_.hidden_size / model_info_.num_attention_heads;
+    model_info_.rope_dim = model_info_.head_dim;
+  }
+  if (model_info_.torch_dtype.empty()) {
+    model_info_.torch_dtype = "float16";
+  }
+  if (model_info_.rms_norm_eps <= 0.0f) {
+    model_info_.rms_norm_eps = 1e-6f;
   }
 
   return true;
@@ -282,7 +645,7 @@ bool GGUFModelLoader::ParseTensorInfo(FILE *file) {
   log::Debug("gguf_loader", "Parsing " + std::to_string(header_.tensor_count) +
                                 " tensor info entries");
 
-  for (uint32_t i = 0; i < header_.tensor_count; ++i) {
+  for (int64_t i = 0; i < header_.tensor_count; ++i) {
     GGUFTensorData tensor;
     uint64_t offset;
 
@@ -293,40 +656,71 @@ bool GGUFModelLoader::ParseTensorInfo(FILE *file) {
     }
 
     // Read number of dimensions
-    uint32_t n_dims;
-    if (fread(&n_dims, 4, 1, file) != 1) {
+    uint32_t n_dims = 0;
+    if (!ReadU32(file, &n_dims)) {
       log::Error("gguf_loader", "Failed to read n_dims");
+      return false;
+    }
+    if (n_dims == 0) {
+      log::Error("gguf_loader",
+                 "Tensor has zero dimensions: " + tensor.info.name);
+      return false;
+    }
+    constexpr uint32_t kMaxDims = 8;
+    if (n_dims > kMaxDims) {
+      log::Error("gguf_loader", "Tensor has unsupported dimension count: " +
+                                    std::to_string(n_dims));
       return false;
     }
 
     // Read dimensions
     tensor.info.shape.resize(n_dims);
     for (uint32_t j = 0; j < n_dims; ++j) {
-      uint32_t dim;
-      if (fread(&dim, 4, 1, file) != 1) {
+      int64_t dim = 0;
+      if (!GGUFReader::ReadInt64(file, &dim)) {
         log::Error("gguf_loader", "Failed to read dimension");
         return false;
       }
-      tensor.info.shape[j] = dim;
+      if (dim <= 0) {
+        log::Error("gguf_loader", "Invalid tensor dimension " +
+                                      std::to_string(dim) + " for " +
+                                      tensor.info.name);
+        return false;
+      }
+      tensor.info.shape[j] = static_cast<uint64_t>(dim);
     }
 
     // Read type
-    uint32_t type_val;
-    if (fread(&type_val, 4, 1, file) != 1) {
+    uint32_t type_val = 0;
+    if (!ReadU32(file, &type_val)) {
       log::Error("gguf_loader", "Failed to read tensor type");
+      return false;
+    }
+    if (type_val > static_cast<uint32_t>(GGUF::TensorType::Q8_K)) {
+      log::Error("gguf_loader",
+                 "Unsupported tensor type id: " + std::to_string(type_val));
       return false;
     }
     tensor.info.type = static_cast<GGUF::TensorType>(type_val);
 
     // Read offset
-    if (fread(&offset, 8, 1, file) != 1) {
+    if (!ReadU64(file, &offset)) {
       log::Error("gguf_loader", "Failed to read tensor offset");
+      return false;
+    }
+    if (offset > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+      log::Error("gguf_loader", "Tensor offset exceeds platform limits");
       return false;
     }
     tensor.info.offset = static_cast<size_t>(offset);
 
     // Calculate byte size
     tensor.info.byte_size = CalcTensorSize(tensor.info.type, tensor.info.shape);
+    if (tensor.info.byte_size == 0) {
+      log::Error("gguf_loader", "Invalid tensor size for " + tensor.info.name +
+                                    " (type=" + std::to_string(type_val) + ")");
+      return false;
+    }
 
     tensors_[tensor.info.name] = std::move(tensor);
   }
@@ -337,10 +731,23 @@ bool GGUFModelLoader::ParseTensorInfo(FILE *file) {
 bool GGUFModelLoader::LoadTensorData(FILE *file) {
   log::Info("gguf_loader", "Loading tensor data...");
 
+  const long metadata_end = ftell(file);
+  if (metadata_end < 0) {
+    log::Error("gguf_loader", "Failed to determine metadata end position");
+    return false;
+  }
+  data_section_offset_ = AlignUp(static_cast<size_t>(metadata_end), alignment_);
+
   for (auto &[name, tensor] : tensors_) {
     // Seek to tensor data
+    if (tensor.info.offset >
+        std::numeric_limits<size_t>::max() - data_section_offset_) {
+      log::Error("gguf_loader", "Tensor data offset overflow: " + name);
+      return false;
+    }
+    const size_t absolute_offset = data_section_offset_ + tensor.info.offset;
     long seek_offset = 0;
-    if (!SizeToLong(tensor.info.offset, &seek_offset)) {
+    if (!SizeToLong(absolute_offset, &seek_offset)) {
       log::Error("gguf_loader", "Tensor offset exceeds seek range: " + name);
       return false;
     }
@@ -367,25 +774,31 @@ bool GGUFModelLoader::LoadTensorData(FILE *file) {
 
   log::Info("gguf_loader", "Loaded " + std::to_string(tensors_.size()) +
                                " tensors, " +
-                               std::to_string(total_size / kMiB) + " MB");
+                               std::to_string(total_size / kMiB) +
+                               " MB (data_section_offset=" +
+                               std::to_string(data_section_offset_) + ")");
 
   return true;
 }
 
 bool GGUFModelLoader::ExtractModelInfo() {
-  // Extract from parsed metadata
-  // For now, use default values
-  // TODO: Parse from GGUF metadata in ParseKeyValuePairs
+  if (model_info_.model_type.empty()) {
+    model_info_.model_type = model_type_.empty() ? "unknown" : model_type_;
+  }
+  if (model_info_.torch_dtype.empty()) {
+    model_info_.torch_dtype = "float16"; // GGUF typically stores fp16/f32
+  }
+  if (model_info_.rms_norm_eps <= 0.0f) {
+    model_info_.rms_norm_eps = 1e-6f;
+  }
 
-  model_info_.model_type = model_type_.empty() ? "unknown" : model_type_;
-  model_info_.torch_dtype = "float16"; // GGUF typically uses FP16
-  model_info_.rms_norm_eps = 1e-6f;
-
-  // Count layers from tensor names
-  for (const auto &[name, tensor] : tensors_) {
-    auto parts = GGUFReader::ParseTensorName(name);
-    if (parts.layer >= 0 && parts.layer + 1 > model_info_.num_hidden_layers) {
-      model_info_.num_hidden_layers = parts.layer + 1;
+  // Count layers from tensor names if metadata omitted it.
+  if (model_info_.num_hidden_layers <= 0) {
+    for (const auto &[name, tensor] : tensors_) {
+      auto parts = GGUFReader::ParseTensorName(name);
+      if (parts.layer >= 0 && parts.layer + 1 > model_info_.num_hidden_layers) {
+        model_info_.num_hidden_layers = parts.layer + 1;
+      }
     }
   }
 
@@ -395,21 +808,60 @@ bool GGUFModelLoader::ExtractModelInfo() {
     tok_emb_it = tensors_.find("token_embd.weight");
   }
   if (tok_emb_it != tensors_.end()) {
-    if (tok_emb_it->second.info.shape.size() >= 1) {
+    if (tok_emb_it->second.info.shape.size() >= 2) {
+      const uint64_t d0 = tok_emb_it->second.info.shape[0];
+      const uint64_t d1 = tok_emb_it->second.info.shape[1];
       model_info_.vocab_size =
-          SaturatingToInt(tok_emb_it->second.info.shape[0]);
+          SaturatingToInt(static_cast<size_t>(std::min<uint64_t>(
+              std::max<uint64_t>(d0, d1),
+              static_cast<uint64_t>(std::numeric_limits<size_t>::max()))));
+      if (model_info_.hidden_size <= 0) {
+        model_info_.hidden_size =
+            SaturatingToInt(static_cast<size_t>(std::min<uint64_t>(
+                std::min<uint64_t>(d0, d1),
+                static_cast<uint64_t>(std::numeric_limits<size_t>::max()))));
+      }
+    } else if (tok_emb_it->second.info.shape.size() >= 1 &&
+               model_info_.vocab_size <= 0) {
+      model_info_.vocab_size =
+          SaturatingToInt(static_cast<size_t>(std::min<uint64_t>(
+              tok_emb_it->second.info.shape[0],
+              static_cast<uint64_t>(std::numeric_limits<size_t>::max()))));
+    }
+  }
+  if (model_info_.vocab_size <= 0 && !tokenizer_pieces_.empty()) {
+    model_info_.vocab_size = static_cast<int>(
+        std::min<size_t>(tokenizer_pieces_.size(),
+                         static_cast<size_t>(std::numeric_limits<int>::max())));
+  }
+
+  // Get hidden size from first attention layer when still missing.
+  if (model_info_.hidden_size <= 0) {
+    for (const auto &[name, tensor] : tensors_) {
+      if (name.find("attn_q.weight") != std::string::npos ||
+          name.find("attn_q.bias") != std::string::npos) {
+        if (tensor.info.shape.size() >= 2) {
+          model_info_.hidden_size =
+              SaturatingToInt(static_cast<size_t>(std::min<uint64_t>(
+                  tensor.info.shape[1],
+                  static_cast<uint64_t>(std::numeric_limits<size_t>::max()))));
+          break;
+        }
+      }
     }
   }
 
-  // Get hidden size from first attention layer
-  for (const auto &[name, tensor] : tensors_) {
-    if (name.find("attn_q.weight") != std::string::npos ||
-        name.find("attn_q.bias") != std::string::npos) {
-      if (tensor.info.shape.size() >= 2) {
-        model_info_.hidden_size = SaturatingToInt(tensor.info.shape[1]);
-        break;
-      }
-    }
+  if (model_info_.num_key_value_heads <= 0 &&
+      model_info_.num_attention_heads > 0) {
+    model_info_.num_key_value_heads = model_info_.num_attention_heads;
+  }
+  if (model_info_.head_dim <= 0 && model_info_.hidden_size > 0 &&
+      model_info_.num_attention_heads > 0) {
+    model_info_.head_dim =
+        model_info_.hidden_size / model_info_.num_attention_heads;
+  }
+  if (model_info_.rope_dim <= 0 && model_info_.head_dim > 0) {
+    model_info_.rope_dim = model_info_.head_dim;
   }
 
   log::Info("gguf_loader",
@@ -546,8 +998,7 @@ GGUFModelLoader::GetWeightAccessor(const std::string &tensor_name) {
   }
 
   // Create accessor
-  auto accessor =
-      std::make_shared<GGUFWeightAccessor>(&tensor_it->second, this);
+  auto accessor = std::make_shared<GGUFWeightAccessor>(&tensor_it->second);
 
   weight_accessor_cache_[tensor_name] = accessor;
   return accessor;

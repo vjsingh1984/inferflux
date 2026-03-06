@@ -33,21 +33,30 @@ struct RadixNode {
   int NumTokens() const { return static_cast<int>(edge.size()); }
 };
 
+struct RadixPrefixCacheLimits {
+  std::size_t capacity{1024};
+  std::size_t max_sequences{12};
+};
+
+struct RadixLookupResult {
+  std::vector<int> block_table;
+  int sequence_id{-1};
+  int matched_tokens{0};
+};
+
 class RadixPrefixCache {
 public:
   using EvictCallback = std::function<void(int)>;
 
   explicit RadixPrefixCache(std::shared_ptr<PagedKVCache> kv_cache,
                             EvictCallback on_evict_seq,
-                            std::size_t capacity = 1024,
-                            std::size_t max_sequences = 12);
+                            const RadixPrefixCacheLimits &limits = {});
 
   // Returns true if a full node match was found (allowing CopySequencePrefix).
   // matched_tokens is always filled with the longest common prefix length
   // including partial edge matches for metrics (§ Item 3).
   bool Lookup(const std::vector<int> &tokens, LlamaCPUBackend *backend,
-              std::vector<int> *out_block_table, int *out_sequence_id,
-              int *matched_tokens);
+              RadixLookupResult *result);
 
   // Insert a sequence of tokens and its corresponding block_table.
   void Insert(const std::vector<int> &tokens,
@@ -63,8 +72,13 @@ private:
   std::pair<RadixNode *, std::size_t>
   FindLongestPrefix(const std::vector<int> &tokens) const;
 
+  struct SplitEdgeSpec {
+    int first_token{0};
+    std::size_t split_at{0};
+  };
+
   // Split the child edge of parent keyed by first_token at split_at tokens in.
-  void SplitEdge(RadixNode *parent, int first_token, std::size_t split_at);
+  void SplitEdge(RadixNode *parent, const SplitEdgeSpec &spec);
 
   // Evict the leaf node with the smallest last_used timestamp.
   void EvictOne();

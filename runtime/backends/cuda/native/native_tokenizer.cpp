@@ -82,6 +82,11 @@ NativeTokenizer::DecodeByteLevelBPE(const std::string &piece) const {
 }
 
 bool NativeTokenizer::Load(const std::string &model_path) {
+  id_to_piece_.clear();
+  piece_to_id_.clear();
+  eos_token_id_ = -1;
+  bos_token_id_ = -1;
+
   std::string tokenizer_path = model_path + "/tokenizer.json";
   std::ifstream f(tokenizer_path);
   if (!f.is_open()) {
@@ -138,6 +143,30 @@ bool NativeTokenizer::Load(const std::string &model_path) {
                "Failed to parse tokenizer.json: " + std::string(e.what()));
     return false;
   }
+}
+
+bool NativeTokenizer::LoadFromPieces(const std::vector<std::string> &pieces,
+                                     int eos_token_id, int bos_token_id) {
+  id_to_piece_.clear();
+  piece_to_id_.clear();
+
+  for (size_t i = 0; i < pieces.size(); ++i) {
+    const int token_id = static_cast<int>(i);
+    id_to_piece_[token_id] = pieces[i];
+    // Keep first ID on duplicates.
+    if (piece_to_id_.find(pieces[i]) == piece_to_id_.end()) {
+      piece_to_id_[pieces[i]] = token_id;
+    }
+  }
+  eos_token_id_ = eos_token_id;
+  bos_token_id_ = bos_token_id;
+
+  log::Info("native_tokenizer",
+            "Loaded tokenizer pieces from GGUF metadata: " +
+                std::to_string(id_to_piece_.size()) +
+                " tokens, eos=" + std::to_string(eos_token_id_) +
+                ", bos=" + std::to_string(bos_token_id_));
+  return !id_to_piece_.empty();
 }
 
 std::string NativeTokenizer::IdToString(int token_id) const {

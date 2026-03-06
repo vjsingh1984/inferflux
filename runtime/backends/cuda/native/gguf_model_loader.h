@@ -24,10 +24,10 @@ namespace native {
 class GGUFTensorData {
 public:
   GGUF::TensorInfo info;
-  std::vector<uint8_t> cpu_data;     // Quantized data on CPU
-  void *gpu_data{nullptr};            // Quantized data on GPU
-  half *dequantized_gpu{nullptr};     // Dequantized FP16 data on GPU (cached)
-  size_t gpu_offset{0};               // Offset in unified GPU buffer
+  std::vector<uint8_t> cpu_data;  // Quantized data on CPU
+  void *gpu_data{nullptr};        // Quantized data on GPU
+  half *dequantized_gpu{nullptr}; // Dequantized FP16 data on GPU (cached)
+  size_t gpu_offset{0};           // Offset in unified GPU buffer
 
   /**
    * @brief Get quantization handler for this tensor
@@ -39,7 +39,10 @@ public:
    */
   bool IsDequantizedCached() const { return dequantized_gpu != nullptr; }
 
-  void ClearCPUMemory() { cpu_data.clear(); cpu_data.shrink_to_fit(); }
+  void ClearCPUMemory() {
+    cpu_data.clear();
+    cpu_data.shrink_to_fit();
+  }
 };
 
 /**
@@ -74,22 +77,28 @@ public:
 
   /**
    * @brief Get weight accessor for a specific tensor
-   * @param tensor_name Internal tensor name (e.g., "model.layers.0.self_attn.q_proj.weight")
+   * @param tensor_name Internal tensor name (e.g.,
+   * "model.layers.0.self_attn.q_proj.weight")
    * @return Shared pointer to weight accessor, or nullptr if not found
    */
-  std::shared_ptr<IWeightAccessor> GetWeightAccessor(
-      const std::string &tensor_name);
+  std::shared_ptr<IWeightAccessor>
+  GetWeightAccessor(const std::string &tensor_name) override;
 
   /**
    * @brief Get tensor by GGUF name (original name)
    */
-  const GGUFTensorData *GetTensorByGGUFName(
-      const std::string &gguf_name) const;
+  const GGUFTensorData *GetTensorByGGUFName(const std::string &gguf_name) const;
 
   /**
    * @brief Get all tensor names (internal naming)
    */
   std::vector<std::string> GetTensorNames() const;
+
+  const std::vector<std::string> &TokenizerPieces() const {
+    return tokenizer_pieces_;
+  }
+  int TokenizerEosTokenId() const { return tokenizer_eos_token_id_; }
+  int TokenizerBosTokenId() const { return tokenizer_bos_token_id_; }
 
   /**
    * @brief Get GGUF to internal tensor name mapping
@@ -124,8 +133,13 @@ private:
   // Parsed data
   GGUF::Header header_;
   ModelInfo model_info_;
-  std::string model_type_;  // "qwen2", "llama", etc.
-  std::string quantization_type_;  // "q4_k_m", "q5_k_m", etc.
+  std::string model_type_;        // "qwen2", "llama", etc.
+  std::string quantization_type_; // "q4_k_m", "q5_k_m", etc.
+  size_t alignment_{32};
+  size_t data_section_offset_{0};
+  std::vector<std::string> tokenizer_pieces_;
+  int tokenizer_eos_token_id_{-1};
+  int tokenizer_bos_token_id_{-1};
 
   // Tensors (keyed by GGUF name)
   std::unordered_map<std::string, GGUFTensorData> tensors_;
@@ -144,8 +158,7 @@ private:
   std::filesystem::path model_path_;
 
   // Weight accessor cache
-  mutable std::unordered_map<std::string,
-                             std::shared_ptr<IWeightAccessor>>
+  mutable std::unordered_map<std::string, std::shared_ptr<IWeightAccessor>>
       weight_accessor_cache_;
 };
 
@@ -157,7 +170,7 @@ private:
  */
 class GGUFWeightAccessor : public IWeightAccessor {
 public:
-  GGUFWeightAccessor(GGUFTensorData *tensor, GGUFModelLoader *loader);
+  explicit GGUFWeightAccessor(GGUFTensorData *tensor);
 
   // IWeightAccessor interface
   std::pair<size_t, size_t> GetDimensions() const override;
@@ -169,7 +182,6 @@ public:
 
 private:
   GGUFTensorData *tensor_;
-  GGUFModelLoader *loader_;
 };
 
 } // namespace native

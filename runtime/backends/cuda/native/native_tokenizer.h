@@ -23,6 +23,13 @@ public:
   bool Load(const std::string &model_path);
 
   /**
+   * Load tokenizer directly from pre-parsed vocabulary pieces.
+   * Useful for GGUF models where tokenizer data is embedded in metadata.
+   */
+  bool LoadFromPieces(const std::vector<std::string> &pieces, int eos_token_id,
+                      int bos_token_id);
+
+  /**
    * Convert token ID to text piece.
    * Handles byte-level BPE decoding (e.g., \xC4\xA0 -> space).
    */

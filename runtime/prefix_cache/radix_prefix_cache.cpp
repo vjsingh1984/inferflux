@@ -27,10 +27,9 @@ std::size_t CommonPrefixLength(const std::vector<int> &edge,
 
 RadixPrefixCache::RadixPrefixCache(std::shared_ptr<PagedKVCache> kv_cache,
                                    EvictCallback on_evict_seq,
-                                   std::size_t capacity,
-                                   std::size_t max_sequences)
+                                   const RadixPrefixCacheLimits &limits)
     : kv_cache_(std::move(kv_cache)), on_evict_seq_(std::move(on_evict_seq)),
-      capacity_(capacity), max_sequences_(max_sequences),
+      capacity_(limits.capacity), max_sequences_(limits.max_sequences),
       root_(std::make_unique<RadixNode>()) {}
 
 std::size_t RadixPrefixCache::Size() const {
@@ -45,11 +44,13 @@ std::size_t RadixPrefixCache::LiveSequences() const {
 
 bool RadixPrefixCache::Lookup(const std::vector<int> &tokens,
                               LlamaCPUBackend *backend,
-                              std::vector<int> *out_block_table,
-                              int *out_sequence_id, int *matched_tokens) {
+                              RadixLookupResult *result) {
+  if (result) {
+    result->block_table.clear();
+    result->sequence_id = -1;
+    result->matched_tokens = 0;
+  }
   if (capacity_ == 0 || tokens.empty()) {
-    if (matched_tokens)
-      *matched_tokens = 0;
     return false;
   }
 
@@ -101,42 +102,41 @@ bool RadixPrefixCache::Lookup(const std::vector<int> &tokens,
     node->last_used = ++clock_;
   }
 
-  if (matched_tokens) {
-    *matched_tokens = static_cast<int>(offset);
+  if (result) {
+    result->matched_tokens = static_cast<int>(offset);
   }
 
   if (node_hit && node != root_.get()) {
-    if (out_block_table)
-      *out_block_table = std::move(blocks);
-    if (out_sequence_id)
-      *out_sequence_id = last_seq_id;
+    if (result) {
+      result->block_table = std::move(blocks);
+      result->sequence_id = last_seq_id;
+    }
     return true;
   }
 
   return false;
 }
 
-void RadixPrefixCache::SplitEdge(RadixNode *parent, int first_token,
-                                 std::size_t split_at) {
-  auto original = std::move(parent->children[first_token]);
+void RadixPrefixCache::SplitEdge(RadixNode *parent, const SplitEdgeSpec &spec) {
+  auto original = std::move(parent->children[spec.first_token]);
 
   auto intermediate = std::make_unique<RadixNode>();
   intermediate->parent = parent;
   intermediate->edge.assign(original->edge.begin(),
                             original->edge.begin() +
-                                static_cast<std::ptrdiff_t>(split_at));
+                                static_cast<std::ptrdiff_t>(spec.split_at));
 
   intermediate->block_table = {};
   intermediate->sequence_id = -1;
 
-  int original_first = original->edge[split_at];
+  int original_first = original->edge[spec.split_at];
   original->parent = intermediate.get();
   original->edge.erase(original->edge.begin(),
                        original->edge.begin() +
-                           static_cast<std::ptrdiff_t>(split_at));
+                           static_cast<std::ptrdiff_t>(spec.split_at));
 
   intermediate->children[original_first] = std::move(original);
-  parent->children[first_token] = std::move(intermediate);
+  parent->children[spec.first_token] = std::move(intermediate);
   size_++;
 }
 
@@ -194,7 +194,7 @@ void RadixPrefixCache::Insert(const std::vector<int> &tokens,
     std::size_t common = CommonPrefixLength(child->edge, tokens, offset);
 
     if (common < child->edge.size()) {
-      SplitEdge(node, first, common);
+      SplitEdge(node, {first, common});
       child = node->children[first].get();
     }
 

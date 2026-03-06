@@ -1,11 +1,46 @@
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "server/logging/logger.h"
+#include <array>
 #include <cstring>
+#include <limits>
+#include <type_traits>
 
 namespace inferflux {
 namespace runtime {
 namespace cuda {
 namespace native {
+namespace {
+
+template <typename T> bool ReadScalar(FILE *file, T *value) {
+  static_assert(std::is_trivially_copyable_v<T>,
+                "ReadScalar expects POD values");
+  if (!file || !value) {
+    return false;
+  }
+  return fread(value, sizeof(T), 1, file) == 1;
+}
+
+bool SkipBytes(FILE *file, uint64_t count) {
+  if (!file) {
+    return false;
+  }
+  if (count == 0) {
+    return true;
+  }
+  std::array<unsigned char, 4096> buffer{};
+  uint64_t remaining = count;
+  while (remaining > 0) {
+    const size_t chunk =
+        static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
+    if (fread(buffer.data(), 1, chunk, file) != chunk) {
+      return false;
+    }
+    remaining -= chunk;
+  }
+  return true;
+}
+
+} // namespace
 
 //==============================================================================
 // GGUF::TensorInfo Implementation
@@ -41,35 +76,26 @@ std::string GGUF::TensorInfo::type_string() const {
 // GGUFReader Implementation
 //==============================================================================
 
-bool GGUFReader::ReadVarint(FILE *file, uint64_t *value) {
-  uint64_t result = 0;
-  int shift = 0;
+bool GGUFReader::ReadUint64(FILE *file, uint64_t *value) {
+  return ReadScalar(file, value);
+}
 
-  for (int i = 0; i < 8; ++i) {
-    uint8_t byte;
-    if (fread(&byte, 1, 1, file) != 1) {
-      return false;
-    }
-
-    result |= (uint64_t)(byte & 0x7F) << shift;
-    shift += 7;
-
-    if (!(byte & 0x80)) {
-      break;
-    }
-  }
-
-  *value = result;
-  return true;
+bool GGUFReader::ReadInt64(FILE *file, int64_t *value) {
+  return ReadScalar(file, value);
 }
 
 bool GGUFReader::ReadString(FILE *file, std::string *str) {
   uint64_t len;
-  if (!ReadVarint(file, &len)) {
+  if (!ReadUint64(file, &len)) {
+    return false;
+  }
+  constexpr uint64_t kMaxStringLen = 1ULL << 30; // 1 GiB safety bound
+  if (len > kMaxStringLen ||
+      len > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
     return false;
   }
 
-  str->resize(len);
+  str->resize(static_cast<size_t>(len));
   if (len > 0 && fread(str->data(), 1, len, file) != len) {
     return false;
   }
@@ -79,38 +105,30 @@ bool GGUFReader::ReadString(FILE *file, std::string *str) {
 
 bool GGUFReader::ReadValue(FILE *file, GGUF::ValueType type,
                            std::vector<uint8_t> *output) {
+  if (!output) {
+    return false;
+  }
+  output->clear();
+
+  const auto read_fixed = [&](size_t bytes) -> bool {
+    output->resize(bytes);
+    return bytes == 0 || fread(output->data(), 1, bytes, file) == bytes;
+  };
+
   switch (type) {
   case GGUF::ValueType::UINT8:
-    output->resize(1);
-    return fread(output->data(), 1, 1, file) == 1;
-
   case GGUF::ValueType::INT8:
-    output->resize(1);
-    return fread(output->data(), 1, 1, file) == 1;
+  case GGUF::ValueType::BOOL:
+    return read_fixed(1);
 
   case GGUF::ValueType::UINT16:
-    output->resize(2);
-    return fread(output->data(), 2, 1, file) == 1;
-
   case GGUF::ValueType::INT16:
-    output->resize(2);
-    return fread(output->data(), 2, 1, file) == 1;
+    return read_fixed(2);
 
   case GGUF::ValueType::UINT32:
-    output->resize(4);
-    return fread(output->data(), 4, 1, file) == 1;
-
   case GGUF::ValueType::INT32:
-    output->resize(4);
-    return fread(output->data(), 4, 1, file) == 1;
-
   case GGUF::ValueType::FLOAT32:
-    output->resize(4);
-    return fread(output->data(), 4, 1, file) == 1;
-
-  case GGUF::ValueType::BOOL:
-    output->resize(1);
-    return fread(output->data(), 1, 1, file) == 1;
+    return read_fixed(4);
 
   case GGUF::ValueType::STRING: {
     std::string str;
@@ -122,17 +140,16 @@ bool GGUFReader::ReadValue(FILE *file, GGUF::ValueType type,
   }
 
   case GGUF::ValueType::ARRAY: {
-    uint32_t len;
-    if (fread(&len, 4, 1, file) != 1) {
+    uint32_t elem_type_raw = 0;
+    if (!ReadScalar(file, &elem_type_raw)) {
       return false;
     }
-    GGUF::ValueType elem_type;
-    if (fread(&elem_type, 4, 1, file) != 1) {
+    GGUF::ValueType elem_type = static_cast<GGUF::ValueType>(elem_type_raw);
+    uint64_t len = 0;
+    if (!ReadUint64(file, &len)) {
       return false;
     }
-    // For simplicity, just skip array contents for now
-    // TODO: Implement full array parsing if needed
-    for (uint32_t i = 0; i < len; ++i) {
+    for (uint64_t i = 0; i < len; ++i) {
       std::vector<uint8_t> temp;
       if (!ReadValue(file, elem_type, &temp)) {
         return false;
@@ -142,20 +159,59 @@ bool GGUFReader::ReadValue(FILE *file, GGUF::ValueType type,
   }
 
   case GGUF::ValueType::UINT64:
-    output->resize(8);
-    return fread(output->data(), 8, 1, file) == 1;
-
   case GGUF::ValueType::INT64:
-    output->resize(8);
-    return fread(output->data(), 8, 1, file) == 1;
-
   case GGUF::ValueType::FLOAT64:
-    output->resize(8);
-    return fread(output->data(), 8, 1, file) == 1;
+    return read_fixed(8);
 
   default:
     log::Error("gguf_reader", "Unknown value type: " +
-                              std::to_string(static_cast<uint32_t>(type)));
+                                  std::to_string(static_cast<uint32_t>(type)));
+    return false;
+  }
+}
+
+bool GGUFReader::SkipValue(FILE *file, GGUF::ValueType type) {
+  switch (type) {
+  case GGUF::ValueType::UINT8:
+  case GGUF::ValueType::INT8:
+  case GGUF::ValueType::BOOL:
+    return SkipBytes(file, 1);
+  case GGUF::ValueType::UINT16:
+  case GGUF::ValueType::INT16:
+    return SkipBytes(file, 2);
+  case GGUF::ValueType::UINT32:
+  case GGUF::ValueType::INT32:
+  case GGUF::ValueType::FLOAT32:
+    return SkipBytes(file, 4);
+  case GGUF::ValueType::UINT64:
+  case GGUF::ValueType::INT64:
+  case GGUF::ValueType::FLOAT64:
+    return SkipBytes(file, 8);
+  case GGUF::ValueType::STRING: {
+    uint64_t len = 0;
+    if (!ReadUint64(file, &len)) {
+      return false;
+    }
+    return SkipBytes(file, len);
+  }
+  case GGUF::ValueType::ARRAY: {
+    uint32_t elem_type_raw = 0;
+    if (!ReadScalar(file, &elem_type_raw)) {
+      return false;
+    }
+    GGUF::ValueType elem_type = static_cast<GGUF::ValueType>(elem_type_raw);
+    uint64_t len = 0;
+    if (!ReadUint64(file, &len)) {
+      return false;
+    }
+    for (uint64_t i = 0; i < len; ++i) {
+      if (!SkipValue(file, elem_type)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  default:
     return false;
   }
 }
@@ -213,14 +269,59 @@ GGUFReader::ParseTensorName(const std::string &name) {
 
 std::string GGUFReader::MapTensorName(const std::string &gguf_name,
                                       const std::string &model_type) {
+  if (gguf_name == "tok_emb.weight" || gguf_name == "token_embd.weight") {
+    return "model.embed_tokens.weight";
+  }
+  if (gguf_name == "output.weight") {
+    return "lm_head.weight";
+  }
+  if (gguf_name == "output_norm.weight" || gguf_name == "norm.weight" ||
+      gguf_name == "ln_f.weight") {
+    return "model.norm.weight";
+  }
+  if (gguf_name == "output_norm.bias" || gguf_name == "norm.bias" ||
+      gguf_name == "ln_f.bias") {
+    return "model.norm.bias";
+  }
+
+  const auto parts = ParseTensorName(gguf_name);
+  if (parts.layer >= 0) {
+    std::string mapped_component;
+    if (parts.component == "attn_q") {
+      mapped_component = "self_attn.q_proj";
+    } else if (parts.component == "attn_k") {
+      mapped_component = "self_attn.k_proj";
+    } else if (parts.component == "attn_v") {
+      mapped_component = "self_attn.v_proj";
+    } else if (parts.component == "attn_o" ||
+               parts.component == "attn_output") {
+      mapped_component = "self_attn.o_proj";
+    } else if (parts.component == "attn_norm") {
+      mapped_component = "input_layernorm";
+    } else if (parts.component == "ffn_norm") {
+      mapped_component = "post_attention_layernorm";
+    } else if (parts.component == "ffn_gate") {
+      mapped_component = "mlp.gate_proj";
+    } else if (parts.component == "ffn_up") {
+      mapped_component = "mlp.up_proj";
+    } else if (parts.component == "ffn_down") {
+      mapped_component = "mlp.down_proj";
+    }
+    if (!mapped_component.empty()) {
+      return "model.layers." + std::to_string(parts.layer) + "." +
+             mapped_component + "." + parts.type;
+    }
+  }
+
+  // Fallback static maps for architecture-specific edge cases.
   if (model_type == "qwen2" || model_type == "qwen") {
-    auto &map = GetQwen2TensorMap();
+    const auto &map = GetQwen2TensorMap();
     auto it = map.find(gguf_name);
     if (it != map.end()) {
       return it->second;
     }
   } else if (model_type == "llama") {
-    auto &map = GetLlamaTensorMap();
+    const auto &map = GetLlamaTensorMap();
     auto it = map.find(gguf_name);
     if (it != map.end()) {
       return it->second;
@@ -258,7 +359,8 @@ GGUFReader::GetQwen2TensorMap() {
 
       // Layer norms per layer
       {"blk.0.attn_norm.weight", "model.layers.0.input_layernorm.weight"},
-      {"blk.0.ffn_norm.weight", "model.layers.0.post_attention_layernorm.weight"},
+      {"blk.0.ffn_norm.weight",
+       "model.layers.0.post_attention_layernorm.weight"},
   };
   return map;
 }
@@ -287,7 +389,8 @@ GGUFReader::GetLlamaTensorMap() {
 
       // Layer norms per layer
       {"blk.0.attn_norm.weight", "model.layers.0.input_layernorm.weight"},
-      {"blk.0.ffn_norm.weight", "model.layers.0.post_attention_layernorm.weight"},
+      {"blk.0.ffn_norm.weight",
+       "model.layers.0.post_attention_layernorm.weight"},
   };
   return map;
 }
@@ -298,14 +401,19 @@ GGUFReader::GetLlamaTensorMap() {
 
 bool ValidateGGUFHeader(const GGUF::Header &header) {
   if (header.magic != GGUF::MAGIC) {
-    log::Error("gguf", "Invalid magic number: " +
-                          std::to_string(header.magic));
+    log::Error("gguf", "Invalid magic number: " + std::to_string(header.magic));
+    return false;
+  }
+
+  if (header.version == 0 || header.version == 1) {
+    log::Error("gguf", "Unsupported legacy GGUF version: " +
+                           std::to_string(header.version));
     return false;
   }
 
   if (header.version > GGUF::VERSION) {
-    log::Error("gguf", "Unsupported version: " +
-                          std::to_string(header.version));
+    log::Error("gguf",
+               "Unsupported version: " + std::to_string(header.version));
     return false;
   }
 
@@ -314,18 +422,12 @@ bool ValidateGGUFHeader(const GGUF::Header &header) {
 
 std::string ValueTypeToString(GGUF::ValueType type) {
   static const std::unordered_map<GGUF::ValueType, std::string> names = {
-      {GGUF::ValueType::UINT8, "uint8"},
-      {GGUF::ValueType::INT8, "int8"},
-      {GGUF::ValueType::UINT16, "uint16"},
-      {GGUF::ValueType::INT16, "int16"},
-      {GGUF::ValueType::UINT32, "uint32"},
-      {GGUF::ValueType::INT32, "int32"},
-      {GGUF::ValueType::FLOAT32, "float32"},
-      {GGUF::ValueType::BOOL, "bool"},
-      {GGUF::ValueType::STRING, "string"},
-      {GGUF::ValueType::ARRAY, "array"},
-      {GGUF::ValueType::UINT64, "uint64"},
-      {GGUF::ValueType::INT64, "int64"},
+      {GGUF::ValueType::UINT8, "uint8"},     {GGUF::ValueType::INT8, "int8"},
+      {GGUF::ValueType::UINT16, "uint16"},   {GGUF::ValueType::INT16, "int16"},
+      {GGUF::ValueType::UINT32, "uint32"},   {GGUF::ValueType::INT32, "int32"},
+      {GGUF::ValueType::FLOAT32, "float32"}, {GGUF::ValueType::BOOL, "bool"},
+      {GGUF::ValueType::STRING, "string"},   {GGUF::ValueType::ARRAY, "array"},
+      {GGUF::ValueType::UINT64, "uint64"},   {GGUF::ValueType::INT64, "int64"},
       {GGUF::ValueType::FLOAT64, "float64"},
   };
 
@@ -338,20 +440,13 @@ std::string ValueTypeToString(GGUF::ValueType type) {
 
 std::string TensorTypeToString(GGUF::TensorType type) {
   static const std::unordered_map<GGUF::TensorType, std::string> names = {
-      {GGUF::TensorType::F32, "f32"},
-      {GGUF::TensorType::F16, "f16"},
-      {GGUF::TensorType::Q4_0, "q4_0"},
-      {GGUF::TensorType::Q4_1, "q4_1"},
-      {GGUF::TensorType::Q5_0, "q5_0"},
-      {GGUF::TensorType::Q5_1, "q5_1"},
-      {GGUF::TensorType::Q8_0, "q8_0"},
-      {GGUF::TensorType::Q8_1, "q8_1"},
-      {GGUF::TensorType::Q2_K, "q2_k"},
-      {GGUF::TensorType::Q3_K, "q3_k"},
-      {GGUF::TensorType::Q4_K, "q4_k"},
-      {GGUF::TensorType::Q5_K, "q5_k"},
-      {GGUF::TensorType::Q6_K, "q6_k"},
-      {GGUF::TensorType::Q8_K, "q8_k"},
+      {GGUF::TensorType::F32, "f32"},   {GGUF::TensorType::F16, "f16"},
+      {GGUF::TensorType::Q4_0, "q4_0"}, {GGUF::TensorType::Q4_1, "q4_1"},
+      {GGUF::TensorType::Q5_0, "q5_0"}, {GGUF::TensorType::Q5_1, "q5_1"},
+      {GGUF::TensorType::Q8_0, "q8_0"}, {GGUF::TensorType::Q8_1, "q8_1"},
+      {GGUF::TensorType::Q2_K, "q2_k"}, {GGUF::TensorType::Q3_K, "q3_k"},
+      {GGUF::TensorType::Q4_K, "q4_k"}, {GGUF::TensorType::Q5_K, "q5_k"},
+      {GGUF::TensorType::Q6_K, "q6_k"}, {GGUF::TensorType::Q8_K, "q8_k"},
   };
 
   auto it = names.find(type);
@@ -363,22 +458,14 @@ std::string TensorTypeToString(GGUF::TensorType type) {
 
 GGUF::TensorType StringToTensorType(const std::string &str) {
   static const std::unordered_map<std::string, GGUF::TensorType> map = {
-      {"f32", GGUF::TensorType::F32},
-      {"f16", GGUF::TensorType::F16},
-      {"q4_0", GGUF::TensorType::Q4_0},
-      {"q4_1", GGUF::TensorType::Q4_1},
-      {"q5_0", GGUF::TensorType::Q5_0},
-      {"q5_1", GGUF::TensorType::Q5_1},
-      {"q8_0", GGUF::TensorType::Q8_0},
-      {"q8_1", GGUF::TensorType::Q8_1},
-      {"q2_k", GGUF::TensorType::Q2_K},
-      {"q3_k", GGUF::TensorType::Q3_K},
-      {"q4_k", GGUF::TensorType::Q4_K},
-      {"q4_k_m", GGUF::TensorType::Q4_K},
-      {"q5_k", GGUF::TensorType::Q5_K},
-      {"q5_k_m", GGUF::TensorType::Q5_K},
-      {"q6_k", GGUF::TensorType::Q6_K},
-      {"q8_k", GGUF::TensorType::Q8_K},
+      {"f32", GGUF::TensorType::F32},   {"f16", GGUF::TensorType::F16},
+      {"q4_0", GGUF::TensorType::Q4_0}, {"q4_1", GGUF::TensorType::Q4_1},
+      {"q5_0", GGUF::TensorType::Q5_0}, {"q5_1", GGUF::TensorType::Q5_1},
+      {"q8_0", GGUF::TensorType::Q8_0}, {"q8_1", GGUF::TensorType::Q8_1},
+      {"q2_k", GGUF::TensorType::Q2_K}, {"q3_k", GGUF::TensorType::Q3_K},
+      {"q4_k", GGUF::TensorType::Q4_K}, {"q4_k_m", GGUF::TensorType::Q4_K},
+      {"q5_k", GGUF::TensorType::Q5_K}, {"q5_k_m", GGUF::TensorType::Q5_K},
+      {"q6_k", GGUF::TensorType::Q6_K}, {"q8_k", GGUF::TensorType::Q8_K},
   };
 
   auto it = map.find(str);
@@ -394,12 +481,24 @@ bool IsQuantizedType(GGUF::TensorType type) {
 
 std::string GetQuantizationType(GGUF::TensorType type) {
   switch (type) {
+  case GGUF::TensorType::Q4_0:
+    return "q4_0";
+  case GGUF::TensorType::Q4_1:
+    return "q4_1";
   case GGUF::TensorType::Q4_K:
     return "q4_k_m"; // GGUF doesn't distinguish Q4_K and Q4_K_M
+  case GGUF::TensorType::Q5_0:
+    return "q5_0";
+  case GGUF::TensorType::Q5_1:
+    return "q5_1";
   case GGUF::TensorType::Q5_K:
     return "q5_k_m";
   case GGUF::TensorType::Q6_K:
     return "q6_k";
+  case GGUF::TensorType::Q8_0:
+    return "q8_0";
+  case GGUF::TensorType::Q8_1:
+    return "q8_1";
   case GGUF::TensorType::Q2_K:
     return "q2_k";
   case GGUF::TensorType::Q3_K:
@@ -412,15 +511,30 @@ std::string GetQuantizationType(GGUF::TensorType type) {
 }
 
 size_t CalcTensorSize(GGUF::TensorType type,
-                      const std::vector<uint32_t> &shape) {
+                      const std::vector<uint64_t> &shape) {
+  if (shape.empty()) {
+    return 0;
+  }
   size_t num_elements = 1;
-  for (uint32_t dim : shape) {
-    num_elements *= dim;
+  for (uint64_t dim : shape) {
+    if (dim == 0 ||
+        dim > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        num_elements >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
+      return 0;
+    }
+    num_elements *= static_cast<size_t>(dim);
   }
 
   if (type == GGUF::TensorType::F32) {
+    if (num_elements > std::numeric_limits<size_t>::max() / 4) {
+      return 0;
+    }
     return num_elements * 4;
   } else if (type == GGUF::TensorType::F16) {
+    if (num_elements > std::numeric_limits<size_t>::max() / 2) {
+      return 0;
+    }
     return num_elements * 2;
   }
 
@@ -434,25 +548,28 @@ size_t CalcTensorSize(GGUF::TensorType type,
 
   // Block sizes from ggml-common.h
   static const std::unordered_map<GGUF::TensorType, size_t> block_bytes = {
-      {GGUF::TensorType::Q4_0, 18},   // sizeof(half) + 32/2
-      {GGUF::TensorType::Q4_1, 20},   // 2*sizeof(half) + 32/2
-      {GGUF::TensorType::Q5_0, 22},   // sizeof(half) + 4 + 32/2
-      {GGUF::TensorType::Q5_1, 24},   // 2*sizeof(half) + 4 + 32/2
-      {GGUF::TensorType::Q8_0, 34},   // sizeof(half) + 32
-      {GGUF::TensorType::Q8_1, 36},   // 2*sizeof(half) + 32
-      {GGUF::TensorType::Q2_K, 96},   // 2*sizeof(half) + 256/16 + 256/4
-      {GGUF::TensorType::Q3_K, 110},  // sizeof(half) + 256/4 + 256/8 + 12
-      {GGUF::TensorType::Q4_K, 144},  // 2*sizeof(half) + 12 + 256/2
-      {GGUF::TensorType::Q5_K, 176},  // 2*sizeof(half) + 12 + 256/2 + 256/8
-      {GGUF::TensorType::Q6_K, 210},  // sizeof(half) + 256/16 + 3*256/4
-      {GGUF::TensorType::Q8_K, 292},  // sizeof(float) + 256 + 256/16*sizeof(int16_t)
+      {GGUF::TensorType::Q4_0, 18},  // sizeof(half) + 32/2
+      {GGUF::TensorType::Q4_1, 20},  // 2*sizeof(half) + 32/2
+      {GGUF::TensorType::Q5_0, 22},  // sizeof(half) + 4 + 32/2
+      {GGUF::TensorType::Q5_1, 24},  // 2*sizeof(half) + 4 + 32/2
+      {GGUF::TensorType::Q8_0, 34},  // sizeof(half) + 32
+      {GGUF::TensorType::Q8_1, 36},  // 2*sizeof(half) + 32
+      {GGUF::TensorType::Q2_K, 96},  // 2*sizeof(half) + 256/16 + 256/4
+      {GGUF::TensorType::Q3_K, 110}, // sizeof(half) + 256/4 + 256/8 + 12
+      {GGUF::TensorType::Q4_K, 144}, // 2*sizeof(half) + 12 + 256/2
+      {GGUF::TensorType::Q5_K, 176}, // 2*sizeof(half) + 12 + 256/2 + 256/8
+      {GGUF::TensorType::Q6_K, 210}, // sizeof(half) + 256/16 + 3*256/4
+      {GGUF::TensorType::Q8_K,
+       292}, // sizeof(float) + 256 + 256/16*sizeof(int16_t)
   };
 
   auto it = block_bytes.find(type);
   if (it == block_bytes.end()) {
-    return num_elements * 2; // Assume F16
+    return 0;
   }
-
+  if (num_blocks > std::numeric_limits<size_t>::max() / it->second) {
+    return 0;
+  }
   return num_blocks * it->second;
 }
 

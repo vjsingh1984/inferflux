@@ -1,7 +1,6 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/model_loader.h"
-#include "runtime/backends/cuda/native_cuda_executor.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 #include <memory>
