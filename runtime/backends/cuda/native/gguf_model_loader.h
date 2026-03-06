@@ -74,6 +74,9 @@ public:
   void FreeGPUMemory() override;
   void *GetGPUBuffer() const override;
   size_t GetGPUSize() const override;
+  void SetDequantizedCachePolicy(DequantizedCachePolicy policy) override;
+  DequantizedCachePolicy GetDequantizedCachePolicy() const override;
+  void ClearDequantizedCache() override;
 
   /**
    * @brief Get weight accessor for a specific tensor
@@ -153,6 +156,8 @@ private:
   void *d_dequantized_buffer_{nullptr}; // Dequantized FP16 weights (optional)
   size_t quantized_buffer_size_{0};
   size_t dequantized_buffer_size_{0};
+  DequantizedCachePolicy dequantized_cache_policy_{
+      DequantizedCachePolicy::kBatchLifetime};
 
   // File path
   std::filesystem::path model_path_;

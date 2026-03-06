@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "runtime/logprob.h"
@@ -28,6 +29,8 @@ struct SamplingParams {
   float repetition_penalty{1.0f}; // multiplicative; 1.0 = disabled
   int penalty_last_n{64};         // lookback window for penalties
   uint32_t seed{UINT32_MAX};      // UINT32_MAX = random per call
+  // OpenAI logit_bias: map token IDs to bias values (-100 to 100).
+  std::unordered_map<int, float> logit_bias;
 };
 
 // InferenceResult surfaced by the scheduler and BatchExecutor to HTTP handlers.

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "runtime/backends/cuda/native_cuda_runtime.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/strategy_registry.h"
+#include "runtime/backends/cuda/native_cuda_runtime.h"
 #include <atomic>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
@@ -242,6 +242,10 @@ private:
   runtime::cuda::native::KvPrecision kv_precision_{
       runtime::cuda::native::KvPrecision::kFp16};
   std::string kv_precision_hint_{"auto"};
+  runtime::cuda::native::DequantizedCachePolicy dequantized_cache_policy_{
+      runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime};
+  std::string dequantized_cache_policy_hint_{"batch"};
+  bool require_fused_quantized_matmul_{false};
 
   // Native kernel pipeline components (only available with CUDA)
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
@@ -306,6 +310,8 @@ private:
   void FreeDeviceMemory();
   bool RunNativeInference(const std::vector<UnifiedBatchInput> &inputs,
                           std::vector<UnifiedBatchOutput> *outputs);
+  bool ConfigureDequantizedCachePolicy(const std::string &raw_policy);
+  void ReleaseBatchScopedDequantizedCache();
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   // Phase overlap helpers
@@ -314,8 +320,8 @@ private:
                         std::vector<size_t> &prefill_indices,
                         std::vector<size_t> &decode_indices) const;
   bool IsPrefillLikeInput(const UnifiedBatchInput &input) const;
-  std::vector<UnifiedBatchOutput> ExecuteUnifiedBatchWithOverlap(
-      const std::vector<UnifiedBatchInput> &inputs);
+  std::vector<UnifiedBatchOutput>
+  ExecuteUnifiedBatchWithOverlap(const std::vector<UnifiedBatchInput> &inputs);
 #endif
 };
 

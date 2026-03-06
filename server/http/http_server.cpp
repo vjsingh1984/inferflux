@@ -28,6 +28,7 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -150,6 +151,10 @@ struct CompletionRequestPayload {
   float presence_penalty{0.0f};
   float repetition_penalty{1.0f};
   uint32_t seed{UINT32_MAX};
+
+  // OpenAI `logit_bias` parameter: map token IDs to bias values (-100 to 100).
+  // Format: {token_id: bias_value, ...}
+  std::unordered_map<int, float> logit_bias;
 
   // OpenAI `stop` parameter: string or array of strings (up to 4).
   std::vector<std::string> stop;
@@ -366,6 +371,19 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
     }
     if (j.contains("seed") && j["seed"].is_number_integer()) {
       payload.seed = j["seed"].get<uint32_t>();
+    }
+    // OpenAI `logit_bias` parameter: map token IDs to bias values.
+    // Bias values should be between -100 and 100.
+    if (j.contains("logit_bias") && j["logit_bias"].is_object()) {
+      for (auto &[key, value] : j["logit_bias"].items()) {
+        if (value.is_number()) {
+          int token_id = std::stoi(key);
+          float bias = value.get<float>();
+          // Clamp bias to OpenAI's allowed range [-100, 100]
+          bias = std::max(-100.0f, std::min(100.0f, bias));
+          payload.logit_bias[token_id] = bias;
+        }
+      }
     }
     // OpenAI-compatible: response_format controls structured output.
     if (j.contains("response_format") && j["response_format"].is_object()) {
@@ -2383,7 +2401,8 @@ void HttpServer::HandleClient(ClientSession &session) {
                     parsed.presence_penalty,
                     parsed.repetition_penalty,
                     /*penalty_last_n=*/64,
-                    parsed.seed};
+                    parsed.seed,
+                    parsed.logit_bias};
 
     // Stop sequences.
     req.stop = parsed.stop;

@@ -147,6 +147,22 @@ jobs:
           ctest --test-dir build -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
 
       # ------------------------------------------------------------------
+      # Focused assertion: GGUF memory-contract gate
+      # Ensures batch policy dequantized-cache cleanup remains explicit and
+      # test count drift is surfaced for this contract suite.
+      # ------------------------------------------------------------------
+      - name: Assert GGUF memory contract gate
+        run: |
+          EXPECTED_GGUF_MEMORY_CONTRACT_TESTS=1
+          ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=$(./build/inferflux_tests "[memory_contract]" --list-tests 2>/dev/null | awk '/matching test case/{print $1}' | tail -n 1)
+          echo "GGUFMemoryContractTests count: expected=${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS} actual=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}"
+          if [ "${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}" -ne "${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS}" ]; then
+            echo "::error::GGUFMemoryContractTests count drifted; update EXPECTED_GGUF_MEMORY_CONTRACT_TESTS in .github/workflows/ci.yml"
+            exit 1
+          fi
+          ctest --test-dir build -R GGUFMemoryContractTests --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
       # Focused assertion: throughput gate batching contract
       # Keeps run_throughput_gate.py argument + metrics parsing stable so
       # CI throughput checks remain trustworthy.
@@ -566,6 +582,22 @@ jobs:
             exit 1
           fi
           ctest --test-dir build-cov -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
+
+      # ------------------------------------------------------------------
+      # Focused assertion: GGUF memory-contract gate
+      # Ensures batch policy dequantized-cache cleanup remains explicit and
+      # test count drift is surfaced for this contract suite.
+      # ------------------------------------------------------------------
+      - name: Assert GGUF memory contract gate
+        run: |
+          EXPECTED_GGUF_MEMORY_CONTRACT_TESTS=1
+          ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=$(./build-cov/inferflux_tests "[memory_contract]" --list-tests 2>/dev/null | awk '/matching test case/{print $1}' | tail -n 1)
+          echo "GGUFMemoryContractTests count: expected=${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS} actual=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}"
+          if [ "${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}" -ne "${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS}" ]; then
+            echo "::error::GGUFMemoryContractTests count drifted; update EXPECTED_GGUF_MEMORY_CONTRACT_TESTS in .github/workflows/ci.yml"
+            exit 1
+          fi
+          ctest --test-dir build-cov -R GGUFMemoryContractTests --output-on-failure --timeout 90 -V
 
       # ------------------------------------------------------------------
       # Focused assertion: throughput gate batching contract

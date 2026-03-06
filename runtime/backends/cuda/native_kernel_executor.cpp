@@ -105,11 +105,48 @@ bool CheckedMulSize(std::size_t a, std::size_t b, std::size_t *out) {
 }
 
 std::string ToLowerAscii(std::string value) {
-  std::transform(value.begin(), value.end(), value.begin(),
-                 [](unsigned char ch) {
-                   return static_cast<char>(std::tolower(ch));
-                 });
+  std::transform(
+      value.begin(), value.end(), value.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
   return value;
+}
+
+bool ParseBoolSetting(const char *raw, bool fallback) {
+  if (!raw) {
+    return fallback;
+  }
+  const std::string lowered = ToLowerAscii(raw);
+  if (lowered == "1" || lowered == "true" || lowered == "yes" ||
+      lowered == "on") {
+    return true;
+  }
+  if (lowered == "0" || lowered == "false" || lowered == "no" ||
+      lowered == "off") {
+    return false;
+  }
+  return fallback;
+}
+
+std::string
+MatmulModeToString(inferflux::runtime::cuda::native::MatmulExecutionMode mode) {
+  switch (mode) {
+  case inferflux::runtime::cuda::native::MatmulExecutionMode::
+      kFusedDequantTileGemm:
+    return "fused_dequant_tile_gemm";
+  case inferflux::runtime::cuda::native::MatmulExecutionMode::
+      kCompatDequantizeThenGemm:
+    return "compat_dequantize_then_gemm";
+  }
+  return "unknown";
+}
+
+bool IsKnownQuantizationType(const std::string &quantization_type) {
+  const std::string lowered = ToLowerAscii(quantization_type);
+  return lowered == "q2_k" || lowered == "q3_k" || lowered == "q4_0" ||
+         lowered == "q4_1" || lowered == "q4_k" || lowered == "q4_k_m" ||
+         lowered == "q5_0" || lowered == "q5_1" || lowered == "q5_k" ||
+         lowered == "q5_k_m" || lowered == "q6_k" || lowered == "q8_0" ||
+         lowered == "q8_1" || lowered == "q8_k";
 }
 
 inferflux::SafetensorsLoader::ModelConfig
@@ -725,6 +762,63 @@ void NativeKernelExecutor::FreeDeviceMemory() {
   // GPU memory is managed by SafetensorsLoader and native components
 }
 
+bool NativeKernelExecutor::ConfigureDequantizedCachePolicy(
+    const std::string &raw_policy) {
+  std::string policy = ToLowerAscii(raw_policy);
+  if (policy.empty()) {
+    policy = "batch";
+  }
+
+  runtime::cuda::native::DequantizedCachePolicy parsed =
+      runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime;
+  if (!runtime::cuda::native::ParseDequantizedCachePolicy(policy, &parsed)) {
+    log::Warn("native_kernel_executor", "Invalid dequantized cache policy '" +
+                                            policy +
+                                            "'; falling back to batch");
+    parsed = runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime;
+    policy = "batch";
+  }
+  dequantized_cache_policy_ = parsed;
+  dequantized_cache_policy_hint_ = policy;
+
+  if (model_loader_) {
+    model_loader_->SetDequantizedCachePolicy(dequantized_cache_policy_);
+  }
+  return true;
+}
+
+void NativeKernelExecutor::ReleaseBatchScopedDequantizedCache() {
+  if (dequantized_cache_policy_ !=
+      runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime) {
+    return;
+  }
+  if (!model_loader_ || model_loader_->GetFormat() != "gguf") {
+    return;
+  }
+
+  if (compute_stream_) {
+    CheckCudaStatus(cudaStreamSynchronize(compute_stream_),
+                    "cudaStreamSynchronize(compute_stream_,dequant_cleanup)");
+  }
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (decode_stream_) {
+    CheckCudaStatus(cudaStreamSynchronize(decode_stream_),
+                    "cudaStreamSynchronize(decode_stream_,dequant_cleanup)");
+  }
+  if (prefill_stream_) {
+    CheckCudaStatus(cudaStreamSynchronize(prefill_stream_),
+                    "cudaStreamSynchronize(prefill_stream_,dequant_cleanup)");
+  }
+#endif
+
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (quantized_weight_map_) {
+    quantized_weight_map_->ClearCache();
+  }
+#endif
+  model_loader_->ClearDequantizedCache();
+}
+
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
 bool NativeKernelExecutor::InitializeNativePipeline() {
   const auto &config = model_config_;
@@ -760,17 +854,15 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   }
 
   if (kv_precision_choice == "auto") {
-    kv_precision_ =
-        want_bf16 ? runtime::cuda::native::KvPrecision::kBf16
-                  : runtime::cuda::native::KvPrecision::kFp16;
+    kv_precision_ = want_bf16 ? runtime::cuda::native::KvPrecision::kBf16
+                              : runtime::cuda::native::KvPrecision::kFp16;
   } else if (!runtime::cuda::native::ParseKvPrecision(kv_precision_choice,
-                                                       &kv_precision_)) {
-    log::Warn("native_kernel_executor",
-              "Invalid KV precision '" + kv_precision_choice +
-                  "', falling back to auto");
-    kv_precision_ =
-        want_bf16 ? runtime::cuda::native::KvPrecision::kBf16
-                  : runtime::cuda::native::KvPrecision::kFp16;
+                                                      &kv_precision_)) {
+    log::Warn("native_kernel_executor", "Invalid KV precision '" +
+                                            kv_precision_choice +
+                                            "', falling back to auto");
+    kv_precision_ = want_bf16 ? runtime::cuda::native::KvPrecision::kBf16
+                              : runtime::cuda::native::KvPrecision::kFp16;
   }
 
   if (kv_precision_ == runtime::cuda::native::KvPrecision::kBf16 &&
@@ -842,26 +934,53 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     }
 
     std::string quantization_type = model_loader_->GetQuantizationType();
-    if (!quantization_type.empty()) {
+    const bool is_quantized_model = model_loader_->IsQuantized();
+    if (!quantization_type.empty() &&
+        IsKnownQuantizationType(quantization_type)) {
       const auto tensor_type =
           runtime::cuda::native::StringToTensorType(quantization_type);
       const auto selection =
           registry.Select(tensor_type, kv_precision_, sm_major, sm_minor);
       if (selection.weight_layout && selection.matmul && selection.attention) {
+        const auto mode = selection.matmul->Mode();
         log::Info("native_kernel_executor",
                   "Selected GGUF strategies: layout=" +
-                      selection.weight_layout->Id() +
-                      ", matmul=" + selection.matmul->Id() +
-                      ", attention=" + selection.attention->Id() + " (" +
+                      selection.weight_layout->Id() + ", matmul=" +
+                      selection.matmul->Id() + " (" + MatmulModeToString(mode) +
+                      ")" + ", attention=" + selection.attention->Id() + " (" +
                       selection.reason + ")");
+        if (require_fused_quantized_matmul_ && is_quantized_model &&
+            mode != runtime::cuda::native::MatmulExecutionMode::
+                        kFusedDequantTileGemm) {
+          log::Error("native_kernel_executor",
+                     "Strict quantized runtime policy rejected startup: "
+                     "fused dequant-tile GEMM required but selected matmul '" +
+                         selection.matmul->Id() + "' (" +
+                         MatmulModeToString(mode) + ")");
+          return false;
+        }
       } else {
-        log::Warn("native_kernel_executor",
-                  "Incomplete GGUF strategy selection: " + selection.reason);
+        const std::string reason =
+            "Incomplete GGUF strategy selection: " + selection.reason;
+        if (require_fused_quantized_matmul_ && is_quantized_model) {
+          log::Error("native_kernel_executor",
+                     "Strict quantized runtime policy rejected startup: " +
+                         reason);
+          return false;
+        }
+        log::Warn("native_kernel_executor", reason);
       }
-    } else if (model_loader_->IsQuantized()) {
-      log::Warn("native_kernel_executor",
-                "Quantized GGUF model loaded but quantization type is unknown; "
-                "strategy selection skipped");
+    } else if (is_quantized_model) {
+      const std::string reason =
+          "Quantized GGUF model loaded but quantization type '" +
+          quantization_type + "' is unknown; strategy selection skipped";
+      if (require_fused_quantized_matmul_) {
+        log::Error("native_kernel_executor",
+                   "Strict quantized runtime policy rejected startup: " +
+                       reason);
+        return false;
+      }
+      log::Warn("native_kernel_executor", reason);
     }
   }
 
@@ -1026,11 +1145,27 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   overlap_enabled_ = config.cuda_phase_overlap_scaffold;
   min_prefill_tokens_ = config.cuda_phase_overlap_min_prefill_tokens;
   kv_precision_hint_ = config.native_kv_cache_dtype;
-  log::Info("native_kernel_executor",
-            "Phase overlap: " +
-                std::string(overlap_enabled_ ? "enabled" : "disabled") +
-                ", min_prefill_tokens=" + std::to_string(min_prefill_tokens_) +
-                ", kv_dtype_hint=" + kv_precision_hint_);
+  dequantized_cache_policy_hint_ = config.native_dequantized_cache_policy;
+  require_fused_quantized_matmul_ =
+      config.native_require_fused_quantized_matmul;
+  if (const char *env_require_fused =
+          std::getenv("INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL")) {
+    require_fused_quantized_matmul_ =
+        ParseBoolSetting(env_require_fused, require_fused_quantized_matmul_);
+  }
+  if (const char *env_dequant_policy =
+          std::getenv("INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY")) {
+    dequantized_cache_policy_hint_ = env_dequant_policy;
+  }
+  ConfigureDequantizedCachePolicy(dequantized_cache_policy_hint_);
+  log::Info(
+      "native_kernel_executor",
+      "Phase overlap: " +
+          std::string(overlap_enabled_ ? "enabled" : "disabled") +
+          ", min_prefill_tokens=" + std::to_string(min_prefill_tokens_) +
+          ", kv_dtype_hint=" + kv_precision_hint_ + ", dequant_cache_policy=" +
+          dequantized_cache_policy_hint_ + ", require_fused_quantized_matmul=" +
+          std::string(require_fused_quantized_matmul_ ? "true" : "false"));
 
   // Initialize CUDA
   if (!InitializeCUDA()) {
@@ -1046,6 +1181,7 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   }
 
   const std::string detected_format = detected_loader->GetFormat();
+  detected_loader->SetDequantizedCachePolicy(dequantized_cache_policy_);
   if (detected_format == "safetensors") {
     // Keep legacy safetensors loader path until the generic loader path is
     // feature-parity validated for BF16/FP16 conversion controls.
@@ -1085,6 +1221,7 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
     }
   } else {
     model_loader_ = std::move(detected_loader);
+    model_loader_->SetDequantizedCachePolicy(dequantized_cache_policy_);
     if (!model_loader_->Load(model_path)) {
       log::Error("native_kernel_executor",
                  "Failed to load model via loader: " + detected_format);
@@ -1396,6 +1533,15 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
     log::Warn("native_kernel_executor", "Native pipeline not initialized");
     return {};
   }
+
+  struct ScopedDequantCacheCleanup {
+    NativeKernelExecutor *executor{nullptr};
+    ~ScopedDequantCacheCleanup() {
+      if (executor) {
+        executor->ReleaseBatchScopedDequantizedCache();
+      }
+    }
+  } scoped_cleanup{this};
 
   NVTX_SCOPE("NativeExecuteUnifiedBatch");
 

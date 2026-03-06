@@ -219,6 +219,8 @@ Session handle contract:
 | `runtime.cuda.attention.kernel` | `auto` | kernel selection policy |
 | `runtime.cuda.flash_attention.enabled` | `true` on SM>=8.0 | throughput uplift on supported GPUs |
 | `runtime.cuda.kv_cache_dtype` | `auto` | KV precision policy (`auto`, `fp16`, `bf16`, `int8`, `fp8`) |
+| `runtime.cuda.dequantized_cache_policy` | `batch` | GGUF dequant cache lifecycle (`batch` memory-efficient default, `model` reuse-heavy) |
+| `runtime.cuda.quantized_runtime.require_fused_matmul` | `false` | fail startup unless fused quantized matmul strategy is selected |
 | `runtime.cuda.phase_overlap.enabled` | `true` for mixed workloads | prefill/decode overlap |
 | `runtime.cuda.phase_overlap.min_prefill_tokens` | `256` | overlap trigger threshold |
 
@@ -284,6 +286,8 @@ Scope contract:
 | `INFERFLUX_MODELS` | multi-model config string |
 | `INFERFLUX_NATIVE_CUDA_STRICT` | fail model load if native CUDA runtime reports fallback |
 | `INFERFLUX_DISABLE_NATIVE_CUDA` | force native CUDA runtime readiness to false |
+| `INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY` | `runtime.cuda.dequantized_cache_policy` |
+| `INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL` | `runtime.cuda.quantized_runtime.require_fused_matmul` |
 | `INFERFLUX_BACKEND_PRIORITY` | runtime backend priority chain |
 | `INFERFLUX_BACKEND_PREFER_NATIVE` | `runtime.backend_exposure.prefer_native` |
 | `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` | `runtime.backend_exposure.allow_llama_cpp_fallback` |

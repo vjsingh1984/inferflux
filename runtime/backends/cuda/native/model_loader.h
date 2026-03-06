@@ -13,6 +13,15 @@ namespace runtime {
 namespace cuda {
 namespace native {
 
+enum class DequantizedCachePolicy {
+  kModelLifetime,
+  kBatchLifetime,
+};
+
+std::string DequantizedCachePolicyToString(DequantizedCachePolicy policy);
+bool ParseDequantizedCachePolicy(const std::string &raw,
+                                 DequantizedCachePolicy *out);
+
 // Forward declarations
 class IWeightAccessor;
 
@@ -86,7 +95,8 @@ public:
 
   /**
    * @brief Get quantization type
-   * @return Quantization type (q4_k_m, q5_k_m, q6_k, etc.) or empty if not quantized
+   * @return Quantization type (q4_k_m, q5_k_m, q6_k, etc.) or empty if not
+   * quantized
    */
   virtual std::string GetQuantizationType() const = 0;
 
@@ -120,12 +130,31 @@ public:
   virtual size_t GetGPUSize() const = 0;
 
   /**
+   * @brief Configure lifecycle for dequantized temporary GPU weights
+   *
+   * Model-lifetime caches maximize reuse but can significantly increase VRAM.
+   * Batch-lifetime caches prioritize memory efficiency and are reclaimed after
+   * each batch.
+   */
+  virtual void SetDequantizedCachePolicy(DequantizedCachePolicy policy) = 0;
+
+  /**
+   * @brief Inspect active dequantized cache lifecycle policy
+   */
+  virtual DequantizedCachePolicy GetDequantizedCachePolicy() const = 0;
+
+  /**
+   * @brief Clear cached dequantized GPU weights, if any
+   */
+  virtual void ClearDequantizedCache() = 0;
+
+  /**
    * @brief Get weight accessor for a specific tensor
    * @param tensor_name Name of tensor
    * @return Shared pointer to weight accessor, or nullptr if not found
    */
-  virtual std::shared_ptr<IWeightAccessor> GetWeightAccessor(
-      const std::string &tensor_name) = 0;
+  virtual std::shared_ptr<IWeightAccessor>
+  GetWeightAccessor(const std::string &tensor_name) = 0;
 };
 
 /**
@@ -208,8 +237,7 @@ public:
    * @param stream CUDA stream for async operations
    */
   virtual void DequantizeGpuToGpu(const void *quantized, half *dequantized,
-                                   size_t num_elements,
-                                   cudaStream_t stream) = 0;
+                                  size_t num_elements, cudaStream_t stream) = 0;
 
   /**
    * @brief Get quantization type
@@ -240,8 +268,8 @@ public:
  * @param model_path Path to model file or directory
  * @return Unique pointer to loader, or nullptr if format not detected
  */
-std::unique_ptr<IModelLoader> CreateModelLoader(
-    const std::filesystem::path &model_path);
+std::unique_ptr<IModelLoader>
+CreateModelLoader(const std::filesystem::path &model_path);
 
 /**
  * @brief Factory function for creating quantization handlers
@@ -249,8 +277,8 @@ std::unique_ptr<IModelLoader> CreateModelLoader(
  * @param quantization_type Quantization type (e.g., "q4_k_m", "q5_k_m")
  * @return Shared pointer to handler, or nullptr if type not supported
  */
-std::shared_ptr<IQuantizationHandler> CreateQuantizationHandler(
-    const std::string &quantization_type);
+std::shared_ptr<IQuantizationHandler>
+CreateQuantizationHandler(const std::string &quantization_type);
 
 } // namespace native
 } // namespace cuda

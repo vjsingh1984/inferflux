@@ -64,6 +64,7 @@ sequenceDiagram
 |---|---|---|
 | Weights | From GGUF tensor metadata | Enabled |
 | KV cache | `auto|fp16|bf16|int8|fp8` | `auto/fp16/bf16` active; `int8/fp8` declared + guarded fallback |
+| Dequantized temp cache | `batch|model` | `batch` default (memory-efficient), `model` opt-in |
 
 Decision: KV precision is fixed at model-load (server lifecycle), not per request.
 

@@ -1,7 +1,7 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#include "runtime/backends/cuda/native/quantized_weight_map.h"
 #include "runtime/backends/cuda/native/model_loader.h"
+#include "runtime/backends/cuda/native/quantized_weight_map.h"
 
 #include <memory>
 #include <vector>
@@ -24,6 +24,13 @@ public:
   void FreeGPUMemory() override {}
   void *GetGPUBuffer() const override { return nullptr; }
   size_t GetGPUSize() const override { return 0; }
+  void SetDequantizedCachePolicy(
+      runtime::cuda::native::DequantizedCachePolicy) override {}
+  runtime::cuda::native::DequantizedCachePolicy
+  GetDequantizedCachePolicy() const override {
+    return runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime;
+  }
+  void ClearDequantizedCache() override {}
 
   std::shared_ptr<runtime::cuda::native::IWeightAccessor>
   GetWeightAccessor(const std::string &tensor_name) override {
@@ -34,14 +41,16 @@ public:
     return nullptr;
   }
 
-  void SetMockAccessor(const std::string &name,
-                      std::shared_ptr<runtime::cuda::native::IWeightAccessor> accessor) {
+  void SetMockAccessor(
+      const std::string &name,
+      std::shared_ptr<runtime::cuda::native::IWeightAccessor> accessor) {
     tensor_map_[name] = accessor;
   }
 
 private:
   runtime::cuda::native::ModelInfo info_;
-  std::unordered_map<std::string, std::shared_ptr<runtime::cuda::native::IWeightAccessor>>
+  std::unordered_map<std::string,
+                     std::shared_ptr<runtime::cuda::native::IWeightAccessor>>
       tensor_map_;
 };
 
@@ -79,14 +88,16 @@ private:
 // Test Suite: QuantizedWeightMap Construction
 // =============================================================================
 
-TEST_CASE("QuantizedWeightMap: Default construction", "[quantized][weight_map]") {
+TEST_CASE("QuantizedWeightMap: Default construction",
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   // Should be in valid state
   // Can't directly test internal state, but verify it exists
 }
 
-TEST_CASE("QuantizedWeightMap: Non-copyable and non-movable", "[quantized][weight_map]") {
+TEST_CASE("QuantizedWeightMap: Non-copyable and non-movable",
+          "[quantized][weight_map]") {
   // These tests verify the deleted constructors compile correctly
   QuantizedWeightMap weight_map1;
 
@@ -108,14 +119,16 @@ TEST_CASE("QuantizedWeightMap: Non-copyable and non-movable", "[quantized][weigh
 // =============================================================================
 
 TEST_CASE("QuantizedWeightMap: Build with null loader returns false",
-      "[quantized][weight_map]") {
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
   cudaStream_t stream = nullptr;
 
-  REQUIRE_FALSE(weight_map.Build(nullptr, MockModelLoader().GetModelInfo(), stream));
+  REQUIRE_FALSE(
+      weight_map.Build(nullptr, MockModelLoader().GetModelInfo(), stream));
 }
 
-TEST_CASE("QuantizedWeightMap: Build with mock loader", "[quantized][weight_map]") {
+TEST_CASE("QuantizedWeightMap: Build with mock loader",
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
   MockModelLoader loader;
   cudaStream_t stream = nullptr;
@@ -134,7 +147,7 @@ TEST_CASE("QuantizedWeightMap: Build with mock loader", "[quantized][weight_map]
 // =============================================================================
 
 TEST_CASE("QuantizedWeightMap: LayerQProj returns nullptr before build",
-      "[quantized][weight_map]") {
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   REQUIRE(weight_map.LayerQProj(0) == nullptr);
@@ -143,7 +156,7 @@ TEST_CASE("QuantizedWeightMap: LayerQProj returns nullptr before build",
 }
 
 TEST_CASE("QuantizedWeightMap: LayerKProj returns nullptr before build",
-      "[quantized][weight_map]") {
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   REQUIRE(weight_map.LayerKProj(0) == nullptr);
@@ -152,7 +165,7 @@ TEST_CASE("QuantizedWeightMap: LayerKProj returns nullptr before build",
 }
 
 TEST_CASE("QuantizedWeightMap: LayerVProj returns nullptr before build",
-      "[quantized][weight_map]") {
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   REQUIRE(weight_map.LayerVProj(0) == nullptr);
@@ -161,7 +174,7 @@ TEST_CASE("QuantizedWeightMap: LayerVProj returns nullptr before build",
 }
 
 TEST_CASE("QuantizedWeightMap: LayerOProj returns nullptr before build",
-      "[quantized][weight_map]") {
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   REQUIRE(weight_map.LayerOProj(0) == nullptr);
@@ -170,7 +183,7 @@ TEST_CASE("QuantizedWeightMap: LayerOProj returns nullptr before build",
 }
 
 TEST_CASE("QuantizedWeightMap: LayerInputNorm returns nullptr before build",
-      "[quantized][weight_map]") {
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   REQUIRE(weight_map.LayerInputNorm(0) == nullptr);
@@ -179,7 +192,7 @@ TEST_CASE("QuantizedWeightMap: LayerInputNorm returns nullptr before build",
 }
 
 TEST_CASE("QuantizedWeightMap: LayerPostAttnNorm returns nullptr before build",
-      "[quantized][weight_map]") {
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   REQUIRE(weight_map.LayerPostAttnNorm(0) == nullptr);
@@ -191,15 +204,15 @@ TEST_CASE("QuantizedWeightMap: LayerPostAttnNorm returns nullptr before build",
 // Test Suite: Memory Management
 // =============================================================================
 
-TEST_CASE("QuantizedWeightMap: Destructor handles empty state", "[quantized][weight_map]") {
+TEST_CASE("QuantizedWeightMap: Destructor handles empty state",
+          "[quantized][weight_map]") {
   // Create and destroy (tests destructor doesn't crash)
-  {
-    QuantizedWeightMap weight_map;
-  }
+  { QuantizedWeightMap weight_map; }
   // If we get here, destructor worked correctly
 }
 
-TEST_CASE("QuantizedWeightMap: Destructor handles build without weights", "[quantized][weight_map]") {
+TEST_CASE("QuantizedWeightMap: Destructor handles build without weights",
+          "[quantized][weight_map]") {
   MockModelLoader loader;
 
   {
@@ -215,7 +228,7 @@ TEST_CASE("QuantizedWeightMap: Destructor handles build without weights", "[quan
 // =============================================================================
 
 TEST_CASE("QuantizedWeightMap: Negative layer indices return nullptr",
-      "[quantized][weight_map]") {
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   REQUIRE(weight_map.LayerQProj(-1) == nullptr);
@@ -223,7 +236,7 @@ TEST_CASE("QuantizedWeightMap: Negative layer indices return nullptr",
 }
 
 TEST_CASE("QuantizedWeightMap: Large layer indices return nullptr",
-      "[quantized][weight_map]") {
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   REQUIRE(weight_map.LayerQProj(1000000) == nullptr);
@@ -233,7 +246,8 @@ TEST_CASE("QuantizedWeightMap: Large layer indices return nullptr",
 // Test Suite: Thread Safety (basic checks)
 // =============================================================================
 
-TEST_CASE("QuantizedWeightMap: Multiple instances don't interfere", "[quantized][weight_map]") {
+TEST_CASE("QuantizedWeightMap: Multiple instances don't interfere",
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map1;
   QuantizedWeightMap weight_map2;
 
@@ -251,7 +265,8 @@ TEST_CASE("QuantizedWeightMap: Multiple instances don't interfere", "[quantized]
 
 #ifdef INFERFLUX_HAS_CUDA
 
-TEST_CASE("QuantizedWeightMap: Build with null stream", "[quantized][weight_map][gpu]") {
+TEST_CASE("QuantizedWeightMap: Build with null stream",
+          "[quantized][weight_map][gpu]") {
   QuantizedWeightMap weight_map;
   MockModelLoader loader;
   cudaStream_t stream = nullptr;
@@ -260,7 +275,8 @@ TEST_CASE("QuantizedWeightMap: Build with null stream", "[quantized][weight_map]
   REQUIRE(weight_map.Build(&loader, loader.GetModelInfo(), stream));
 }
 
-TEST_CASE("QuantizedWeightMap: Build with CUDA stream", "[quantized][weight_map][gpu]") {
+TEST_CASE("QuantizedWeightMap: Build with CUDA stream",
+          "[quantized][weight_map][gpu]") {
   QuantizedWeightMap weight_map;
   MockModelLoader loader;
 
@@ -284,7 +300,7 @@ TEST_CASE("QuantizedWeightMap: Build with CUDA stream", "[quantized][weight_map]
 // =============================================================================
 
 TEST_CASE("QuantizedWeightMap: Works with mock weight accessors",
-      "[quantized][weight_map][mock]") {
+          "[quantized][weight_map][mock]") {
   // This test verifies the interface works with mock objects
   // Real weight access is tested in integration tests
 
@@ -311,7 +327,8 @@ TEST_CASE("QuantizedWeightMap: Works with mock weight accessors",
 // Test Suite: Edge Cases
 // =============================================================================
 
-TEST_CASE("QuantizedWeightMap: Handle layer 0 (first layer)", "[quantized][weight_map]") {
+TEST_CASE("QuantizedWeightMap: Handle layer 0 (first layer)",
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   // Layer 0 should be handled just like any other layer
@@ -320,7 +337,7 @@ TEST_CASE("QuantizedWeightMap: Handle layer 0 (first layer)", "[quantized][weigh
 }
 
 TEST_CASE("QuantizedWeightMap: All accessor methods return consistent nulls",
-      "[quantized][weight_map]") {
+          "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   // Before build, all accessors should return nullptr

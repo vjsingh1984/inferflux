@@ -215,6 +215,8 @@ int main(int argc, char **argv) {
   int cuda_flash_attention_tile = 128;
   std::string cuda_attention_kernel = "auto";
   std::string native_kv_cache_dtype = "auto";
+  std::string native_dequantized_cache_policy = "batch";
+  bool native_require_fused_quantized_matmul = false;
   bool cuda_phase_overlap_scaffold = false;
   int cuda_phase_overlap_min_prefill_tokens = 256;
   bool cuda_phase_overlap_prefill_replica = false;
@@ -366,6 +368,22 @@ int main(int argc, char **argv) {
             config["runtime"]["cuda"]["kv_cache_dtype"].IsScalar()) {
           native_kv_cache_dtype = ToLower(
               config["runtime"]["cuda"]["kv_cache_dtype"].as<std::string>());
+        }
+        if (config["runtime"]["cuda"] &&
+            config["runtime"]["cuda"]["dequantized_cache_policy"] &&
+            config["runtime"]["cuda"]["dequantized_cache_policy"].IsScalar()) {
+          native_dequantized_cache_policy =
+              ToLower(config["runtime"]["cuda"]["dequantized_cache_policy"]
+                          .as<std::string>());
+        }
+        if (config["runtime"]["cuda"] &&
+            config["runtime"]["cuda"]["quantized_runtime"] &&
+            config["runtime"]["cuda"]["quantized_runtime"]
+                  ["require_fused_matmul"]) {
+          native_require_fused_quantized_matmul =
+              config["runtime"]["cuda"]["quantized_runtime"]
+                    ["require_fused_matmul"]
+                        .as<bool>();
         }
         if (config["runtime"]["cuda"] &&
             config["runtime"]["cuda"]["phase_overlap"] &&
@@ -725,6 +743,14 @@ int main(int argc, char **argv) {
           std::getenv("INFERFLUX_NATIVE_KV_DTYPE")) {
     native_kv_cache_dtype = ToLower(env_native_kv_precision);
   }
+  if (const char *env_native_dequant_policy =
+          std::getenv("INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY")) {
+    native_dequantized_cache_policy = ToLower(env_native_dequant_policy);
+  }
+  if (const char *env_native_require_fused =
+          std::getenv("INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL")) {
+    native_require_fused_quantized_matmul = ParseBool(env_native_require_fused);
+  }
   if (const char *env_cuda_overlap =
           std::getenv("INFERFLUX_CUDA_PHASE_OVERLAP")) {
     cuda_phase_overlap_scaffold = ParseBool(env_cuda_overlap);
@@ -979,6 +1005,9 @@ int main(int argc, char **argv) {
   primary_cfg.flash_attention_tile = cuda_flash_attention_tile;
   primary_cfg.cuda_attention_kernel = cuda_attention_kernel;
   primary_cfg.native_kv_cache_dtype = native_kv_cache_dtype;
+  primary_cfg.native_dequantized_cache_policy = native_dequantized_cache_policy;
+  primary_cfg.native_require_fused_quantized_matmul =
+      native_require_fused_quantized_matmul;
   primary_cfg.cuda_phase_overlap_scaffold =
       cuda_enabled && cuda_phase_overlap_scaffold;
   primary_cfg.cuda_phase_overlap_min_prefill_tokens =
@@ -1029,6 +1058,13 @@ int main(int argc, char **argv) {
   if (cuda_enabled) {
     std::cout << "[server] Native CUDA KV cache precision policy: "
               << native_kv_cache_dtype << ".\n";
+    std::cout << "[server] Native CUDA dequant cache policy: "
+              << native_dequantized_cache_policy
+              << " (batch default, memory-efficient).\n";
+    std::cout << "[server] Native CUDA strict fused quantized matmul: "
+              << (native_require_fused_quantized_matmul ? "enabled"
+                                                        : "disabled")
+              << ".\n";
   }
   if (cuda_flash_attention_enabled) {
     std::cout << "[server] FlashAttention toggled on (kernel="

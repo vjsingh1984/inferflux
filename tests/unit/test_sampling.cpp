@@ -237,3 +237,48 @@ TEST_CASE("best_of with equal logprobs is stable (no crash)", "[sampling]") {
                 }));
   REQUIRE(results.size() == 3u);
 }
+
+// =============================================================================
+// Test Suite: Logit Bias (OpenAI-compatible token-level biasing)
+// =============================================================================
+
+TEST_CASE("SamplingParams logit_bias defaults to empty map", "[sampling]") {
+  SamplingParams sp;
+  REQUIRE(sp.logit_bias.empty());
+}
+
+TEST_CASE("SamplingParams accepts logit_bias entries", "[sampling]") {
+  SamplingParams sp;
+  sp.logit_bias[42] = 10.5f;
+  sp.logit_bias[100] = -5.0f;
+  
+  REQUIRE(sp.logit_bias.size() == 2);
+  REQUIRE(sp.logit_bias.at(42) == 10.5f);
+  REQUIRE(sp.logit_bias.at(100) == -5.0f);
+}
+
+TEST_CASE("SamplingParams logit_bias respects OpenAI range [-100, 100]",
+      "[sampling]") {
+  // This test documents that the API accepts the full OpenAI range.
+  // Clamping to [-100, 100] is done at HTTP parsing time.
+  SamplingParams sp;
+  sp.logit_bias[0] = -100.0f;      // Minimum allowed
+  sp.logit_bias[1000] = 100.0f;     // Maximum allowed
+  sp.logit_bias[500] = 50.0f;       // Mid-range
+  
+  REQUIRE(sp.logit_bias.size() == 3);
+  REQUIRE(sp.logit_bias.at(0) == -100.0f);
+  REQUIRE(sp.logit_bias.at(1000) == 100.0f);
+  REQUIRE(sp.logit_bias.at(500) == 50.0f);
+}
+
+TEST_CASE("InferenceRequest inherits logit_bias from sampling params",
+      "[sampling]") {
+  InferenceRequest req;
+  req.sampling.logit_bias[123] = 25.0f;
+  req.sampling.logit_bias[456] = -10.0f;
+  
+  REQUIRE(req.sampling.logit_bias.size() == 2);
+  REQUIRE(req.sampling.logit_bias.at(123) == 25.0f);
+  REQUIRE(req.sampling.logit_bias.at(456) == -10.0f);
+}

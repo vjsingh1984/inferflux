@@ -50,6 +50,9 @@ runtime:
 
     # Native CUDA KV cache precision (independent from weight precision)
     kv_cache_dtype: auto            # auto, fp16, bf16, int8, fp8
+    dequantized_cache_policy: batch # batch (default, lower VRAM) | model (higher reuse, higher VRAM)
+    quantized_runtime:
+      require_fused_matmul: false   # true = fail startup unless fused quantized matmul strategy is selected
 
     # FlashAttention configuration (requires SM 8.0+)
     flash_attention:
@@ -213,6 +216,8 @@ registry:
 # INFERFLUX_MODELS                  - Multi-model config string
 # INFERFLUX_NATIVE_CUDA_STRICT      - fail if native runtime reports fallback
 # INFERFLUX_NATIVE_KV_DTYPE         - KV precision policy override (auto/fp16/bf16/int8/fp8)
+# INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY - GGUF dequant cache lifecycle (batch/model)
+# INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL - fail startup unless fused quantized matmul is selected
 # INFERFLUX_BACKEND_PRIORITY        - Override backend selection (Rule 8)
 # INFERFLUX_DISABLE_STARTUP_ADVISOR - Disable recommendation logging
 #

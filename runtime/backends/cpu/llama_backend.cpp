@@ -271,6 +271,19 @@ void LlamaCPUBackend::SetupSampler(const std::string &grammar,
                                 sp.frequency_penalty, sp.presence_penalty));
   }
 
+  // Logit bias: bias specific tokens.
+  if (!sp.logit_bias.empty()) {
+    std::vector<llama_logit_bias> llama_logit_biases;
+    llama_logit_biases.reserve(sp.logit_bias.size());
+    for (const auto &[token_id, bias] : sp.logit_bias) {
+      llama_logit_biases.push_back({static_cast<llama_token>(token_id), bias});
+    }
+    llama_sampler_chain_add(chain,
+                            llama_sampler_init_logit_bias(
+                                llama_vocab_n_tokens(vocab_), llama_logit_biases.size(),
+                                llama_logit_biases.data()));
+  }
+
   // Top-K filtering.
   if (sp.top_k > 0) {
     llama_sampler_chain_add(chain, llama_sampler_init_top_k(sp.top_k));

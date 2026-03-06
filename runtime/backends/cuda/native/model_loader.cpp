@@ -1,13 +1,53 @@
 #include "runtime/backends/cuda/native/model_loader.h"
-#include "runtime/backends/cuda/native/safetensors_adapter.h"
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
+#include "runtime/backends/cuda/native/safetensors_adapter.h"
 #include "server/logging/logger.h"
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 
 namespace inferflux {
 namespace runtime {
 namespace cuda {
 namespace native {
+
+namespace {
+
+std::string ToLowerAscii(std::string value) {
+  std::transform(
+      value.begin(), value.end(), value.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return value;
+}
+
+} // namespace
+
+std::string DequantizedCachePolicyToString(DequantizedCachePolicy policy) {
+  switch (policy) {
+  case DequantizedCachePolicy::kModelLifetime:
+    return "model";
+  case DequantizedCachePolicy::kBatchLifetime:
+    return "batch";
+  }
+  return "batch";
+}
+
+bool ParseDequantizedCachePolicy(const std::string &raw,
+                                 DequantizedCachePolicy *out) {
+  if (!out) {
+    return false;
+  }
+  const std::string lowered = ToLowerAscii(raw);
+  if (lowered == "model" || lowered == "model_lifetime") {
+    *out = DequantizedCachePolicy::kModelLifetime;
+    return true;
+  }
+  if (lowered == "batch" || lowered == "batch_lifetime") {
+    *out = DequantizedCachePolicy::kBatchLifetime;
+    return true;
+  }
+  return false;
+}
 
 //==============================================================================
 // Factory Functions

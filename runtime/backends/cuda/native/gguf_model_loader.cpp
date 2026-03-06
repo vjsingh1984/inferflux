@@ -940,6 +940,7 @@ void GGUFModelLoader::FreeCPUMemory() {
 void GGUFModelLoader::FreeGPUMemory() { FreeGPUMemoryImpl(); }
 
 void GGUFModelLoader::FreeGPUMemoryImpl() {
+  ClearDequantizedCache();
   if (d_quantized_buffer_) {
     CheckCudaStatus(cudaFree(d_quantized_buffer_), "gguf_loader",
                     "cudaFree(quantized buffer)");
@@ -950,6 +951,21 @@ void GGUFModelLoader::FreeGPUMemoryImpl() {
                     "cudaFree(dequantized buffer)");
     d_dequantized_buffer_ = nullptr;
   }
+}
+
+void *GGUFModelLoader::GetGPUBuffer() const { return d_quantized_buffer_; }
+
+size_t GGUFModelLoader::GetGPUSize() const { return quantized_buffer_size_; }
+
+void GGUFModelLoader::SetDequantizedCachePolicy(DequantizedCachePolicy policy) {
+  dequantized_cache_policy_ = policy;
+}
+
+DequantizedCachePolicy GGUFModelLoader::GetDequantizedCachePolicy() const {
+  return dequantized_cache_policy_;
+}
+
+void GGUFModelLoader::ClearDequantizedCache() {
   for (auto &[name, tensor] : tensors_) {
     if (tensor.dequantized_gpu) {
       CheckCudaStatus(cudaFree(tensor.dequantized_gpu), "gguf_loader",
@@ -958,10 +974,6 @@ void GGUFModelLoader::FreeGPUMemoryImpl() {
     }
   }
 }
-
-void *GGUFModelLoader::GetGPUBuffer() const { return d_quantized_buffer_; }
-
-size_t GGUFModelLoader::GetGPUSize() const { return quantized_buffer_size_; }
 
 const ModelInfo &GGUFModelLoader::GetModelInfo() const { return model_info_; }
 

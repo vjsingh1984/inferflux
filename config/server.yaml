@@ -38,6 +38,10 @@ runtime:
     enabled: false                  # Rule 8: Set to true for GPU inference
     attention:
       kernel: auto                  # Rule 2: 'fa2' for SM ≥ 8.0 (Ampere+), 'auto' for auto-detect
+    kv_cache_dtype: auto            # KV precision policy: auto, fp16, bf16, int8, fp8
+    dequantized_cache_policy: batch # batch (memory efficient default) | model (higher reuse)
+    quantized_runtime:
+      require_fused_matmul: false   # true = fail startup unless fused quantized matmul is selected
     flash_attention:
       enabled: false                # Rule 2: Set to true on GPUs with SM ≥ 8.0
       tile_size: 128

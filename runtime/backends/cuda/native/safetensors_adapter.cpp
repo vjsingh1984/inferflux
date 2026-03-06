@@ -19,8 +19,14 @@ SafetensorsWeightAccessor::SafetensorsWeightAccessor(
   }
 }
 
-std::pair<size_t, size_t>
-SafetensorsWeightAccessor::GetDimensions() const {
+SafetensorsWeightAccessor::~SafetensorsWeightAccessor() {
+  if (dequantized_cache_) {
+    cudaFree(dequantized_cache_);
+    dequantized_cache_ = nullptr;
+  }
+}
+
+std::pair<size_t, size_t> SafetensorsWeightAccessor::GetDimensions() const {
   if (!tensor_ || tensor_->shape.size() < 2) {
     return {0, 0};
   }
@@ -50,8 +56,7 @@ void *SafetensorsWeightAccessor::GetGpuWeights(cudaStream_t stream) {
   return static_cast<uint8_t *>(gpu_base_) + tensor_->gpu_offset;
 }
 
-half *
-SafetensorsWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
+half *SafetensorsWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
   if (!tensor_) {
     return nullptr;
   }
@@ -140,17 +145,15 @@ bool SafetensorsLoaderAdapter::IsQuantized() const {
   return false;
 }
 
-std::string SafetensorsLoaderAdapter::GetQuantizationType() const {
-  return "";
-}
+std::string SafetensorsLoaderAdapter::GetQuantizationType() const { return ""; }
 
 bool SafetensorsLoaderAdapter::UploadToGPU(cudaStream_t stream) {
   log::Info("safetensors_adapter", "Uploading weights to GPU...");
 
   // Check for BF16 weights - need conversion
   const auto &config = loader_->GetConfig();
-  bool has_bf16 = (config.torch_dtype == "bfloat16" ||
-                   config.torch_dtype == "bf16");
+  bool has_bf16 =
+      (config.torch_dtype == "bfloat16" || config.torch_dtype == "bf16");
 
   bool success = loader_->UploadToGPU(stream, !has_bf16);
 
@@ -178,6 +181,21 @@ size_t SafetensorsLoaderAdapter::GetGPUSize() const {
   return loader_->GetGPUSize();
 }
 
+void SafetensorsLoaderAdapter::SetDequantizedCachePolicy(
+    DequantizedCachePolicy policy) {
+  dequantized_cache_policy_ = policy;
+}
+
+DequantizedCachePolicy
+SafetensorsLoaderAdapter::GetDequantizedCachePolicy() const {
+  return dequantized_cache_policy_;
+}
+
+void SafetensorsLoaderAdapter::ClearDequantizedCache() {
+  // Safetensors path is already dense FP16/BF16 and doesn't use the GGUF
+  // dequant cache lifecycle contract.
+}
+
 std::shared_ptr<IWeightAccessor>
 SafetensorsLoaderAdapter::GetWeightAccessor(const std::string &tensor_name) {
   // Check cache first
@@ -189,8 +207,7 @@ SafetensorsLoaderAdapter::GetWeightAccessor(const std::string &tensor_name) {
   // Get tensor from loader
   const auto *tensor = loader_->GetTensor(tensor_name);
   if (!tensor) {
-    log::Warn("safetensors_adapter",
-              "Tensor not found: " + tensor_name);
+    log::Warn("safetensors_adapter", "Tensor not found: " + tensor_name);
     return nullptr;
   }
 
@@ -230,9 +247,10 @@ void SafetensorsLoaderAdapter::ConvertModelInfo() {
 // SafetensorsQuantizationHandler Implementation
 //==============================================================================
 
-void SafetensorsQuantizationHandler::DequantizeGpuToGpu(
-    const void *quantized, half *dequantized, size_t num_elements,
-    cudaStream_t stream) {
+void SafetensorsQuantizationHandler::DequantizeGpuToGpu(const void *quantized,
+                                                        half *dequantized,
+                                                        size_t num_elements,
+                                                        cudaStream_t stream) {
   // No-op: safetensors weights are already FP16/BF16
   // Just copy if source and destination are different
   if (quantized != dequantized) {
