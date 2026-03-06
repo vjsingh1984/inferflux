@@ -32,6 +32,8 @@ graph LR
 ```bash
 # 1) Build
 ./scripts/build.sh
+# Optional: target Ada RTX 4000 specifically
+# INFERFLUX_CUDA_ARCHS=89 ./scripts/build.sh
 
 # 2) Run server (default config + default dev keys)
 INFERFLUX_MODEL_PATH=models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf \

@@ -15,7 +15,7 @@ flowchart LR
 | Area | Contract |
 |---|---|
 | Model format | GGUF (`format: gguf` or `auto` detection) |
-| Runtime paths | native CUDA and universal CUDA compatibility paths |
+| Runtime paths | native CUDA and llama.cpp CUDA compatibility paths |
 | Quantization support | Q4_K, Q5_K, Q6_K, Q8_0 handler path |
 | Validation | unit tags (`[gguf]`, `[quantization]`) + smoke runbook |
 

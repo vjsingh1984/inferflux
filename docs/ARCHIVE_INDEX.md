@@ -21,6 +21,7 @@ flowchart LR
 |---|---|---|
 | [NATIVE_CUDA_BENCHMARK_GUIDE](archive/evidence/NATIVE_CUDA_BENCHMARK_GUIDE.md) | Reference-Evidence | benchmark procedure |
 | [NATIVE_vs_LLAMA_CPP_CUDA_BENCHMARK](archive/evidence/NATIVE_vs_LLAMA_CPP_CUDA_BENCHMARK.md) | Reference-Evidence | native vs universal snapshot |
+| [QWEN14B_PREFILL_BATCH_MATRIX_2026_03_06](archive/evidence/QWEN14B_PREFILL_BATCH_MATRIX_2026_03_06.md) | Reference-Evidence | prefill and batching contrast snapshot (native vs llama CUDA) |
 | [COMPLETE_STRESS_TEST_REPORT_2026_03_04](archive/evidence/COMPLETE_STRESS_TEST_REPORT_2026_03_04.md) | Reference-Evidence | stress/debug summary |
 | [GGUF_COMPLETE_IMPLEMENTATION_2026_03_04](archive/evidence/GGUF_COMPLETE_IMPLEMENTATION_2026_03_04.md) | Reference-Evidence | GGUF milestone snapshot |
 | [GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05](archive/evidence/GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05.md) | Reference-Evidence | GGUF concurrent throughput snapshot |

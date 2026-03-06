@@ -12,7 +12,7 @@ Extract common types and interfaces from `LlamaCPUBackend` into a shared module 
 
 **Issues Identified:**
 1. Types (`UnifiedBatchInput/Output`, `UnifiedBatchLane`, etc.) defined in `LlamaCPUBackend` but used globally
-2. `NativeCudaExecutor` tightly coupled via type aliases to `LlamaCPUBackend`
+2. `NativeCudaRuntime` tightly coupled via type aliases to `LlamaCPUBackend`
 3. Duplication of batching utilities across backends
 4. Inconsistent patterns: `CudaBackend` inherits, `NativeKernelExecutor` composes
 
@@ -34,14 +34,14 @@ runtime/backends/cpu/llama_backend.h
 ├── UnifiedBatchHandle
 └── LlamaCPUBackend (concrete implementation)
 
-runtime/backends/cuda/native_cuda_executor.h
+runtime/backends/cuda/native_cuda_runtime.h
 ├── using UnifiedBatchInput = LlamaCPUBackend::UnifiedBatchInput
 ├── using UnifiedBatchOutput = LlamaCPUBackend::UnifiedBatchOutput
 ├── using UnifiedBatchLane = LlamaCPUBackend::UnifiedBatchLane
-└── NativeCudaExecutor (interface)
+└── NativeCudaRuntime (interface)
 
 runtime/backends/cuda/native_kernel_executor.cpp
-├── implements NativeCudaExecutor
+├── implements NativeCudaRuntime
 ├── contains shared_ptr<LlamaCPUBackend> llama_backend_
 └── delegates to llama_backend_->ExecuteUnifiedBatch()
 ```
@@ -80,7 +80,7 @@ runtime/backends/cpu/
 
 runtime/backends/cuda/
 ├── cuda_backend.h               # Inherits LlamaCPUBackend (CPU backend with CUDA)
-├── native_cuda_executor.h       # Now uses common types (no aliases)
+├── native_cuda_runtime.h       # Now uses common types (no aliases)
 └── native_kernel_executor.cpp   # Uses BatchAnalyzer utilities
 ```
 
@@ -473,13 +473,13 @@ public:
 
 ---
 
-## Phase 5: Update NativeCudaExecutor (Breaking)
+## Phase 5: Update NativeCudaRuntime (Breaking)
 
-### File: `runtime/backends/cuda/native_cuda_executor.h`
+### File: `runtime/backends/cuda/native_cuda_runtime.h`
 
 **Before:**
 ```cpp
-class NativeCudaExecutor {
+class NativeCudaRuntime {
 public:
   using UnifiedBatchHandle = LlamaCPUBackend::UnifiedBatchHandle;
   using UnifiedBatchLane = LlamaCPUBackend::UnifiedBatchLane;
@@ -494,7 +494,7 @@ public:
 #include "runtime/backends/common/backend_types.h"
 #include "runtime/backends/common/backend_interface.h"
 
-class NativeCudaExecutor : public BackendInterface {
+class NativeCudaRuntime : public BackendInterface {
 public:
   // Types inherited from BackendInterface namespace (no aliases needed)
 
@@ -563,7 +563,7 @@ void NativeKernelExecutor::SomeMethod() {
 
 ### Step 3: Migrate One Backend (Breaking)
 
-1. Update `NativeCudaExecutor` to use common types
+1. Update `NativeCudaRuntime` to use common types
 2. Update `NativeKernelExecutor` to use `BatchAnalyzer`
 3. Run tests
 4. Fix compilation errors
@@ -665,7 +665,7 @@ TEST_CASE("BatchAnalyzer counts tokens") {
 // tests/integration/test_backend_interface.cpp
 #include "runtime/backends/cpu/llama_backend.h"
 #include "runtime/backends/cuda/cuda_backend.h"
-#include "runtime/backends/cuda/native_cuda_executor.h"
+#include "runtime/backends/cuda/native_cuda_runtime.h"
 
 TEST_CASE("LlamaCPUBackend implements BackendInterface") {
   LlamaCPUBackend llama;
@@ -806,9 +806,9 @@ TEST_CASE("UnifiedBatch types work across backends") {
 - [ ] Run tests: `./build/inferflux_tests [llama_backend]`
 - [ ] Benchmark: Verify no performance regression
 
-### Week 3: NativeCudaExecutor Migration
+### Week 3: NativeCudaRuntime Migration
 
-- [ ] Update `native_cuda_executor.h` to use common types
+- [ ] Update `native_cuda_runtime.h` to use common types
 - [ ] Remove type aliases
 - [ ] Update `native_kernel_executor.cpp`
 - [ ] Use `BatchAnalyzer` utilities
@@ -846,7 +846,7 @@ TEST_CASE("UnifiedBatch types work across backends") {
 
 ### Architectural Requirements
 
-- [ ] `NativeCudaExecutor` no longer aliases `LlamaCPUBackend` types
+- [ ] `NativeCudaRuntime` no longer aliases `LlamaCPUBackend` types
 - [ ] `BatchAnalyzer` utilities used by multiple backends
 - [ ] `BackendInterface` implemented by all backends
 - [ ] Clear separation of common vs backend-specific code
@@ -937,7 +937,7 @@ This would require updating scheduler and all backends.
 
 ### Benefits Achieved
 
-- **Reduced coupling**: `NativeCudaExecutor` independent of `LlamaCPUBackend`
+- **Reduced coupling**: `NativeCudaRuntime` independent of `LlamaCPUBackend`
 - **Code reuse**: `BatchAnalyzer` used by all backends
 - **Easier testing**: Mock `BackendInterface` for tests
 - **Clear architecture**: Common vs backend-specific separation

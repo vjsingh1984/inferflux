@@ -50,7 +50,7 @@ Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 
 | Workload/Signal | What to check | How to interpret |
 |---|---|---|
-| `backend_exposure.provider` and `fallback` | `/v1/models` or `inferctl models --json` | `provider=universal` + `fallback=true` means runtime is not on native provider path |
+| `backend_exposure.provider` and `fallback` | `/v1/models` or `inferctl models --json` | `provider=llama_cpp` + `fallback=true` means runtime is not on native provider path |
 | CUDA lane activity | `inferflux_cuda_lane_submissions_total{lane=...}` | Zero lane deltas under gate workload means overlap lane path is inactive |
 | Native forward counters | `inferflux_native_forward_passes_total{phase=...}` | Zero deltas indicate native forward path is not executing |
 | Attention kernel | `inferflux_cuda_attention_kernel_selected` | Confirms kernel selected on current path (`fa2`/`fa3`/`standard`) |
@@ -62,7 +62,18 @@ Example snapshot evidence (TinyLlama 1.1B Q4_K_M, March 5, 2026):
 | `cuda_llama_cpp` | `2774` | Lower latency in this specific small-model run |
 | `cuda_native` | `2489` | Similar tier on this run; expected separation grows with larger models/workloads |
 
-Treat these as snapshot measurements, not guaranteed universal ordering.
+Treat these as snapshot measurements, not guaranteed global ordering.
+
+Latest 14B prefill/batching snapshot (March 6, 2026):
+
+| Profile | Native (`cuda_native`) | Llama CUDA (`cuda_llama_cpp`) | Reading |
+|---|---|---|---|
+| baseline small prefill | pass (`3.991 tok/s`) | pass (`5.340 tok/s`) | llama higher in this run |
+| prefill heavy | pass (`8.235 tok/s`) | pass (`22.976 tok/s`) | llama higher in this run |
+| batch medium (`c=4`, `r=8`) | pass (`6.290 tok/s`, batch max `4`) | pass (`48.553 tok/s`, batch max `4`) | both batch, llama significantly higher |
+| batch heavy (`c=8`, `r=16`) | **fail** (native forward counters `0`) | pass (`23.150 tok/s`) | native heavy profile remains unstable |
+
+Full evidence: [QWEN14B_PREFILL_BATCH_MATRIX_2026_03_06](archive/evidence/QWEN14B_PREFILL_BATCH_MATRIX_2026_03_06.md)
 
 FP16-specific deployment status and memory-concurrency cautions are tracked in [FP16_STATUS](FP16_STATUS.md).
 
@@ -127,5 +138,6 @@ Deep-dive legacy docs are archived as evidence:
 - [FLASHATTENTION_LIVE_TEST_RESULTS_2025_03_02](archive/evidence/FLASHATTENTION_LIVE_TEST_RESULTS_2025_03_02.md)
 - [GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05](archive/evidence/GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05.md)
 - [GGUF_PROFILING_QUICK_REFERENCE_2026_03_05](archive/evidence/GGUF_PROFILING_QUICK_REFERENCE_2026_03_05.md)
+- [QWEN14B_PREFILL_BATCH_MATRIX_2026_03_06](archive/evidence/QWEN14B_PREFILL_BATCH_MATRIX_2026_03_06.md)
 
 For triage runbooks, see [Troubleshooting](Troubleshooting.md).

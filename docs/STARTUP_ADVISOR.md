@@ -37,7 +37,7 @@ flowchart LR
     B -->|cuda_llama_cpp| C[⚠️ Mismatch]
     B -->|cuda_native| D[✅ Correct]
 
-    C --> E[Recommendation:<br/>INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel]
+    C --> E[Recommendation:<br/>Set backend: cuda_native]
     D --> F[No action needed]
 
     style C fill:#ff6b6b
@@ -50,10 +50,10 @@ flowchart LR
 **Recommendation:**
 ```
 [RECOMMEND] backend: Model 'qwen2.5-3b' uses safetensors on CUDA —
-set INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
+set backend to cuda_native
 ```
 
-**Why it matters:** The llama.cpp.cpp backend doesn't support safetensors. The native CUDA backend must be used explicitly.
+**Why it matters:** The llama.cpp backend doesn't support safetensors. The native CUDA backend must be used explicitly.
 
 **Fix:**
 ```yaml
@@ -64,9 +64,9 @@ models:
     format: auto
 ```
 
-Then set environment variable:
+Then start the server normally:
 ```bash
-INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel ./build/inferfluxd --config config/server.yaml
+./build/inferfluxd --config config/server.yaml
 ```
 
 ### Rule 2: Attention Kernel

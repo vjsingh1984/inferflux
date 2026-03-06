@@ -8,7 +8,7 @@ Dependencies: None
 Labels: runtime, cli, api-contract, observability
 
 ## Problem
-`cuda_universal` and `cuda_native` behavior is not surfaced consistently enough for operators and automation. This creates benchmarking ambiguity and policy-routing confusion.
+`cuda_llama_cpp` and `cuda_native` behavior is not surfaced consistently enough for operators and automation. This creates benchmarking ambiguity and policy-routing confusion.
 
 ## Scope Files
 - `runtime/backends/backend_factory.cpp`
@@ -24,7 +24,7 @@ Labels: runtime, cli, api-contract, observability
 - `docs/CONFIG_REFERENCE.md`
 
 ## Test Plan
-1. Add unit tests for backend hint normalization and identity mapping (`cuda`, `cuda_universal`, `cuda_native`).
+1. Add unit tests for backend hint normalization and identity mapping (`cuda`, `cuda_llama_cpp`, `cuda_native`).
 2. Add integration tests for `/v1/models` and `/v1/models/{id}` to assert explicit backend identity fields.
 3. Add CLI integration tests for `inferctl models --json` and `inferctl models --id ... --json` identity parity with HTTP.
 4. Run contract tests and docs gate.

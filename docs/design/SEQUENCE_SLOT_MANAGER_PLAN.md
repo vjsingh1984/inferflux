@@ -1,6 +1,6 @@
 # KV Cache Slot Manager Implementation Plan
 
-**Goal**: Universal sequence slot management for both cuda_native and cuda_universal backends
+**Goal**: Universal sequence slot management for both cuda_native and cuda_llama_cpp backends
 
 ## Phase 1: Create SequenceSlotManager (Week 1)
 
@@ -237,7 +237,7 @@ if (!slot) {
 // Associate slot with request
 request->slot_id = *slot;
 
-// Call backend (same for both cuda_native and cuda_universal)
+// Call backend (same for both cuda_native and cuda_llama_cpp)
 backend->Prefill(..., request->slot_id);
 
 // After request completes:

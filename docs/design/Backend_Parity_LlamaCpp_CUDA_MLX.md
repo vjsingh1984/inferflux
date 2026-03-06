@@ -46,14 +46,12 @@ target-specific optimization paths and minimizing duplicated control logic.
      normalization.
    - Explicit CUDA provider hints are now supported for deterministic routing:
      `cuda_native` (native only; fail if unavailable) and
-     `cuda_universal`/`cuda_llama` (force universal llama path).
-   - Native CUDA currently routes through a scaffold backend that reports
-     `provider=native` with `backend_fallback=true` until custom kernels are
-     wired; `INFERFLUX_NATIVE_CUDA_STRICT=1` can hard-fail this delegate path.
-   - Native scaffold executor can be selected explicitly with
-     `INFERFLUX_NATIVE_CUDA_EXECUTOR=delegate|direct_llama` to compare
-     delegated vs non-delegating control-plane paths while kernels are under
-     development.
+     `cuda_llama_cpp`/`cuda_llama` (force universal llama path).
+   - Native CUDA now routes through a single native runtime
+     (`runtime/backends/cuda/native_cuda_runtime.*`) and no longer exposes
+     delegate/direct scaffold executors.
+   - `INFERFLUX_NATIVE_CUDA_STRICT=1` can still hard-fail any fallback
+     condition reported by the native runtime.
    - `SingleModelRouter` now resolves backend candidates from a priority chain
      (`runtime.backend_priority` / `INFERFLUX_BACKEND_PRIORITY`) and records
      per-model provenance (`requested_backend`, `backend_provider`,
@@ -78,8 +76,8 @@ target-specific optimization paths and minimizing duplicated control logic.
      are available, so prefill-lane telemetry reflects real request traffic
      (with legacy `Prefill`/`PrefillPartial` fallback on failure).
    - `NativeCudaBackend` now delegates readiness + core prefill/decode/tokenizer
-     operations to its active executor backend so `cuda_native` requests execute
-     through the scaffold path instead of being treated as not-ready.
+     operations to its single native runtime so `cuda_native` requests execute
+     through the canonical native path.
 7. Added CUDA attention policy ladder:
    - `runtime.cuda.attention.kernel` / `INFERFLUX_CUDA_ATTENTION_KERNEL`
      supports `auto|fa3|fa2|standard`.

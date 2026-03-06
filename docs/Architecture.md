@@ -81,7 +81,7 @@ sequenceDiagram
 |---|---|
 | `requested_backend` | backend hint from config/admin load intent |
 | `exposed_backend` | backend actually selected |
-| `provider` | provider path (`native` or `universal`) |
+| `provider` | provider path (`native` or `llama_cpp`) |
 | `fallback` | `true` when routing/policy changed selected backend |
 | `fallback_reason` | diagnostic reason for changed selection |
 

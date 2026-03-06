@@ -35,7 +35,7 @@ Expected: each supported quantization variant reports `SUCCESS`.
   --num-tokens 20
 ```
 
-Use this when you want native-vs-universal/llama comparison behavior in one flow.
+Use this when you want native-vs-llama.cpp comparison behavior in one flow.
 
 ## 4) Post-Run Verification
 

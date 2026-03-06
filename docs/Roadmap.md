@@ -1,129 +1,67 @@
 # InferFlux Roadmap
 
 **Snapshot date:** March 5, 2026  
-**Current overall grade:** C+ (revalidated March 5, 2026 after commit-history refresh + regression reruns)  
+**Current overall grade:** C+  
 **Target overall grade:** B- (2026), B (2027)
-
-## 1) One-Screen Plan
 
 ```mermaid
 flowchart LR
-    A[Q1 2026: Contracts + Baseline] --> B[Q2 2026: Foundation Gates]
-    B --> C[Q3 2026: Throughput Core]
-    C --> D[Q4 2026: Enterprise Runtime]
-    D --> E[Q1-Q2 2027: Scale + SLA]
+    A[Now: Contract Correctness] --> B[Next: Throughput Core]
+    B --> C[Then: Enterprise Runtime]
 
-    A1[cuda identity + strict policy] --> A
-    A2[API/admin contract hardening] --> A
-    B1[mandatory GPU CI behavior gate] --> B
-    B2[resource economy metrics] --> B
-    C1[GPU continuous batching] --> C
-    C2[GPU KV page reuse] --> C
-    D1[distributed failure contracts] --> D
-    E1[autoscaling + multi-region + SLA] --> E
+    A1[API/CLI/admin identity gates] --> A
+    A2[Strict native-request policy path] --> A
+
+    B1[GPU iteration batching] --> B
+    B2[KV page reuse + kernel maturity] --> B
+
+    C1[Distributed failure contracts] --> C
+    C2[Mandatory GPU release lane] --> C
 ```
 
-## 2) Current vs Target Scorecard
+## 1) Grade Scorecard (Code-Aligned)
 
-| Dimension | Current | Target | Primary Blocker | Primary Issues |
+| Dimension | Current | Evidence in code today | Blocker to next grade | Primary issues |
 |---|---|---|---|---|
-| Throughput | C+ | B | Native CUDA lanes/overlap still inactive in default `backend=cuda` despite request-layer concurrency mitigation | [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#4](https://github.com/vjsingh1984/inferflux/issues/4), [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
-| Continuous batching | C | B | HTTP worker bottleneck was reduced (4→16), but no full GPU iteration scheduler yet | [#3](https://github.com/vjsingh1984/inferflux/issues/3) |
-| Resource economy | B- | B | Memory-pressure telemetry export and autoscaling SLO set remain partial | [#9](https://github.com/vjsingh1984/inferflux/issues/9) |
-| CI/TDD enforcement | B+ | A- | GPU behavior lane remains conditional on self-hosted availability | [#5](https://github.com/vjsingh1984/inferflux/issues/5), [#10](https://github.com/vjsingh1984/inferflux/issues/10) |
-| Distributed runtime | C- | C+ | Failure-path/fault-matrix coverage still incomplete | [#11](https://github.com/vjsingh1984/inferflux/issues/11) |
-| Capability identity | B | B+ | Native path still scaffolded even with strict policy contracts in place | [#1](https://github.com/vjsingh1984/inferflux/issues/1), [#2](https://github.com/vjsingh1984/inferflux/issues/2) |
-| OSS docs and operator clarity | B+ | A- | Full-repo link freshness is not merge-gated outside canonical docs | docs consolidation + docs contract gate baseline |
+| Throughput | C+ | Request-layer concurrency improved (`server/main.cpp` default workers `16`) | CUDA lane/overlap path still not active in default `backend=cuda` flow | [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#4](https://github.com/vjsingh1984/inferflux/issues/4), [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
+| Continuous batching | C | Phase-aware scheduler exists; fairness and token-budget controls are in place | No production-grade GPU iteration scheduler yet | [#3](https://github.com/vjsingh1984/inferflux/issues/3) |
+| Capability identity | B | Provider contract is explicit in runtime (`kNative`/`kLlamaCpp`) and surfaced by router/API | Native path readiness is still gated/scaffolded | [#1](https://github.com/vjsingh1984/inferflux/issues/1), [#2](https://github.com/vjsingh1984/inferflux/issues/2) |
+| Resource efficiency | B- | Startup advisor + policy/runtime safety hardening landed with tests | Economy metrics and autoscaling signals are still partial | [#9](https://github.com/vjsingh1984/inferflux/issues/9) |
+| CI/TDD enforcement | B+ | Contract suites are explicit in CI logs (including CLI arg-contract blocks) | Merge-blocking GPU behavior lane is not yet universally guaranteed | [#5](https://github.com/vjsingh1984/inferflux/issues/5), [#10](https://github.com/vjsingh1984/inferflux/issues/10) |
+| Distributed runtime | C- | Split/runtime hooks exist | Failure-path contract matrix is incomplete | [#11](https://github.com/vjsingh1984/inferflux/issues/11) |
 
-## 2.1) Evidence Behind Current Grade
+## 2) Evidence Ledger (What Was Reconciled)
 
-| Check | Result | Grade impact |
+| Evidence type | Current reading | Grade impact |
 |---|---|---|
-| Contract + native-regression suites (`NativeForward`, `NativeBatch`, `GGUF`, `Quantization`, `ModelIdentity`, `EmbeddingsRouting`, integration contract checks, native metrics) | 12/12 pass | Raised confidence in capability identity and CI/TDD dimensions while hardening native runtime paths |
-| Startup/policy safety coverage (`StartupAdvisor`, `policy`) | 2/2 pass | Confirms memory-pressure handling and policy persistence safety landed with regression coverage |
-| HTTP worker pool default (`a18ca46`) | 4→16 workers in `server/main.cpp` | Mitigates non-streaming queue saturation at request layer; does not close kernel-level throughput gap |
-| CUDA throughput gate (`gpu_profile=ada_rtx_4000`, `--require-cuda-lanes`) | Failed (`137.33` completion tok/s; lane + overlap + mixed-iteration counters stayed `0`; fallback=`true`; provider=`universal`) | Keeps throughput + continuous batching below target and confirms native CUDA path is still inactive in default `backend=cuda` flow |
-| CUDA throughput gate (relaxed lane requirement) | Passed (`265.675` completion tok/s, `1.0` success rate, fallback=`true`, provider=`universal`) | Confirms stable universal baseline while native CUDA path remains incomplete |
-| Focused static-analysis tranche (`bugprone-empty-catch`, `narrowing`, `implicit-widening`) across runtime/http/policy hot paths | Clean on targeted files | Improves implementation quality and lowers latent runtime-failure risk |
-| Canonical docs contract (`scripts/check_docs_contract.py`) | Passed | Raises confidence in OSS docs/operator clarity dimension |
+| Provider identity contract | Runtime provider enum is `kLlamaCpp`/`kNative`; exposure policy is `prefer_native`, `allow_llama_cpp_fallback`, `strict_native_request` | Removes naming ambiguity in canonical docs and API semantics |
+| Native readiness gate | `NativeCudaBackend::NativeKernelsReady()` now auto-enables when native kernels are compiled and CUDA device is available (unless scaffold is forced via env) | `backend=cuda` can prefer native by default on ready CUDA nodes |
+| API/CLI identity exposure | `/v1/models` and CLI surfaces include requested/exposed backend + provider/fallback fields | Supports deterministic automation and policy checks |
+| CUDA fallback chain | Model-load routing now uses `cuda -> cuda_llama_cpp -> rocm -> mlx -> mps -> cpu` (compiled targets only) | Improves resilience while preserving deterministic fallback ordering |
+| Throughput gate (Qwen14B prefill/batching snapshot, March 6, 2026) | `cuda_native` passed baseline/prefill/batch-medium but failed strict native-forward check in batch-heavy profile; `cuda_llama_cpp` passed all four profiles | Throughput grade stays constrained until native heavy-batch behavior is stable and lane/overlap activation is proven |
 
-## 2.2) Latest Commit-History Findings (March 5, 2026)
+## 3) Priority Order
 
-| Commit | Finding | Grade implication |
+| Priority | Foundation | Done when |
 |---|---|---|
-| `a8cee5b` | Hardened native CUDA runtime error handling (event/stream/malloc/copy checks) | Improves reliability and failure diagnosability in throughput-critical paths |
-| `a18ca46` | Increased default HTTP worker pool from 4 to 16 | Reduces request-layer concurrency collapse risk for non-streaming loads |
-| `307bc12` / `24412c2` | Hardened policy/HTTP parse and size-conversion safety paths | Lowers correctness and operational-risk debt for control-plane endpoints |
-| `f795f31` / `2eaa66b` | Hardened startup-advisor and runtime conversion/math safety | Improves resource-planning robustness and reduces conversion-overflow risk |
-| `5d284f6` / `b22d4d5` | Added and hardened concurrent/quick streaming benchmark scripts | Improves repeatability of throughput investigations and operator benchmarking |
+| P0 | Native CUDA identity + strict policy | Explicit native requests fail fast correctly and provider identity is unambiguous end-to-end |
+| P1 | GPU continuous batching | Iteration scheduler is active with stable fairness and no regression in contract tests |
+| P1 | GPU KV reuse + kernel maturity | Reuse accounting is correct and native kernel path shows sustained uplift |
+| P2 | Mandatory GPU CI behavior lane | Release cannot pass without GPU behavioral gate |
+| P2 | Distributed failure contracts | Fault matrix is covered by integration tests and runbooks |
 
-## 3) Foundational Program (Priority Order)
+## 4) Quarter Targets
 
-| Priority | Foundation | Definition of Done | KPI Gate |
-|---|---|---|---|
-| P0 | Native CUDA identity contract | API/CLI/metrics show explicit provider identity and strict-fail unsupported native requests | 0 ambiguous provider reports in contract tests |
-| P1 | GPU continuous batching | Iteration scheduler active with stable fairness + no throughput regressions | Throughput gate passes with target batch packing and skip ceilings |
-| P1 | GPU KV page reuse | Prefix/KV page reuse enabled with correctness and accounting tests | Prefix-reuse hit metrics up, no KV corruption regressions |
-| P1 | Resource efficiency metrics | Batch-loss + skip-reason + efficiency metrics published and documented | Autoscaling/economy docs use those metrics as inputs |
-| P2 | Mandatory GPU CI lane | At least one stable GPU lane is merge-blocking for behavioral gates | No release without passing GPU behavioral suite |
-| P2 | Distributed failure-path contracts | Prefill/decode split failure injections validated end-to-end | Fault-injection matrix passes in CI |
-
-## 4) Quarter Plan (Concise)
-
-| Quarter | Outcomes | Exit Criteria |
-|---|---|---|
-| Q2 2026 | Lock policy/identity contracts and CI observability base | #1/#2/#5/#9/#10 merged and enforced |
-| Q3 2026 | Land throughput core (batching + KV reuse + native kernel maturity) | #3/#4 plus #6/#7 show sustained throughput lift |
-| Q4 2026 | Raise enterprise runtime resilience | #11 failure-path contracts + distributed readiness checks |
-| Q1-Q2 2027 | Scale and SLA | Autoscaling + multi-region + SLA reporting integrated |
-
-## 5) Workstream Board
-
-### A) Runtime Throughput
-
-| Status | Items |
+| Quarter | Exit criteria |
 |---|---|
-| Done | Fairness scheduler, phased prefill/decode, prefix cache, capability routing, throughput harness |
-| In progress | Native identity hardening, strict policy path, CI behavioral gates |
-| Next | GPU iteration scheduler, GPU KV paging/reuse, quantized/native fused path |
+| Q2 2026 | Identity/policy contracts + CI visibility complete |
+| Q3 2026 | Throughput-core items (#3/#4/#6/#7) show sustained gains |
+| Q4 2026 | Distributed failure-path contracts land |
+| Q1-Q2 2027 | SLA-oriented scale and operations maturity |
 
-### B) Security and Operations
+## 5) Canonical References
 
-| Status | Items |
-|---|---|
-| Done | TLS, OIDC/JWKS, hashed API keys, audit logging, tracing baseline |
-| In progress | Metrics-backed operational docs and startup checks |
-| Next | Enterprise-grade failover and policy replication contracts |
-
-### C) Developer Experience
-
-| Status | Items |
-|---|---|
-| Done | OpenAI-compatible APIs, model lifecycle admin ops, CLI contract hardening |
-| In progress | Infographic-first OSS docs and contract-focused CLI coverage |
-| Next | Prefix cache CLI surfaces and advanced diagnostics UX |
-
-### D) Distributed Runtime
-
-| Status | Items |
-|---|---|
-| Done | SHM transport path, split-pool hooks, readiness surfaces |
-| In progress | Failure-mode contract coverage |
-| Next | Multi-node transport hardening and recovery SLOs |
-
-## 6) Issue Map
-
-- Native CUDA identity and strict policy: [#1](https://github.com/vjsingh1984/inferflux/issues/1), [#2](https://github.com/vjsingh1984/inferflux/issues/2)
-- GPU batching and KV reuse: [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#4](https://github.com/vjsingh1984/inferflux/issues/4)
-- GPU CI and coverage hardening: [#5](https://github.com/vjsingh1984/inferflux/issues/5), [#10](https://github.com/vjsingh1984/inferflux/issues/10)
-- Native kernel maturity: [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7)
-- Scheduler lock partitioning: [#8](https://github.com/vjsingh1984/inferflux/issues/8)
-- Efficiency/economy metrics: [#9](https://github.com/vjsingh1984/inferflux/issues/9)
-- Distributed failure-path contracts: [#11](https://github.com/vjsingh1984/inferflux/issues/11)
-
-## 7) Canonical References
-
-- [INDEX](INDEX.md)
 - [TechDebt and Competitive Roadmap](TechDebt_and_Competitive_Roadmap.md)
+- [PRD](PRD.md)
 - [Architecture](Architecture.md)
 - [ARCHIVE_INDEX](ARCHIVE_INDEX.md)

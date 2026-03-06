@@ -109,12 +109,12 @@ The CMake target `inferflux_core` links all modules into a single library consum
 
 ## Backend Selection & Model Format Routing
 
-**Backend types:** `cpu`, `cuda`, `cuda_native` (native CUDA implementation), `cuda_universal`/`cuda_llama` (llama.cpp-backed), `mps`, `rocm`
+**Backend types:** `cpu`, `cuda`, `cuda_native` (native CUDA implementation), `cuda_llama_cpp`/`cuda_llama` (llama.cpp-backed), `mps`, `rocm`
 
 **Model formats:** `auto` (default), `gguf`, `safetensors`, `hf` (HuggingFace URI-style `hf://org/repo`)
 
 **Backend resolution logic:**
-1. Explicit backend hints (`cuda_native`, `cuda_universal`) are honored when available
+1. Explicit backend hints (`cuda_native`, `cuda_llama_cpp`) are honored when available
 2. Backend priority (`runtime.backend_priority`, `INFERFLUX_BACKEND_PRIORITY`) determines fallback order
 3. Capability routing (`runtime.capability_routing.*`) enables graceful degradation when requested capabilities aren't available
 4. Backend exposure policy controls which backends are exposed via `/v1/models`
@@ -136,12 +136,12 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 - `INFERFLUX_PORT_OVERRIDE` / `INFERFLUX_HOST_OVERRIDE` — network overrides
 - `INFERFLUX_BACKEND_PREFER_NATIVE` — prefer native implementations over universal
 - `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` — allow fallback to llama.cpp backends
-- `INFERFLUX_NATIVE_CUDA_EXECUTOR` — native CUDA executor mode (`delegate`|`direct_llama`)
+- `INFERFLUX_NATIVE_CUDA_STRICT` — fail load if native CUDA runtime reports fallback
 - `INFERFLUX_MODEL_FORMAT` — override model format detection
 
 ## CUDA Development
 
-**Native CUDA backend:** `runtime/backends/cuda/native_cuda_backend.cpp` provides a native CUDA implementation path. Currently scaffolded with delegate/executor pattern for future kernel development.
+**Native CUDA backend:** `runtime/backends/cuda/native_cuda_backend.cpp` and `runtime/backends/cuda/native_cuda_runtime.cpp` provide the canonical native CUDA path used by `cuda_native`.
 
 **Phase overlap:** Mixed-batch decode prioritization with configurable prefill/decode overlap. Enable via `runtime.cuda.phase_overlap.enabled` or `INFERFLUX_CUDA_PHASE_OVERLAP`. Monitor via Prometheus metrics: `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_completions_total`, `inferflux_cuda_lane_overlap_events_total`, `inferflux_cuda_lane_overlap_duration_ms_total`.
 

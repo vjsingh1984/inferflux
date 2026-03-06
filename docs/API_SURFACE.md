@@ -81,6 +81,8 @@ graph TD
 - HTTP interface is OpenAI-style for client interoperability.
 - Scope checks are enforced server-side (`generate`, `read`, `admin`).
 - `/v1/models` and `/v1/models/{id}` are distinct from admin model lifecycle endpoints.
+- `session_id` is an optional InferFlux extension for `/v1/completions` and `/v1/chat/completions`;
+  it is ignored unless `runtime.scheduler.session_handles.enabled=true` and does not change default stateless behavior.
 
 ## 6) Model Identity Contract
 
@@ -91,7 +93,7 @@ automation and policy validation.
 |---|---|
 | `backend_exposure.requested_backend` | backend hint requested by config/admin load path |
 | `backend_exposure.exposed_backend` | backend actually exposed by the router |
-| `backend_exposure.provider` | provider path (`native` or `universal`) |
+| `backend_exposure.provider` | provider path (`native` or `llama_cpp`) |
 | `backend_exposure.fallback` | `true` when selected backend differs due fallback |
 | `backend_exposure.fallback_reason` | optional fallback diagnostic string |
 

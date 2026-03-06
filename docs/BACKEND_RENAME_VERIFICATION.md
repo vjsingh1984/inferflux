@@ -93,7 +93,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ### Core Implementation
 - `runtime/backends/backend_factory.h` - Enum and struct definitions
 - `runtime/backends/backend_factory.cpp` - Implementation logic
-- `runtime/backends/cuda/native_cuda_executor.cpp` - Error messages
+- `runtime/backends/cuda/native_cuda_runtime.cpp` - Error messages
 
 ### Scheduler & Router
 - `scheduler/model_router.h` - Comments and defaults
@@ -127,7 +127,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ### ✅ Backend Hints
 ```yaml
 # Old:
-backend: cuda_universal
+backend: cuda_llama_cpp
 
 # New:
 backend: cuda_llama_cpp

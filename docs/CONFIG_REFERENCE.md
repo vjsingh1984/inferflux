@@ -92,6 +92,10 @@ runtime:
     max_batch_tokens: 8192
     min_batch_size: 1
     batch_accumulation_ms: 0
+    session_handles:
+      enabled: false
+      ttl_ms: 300000
+      max_sessions: 1024
   paged_kv:
     cpu_pages: 4096
     eviction: lru
@@ -103,7 +107,7 @@ auth:
   rate_limit_per_minute: 120
 ```
 
-### NVIDIA CUDA + GGUF universal profile
+### NVIDIA CUDA + GGUF llama.cpp compatibility profile
 
 ```yaml
 models:
@@ -127,6 +131,10 @@ runtime:
     max_batch_tokens: 8192
     min_batch_size: 1
     batch_accumulation_ms: 5
+    session_handles:
+      enabled: false
+      ttl_ms: 300000
+      max_sessions: 1024
 ```
 
 ### NVIDIA CUDA + safetensors native profile
@@ -169,10 +177,13 @@ runtime:
 | Key | Behavior |
 |---|---|
 | `prefer_native` | choose native provider when eligible |
-| `allow_llama_cpp_fallback` | allow fallback to universal path when native unavailable |
+| `allow_llama_cpp_fallback` | allow fallback to llama.cpp path when native unavailable |
 | `strict_native_request` | explicit `cuda_native` requests fail fast if native path is not ready |
 
 When strict mode is enabled, unsupported explicit native requests fail with `422 backend_policy_violation`.
+
+For `backend: cuda` requests, runtime fallback order is:
+`cuda(native)` -> `cuda_llama_cpp` -> `rocm` (if compiled) -> `mlx` (if compiled) -> `mps` (if compiled) -> `cpu`.
 
 ## 7) Runtime Tuning Cheat Sheet
 
@@ -184,6 +195,14 @@ When strict mode is enabled, unsupported explicit native requests fail with `422
 | `runtime.scheduler.max_batch_tokens` | 8192 | cap per-batch token memory pressure |
 | `runtime.scheduler.min_batch_size` | 1 | keep low for responsiveness |
 | `runtime.scheduler.batch_accumulation_ms` | 0-5 | small wait to form better batches |
+| `runtime.scheduler.session_handles.enabled` | `false` | optional `session_id -> sequence slot` mapping layer |
+| `runtime.scheduler.session_handles.ttl_ms` | `300000` | TTL for idle session mappings |
+| `runtime.scheduler.session_handles.max_sessions` | `1024` | upper bound on concurrently tracked sessions |
+
+Session handle contract:
+- API behavior remains stateless by default.
+- `session_id` support is opt-in and only active when `session_handles.enabled=true`.
+- KV dtype stays server/model-load scoped (`runtime.cuda.kv_cache_dtype`), not per request/session.
 
 ### KV cache
 
@@ -199,6 +218,7 @@ When strict mode is enabled, unsupported explicit native requests fail with `422
 | `runtime.cuda.enabled` | `true` on GPU nodes | enable accelerator path |
 | `runtime.cuda.attention.kernel` | `auto` | kernel selection policy |
 | `runtime.cuda.flash_attention.enabled` | `true` on SM>=8.0 | throughput uplift on supported GPUs |
+| `runtime.cuda.kv_cache_dtype` | `auto` | KV precision policy (`auto`, `fp16`, `bf16`, `int8`, `fp8`) |
 | `runtime.cuda.phase_overlap.enabled` | `true` for mixed workloads | prefill/decode overlap |
 | `runtime.cuda.phase_overlap.min_prefill_tokens` | `256` | overlap trigger threshold |
 
@@ -262,7 +282,8 @@ Scope contract:
 |---|---|
 | `INFERFLUX_MODEL_PATH` | default model path |
 | `INFERFLUX_MODELS` | multi-model config string |
-| `INFERFLUX_NATIVE_CUDA_EXECUTOR` | native/universal CUDA executor behavior |
+| `INFERFLUX_NATIVE_CUDA_STRICT` | fail model load if native CUDA runtime reports fallback |
+| `INFERFLUX_DISABLE_NATIVE_CUDA` | force native CUDA runtime readiness to false |
 | `INFERFLUX_BACKEND_PRIORITY` | runtime backend priority chain |
 | `INFERFLUX_BACKEND_PREFER_NATIVE` | `runtime.backend_exposure.prefer_native` |
 | `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` | `runtime.backend_exposure.allow_llama_cpp_fallback` |

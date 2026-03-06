@@ -20,6 +20,17 @@ flowchart LR
 ./scripts/build.sh
 ```
 
+`scripts/build.sh` prefers Ninja when available and uses `nvcc` with GCC (`/usr/bin/g++`) as CUDA host compiler by default.
+For arch-specific CUDA builds (example Ada RTX 4000), set:
+
+```bash
+INFERFLUX_CUDA_ARCHS=89 ./scripts/build.sh
+```
+
+Optional CUDA kernel tuning toggles passed through to CMake:
+- `INFERFLUX_CUDA_USE_FAST_MATH=ON` (throughput vs precision tradeoff)
+- `INFERFLUX_CUDA_DEVICE_LTO=ON` (advanced profile; requires explicit `code=lto_<arch>` gencode wiring)
+
 CPU-only fallback build:
 
 ```bash
