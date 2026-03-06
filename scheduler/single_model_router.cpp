@@ -2,6 +2,7 @@
 
 #include "model/model_format.h"
 #include "runtime/backends/backend_factory.h"
+#include "runtime/backends/cuda/native_cuda_backend.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 
@@ -44,6 +45,41 @@ bool BackendSupportsModelFormat(const BackendFactoryResult &selection,
     }
   }
   return false;
+}
+
+void AppendUniqueHint(std::vector<std::string> *candidates,
+                      const std::string &hint) {
+  if (!candidates) {
+    return;
+  }
+  const std::string normalized = BackendFactory::NormalizeHint(hint);
+  if (normalized.empty()) {
+    return;
+  }
+  if (std::find(candidates->begin(), candidates->end(), normalized) ==
+      candidates->end()) {
+    candidates->push_back(normalized);
+  }
+}
+
+std::vector<std::string> BuildCudaFallbackCandidates() {
+  std::vector<std::string> candidates;
+  candidates.reserve(6);
+  // Requested chain: native CUDA -> llama.cpp CUDA -> llama.cpp ROCm -> MLX ->
+  // llama.cpp MPS -> CPU.
+  AppendUniqueHint(&candidates, "cuda");
+  AppendUniqueHint(&candidates, "cuda_llama_cpp");
+#ifdef INFERFLUX_HAS_ROCM
+  AppendUniqueHint(&candidates, "rocm");
+#endif
+#ifdef INFERFLUX_HAS_MLX
+  AppendUniqueHint(&candidates, "mlx");
+#endif
+#ifdef INFERFLUX_HAS_METAL
+  AppendUniqueHint(&candidates, "mps");
+#endif
+  AppendUniqueHint(&candidates, "cpu");
+  return candidates;
 }
 
 void MaybePrependMlxCandidate(std::vector<std::string> *candidates,
@@ -210,6 +246,8 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
   std::string selected_requested_backend;
   std::string selected_path = path;
   std::string selected_format = resolved_format;
+  bool selected_native_executor_fallback = false;
+  std::string selected_native_executor_fallback_reason;
   std::string failure_reason;
 
   auto start = std::chrono::steady_clock::now();
@@ -281,6 +319,30 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
     if (!loaded) {
       continue;
     }
+    bool native_executor_fallback = false;
+    std::string native_executor_fallback_reason;
+    if (candidate_selection.provider == BackendProvider::kNative) {
+      auto native_backend =
+          std::dynamic_pointer_cast<NativeCudaBackend>(candidate_selection.backend);
+      if (native_backend && native_backend->IsFallbackExecutor()) {
+        native_executor_fallback = true;
+        native_executor_fallback_reason = native_backend->FallbackReason();
+      }
+    }
+    if (candidate_selection.require_strict_native_execution &&
+        (candidate_selection.used_fallback || native_executor_fallback)) {
+      failure_reason =
+          "backend policy violation: strict native execution required for '" +
+          candidate + "'";
+      if (!candidate_selection.fallback_reason.empty()) {
+        failure_reason += " (" + candidate_selection.fallback_reason + ")";
+      } else if (!native_executor_fallback_reason.empty()) {
+        failure_reason += " (" + native_executor_fallback_reason + ")";
+      }
+      continue;
+    }
+    selected_native_executor_fallback = native_executor_fallback;
+    selected_native_executor_fallback_reason = native_executor_fallback_reason;
     selection = std::move(candidate_selection);
     break;
   }
@@ -309,8 +371,13 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
                                ? selection.backend_label
                                : selected_requested_backend;
   info.backend_provider = ProviderLabel(selection.provider);
-  info.backend_fallback = selection.used_fallback;
+  info.backend_fallback =
+      selection.used_fallback || selected_native_executor_fallback;
   info.backend_fallback_reason = selection.fallback_reason;
+  if (info.backend_fallback_reason.empty() &&
+      !selected_native_executor_fallback_reason.empty()) {
+    info.backend_fallback_reason = selected_native_executor_fallback_reason;
+  }
   info.ready = selection.backend->IsReady();
   info.capabilities = selection.capabilities;
   info.capabilities.supports_vision = selection.backend->SupportsVision();
@@ -492,6 +559,9 @@ std::vector<std::string> SingleModelRouter::BuildBackendCandidates(
   if (!backend_hint.empty()) {
     const std::string normalized = BackendFactory::NormalizeHint(backend_hint);
     if (normalized != "auto") {
+      if (normalized == "cuda") {
+        return BuildCudaFallbackCandidates();
+      }
       return {normalized};
     }
   }
