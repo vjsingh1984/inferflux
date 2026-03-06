@@ -6,7 +6,9 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef INFERFLUX_HAS_CUDA
+#if defined(INFERFLUX_HAS_CUDA) ||                                     \
+    (defined(__has_include) && __has_include(<cuda_runtime_api.h>) && \
+     __has_include(<cuda_fp16.h>))
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 #else
