@@ -1,7 +1,7 @@
 #include "runtime/backends/cuda/native/model_forward_factory.h"
-#include "runtime/backends/cuda/native/quantized_forward.h"
 #include "runtime/backends/cuda/common/dtype_traits.cuh"
 #include "runtime/backends/cuda/native/llama_forward.h"
+#include "runtime/backends/cuda/native/quantized_forward.h"
 #include "server/logging/logger.h"
 
 #include <algorithm>
@@ -61,7 +61,7 @@ CreateQuantizedForwardAsModelForward(const std::string &model_type) {
 
   if (IsLlamaFamily(type)) {
     log::Info("model_forward_factory",
-               "Creating QuantizedForward for model_type=" + model_type);
+              "Creating QuantizedForward for model_type=" + model_type);
     return std::make_unique<QuantizedForward>();
   }
 

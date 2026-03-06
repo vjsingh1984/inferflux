@@ -79,12 +79,10 @@ public:
   const IMatmulStrategy *SelectMatmul(GGUF::TensorType tensor_type,
                                       int sm_major, int sm_minor) const;
   const IAttentionStrategy *SelectAttention(KvPrecision requested_mode,
-                                            int sm_major,
-                                            int sm_minor) const;
+                                            int sm_major, int sm_minor) const;
 
   StrategySelection Select(GGUF::TensorType tensor_type,
-                           KvPrecision requested_kv_mode,
-                           int sm_major,
+                           KvPrecision requested_kv_mode, int sm_major,
                            int sm_minor) const;
 
   void RegisterDefaults();

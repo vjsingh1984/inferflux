@@ -135,17 +135,20 @@ private:
    * @brief Get tensor name for a layer component
    *
    * Generates HuggingFace-style tensor names:
-   * - With type (3-4 params): "model.layers.{layer}.{component}.{type}.{suffix}"
+   * - With type (3-4 params):
+   * "model.layers.{layer}.{component}.{type}.{suffix}"
    * - Without type (2 params): "model.layers.{layer}.{component}.{suffix}"
    *
    * @param layer Layer index
-   * @param component Component name (e.g., "self_attn", "mlp", "input_layernorm")
-   * @param type Optional type (e.g., "q_proj", "gate_proj"). Empty for simple components
+   * @param component Component name (e.g., "self_attn", "mlp",
+   * "input_layernorm")
+   * @param type Optional type (e.g., "q_proj", "gate_proj"). Empty for simple
+   * components
    * @param suffix Suffix (default "weight", or "bias")
    */
   std::string GetLayerTensorName(int layer, const std::string &component,
-                                  const std::string &type = "",
-                                  const std::string &suffix = "weight") const;
+                                 const std::string &type = "",
+                                 const std::string &suffix = "weight") const;
   struct LayerWeights {
     mutable const half *q_proj{nullptr};
     mutable const half *k_proj{nullptr};
@@ -177,9 +180,8 @@ private:
   };
 
   // Helper to get dequantized weights (lazy evaluation)
-  const half *GetDequantizedWeights(
-      std::shared_ptr<IWeightAccessor> accessor,
-      const half *&cache_ptr) const;
+  const half *GetDequantizedWeights(std::shared_ptr<IWeightAccessor> accessor,
+                                    const half *&cache_ptr) const;
 
   IModelLoader *loader_{nullptr};
   cudaStream_t stream_{nullptr};

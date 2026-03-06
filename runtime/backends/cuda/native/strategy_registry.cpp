@@ -11,10 +11,9 @@ namespace native {
 namespace {
 
 std::string ToLower(std::string value) {
-  std::transform(value.begin(), value.end(), value.begin(),
-                 [](unsigned char ch) {
-                   return static_cast<char>(std::tolower(ch));
-                 });
+  std::transform(
+      value.begin(), value.end(), value.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
   return value;
 }
 
@@ -170,10 +169,8 @@ QuantizedRuntimeStrategyRegistry::SelectWeightLayout(
   return nullptr;
 }
 
-const IMatmulStrategy *
-QuantizedRuntimeStrategyRegistry::SelectMatmul(GGUF::TensorType tensor_type,
-                                               int sm_major,
-                                               int sm_minor) const {
+const IMatmulStrategy *QuantizedRuntimeStrategyRegistry::SelectMatmul(
+    GGUF::TensorType tensor_type, int sm_major, int sm_minor) const {
   for (const auto &candidate : matmul_strategies_) {
     if (candidate && candidate->Supports(tensor_type, sm_major, sm_minor)) {
       return candidate.get();
@@ -182,10 +179,8 @@ QuantizedRuntimeStrategyRegistry::SelectMatmul(GGUF::TensorType tensor_type,
   return nullptr;
 }
 
-const IAttentionStrategy *
-QuantizedRuntimeStrategyRegistry::SelectAttention(KvPrecision requested_mode,
-                                                  int sm_major,
-                                                  int sm_minor) const {
+const IAttentionStrategy *QuantizedRuntimeStrategyRegistry::SelectAttention(
+    KvPrecision requested_mode, int sm_major, int sm_minor) const {
   for (const auto &candidate : attention_strategies_) {
     if (candidate && candidate->Supports(requested_mode, sm_major, sm_minor)) {
       return candidate.get();
@@ -194,9 +189,10 @@ QuantizedRuntimeStrategyRegistry::SelectAttention(KvPrecision requested_mode,
   return nullptr;
 }
 
-StrategySelection QuantizedRuntimeStrategyRegistry::Select(
-    GGUF::TensorType tensor_type, KvPrecision requested_kv_mode, int sm_major,
-    int sm_minor) const {
+StrategySelection
+QuantizedRuntimeStrategyRegistry::Select(GGUF::TensorType tensor_type,
+                                         KvPrecision requested_kv_mode,
+                                         int sm_major, int sm_minor) const {
   StrategySelection result;
   result.weight_layout = SelectWeightLayout(tensor_type);
   result.matmul = SelectMatmul(tensor_type, sm_major, sm_minor);
@@ -216,72 +212,64 @@ void QuantizedRuntimeStrategyRegistry::RegisterDefaults() {
 
   // Quantized K-block layouts (Q*_K family).
   RegisterWeightLayout(std::make_unique<StaticWeightLayoutStrategy>(
-      "layout.gguf.kblock.256", std::vector<GGUF::TensorType>{
-                                   GGUF::TensorType::Q2_K,
-                                   GGUF::TensorType::Q3_K,
-                                   GGUF::TensorType::Q4_K,
-                                   GGUF::TensorType::Q5_K,
-                                   GGUF::TensorType::Q6_K,
-                                   GGUF::TensorType::Q8_K,
-                               },
+      "layout.gguf.kblock.256",
+      std::vector<GGUF::TensorType>{
+          GGUF::TensorType::Q2_K,
+          GGUF::TensorType::Q3_K,
+          GGUF::TensorType::Q4_K,
+          GGUF::TensorType::Q5_K,
+          GGUF::TensorType::Q6_K,
+          GGUF::TensorType::Q8_K,
+      },
       256U, 0U));
 
   // Quantized 32-element block layouts.
   RegisterWeightLayout(std::make_unique<StaticWeightLayoutStrategy>(
-      "layout.gguf.block.32", std::vector<GGUF::TensorType>{
-                                  GGUF::TensorType::Q4_0,
-                                  GGUF::TensorType::Q4_1,
-                                  GGUF::TensorType::Q5_0,
-                                  GGUF::TensorType::Q5_1,
-                                  GGUF::TensorType::Q8_0,
-                                  GGUF::TensorType::Q8_1,
-                              },
+      "layout.gguf.block.32",
+      std::vector<GGUF::TensorType>{
+          GGUF::TensorType::Q4_0,
+          GGUF::TensorType::Q4_1,
+          GGUF::TensorType::Q5_0,
+          GGUF::TensorType::Q5_1,
+          GGUF::TensorType::Q8_0,
+          GGUF::TensorType::Q8_1,
+      },
       32U, 0U));
 
   // Dense floating-point tensors.
   RegisterWeightLayout(std::make_unique<StaticWeightLayoutStrategy>(
-      "layout.gguf.dense", std::vector<GGUF::TensorType>{
-                               GGUF::TensorType::F16,
-                               GGUF::TensorType::F32,
-                           },
+      "layout.gguf.dense",
+      std::vector<GGUF::TensorType>{
+          GGUF::TensorType::F16,
+          GGUF::TensorType::F32,
+      },
       1U, 0U));
 
   // Preferred fused strategy (selected when SM >= 80 and quantized type).
   RegisterMatmul(std::make_unique<StaticMatmulStrategy>(
       "matmul.fused.dequant_tile_gemm.v1",
       MatmulExecutionMode::kFusedDequantTileGemm,
-      std::vector<GGUF::TensorType>{GGUF::TensorType::Q4_0,
-                                    GGUF::TensorType::Q4_1,
-                                    GGUF::TensorType::Q5_0,
-                                    GGUF::TensorType::Q5_1,
-                                    GGUF::TensorType::Q8_0,
-                                    GGUF::TensorType::Q8_1,
-                                    GGUF::TensorType::Q2_K,
-                                    GGUF::TensorType::Q3_K,
-                                    GGUF::TensorType::Q4_K,
-                                    GGUF::TensorType::Q5_K,
-                                    GGUF::TensorType::Q6_K,
-                                    GGUF::TensorType::Q8_K},
+      std::vector<GGUF::TensorType>{
+          GGUF::TensorType::Q4_0, GGUF::TensorType::Q4_1,
+          GGUF::TensorType::Q5_0, GGUF::TensorType::Q5_1,
+          GGUF::TensorType::Q8_0, GGUF::TensorType::Q8_1,
+          GGUF::TensorType::Q2_K, GGUF::TensorType::Q3_K,
+          GGUF::TensorType::Q4_K, GGUF::TensorType::Q5_K,
+          GGUF::TensorType::Q6_K, GGUF::TensorType::Q8_K},
       8));
 
   // Compatibility strategy (existing dequantize-then-GEMM path).
   RegisterMatmul(std::make_unique<StaticMatmulStrategy>(
       "matmul.compat.dequantize_then_gemm",
       MatmulExecutionMode::kCompatDequantizeThenGemm,
-      std::vector<GGUF::TensorType>{GGUF::TensorType::F16,
-                                    GGUF::TensorType::F32,
-                                    GGUF::TensorType::Q4_0,
-                                    GGUF::TensorType::Q4_1,
-                                    GGUF::TensorType::Q5_0,
-                                    GGUF::TensorType::Q5_1,
-                                    GGUF::TensorType::Q8_0,
-                                    GGUF::TensorType::Q8_1,
-                                    GGUF::TensorType::Q2_K,
-                                    GGUF::TensorType::Q3_K,
-                                    GGUF::TensorType::Q4_K,
-                                    GGUF::TensorType::Q5_K,
-                                    GGUF::TensorType::Q6_K,
-                                    GGUF::TensorType::Q8_K},
+      std::vector<GGUF::TensorType>{
+          GGUF::TensorType::F16, GGUF::TensorType::F32, GGUF::TensorType::Q4_0,
+          GGUF::TensorType::Q4_1, GGUF::TensorType::Q5_0,
+          GGUF::TensorType::Q5_1, GGUF::TensorType::Q8_0,
+          GGUF::TensorType::Q8_1, GGUF::TensorType::Q2_K,
+          GGUF::TensorType::Q3_K, GGUF::TensorType::Q4_K,
+          GGUF::TensorType::Q5_K, GGUF::TensorType::Q6_K,
+          GGUF::TensorType::Q8_K},
       0));
 
   // Attention strategies keyed by KV precision. FP16 is universally supported.

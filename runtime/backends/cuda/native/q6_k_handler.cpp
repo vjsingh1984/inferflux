@@ -6,16 +6,15 @@ namespace runtime {
 namespace cuda {
 namespace native {
 
-void Q6_K_Handler::DequantizeGpuToGpu(const void *quantized,
-                                       half *dequantized,
-                                       size_t num_elements,
-                                       cudaStream_t stream) {
+void Q6_K_Handler::DequantizeGpuToGpu(const void *quantized, half *dequantized,
+                                      size_t num_elements,
+                                      cudaStream_t stream) {
   cudaError_t err =
       dequantize_q6_k(quantized, dequantized, num_elements, stream);
 
   if (err != cudaSuccess) {
     log::Error("q6_k_handler", "Dequantization failed: " +
-                                     std::string(cudaGetErrorString(err)));
+                                   std::string(cudaGetErrorString(err)));
   }
 }
 

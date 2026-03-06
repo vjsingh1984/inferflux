@@ -19,8 +19,9 @@ bool QuantizedGemm::Gemm(int, int, int, const half *,
 }
 
 bool QuantizedGemm::GemmBatched(
-    int, int, int, const half *, std::shared_ptr<IWeightAccessor> weight_accessor,
-    half *, int, long long, long long) {
+    int, int, int, const half *,
+    std::shared_ptr<IWeightAccessor> weight_accessor, half *, int, long long,
+    long long) {
   return static_cast<bool>(weight_accessor);
 }
 
@@ -34,8 +35,8 @@ bool QuantizedGemm::ShouldUseCache(
   return num_elements > 1024U * 1024U;
 }
 
-QuantizedGemm::DequantizedCache *QuantizedGemm::FindOrCreateCache(
-    std::shared_ptr<IWeightAccessor> accessor) {
+QuantizedGemm::DequantizedCache *
+QuantizedGemm::FindOrCreateCache(std::shared_ptr<IWeightAccessor> accessor) {
   if (!accessor) {
     return nullptr;
   }

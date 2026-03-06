@@ -47,7 +47,9 @@ const ModelInfo &GGUFModelLoader::GetModelInfo() const { return model_info_; }
 
 std::string GGUFModelLoader::GetFormat() const { return "gguf"; }
 
-bool GGUFModelLoader::IsQuantized() const { return !quantization_type_.empty(); }
+bool GGUFModelLoader::IsQuantized() const {
+  return !quantization_type_.empty();
+}
 
 std::string GGUFModelLoader::GetQuantizationType() const {
   return quantization_type_;
@@ -131,8 +133,8 @@ bool GGUFModelLoader::ParseHeader(FILE *file) {
   if (std::fread(&header_.version, sizeof(header_.version), 1, file) != 1) {
     return false;
   }
-  if (std::fread(&header_.tensor_count, sizeof(header_.tensor_count), 1, file) !=
-      1) {
+  if (std::fread(&header_.tensor_count, sizeof(header_.tensor_count), 1,
+                 file) != 1) {
     return false;
   }
   if (std::fread(&header_.kv_count, sizeof(header_.kv_count), 1, file) != 1) {
@@ -157,7 +159,8 @@ bool GGUFModelLoader::UploadDequantizedToGPU(cudaStream_t) { return true; }
 
 size_t GGUFModelLoader::CalcGPUBufferSize() const { return 0; }
 
-GGUFWeightAccessor::GGUFWeightAccessor(GGUFTensorData *tensor) : tensor_(tensor) {}
+GGUFWeightAccessor::GGUFWeightAccessor(GGUFTensorData *tensor)
+    : tensor_(tensor) {}
 
 std::pair<size_t, size_t> GGUFWeightAccessor::GetDimensions() const {
   if (!tensor_ || tensor_->info.shape.size() < 2) {

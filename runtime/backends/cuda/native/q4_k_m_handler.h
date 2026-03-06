@@ -31,8 +31,7 @@ public:
 
   // IQuantizationHandler interface
   void DequantizeGpuToGpu(const void *quantized, half *dequantized,
-                          size_t num_elements,
-                          cudaStream_t stream) override;
+                          size_t num_elements, cudaStream_t stream) override;
 
   std::string GetType() const override { return "q4_k_m"; }
 

@@ -66,15 +66,16 @@ bool QuantizedGemm::Gemm(int M, int N, int K, const half *A,
   return GemmDirect(M, N, K, A, d_dequantized, C);
 }
 
-bool QuantizedGemm::GemmBatched(int M, int N, int K, const half *A,
-                                std::shared_ptr<IWeightAccessor> weight_accessor,
-                                half *C, int batch_count, long long stride_A,
-                                long long stride_C) {
+bool QuantizedGemm::GemmBatched(
+    int M, int N, int K, const half *A,
+    std::shared_ptr<IWeightAccessor> weight_accessor, half *C, int batch_count,
+    long long stride_A, long long stride_C) {
 
   // For batched operations, typically dequantize once
   half *d_dequantized = weight_accessor->GetDequantizedGpuWeights(stream_);
   if (!d_dequantized) {
-    log::Error("quantized_gemm", "Failed to dequantize weights for batched GEMM");
+    log::Error("quantized_gemm",
+               "Failed to dequantize weights for batched GEMM");
     return false;
   }
 
@@ -91,7 +92,8 @@ bool QuantizedGemm::GemmBatched(int M, int N, int K, const half *A,
   return true;
 }
 
-bool QuantizedGemm::ShouldUseCache(std::shared_ptr<IWeightAccessor> accessor) const {
+bool QuantizedGemm::ShouldUseCache(
+    std::shared_ptr<IWeightAccessor> accessor) const {
   // Cache weights that are:
   // 1. Large (expensive to dequantize repeatedly)
   // 2. Frequently accessed (projections in all layers)
@@ -148,7 +150,8 @@ bool QuantizedGemm::GemmDirect(int M, int N, int K, const half *A, half *W,
   // In production, this would call:
   //   cublasGemmEx(handle_, CUBLAS_OP_N, CUBLAS_OP_T, ...)
 
-  cudaMemcpyAsync(C, A, M * K * sizeof(half), cudaMemcpyDeviceToDevice, stream_);
+  cudaMemcpyAsync(C, A, M * K * sizeof(half), cudaMemcpyDeviceToDevice,
+                  stream_);
   return true;
 }
 

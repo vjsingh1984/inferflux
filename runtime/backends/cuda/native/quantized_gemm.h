@@ -10,9 +10,9 @@ namespace inferflux {
 
 // Bring in the types from the nested namespace
 using runtime::cuda::native::IModelLoader;
+using runtime::cuda::native::IQuantizationHandler;
 using runtime::cuda::native::IWeightAccessor;
 using runtime::cuda::native::ModelInfo;
-using runtime::cuda::native::IQuantizationHandler;
 
 /**
  * @brief QuantizedGemm - GEMM dispatcher for quantized weights
@@ -54,7 +54,7 @@ public:
    * @return true on success
    */
   bool Gemm(int M, int N, int K, const half *A,
-             std::shared_ptr<IWeightAccessor> weight_accessor, half *C);
+            std::shared_ptr<IWeightAccessor> weight_accessor, half *C);
 
   /**
    * @brief Batched GEMM with quantized weights
@@ -88,7 +88,8 @@ private:
   int cache_size_{0};
 
   // Find or create cache entry
-  DequantizedCache *FindOrCreateCache(std::shared_ptr<IWeightAccessor> accessor);
+  DequantizedCache *
+  FindOrCreateCache(std::shared_ptr<IWeightAccessor> accessor);
 
   // Direct GEMM (dequantize then cuBLAS)
   bool GemmDirect(int M, int N, int K, const half *A, half *W, half *C);

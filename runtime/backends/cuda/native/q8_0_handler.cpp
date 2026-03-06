@@ -20,11 +20,12 @@ void Q8_0_Handler::DequantizeGpuToGpu(const void *quantized, half *dequantized,
   }
 
   // Use CUDA kernel for dequantization
-  cudaError_t err = dequantize_q8_0(quantized, dequantized, num_elements, stream);
+  cudaError_t err =
+      dequantize_q8_0(quantized, dequantized, num_elements, stream);
 
   if (err != cudaSuccess) {
-    log::Error("q8_0_handler",
-               "CUDA dequantization failed: " + std::string(cudaGetErrorString(err)));
+    log::Error("q8_0_handler", "CUDA dequantization failed: " +
+                                   std::string(cudaGetErrorString(err)));
   }
 }
 

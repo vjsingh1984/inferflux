@@ -41,8 +41,7 @@ public:
    * where d is the scale (delta)
    */
   void DequantizeGpuToGpu(const void *quantized, half *dequantized,
-                          size_t num_elements,
-                          cudaStream_t stream) override;
+                          size_t num_elements, cudaStream_t stream) override;
 
   /**
    * @brief Get quantization type identifier

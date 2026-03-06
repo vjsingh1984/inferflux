@@ -60,7 +60,9 @@ const ModelInfo &SafetensorsLoaderAdapter::GetModelInfo() const {
   return model_info_;
 }
 
-std::string SafetensorsLoaderAdapter::GetFormat() const { return "safetensors"; }
+std::string SafetensorsLoaderAdapter::GetFormat() const {
+  return "safetensors";
+}
 
 bool SafetensorsLoaderAdapter::IsQuantized() const { return false; }
 
@@ -89,8 +91,8 @@ void SafetensorsLoaderAdapter::SetDequantizedCachePolicy(
   dequantized_cache_policy_ = policy;
 }
 
-DequantizedCachePolicy SafetensorsLoaderAdapter::GetDequantizedCachePolicy()
-    const {
+DequantizedCachePolicy
+SafetensorsLoaderAdapter::GetDequantizedCachePolicy() const {
   return dequantized_cache_policy_;
 }
 

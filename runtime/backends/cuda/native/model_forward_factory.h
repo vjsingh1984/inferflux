@@ -7,7 +7,8 @@
 namespace inferflux {
 
 // Forward declaration for QuantizedForward (defined in quantized_forward.h)
-// Note: This must be a full include where QuantizedForward is used as a complete type
+// Note: This must be a full include where QuantizedForward is used as a
+// complete type
 class QuantizedForward;
 
 /**
@@ -38,6 +39,7 @@ CreateModelForwardTyped(const std::string &model_type);
  * to maintain compatibility with the existing factory interface.
  * The actual object is a QuantizedForward instance.
  */
-std::unique_ptr<ModelForward> CreateQuantizedForwardAsModelForward(const std::string &model_type);
+std::unique_ptr<ModelForward>
+CreateQuantizedForwardAsModelForward(const std::string &model_type);
 
 } // namespace inferflux
