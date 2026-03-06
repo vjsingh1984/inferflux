@@ -3,9 +3,13 @@
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/strategy_registry.h"
 #include "runtime/backends/cuda/native_cuda_runtime.h"
-#include <atomic>
+
+#ifdef INFERFLUX_HAS_CUDA
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
+#endif
+
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <mutex>
