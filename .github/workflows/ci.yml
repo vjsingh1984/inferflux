@@ -155,6 +155,7 @@ jobs:
         run: |
           EXPECTED_GGUF_MEMORY_CONTRACT_TESTS=1
           ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=$(./build/inferflux_tests "[memory_contract]" --list-tests 2>/dev/null | awk '/matching test case/{print $1}' | tail -n 1)
+          ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS:-0}
           echo "GGUFMemoryContractTests count: expected=${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS} actual=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}"
           if [ "${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}" -ne "${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS}" ]; then
             echo "::error::GGUFMemoryContractTests count drifted; update EXPECTED_GGUF_MEMORY_CONTRACT_TESTS in .github/workflows/ci.yml"
@@ -592,6 +593,7 @@ jobs:
         run: |
           EXPECTED_GGUF_MEMORY_CONTRACT_TESTS=1
           ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=$(./build-cov/inferflux_tests "[memory_contract]" --list-tests 2>/dev/null | awk '/matching test case/{print $1}' | tail -n 1)
+          ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS:-0}
           echo "GGUFMemoryContractTests count: expected=${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS} actual=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}"
           if [ "${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}" -ne "${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS}" ]; then
             echo "::error::GGUFMemoryContractTests count drifted; update EXPECTED_GGUF_MEMORY_CONTRACT_TESTS in .github/workflows/ci.yml"
@@ -804,6 +806,24 @@ jobs:
         run: |
           echo "=== Running quantization tests (with CUDA) ==="
           ctest --test-dir build -R quantization --output-on-failure --timeout 90 -V
+
+      # Focused assertion: memory-contract gate must execute on CUDA runners.
+      - name: Assert GGUF memory contract gate (CUDA)
+        run: |
+          set -euo pipefail
+          EXPECTED_GGUF_MEMORY_CONTRACT_TESTS=1
+          ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=$(./build/inferflux_tests "[memory_contract]" --list-tests 2>/dev/null | awk '/matching test case/{print $1}' | tail -n 1)
+          ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS:-0}
+          echo "GGUFMemoryContractTests count: expected=${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS} actual=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}"
+          if [ "${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}" -ne "${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS}" ]; then
+            echo "::error::GGUFMemoryContractTests count drifted; update EXPECTED_GGUF_MEMORY_CONTRACT_TESTS in .github/workflows/ci.yml"
+            exit 1
+          fi
+          ctest --test-dir build -R GGUFMemoryContractTests --output-on-failure --timeout 90 -V 2>&1 | tee build/gguf_memory_contract_ctest.log
+          if grep -q "skipping memory-contract gate" build/gguf_memory_contract_ctest.log; then
+            echo "::error::GGUF memory contract gate was skipped on CUDA runner"
+            exit 1
+          fi
 
       - name: Verify CUDA tests ran
         run: |

@@ -133,6 +133,16 @@ add_library(inferflux_core
   net/http_client.h
 )
 
+# GGUF/quantization components that are required by CPU tests and
+# non-CUDA build paths.
+target_sources(inferflux_core PRIVATE
+  runtime/backends/cuda/native/model_loader.cpp
+  runtime/backends/cuda/native/quantization_handler.cpp
+  runtime/backends/cuda/native/gguf_util.cpp
+  runtime/backends/cuda/native/strategy_registry.cpp
+  runtime/backends/cuda/native/quantized_weight_map.cpp
+)
+
 target_include_directories(inferflux_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/external
@@ -179,17 +189,12 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/model_forward_factory.cpp
     runtime/backends/cuda/native/transformer_forward.cu
     # GGUF quantization support (Phase 1-5: Foundation, GGUF Parsing, Handlers, CUDA Kernels, Forward Pass)
-    runtime/backends/cuda/native/model_loader.cpp
     runtime/backends/cuda/native/safetensors_adapter.cpp
-    runtime/backends/cuda/native/quantization_handler.cpp
-    runtime/backends/cuda/native/gguf_util.cpp
-    runtime/backends/cuda/native/strategy_registry.cpp
     runtime/backends/cuda/native/gguf_model_loader.cpp
     runtime/backends/cuda/native/q4_k_m_handler.cpp
     runtime/backends/cuda/native/q5_k_m_handler.cpp
     runtime/backends/cuda/native/q6_k_handler.cpp
     runtime/backends/cuda/native/q8_0_handler.cpp
-    runtime/backends/cuda/native/quantized_weight_map.cpp
     runtime/backends/cuda/native/quantized_forward.cpp
     runtime/backends/cuda/native/quantized_gemm.cpp
   )
@@ -213,6 +218,13 @@ else()
   if(ENABLE_CUDA)
     message(WARNING "ENABLE_CUDA=ON but CUDA toolkit not found; building without GPU support")
   endif()
+  # CPU-only stubs for GGUF/safetensors/quantized interfaces that are part of
+  # the test and API surface even when CUDA kernels are unavailable.
+  target_sources(inferflux_core PRIVATE
+    runtime/backends/cuda/native/safetensors_adapter_stub.cpp
+    runtime/backends/cuda/native/gguf_model_loader_stub.cpp
+    runtime/backends/cuda/native/quantized_gemm_stub.cpp
+  )
   set(LLAMA_CUDA OFF CACHE BOOL "" FORCE)
 endif()
 

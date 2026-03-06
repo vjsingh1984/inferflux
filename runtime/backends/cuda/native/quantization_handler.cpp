@@ -133,16 +133,16 @@ QuantizationHandlerRegistry::GetRegisteredTypes() const {
 
 std::shared_ptr<IQuantizationHandler>
 CreateQuantizationHandler(const std::string &quantization_type) {
+  // Non-quantized models use the safetensors/null handler.
+  if (quantization_type.empty() || quantization_type == "none") {
+    return std::make_shared<SafetensorsQuantizationHandler>();
+  }
+
   // Check registry first
   auto handler = QuantizationHandlerRegistry::Instance().Create(
       quantization_type);
   if (handler) {
     return handler;
-  }
-
-  // Fall back to safetensors handler for non-quantized
-  if (quantization_type.empty() || quantization_type == "none") {
-    return std::make_shared<SafetensorsQuantizationHandler>();
   }
 
   log::Error("quantization_factory",
