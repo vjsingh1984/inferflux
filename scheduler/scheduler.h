@@ -6,12 +6,13 @@
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/logprob.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
-#include "runtime/speculative/speculative_decoder.h"
 #include "runtime/scheduler/sequence_slot_manager.h"
+#include "runtime/speculative/speculative_decoder.h"
 #include "scheduler/fairness_controller.h"
 #include "scheduler/model_router.h"
 #include "scheduler/model_selection.h"
 #include "scheduler/request_batch.h"
+#include "scheduler/session_handle_manager.h"
 
 #include <atomic>
 #include <chrono>
@@ -39,6 +40,12 @@ struct DisaggregatedConfig {
 class Scheduler {
 public:
   struct Config {
+    struct SessionHandleConfig {
+      bool enabled{false};
+      int ttl_ms{300000};
+      int max_sessions{1024};
+    };
+
     Config()
         : max_batch_size(4), max_batch_tokens(8192), min_batch_size(1),
           batch_accumulation_ms(0) {}
@@ -46,6 +53,7 @@ public:
     int max_batch_tokens;
     int min_batch_size;        // Minimum batch to wait for
     int batch_accumulation_ms; // Max wait time (0 = no waiting)
+    SessionHandleConfig session_handles{};
   };
 
   explicit Scheduler(
@@ -89,7 +97,9 @@ public:
 
   // Sequence slot manager for universal KV cache slot tracking.
   scheduler::SequenceSlotManager *SlotManager() { return slot_manager_.get(); }
-  const scheduler::SequenceSlotManager *SlotManager() const { return slot_manager_.get(); }
+  const scheduler::SequenceSlotManager *SlotManager() const {
+    return slot_manager_.get();
+  }
 
 private:
   struct PendingRequest {
@@ -117,6 +127,10 @@ private:
   void UpdateQueueDepthLocked() const;
   void
   ResolveBackends(const std::vector<std::shared_ptr<PendingRequest>> &batch);
+  bool RequestUsesSessionHandle(const InferenceRequest &request) const;
+  void ReleaseSessionState(const scheduler::SessionHandleState &state,
+                           std::shared_ptr<LlamaCPUBackend> backend_hint);
+  void FinalizeSessionLease(PendingRequest *pending, bool commit_state);
 
   BatchSelection BuildBatchLocked();
 
@@ -157,6 +171,7 @@ private:
 
   // Universal sequence slot manager for KV cache tracking across both backends.
   std::unique_ptr<scheduler::SequenceSlotManager> slot_manager_;
+  std::unique_ptr<scheduler::SessionHandleManager> session_handle_manager_;
   std::thread eviction_thread_;
   std::atomic<bool> eviction_running_{false};
   void EvictionWorkerLoop();

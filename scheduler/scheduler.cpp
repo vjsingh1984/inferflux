@@ -29,6 +29,14 @@ constexpr int kMinPrefixTokens = 32;
 // Tokens per physical KV block (PagedAttention style).
 constexpr int kTokensPerBlock = 16;
 
+bool TokensHavePrefix(const std::vector<int> &tokens,
+                      const std::vector<int> &prefix) {
+  if (prefix.size() > tokens.size()) {
+    return false;
+  }
+  return std::equal(prefix.begin(), prefix.end(), tokens.begin());
+}
+
 std::size_t EstimateQueueTokenCost(const InferenceRequest &inference,
                                    bool from_decode,
                                    const FairnessConfig &fairness_config) {
@@ -179,6 +187,10 @@ Scheduler::Config NormalizeSchedulerConfig(const Scheduler::Config &raw) {
   if (normalized.max_batch_tokens > 131072) {
     normalized.max_batch_tokens = 131072;
   }
+  normalized.session_handles.ttl_ms =
+      std::max(1, normalized.session_handles.ttl_ms);
+  normalized.session_handles.max_sessions =
+      std::max(1, normalized.session_handles.max_sessions);
   return normalized;
 }
 } // namespace
@@ -214,6 +226,26 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
   // With use_decode_workers_=true, ProcessBatch only runs Prefill and
   // hands off to pending_decode_; decode workers drain that queue.
   use_decode_workers_ = disagg_config_.decode_pool_size > 0;
+  if (config_.session_handles.enabled) {
+    if (use_decode_workers_) {
+      log::Warn("scheduler",
+                "Session handles currently support unified scheduler mode "
+                "only; disabling session handle feature");
+    } else {
+      scheduler::SessionHandleManager::Config session_cfg;
+      session_cfg.max_sessions =
+          static_cast<std::size_t>(config_.session_handles.max_sessions);
+      session_cfg.ttl =
+          std::chrono::milliseconds(config_.session_handles.ttl_ms);
+      session_handle_manager_ =
+          std::make_unique<scheduler::SessionHandleManager>(session_cfg);
+      log::Info("scheduler",
+                "Session handles enabled (ttl_ms=" +
+                    std::to_string(config_.session_handles.ttl_ms) +
+                    ", max_sessions=" +
+                    std::to_string(config_.session_handles.max_sessions) + ")");
+    }
+  }
   worker_ = std::thread(&Scheduler::WorkerLoop, this);
   if (use_decode_workers_) {
     StartDecodeWorkers();
@@ -244,6 +276,12 @@ Scheduler::~Scheduler() {
   }
   if (use_decode_workers_) {
     StopDecodeWorkers();
+  }
+  if (session_handle_manager_) {
+    auto remaining_sessions = session_handle_manager_->DrainAll();
+    for (const auto &state : remaining_sessions) {
+      ReleaseSessionState(state, nullptr);
+    }
   }
 }
 
@@ -284,6 +322,11 @@ void Scheduler::UpdateModelSelectionOptions(
 ModelSelectionOptions Scheduler::ModelSelectionOptionsSnapshot() const {
   std::lock_guard<std::mutex> lock(model_selection_options_mutex_);
   return model_selection_options_;
+}
+
+bool Scheduler::RequestUsesSessionHandle(
+    const InferenceRequest &request) const {
+  return session_handle_manager_ != nullptr && !request.session_id.empty();
 }
 
 void Scheduler::DecodeWorkerLoop() {
@@ -419,9 +462,16 @@ void Scheduler::DecodeWorkerLoop() {
         pending->promise.set_value(std::move(error));
         // Return the sequence slot and KV blocks so they are not leaked.
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (inference->sequence_id >= 0) {
-          if (cache_)
-            cache_->ReleaseBlocks(inference->block_table);
+        if (inference->session_lease_acquired &&
+            RequestUsesSessionHandle(*inference)) {
+          FinalizeSessionLease(pending.get(), false);
+        } else if (inference->sequence_id >= 0) {
+          if (pending->resolved_backend) {
+            pending->resolved_backend->FreeSequence(inference->sequence_id);
+          }
+          if (cache_) {
+            cache_->ReleaseBlocksRef(inference->block_table);
+          }
           inference->block_table.clear();
           FreeSeqSlot(inference->sequence_id);
           inference->sequence_id = -1;
@@ -443,9 +493,16 @@ void Scheduler::DecodeWorkerLoop() {
                                  : adapter_error;
           pending->promise.set_value(std::move(error));
           std::lock_guard<std::mutex> lock(queue_mutex_);
-          if (inference->sequence_id >= 0) {
-            if (cache_)
-              cache_->ReleaseBlocks(inference->block_table);
+          if (inference->session_lease_acquired &&
+              RequestUsesSessionHandle(*inference)) {
+            FinalizeSessionLease(pending.get(), false);
+          } else if (inference->sequence_id >= 0) {
+            if (pending->resolved_backend) {
+              pending->resolved_backend->FreeSequence(inference->sequence_id);
+            }
+            if (cache_) {
+              cache_->ReleaseBlocksRef(inference->block_table);
+            }
             inference->block_table.clear();
             FreeSeqSlot(inference->sequence_id);
             inference->sequence_id = -1;
@@ -504,13 +561,17 @@ void Scheduler::DecodeWorkerLoop() {
       // both FreeSequence and FreeSeqSlot together in one place.
       {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (inference->sequence_id >= 0) {
+        if (inference->session_lease_acquired &&
+            RequestUsesSessionHandle(*inference)) {
+          FinalizeSessionLease(pending.get(), !result.no_backend);
+        } else if (inference->sequence_id >= 0) {
           // Release the llama.cpp KV memory for this sequence.
           if (pending->resolved_backend) {
             pending->resolved_backend->FreeSequence(inference->sequence_id);
           }
-          if (cache_)
-            cache_->ReleaseBlocks(inference->block_table);
+          if (cache_) {
+            cache_->ReleaseBlocksRef(inference->block_table);
+          }
           inference->block_table.clear();
           FreeSeqSlot(inference->sequence_id);
           inference->sequence_id = -1;
@@ -541,6 +602,7 @@ std::future<InferenceResult> Scheduler::Generate(InferenceRequest request) {
   pending->enqueue_time = std::chrono::steady_clock::now();
   pending->inference.id = pending->sequence;
   pending->inference.phase = RequestPhase::kPending;
+  pending->inference.session_lease_acquired = false;
   pending->inference.enqueue_time = pending->enqueue_time;
   if (pending->inference.max_tokens <= 0) {
     pending->inference.max_tokens = 1;
@@ -808,10 +870,47 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         int matched_tokens = 0;
         int cached_seq_id = -1;
         bool prefix_hit = false;
-        if (prefix_cache_) {
+        bool reused_session_state = false;
+        if (RequestUsesSessionHandle(inf) && !inf.session_lease_acquired) {
+          auto lease = session_handle_manager_->AcquireLease(inf.session_id);
+          for (const auto &cleanup_state : lease.cleanup_states) {
+            ReleaseSessionState(cleanup_state, nullptr);
+          }
+          if (lease.status ==
+              scheduler::SessionHandleManager::LeaseResult::Status::kAcquired) {
+            inf.session_lease_acquired = true;
+            if (lease.has_state) {
+              const std::string resolved_model =
+                  inf.resolved_model.empty() ? inf.model : inf.resolved_model;
+              const bool model_compatible =
+                  lease.state.model_id.empty() || resolved_model.empty() ||
+                  lease.state.model_id == resolved_model;
+              const bool prompt_compatible = TokensHavePrefix(
+                  inf.bpe_prompt_tokens, lease.state.prompt_tokens);
+              if (model_compatible && prompt_compatible &&
+                  lease.state.sequence_id >= 0) {
+                prefix_hit = true;
+                reused_session_state = true;
+                cached_seq_id = lease.state.sequence_id;
+                matched_tokens =
+                    static_cast<int>(lease.state.prompt_tokens.size());
+                cached_blocks = lease.state.block_table;
+              } else {
+                ReleaseSessionState(lease.state, pending->resolved_backend);
+                session_handle_manager_->DiscardLeasedState(inf.session_id);
+              }
+            }
+          }
+        } else if (!RequestUsesSessionHandle(inf)) {
+          inf.session_lease_acquired = false;
+        }
+        if (!reused_session_state && prefix_cache_) {
+          RadixLookupResult lookup;
           prefix_hit = prefix_cache_->Lookup(
-              inf.bpe_prompt_tokens, pending->resolved_backend.get(),
-              &cached_blocks, &cached_seq_id, &matched_tokens);
+              inf.bpe_prompt_tokens, pending->resolved_backend.get(), &lookup);
+          cached_blocks = std::move(lookup.block_table);
+          cached_seq_id = lookup.sequence_id;
+          matched_tokens = lookup.matched_tokens;
         }
 
         // PagedAttention Block Allocation: calculate additional blocks needed.
@@ -855,7 +954,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           }
         }
 
-        int seq_id = AllocSeqSlot();
+        int seq_id = reused_session_state ? cached_seq_id : AllocSeqSlot();
         // Admission logic (§ Item 4): can admit if we have a seq slot AND
         // (no paged cache configured OR new blocks were successfully reserved).
         bool can_admit = (seq_id >= 0) && (!cache_ || new_blocks_needed == 0 ||
@@ -864,8 +963,11 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
 
         if (can_admit) {
           if (cache_) {
-            // Take ownership of cached blocks (§P1b).
-            cache_->AcquireBlocks(cached_blocks);
+            // Prefix cache warm blocks need a scheduler ref. Session-owned
+            // warm blocks already have a dedicated lease-owned ref.
+            if (!reused_session_state) {
+              cache_->AcquireBlocks(cached_blocks);
+            }
             inf.block_table = std::move(cached_blocks);
             inf.block_table.insert(inf.block_table.end(), new_blocks.begin(),
                                    new_blocks.end());
@@ -894,8 +996,10 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                 prefill_start =
                     static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
               }
-              pending->resolved_backend->CopySequencePrefix(
-                  cached_seq_id, seq_id, prefill_start);
+              if (!reused_session_state) {
+                pending->resolved_backend->CopySequencePrefix(
+                    cached_seq_id, seq_id, prefill_start);
+              }
               copied_prefix = true;
             }
 
@@ -933,8 +1037,10 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                 prefill_start =
                     static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
               }
-              pending->resolved_backend->CopySequencePrefix(
-                  cached_seq_id, seq_id, prefill_start);
+              if (!reused_session_state) {
+                pending->resolved_backend->CopySequencePrefix(
+                    cached_seq_id, seq_id, prefill_start);
+              }
               copied_prefix = true;
             }
 
@@ -963,13 +1069,26 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
             } else {
               // Prefill failed: release only the NEW blocks (warm blocks belong
               // to the cache).
-              if (cache_)
+              if (reused_session_state) {
+                if (pending->resolved_backend) {
+                  pending->resolved_backend->FreeSequence(seq_id);
+                }
+                if (cache_) {
+                  cache_->ReleaseBlocksRef(inf.block_table);
+                }
+                if (inf.session_lease_acquired) {
+                  session_handle_manager_->DiscardLeasedState(inf.session_id);
+                }
+                FreeSeqSlot(seq_id);
+              } else if (cache_) {
                 cache_->ReleaseBlocks(new_blocks);
+              }
               inf.block_table.clear();
-              FreeSeqSlot(seq_id);
+              inf.sequence_id = -1;
+              inf.n_past = -1;
             }
           }
-        } else if (seq_id >= 0) {
+        } else if (seq_id >= 0 && !reused_session_state) {
           FreeSeqSlot(seq_id);
         }
         if (queued_via_unified_prefill) {
@@ -1079,6 +1198,20 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           inference->response_format_error.empty()
               ? "Selected model does not support requested features"
               : inference->response_format_error;
+      if (inference->session_lease_acquired &&
+          RequestUsesSessionHandle(*inference)) {
+        FinalizeSessionLease(pending.get(), false);
+      } else if (inference->sequence_id >= 0) {
+        if (pending->resolved_backend) {
+          pending->resolved_backend->FreeSequence(inference->sequence_id);
+        }
+        if (cache_) {
+          cache_->ReleaseBlocksRef(inference->block_table);
+        }
+        inference->block_table.clear();
+        FreeSeqSlot(inference->sequence_id);
+        inference->sequence_id = -1;
+      }
       pending->promise.set_value(std::move(error));
       continue;
     }
@@ -1095,6 +1228,20 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         error.completion = adapter_error.empty()
                                ? "response_format could not be converted"
                                : adapter_error;
+        if (inference->session_lease_acquired &&
+            RequestUsesSessionHandle(*inference)) {
+          FinalizeSessionLease(pending.get(), false);
+        } else if (inference->sequence_id >= 0) {
+          if (pending->resolved_backend) {
+            pending->resolved_backend->FreeSequence(inference->sequence_id);
+          }
+          if (cache_) {
+            cache_->ReleaseBlocksRef(inference->block_table);
+          }
+          inference->block_table.clear();
+          FreeSeqSlot(inference->sequence_id);
+          inference->sequence_id = -1;
+        }
         pending->promise.set_value(std::move(error));
         continue;
       }
@@ -1172,8 +1319,10 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     // KV prefix cache (§P1b): insert the completed request's blocks into
     // the global Radix Trie to enable zero-copy reuse for future requests.
     bool donated = false;
+    const bool session_owned = inference->session_lease_acquired &&
+                               RequestUsesSessionHandle(*inference);
     if (prefix_cache_ && inference->sequence_id >= 0 &&
-        !inference->fairness_yielded) {
+        !inference->fairness_yielded && !session_owned) {
       // Concatenate prompt BPE tokens and any generated output BPE tokens.
       // (Simplified: we use prompt_bpe_tokens for the architectural
       // foundation).
@@ -1189,7 +1338,9 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       }
     }
 
-    if (inference->sequence_id >= 0) {
+    if (session_owned) {
+      FinalizeSessionLease(pending.get(), !result.no_backend);
+    } else if (inference->sequence_id >= 0) {
       // Correctness Fix (§ Item 2): Do NOT FreeSequence if we donated!
       // The trie now owns this sequence's KV state until it is evicted.
       if (!donated) {
@@ -1338,6 +1489,66 @@ void Scheduler::FreeSeqSlot(int slot) {
   }
 }
 
+void Scheduler::ReleaseSessionState(
+    const scheduler::SessionHandleState &state,
+    std::shared_ptr<LlamaCPUBackend> backend_hint) {
+  if (state.sequence_id < 0 && state.block_table.empty()) {
+    return;
+  }
+  if (!backend_hint && router_ && !state.model_id.empty()) {
+    backend_hint = router_->GetBackend(state.model_id);
+  }
+  if (backend_hint && state.sequence_id >= 0) {
+    backend_hint->FreeSequence(state.sequence_id);
+  }
+  if (cache_ && !state.block_table.empty()) {
+    cache_->ReleaseBlocksRef(state.block_table);
+  }
+  if (state.sequence_id >= 0) {
+    FreeSeqSlot(state.sequence_id);
+  }
+}
+
+void Scheduler::FinalizeSessionLease(PendingRequest *pending,
+                                     bool commit_state) {
+  if (!pending || !session_handle_manager_) {
+    return;
+  }
+  auto &inference = pending->inference;
+  if (!inference.session_lease_acquired || inference.session_id.empty()) {
+    return;
+  }
+
+  if (commit_state && inference.sequence_id >= 0) {
+    scheduler::SessionHandleState state;
+    state.model_id = inference.resolved_model.empty()
+                         ? inference.model
+                         : inference.resolved_model;
+    state.sequence_id = inference.sequence_id;
+    state.prompt_tokens = inference.bpe_prompt_tokens;
+    state.block_table = inference.block_table;
+    session_handle_manager_->CommitLease(inference.session_id, state);
+    inference.block_table.clear();
+    inference.sequence_id = -1;
+    inference.session_lease_acquired = false;
+    return;
+  }
+
+  if (inference.sequence_id >= 0) {
+    if (pending->resolved_backend) {
+      pending->resolved_backend->FreeSequence(inference.sequence_id);
+    }
+    if (cache_ && !inference.block_table.empty()) {
+      cache_->ReleaseBlocksRef(inference.block_table);
+    }
+    inference.block_table.clear();
+    FreeSeqSlot(inference.sequence_id);
+    inference.sequence_id = -1;
+  }
+  session_handle_manager_->ReleaseLease(inference.session_id);
+  inference.session_lease_acquired = false;
+}
+
 void Scheduler::EvictionWorkerLoop() {
   // Periodically evict idle sequences to prevent slot exhaustion.
   // Runs in a separate thread with 30-second check intervals.
@@ -1376,6 +1587,18 @@ void Scheduler::EvictionWorkerLoop() {
                 return ids;
               }() +
               ")");
+    }
+
+    if (session_handle_manager_) {
+      auto expired_sessions = session_handle_manager_->CollectExpired();
+      for (const auto &state : expired_sessions) {
+        ReleaseSessionState(state, nullptr);
+      }
+      if (!expired_sessions.empty()) {
+        log::Info("scheduler", "Released " +
+                                   std::to_string(expired_sessions.size()) +
+                                   " expired session handle(s)");
+      }
     }
   }
 }

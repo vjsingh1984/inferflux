@@ -64,6 +64,10 @@ struct InferenceRequest {
   uint64_t id{0};
   std::string model;          // Requested model ID (empty = default).
   std::string resolved_model; // Assigned model ID after router resolution.
+  // Optional upper-layer session handle (feature-flagged server behavior).
+  // Empty keeps default stateless OpenAI-compatible semantics.
+  std::string session_id;
+  bool session_lease_acquired{false};
   std::string prompt;
   int max_tokens{256};
   int priority{0};         // Higher = more urgent. 0 = default.

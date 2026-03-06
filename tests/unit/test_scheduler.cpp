@@ -219,6 +219,23 @@ private:
   std::atomic<int> prefill_partial_fallback_calls_{0};
 };
 
+class SessionLeaseStubBackend final : public ReadyStubBackend {
+public:
+  explicit SessionLeaseStubBackend(std::string output)
+      : ReadyStubBackend(std::move(output)) {}
+
+  void FreeSequence(int) override {
+    free_sequence_calls_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  int FreeSequenceCalls() const {
+    return free_sequence_calls_.load(std::memory_order_relaxed);
+  }
+
+private:
+  std::atomic<int> free_sequence_calls_{0};
+};
+
 } // namespace
 
 TEST_CASE("Scheduler stub response with no backend", "[scheduler]") {
@@ -264,8 +281,8 @@ TEST_CASE("on_token callback fires on prefix cache hit", "[scheduler]") {
   auto device = std::make_shared<CPUDeviceContext>();
   auto cache = std::make_shared<PagedKVCache>(
       4, 1024, PagedKVCache::EvictionPolicy::kLRU);
-  auto prefix_cache =
-      std::make_shared<RadixPrefixCache>(cache, [](int) {}, 1024, 12);
+  auto prefix_cache = std::make_shared<RadixPrefixCache>(
+      cache, [](int) {}, RadixPrefixCacheLimits{1024, 12});
 
   const std::string prompt = "cached prompt";
   auto prompt_tokens = tokenizer.Encode(prompt);
@@ -392,6 +409,58 @@ TEST_CASE("Scheduler token budget accounts decode slices, not full prompts",
 
   const int64_t skips_after = ReadBatchTokenBudgetSkipsTotal();
   REQUIRE(skips_after == skips_before);
+}
+
+TEST_CASE("Scheduler session handles preserve sequence until lease release",
+          "[scheduler]") {
+  auto backend = std::make_shared<SessionLeaseStubBackend>("ok");
+
+  {
+    SimpleTokenizer tokenizer;
+    auto device = std::make_shared<CPUDeviceContext>();
+    auto cache = std::make_shared<PagedKVCache>(
+        16, 1024, PagedKVCache::EvictionPolicy::kLRU);
+    auto router = std::make_shared<SingleModelRouter>();
+
+    ModelInfo info;
+    info.id = "session-model";
+    info.path = "/tmp/session.gguf";
+    info.backend = "cpu";
+    REQUIRE(router->RegisterModel(info, backend));
+    REQUIRE(router->SetDefaultModel(info.id));
+
+    Scheduler::Config cfg;
+    cfg.session_handles.enabled = true;
+    cfg.session_handles.ttl_ms = 60000;
+    cfg.session_handles.max_sessions = 64;
+
+    Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                        FairnessConfig{}, DisaggregatedConfig{},
+                        ModelSelectionOptions{}, cfg);
+
+    InferenceRequest req1;
+    req1.model = info.id;
+    req1.session_id = "session-a";
+    req1.prompt = "hello session";
+    req1.max_tokens = 2;
+    auto resp1 = scheduler.Generate(std::move(req1)).get();
+    REQUIRE_FALSE(resp1.no_backend);
+
+    InferenceRequest req2;
+    req2.model = info.id;
+    req2.session_id = "session-a";
+    req2.prompt = "hello session";
+    req2.max_tokens = 2;
+    auto resp2 = scheduler.Generate(std::move(req2)).get();
+    REQUIRE_FALSE(resp2.no_backend);
+
+    // Session-owned sequences should reduce per-request sequence teardown.
+    REQUIRE(backend->FreeSequenceCalls() < 2);
+  }
+
+  // Scheduler teardown drains session handles and frees retained sequence
+  // state.
+  REQUIRE(backend->FreeSequenceCalls() >= 1);
 }
 
 TEST_CASE("FairnessController evaluation", "[fairness]") {

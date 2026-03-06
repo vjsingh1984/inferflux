@@ -16,8 +16,8 @@
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/quantization_handler.h"
 
-#include <fstream>
 #include <cstring>
+#include <fstream>
 #include <numeric>
 #include <vector>
 
@@ -40,31 +40,26 @@ struct GGUFTestFile {
   fs::path path;
   std::vector<uint8_t> data;
 
-  GGUFTestFile(const std::string &name, const std::string &quant_type = "q4_k_m") {
+  GGUFTestFile(const std::string &name,
+               const std::string &quant_type = "q4_k_m") {
     // Create temporary file
     path = fs::temp_directory_path() / ("test_gguf_" + name + ".gguf");
 
-    // Build GGUF header (20 bytes total)
-    // Magic (8 bytes): "GGUF"
-    data.resize(20);
+    // Build GGUF header (24 bytes total)
+    data.resize(24);
 
     memcpy(data.data(), "GGUF", 4);
-    data[4] = 0;
-    data[5] = 0;
-    data[6] = 0;
-    data[7] = 0;
-
-    // Version (4 bytes): v3
+    // Version (4 bytes): v3 at offset 4
     uint32_t version = 3;
-    memcpy(data.data() + 8, &version, 4);
+    memcpy(data.data() + 4, &version, 4);
 
-    // Tensor count (4 bytes): 1 tensor
-    uint32_t tensor_count = 1;
-    memcpy(data.data() + 12, &tensor_count, 4);
+    // Tensor count (8 bytes): 1 tensor at offset 8
+    int64_t tensor_count = 1;
+    memcpy(data.data() + 8, &tensor_count, 8);
 
-    // KV count (4 bytes): 3 key-value pairs
-    uint32_t kv_count = 3;
-    memcpy(data.data() + 16, &kv_count, 4);
+    // KV count (8 bytes): 3 key-value pairs at offset 16
+    int64_t kv_count = 3;
+    memcpy(data.data() + 16, &kv_count, 8);
 
     // Add KV pairs (simplified)
     // KV 1: general.architecture (string)
@@ -316,12 +311,12 @@ TEST_CASE("GGUF Integration: Tensor name mapping", "[gguf][integration]") {
 TEST_CASE("GGUF Integration: Tensor name parsing", "[gguf][integration]") {
   SECTION("Parse special layer indices") {
     auto parts = GGUFReader::ParseTensorName("tok_emb.weight");
-    REQUIRE(parts.layer == -1);  // Special index for token embeddings
+    REQUIRE(parts.layer == -1); // Special index for token embeddings
     REQUIRE(parts.component == "tok_emb");
     REQUIRE(parts.type == "weight");
 
     parts = GGUFReader::ParseTensorName("output.weight");
-    REQUIRE(parts.layer == -2);  // Special index for output layer
+    REQUIRE(parts.layer == -2); // Special index for output layer
     REQUIRE(parts.component == "output");
   }
 
@@ -341,7 +336,8 @@ TEST_CASE("GGUF Integration: Tensor name parsing", "[gguf][integration]") {
 // Memory Efficiency Integration Tests
 //==============================================================================
 
-TEST_CASE("GGUF Integration: Memory efficiency validation", "[gguf][integration]") {
+TEST_CASE("GGUF Integration: Memory efficiency validation",
+          "[gguf][integration]") {
 
   SECTION("Quantized size calculations for model sizing") {
     // For a 1B parameter model
@@ -349,7 +345,7 @@ TEST_CASE("GGUF Integration: Memory efficiency validation", "[gguf][integration]
 
     // FP16 baseline
     size_t fp16_gb = (params_1b * 2) / (1024 * 1024 * 1024);
-    REQUIRE(fp16_gb == 1);  // ~2 GB
+    REQUIRE(fp16_gb == 1); // ~2 GB
 
     // Q4_K_M: 1B * (144/256 * 2) / (1024^3) ≈ 1.1 GB
     size_t q4_gb = (params_1b * 144 / 256 * 2) / (1024 * 1024 * 1024);
@@ -371,10 +367,14 @@ TEST_CASE("GGUF Integration: Memory efficiency validation", "[gguf][integration]
     size_t num_elements = 256;
 
     // Calculate sizes
-    size_t fp16_size = BaseQuantizationHandler::GetQuantizedSize(num_elements, "f16");
-    size_t q4_size = BaseQuantizationHandler::GetQuantizedSize(num_elements, "q4_k_m");
-    size_t q6_size = BaseQuantizationHandler::GetQuantizedSize(num_elements, "q6_k");
-    size_t q8_size = BaseQuantizationHandler::GetQuantizedSize(num_elements, "q8_0");
+    size_t fp16_size =
+        BaseQuantizationHandler::GetQuantizedSize(num_elements, "f16");
+    size_t q4_size =
+        BaseQuantizationHandler::GetQuantizedSize(num_elements, "q4_k_m");
+    size_t q6_size =
+        BaseQuantizationHandler::GetQuantizedSize(num_elements, "q6_k");
+    size_t q8_size =
+        BaseQuantizationHandler::GetQuantizedSize(num_elements, "q8_0");
 
     // Calculate compression ratios
     double q4_ratio = (double)fp16_size / q4_size;
@@ -384,7 +384,7 @@ TEST_CASE("GGUF Integration: Memory efficiency validation", "[gguf][integration]
     // Validate: Q4 should compress more than Q6, which compresses more than Q8
     REQUIRE(q4_ratio > q6_ratio);
     REQUIRE(q6_ratio > q8_ratio);
-    REQUIRE(q4_ratio > 1.5);  // At least 1.5x compression
+    REQUIRE(q4_ratio > 1.5); // At least 1.5x compression
   }
 }
 
@@ -412,16 +412,18 @@ TEST_CASE("GGUF Integration: Block size consistency", "[gguf][integration]") {
   }
 
   SECTION("Block size affects quantized size calculation") {
-    size_t num_32_blocks = 32 * 10;  // 10 blocks of 32 values
+    size_t num_32_blocks = 32 * 10;   // 10 blocks of 32 values
     size_t num_256_blocks = 256 * 10; // 10 blocks of 256 values
 
     // Q8_0 uses 32-value blocks
-    size_t q8_0_size = BaseQuantizationHandler::GetQuantizedSize(num_32_blocks, "q8_0");
-    REQUIRE(q8_0_size == 10 * 34);  // 10 blocks * 34 bytes
+    size_t q8_0_size =
+        BaseQuantizationHandler::GetQuantizedSize(num_32_blocks, "q8_0");
+    REQUIRE(q8_0_size == 10 * 34); // 10 blocks * 34 bytes
 
     // Q4_K_M uses 256-value blocks
-    size_t q4_k_m_size = BaseQuantizationHandler::GetQuantizedSize(num_256_blocks, "q4_k_m");
-    REQUIRE(q4_k_m_size == 10 * 144);  // 10 blocks * 144 bytes
+    size_t q4_k_m_size =
+        BaseQuantizationHandler::GetQuantizedSize(num_256_blocks, "q4_k_m");
+    REQUIRE(q4_k_m_size == 10 * 144); // 10 blocks * 144 bytes
   }
 }
 
@@ -479,9 +481,9 @@ TEST_CASE("GGUF Integration: Type string conversions", "[gguf][integration]") {
     REQUIRE(StringToTensorType("f32") == GGUF::TensorType::F32);
     REQUIRE(StringToTensorType("f16") == GGUF::TensorType::F16);
     REQUIRE(StringToTensorType("q4_k") == GGUF::TensorType::Q4_K);
-    REQUIRE(StringToTensorType("q4_k_m") == GGUF::TensorType::Q4_K);  // Alias
+    REQUIRE(StringToTensorType("q4_k_m") == GGUF::TensorType::Q4_K); // Alias
     REQUIRE(StringToTensorType("q5_k") == GGUF::TensorType::Q5_K);
-    REQUIRE(StringToTensorType("q5_k_m") == GGUF::TensorType::Q5_K);  // Alias
+    REQUIRE(StringToTensorType("q5_k_m") == GGUF::TensorType::Q5_K); // Alias
     REQUIRE(StringToTensorType("q6_k") == GGUF::TensorType::Q6_K);
   }
 
@@ -489,7 +491,7 @@ TEST_CASE("GGUF Integration: Type string conversions", "[gguf][integration]") {
     REQUIRE(GetQuantizationType(GGUF::TensorType::Q4_K) == "q4_k_m");
     REQUIRE(GetQuantizationType(GGUF::TensorType::Q5_K) == "q5_k_m");
     REQUIRE(GetQuantizationType(GGUF::TensorType::Q6_K) == "q6_k");
-    REQUIRE(GetQuantizationType(GGUF::TensorType::F16) == "");  // Not quantized
-    REQUIRE(GetQuantizationType(GGUF::TensorType::F32) == "");  // Not quantized
+    REQUIRE(GetQuantizationType(GGUF::TensorType::F16) == ""); // Not quantized
+    REQUIRE(GetQuantizationType(GGUF::TensorType::F32) == ""); // Not quantized
   }
 }
