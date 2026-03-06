@@ -24,6 +24,8 @@ set(MLX_C_TAG "v0.5.0" CACHE STRING "mlx-c git tag to use when building from sou
 option(ENABLE_CPU "Enable CPU runtime" ON)
 option(ENABLE_MTMD "Enable multimodal (vision) support via libmtmd" OFF)
 option(INFERFLUX_USE_COMMON_BACKEND_TYPES "Use common backend types from runtime/backends/common (Phase 2 migration)" OFF)
+option(INFERFLUX_CUDA_DEVICE_LTO "Enable CUDA device LTO profile (requires custom lto gencode)" OFF)
+option(INFERFLUX_CUDA_USE_FAST_MATH "Enable --use_fast_math for CUDA kernels (precision tradeoff)" OFF)
 
 if(INFERFLUX_USE_COMMON_BACKEND_TYPES)
   add_compile_definitions(INFERFLUX_USE_COMMON_BACKEND_TYPES)
@@ -42,8 +44,8 @@ add_library(inferflux_core
   runtime/backends/cuda/cuda_device_context.h
   runtime/backends/cuda/cuda_backend.cpp
   runtime/backends/cuda/cuda_backend.h
-  runtime/backends/cuda/native_cuda_executor.cpp
-  runtime/backends/cuda/native_cuda_executor.h
+  runtime/backends/cuda/native_cuda_runtime.cpp
+  runtime/backends/cuda/native_cuda_runtime.h
   runtime/backends/cuda/native_cuda_backend.cpp
   runtime/backends/cuda/native_cuda_backend.h
   runtime/backends/cuda/native/safetensors_parser.cpp
@@ -82,6 +84,8 @@ add_library(inferflux_core
   runtime/scheduler/sequence_slot_manager.cpp
   runtime/scheduler/sequence_slot_manager.h
   scheduler/scheduler.cpp
+  scheduler/session_handle_manager.cpp
+  scheduler/session_handle_manager.h
   scheduler/fairness_controller.cpp
   scheduler/scheduler.h
   scheduler/model_selection.cpp
@@ -159,6 +163,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   set_target_properties(inferflux_cuda_kernels PROPERTIES
     CUDA_STANDARD 17
     CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
   )
   target_include_directories(inferflux_cuda_kernels PUBLIC
@@ -178,6 +183,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/safetensors_adapter.cpp
     runtime/backends/cuda/native/quantization_handler.cpp
     runtime/backends/cuda/native/gguf_util.cpp
+    runtime/backends/cuda/native/strategy_registry.cpp
     runtime/backends/cuda/native/gguf_model_loader.cpp
     runtime/backends/cuda/native/q4_k_m_handler.cpp
     runtime/backends/cuda/native/q5_k_m_handler.cpp
@@ -189,6 +195,17 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   )
   target_link_libraries(inferflux_core PUBLIC inferflux_cuda_kernels CUDA::cublas CUDA::nvToolsExt)
   set_target_properties(inferflux_core PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  if(INFERFLUX_CUDA_DEVICE_LTO)
+    message(WARNING
+      "INFERFLUX_CUDA_DEVICE_LTO is requested, but automatic -dlto wiring is disabled "
+      "when CMAKE_CUDA_ARCHITECTURES uses standard gencode targets. "
+      "Use explicit code=lto_<arch> gencode flags for device-LTO builds.")
+  endif()
+  if(INFERFLUX_CUDA_USE_FAST_MATH)
+    target_compile_options(inferflux_cuda_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    target_compile_options(inferflux_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    message(STATUS "CUDA fast math enabled (--use_fast_math)")
+  endif()
   target_compile_definitions(inferflux_core PUBLIC INFERFLUX_NATIVE_KERNELS_READY=1)
   message(STATUS "Native CUDA kernels enabled (cuBLAS + custom kernels)")
 
@@ -416,6 +433,7 @@ add_executable(inferflux_tests
   tests/unit/test_audit_logger.cpp
   tests/unit/test_metrics.cpp
   tests/unit/test_scheduler.cpp
+  tests/unit/test_session_handle_manager.cpp
   tests/unit/test_sequence_slot_manager.cpp
   tests/unit/test_policy_store.cpp
   tests/unit/test_oidc_validator.cpp
@@ -453,6 +471,10 @@ add_executable(inferflux_tests
   tests/unit/test_native_batching.cpp
   tests/unit/test_startup_advisor.cpp
   tests/unit/test_gguf_parsing.cpp
+  tests/unit/test_gguf_model_loader.cpp
+  tests/unit/test_quantized_weight_map.cpp
+  tests/unit/test_quantized_gemm.cpp
+  tests/unit/test_strategy_registry.cpp
   tests/integration/test_gguf_quantization.cpp
   external/catch2/catch_amalgamated.cpp
 )

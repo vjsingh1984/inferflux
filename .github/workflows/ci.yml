@@ -153,7 +153,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Assert throughput gate batching contract
         run: |
-          EXPECTED_TP_GATE_CONTRACT_TESTS=4
+          EXPECTED_TP_GATE_CONTRACT_TESTS=6
           ACTUAL_TP_GATE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_contract_test.py | wc -l | tr -d ' ')
           echo "ThroughputGateContractTests method count: expected=${EXPECTED_TP_GATE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_CONTRACT_TESTS}"
           if [ "${ACTUAL_TP_GATE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_CONTRACT_TESTS}" ]; then
@@ -168,7 +168,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Assert throughput gate batching failure diagnostics
         run: |
-          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=4
+          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=5
           ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_failure_contract_test.py | wc -l | tr -d ' ')
           echo "ThroughputGateFailureContractTests method count: expected=${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}"
           if [ "${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS}" ]; then
@@ -572,7 +572,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Assert throughput gate batching contract
         run: |
-          EXPECTED_TP_GATE_CONTRACT_TESTS=4
+          EXPECTED_TP_GATE_CONTRACT_TESTS=6
           ACTUAL_TP_GATE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_contract_test.py | wc -l | tr -d ' ')
           echo "ThroughputGateContractTests method count: expected=${EXPECTED_TP_GATE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_CONTRACT_TESTS}"
           if [ "${ACTUAL_TP_GATE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_CONTRACT_TESTS}" ]; then
@@ -586,7 +586,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Assert throughput gate batching failure diagnostics
         run: |
-          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=4
+          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=5
           ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_failure_contract_test.py | wc -l | tr -d ' ')
           echo "ThroughputGateFailureContractTests method count: expected=${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}"
           if [ "${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS}" ]; then
@@ -621,6 +621,168 @@ jobs:
           name: coverage-html-${{ github.sha }}
           path: build-cov/coverage/html/
           retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # GGUF quantization tests (CPU-only)
+  # Runs GGUF parsing and quantization handler tests on standard runners.
+  # GPU-dependent tests are automatically skipped via #ifdef INFERFLUX_HAS_CUDA.
+  # ---------------------------------------------------------------------------
+  gguf-quantization-tests:
+    name: GGUF & Quantization Tests (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            libssl-dev \
+            libyaml-cpp-dev \
+            python3 \
+            ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-ubuntu-gguf-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'external/llama.cpp/CMakeLists.txt') }}
+          restore-keys: |
+            ccache-ubuntu-gguf-
+            ccache-ubuntu-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=500M
+          ccache --zero-stats
+
+      # CPU-only build: GPU tests will be skipped via #ifdef INFERFLUX_HAS_CUDA
+      - name: Configure (CPU-only)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DENABLE_CUDA=OFF \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
+            -DENABLE_MTMD=OFF \
+            -DENABLE_SBOM=OFF
+
+      - name: Build tests
+        run: cmake --build build --target inferflux_tests -j$(nproc)
+
+      - name: ccache stats
+        run: ccache --show-stats
+
+      # Run GGUF tests (CPU-only, GPU tests automatically skipped)
+      - name: Run GGUF tests
+        run: |
+          echo "=== Running GGUF tests (CPU-only) ==="
+          ctest --test-dir build -R gguf --output-on-failure --timeout 90 -V
+
+      # Run quantization tests (CPU-only, GPU tests automatically skipped)
+      - name: Run quantization tests
+        run: |
+          echo "=== Running quantization tests (CPU-only) ==="
+          ctest --test-dir build -R quantization --output-on-failure --timeout 90 -V
+
+      # Verify test count expectations
+      - name: Assert GGUF test count
+        run: |
+          echo "=== Verifying GGUF test count ==="
+          # Test count should be at least 55 (as of 2026-03-05)
+          MIN_GGUF_TESTS=55
+          ACTUAL_GGUF_TESTS=$(./build/inferflux_tests "[gguf]" --list-tests 2>/dev/null | wc -l)
+          echo "GGUF test count: minimum=${MIN_GGUF_TESTS} actual=${ACTUAL_GGUF_TESTS}"
+          if [ "${ACTUAL_GGUF_TESTS}" -lt "${MIN_GGUF_TESTS}" ]; then
+            echo "::error::GGUF test count below minimum; update MIN_GGUF_TESTS in .github/workflows/ci.yml"
+            exit 1
+          fi
+
+      - name: Assert quantization test count
+        run: |
+          echo "=== Verifying quantization test count ==="
+          # Test count should be at least 8 (as of 2026-03-05)
+          MIN_QUANT_TESTS=8
+          ACTUAL_QUANT_TESTS=$(./build/inferflux_tests "[quantization]" --list-tests 2>/dev/null | wc -l)
+          echo "Quantization test count: minimum=${MIN_QUANT_TESTS} actual=${ACTUAL_QUANT_TESTS}"
+          if [ "${ACTUAL_QUANT_TESTS}" -lt "${MIN_QUANT_TESTS}" ]; then
+            echo "::error::Quantization test count below minimum; update MIN_QUANT_TESTS in .github/workflows/ci.yml"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # GGUF quantization tests (self-hosted CUDA)
+  # Runs full GGUF and quantization test suite on self-hosted GPU runners.
+  # Tests both CPU and GPU code paths.
+  # Only runs when explicitly enabled via repo variable.
+  # ---------------------------------------------------------------------------
+  gguf-quantization-tests-cuda:
+    name: GGUF & Quantization Tests (self-hosted CUDA)
+    if: ${{ vars.INFERFLUX_ENABLE_CUDA_GGUF_TESTS == 'true' }}
+    runs-on: [self-hosted, linux, x64, cuda]
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Verify toolchain
+        run: |
+          command -v cmake
+          command -v python3
+          command -v nvcc
+
+      # CUDA build: INFERFLUX_HAS_CUDA will be defined
+      - name: Configure (CUDA=ON)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_CUDA=ON \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
+            -DENABLE_MTMD=OFF \
+            -DENABLE_SBOM=OFF
+
+      - name: Build tests
+        run: cmake --build build --target inferflux_tests -j$(nproc)
+
+      # Run GGUF tests (includes GPU tests)
+      - name: Run GGUF tests (CUDA)
+        run: |
+          echo "=== Running GGUF tests (with CUDA) ==="
+          ctest --test-dir build -R gguf --output-on-failure --timeout 90 -V
+
+      # Run quantization tests (includes GPU tests)
+      - name: Run quantization tests (CUDA)
+        run: |
+          echo "=== Running quantization tests (with CUDA) ==="
+          ctest --test-dir build -R quantization --output-on-failure --timeout 90 -V
+
+      - name: Verify CUDA tests ran
+        run: |
+          echo "=== Verifying CUDA test execution ==="
+          # Check that GPU tests were compiled and executed
+          if ! ./build/inferflux_tests --list-tests | grep -q "\[gpu\]"; then
+            echo "::warning::No GPU tests found in test suite"
+          else
+            GPU_TEST_COUNT=$(./build/inferflux_tests --list-tests | grep "\[gpu\]" | wc -l)
+            echo "GPU tests available: ${GPU_TEST_COUNT}"
+          fi
 
   # ---------------------------------------------------------------------------
   # clang-format style gate
