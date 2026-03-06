@@ -17,8 +17,8 @@ namespace inferflux {
 /// n_past=0) and decode (one token, n_past>0) sequences in the same forward
 /// pass.
 struct UnifiedBatchInput {
-  int sequence_id;
-  int n_past;
+  int sequence_id{0};
+  int n_past{0};
   std::vector<int> tokens;
   bool request_logits{true};
   SamplingParams sampling; // Per-request sampling parameters
