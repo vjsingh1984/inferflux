@@ -64,6 +64,10 @@ runtime:
     max_batch_tokens: 8192          # Max tokens per batch
     min_batch_size: 1               # Minimum batch size before flushing
     batch_accumulation_ms: 0        # Wait time to accumulate larger batches
+    session_handles:
+      enabled: false                # Optional stateful layer (default API remains stateless)
+      ttl_ms: 300000                # Session TTL in milliseconds
+      max_sessions: 1024            # Maximum live session mappings
 
   # Tensor parallelism (multi-GPU inference)
   tensor_parallel: 1                # Rule 6: Set to GPU count for large models
@@ -129,6 +133,6 @@ registry:
 # Environment variable overrides:
 # INFERFLUX_MODEL_PATH              - Override default model path
 # INFERFLUX_MODELS                  - Multi-model config string
-# INFERFLUX_NATIVE_CUDA_EXECUTOR    - native_kernel for safetensors on CUDA
+# INFERFLUX_NATIVE_CUDA_STRICT      - fail if native runtime reports fallback
 # INFERFLUX_BACKEND_PRIORITY        - Override backend selection order
 # INFERFLUX_DISABLE_STARTUP_ADVISOR - Disable recommendation logging

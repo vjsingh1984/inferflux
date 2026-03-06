@@ -14,10 +14,10 @@
 
 | Model | Size | Format | Backend | Config | Advisor Recs |
 |-------|------|--------|---------|--------|--------------|
-| TinyLlama 1.1B | 638 MB | GGUF Q4 | cuda_universal | server.cuda.yaml | 1 (batch_size) |
-| Qwen2.5 3B | 2.0 GB | GGUF Q4 | cuda_universal | server.cuda.yaml | 1 (batch_size) |
-| Qwen2.5 3B | 5.8 GB | GGUF FP16 | cuda_universal | server.cuda.yaml | 0-1 ✨ |
-| Qwen2.5 Coder 14B | 8.4 GB | GGUF Q4 | cuda_universal | server.cuda.qwen14b.yaml | 0-1 ✨ |
+| TinyLlama 1.1B | 638 MB | GGUF Q4 | cuda_llama_cpp | server.cuda.yaml | 1 (batch_size) |
+| Qwen2.5 3B | 2.0 GB | GGUF Q4 | cuda_llama_cpp | server.cuda.yaml | 1 (batch_size) |
+| Qwen2.5 3B | 5.8 GB | GGUF FP16 | cuda_llama_cpp | server.cuda.yaml | 0-1 ✨ |
+| Qwen2.5 Coder 14B | 8.4 GB | GGUF Q4 | cuda_llama_cpp | server.cuda.qwen14b.yaml | 0-1 ✨ |
 | Qwen2.5 3B | 5.8 GB | Safetensors BF16 | cuda_native | server.cuda.safetensors.yaml | **0 ✨** |
 
 ✨ = Well-tuned configuration
@@ -26,7 +26,7 @@
 
 ### Rule 1: Backend Mismatch
 - ✅ **Status:** PASS
-- **Config:** Safetensors use `cuda_native` with `INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel`
+- **Config:** Safetensors use `cuda_native`
 - **Result:** Safetensors BF16 model loads successfully with native kernel executor
 
 ### Rule 2: Attention Kernel
@@ -88,18 +88,17 @@
 
 ### For Safetensors Models
 ```bash
-INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel \
-  ./build/inferfluxd --config config/server.cuda.safetensors.yaml
+./build/inferfluxd --config config/server.cuda.safetensors.yaml
 ```
 
 ## Format Compatibility Matrix
 
-| Format | Backend | Executor | Works | Notes |
-|--------|---------|----------|-------|-------|
-| GGUF Q4 | cuda_universal | llama.cpp | ✅ | Best performance |
-| GGUF FP16 | cuda_universal | llama.cpp | ✅ | Good quality |
-| Safetensors BF16 | cuda_native | native_kernel | ✅ | Requires env var |
-| Safetensors | cuda_universal | llama.cpp | ❌ | Not supported |
+| Format | Backend | Runtime | Works | Notes |
+|--------|---------|---------|-------|-------|
+| GGUF Q4 | cuda_llama_cpp | llama.cpp | ✅ | Best performance |
+| GGUF FP16 | cuda_llama_cpp | llama.cpp | ✅ | Good quality |
+| Safetensors BF16 | cuda_native | native CUDA | ✅ | No executor env required |
+| Safetensors | cuda_llama_cpp | llama.cpp | ❌ | Not supported |
 
 ## Removed Placeholder Files
 
@@ -120,4 +119,3 @@ The following 0-byte placeholder files were removed:
 All models in the `models/` directory are verified and working correctly with their respective production configurations. The startup advisor confirms that all 8 rules are properly satisfied, and configs are production-ready.
 
 **Recommendation:** Use `server.cuda.safetensors.yaml` as a reference for optimal configuration (0 advisor recommendations).
-

@@ -72,12 +72,6 @@ runtime:
     enabled: true
     device_id: 0
 
-    # Native CUDA executor mode
-    # Options:
-    #   - "native_kernel": Use custom CUDA kernels (requires safetensors or GGUF)
-    #   - "delegate": Delegate to llama.cpp (fallback)
-    native_executor_mode: "native_kernel"
-
     # FlashAttention-2 configuration
     flash_attention:
       enabled: true
@@ -160,6 +154,5 @@ policy:
 # These can be overridden via environment variables:
 # - INFERFLUX_MODEL_PATH: Override model path
 # - INFERFLUX_MODELS: Multi-model configuration string
-# - INFERFLUX_NATIVE_CUDA_EXECUTOR: Override executor mode
 # - INFERFLUX_CUDA_PHASE_OVERLAP: Enable/disable phase overlap
 # - INFERFLUX_PORT_OVERRIDE: Override server port

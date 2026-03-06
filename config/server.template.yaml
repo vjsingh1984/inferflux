@@ -48,6 +48,9 @@ runtime:
     attention:
       kernel: auto                  # Rule 2: auto (selects FA2 on SM≥8.0), fa2, standard
 
+    # Native CUDA KV cache precision (independent from weight precision)
+    kv_cache_dtype: auto            # auto, fp16, bf16, int8, fp8
+
     # FlashAttention configuration (requires SM 8.0+)
     flash_attention:
       enabled: true                 # Rule 2: Enable on Ampere+ GPUs (RTX 3090, 4090, Ada, Hopper)
@@ -77,6 +80,10 @@ runtime:
     max_batch_tokens: 8192          # Max tokens per batch (affects memory)
     min_batch_size: 1               # Minimum batch size before flushing
     batch_accumulation_ms: 5        # Wait time to accumulate larger batches
+    session_handles:
+      enabled: false                # Optional stateful layer; OpenAI flow stays stateless by default
+      ttl_ms: 300000                # Session TTL in milliseconds
+      max_sessions: 1024            # Maximum live session_id -> sequence slot mappings
 
     # Recommended max_batch_size by model size (20GB VRAM):
     # - 1B-3B models: 24-32
@@ -127,7 +134,7 @@ runtime:
 #
 # Rule 1: Backend mismatch
 #   Trigger: safetensors + CUDA + universal provider
-#   Fix: Use backend: cuda_native with INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
+#   Fix: Use backend: cuda_native
 #
 # Rule 2: Attention kernel
 #   Trigger: GPU SM ≥ 8.0, FlashAttention disabled
@@ -204,9 +211,10 @@ registry:
 #
 # INFERFLUX_MODEL_PATH              - Override default model path
 # INFERFLUX_MODELS                  - Multi-model config string
-# INFERFLUX_NATIVE_CUDA_EXECUTOR    - native_kernel for safetensors (Rule 1)
+# INFERFLUX_NATIVE_CUDA_STRICT      - fail if native runtime reports fallback
+# INFERFLUX_NATIVE_KV_DTYPE         - KV precision policy override (auto/fp16/bf16/int8/fp8)
 # INFERFLUX_BACKEND_PRIORITY        - Override backend selection (Rule 8)
 # INFERFLUX_DISABLE_STARTUP_ADVISOR - Disable recommendation logging
 #
 # Example for safetensors on CUDA:
-#   INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel ./build/inferfluxd --config config/server.yaml
+#   ./build/inferfluxd --config config/server.yaml

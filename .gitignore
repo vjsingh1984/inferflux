@@ -11,6 +11,7 @@ server.log
 config/policy_store.conf
 config/policy_store.conf.bak
 blogs/
+docs/blog/assets/
 
 # MLX external dependencies — fetched by CMake FetchContent or cloned manually;
 # never committed to the repo.

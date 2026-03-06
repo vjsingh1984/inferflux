@@ -32,7 +32,7 @@ Choose a config based on your hardware and model format:
 ### server.cuda.yaml
 **CUDA configuration for GGUF models (recommended)**
 
-- Backend: `cuda_universal` (llama.cpp)
+- Backend: `cuda_llama_cpp` (llama.cpp)
 - Flash Attention: **Enabled** (Rule 2)
 - Phase Overlap: **Enabled** (Rule 4)
 - Batch Size: 32 (for 1-3B models)
@@ -51,9 +51,8 @@ Choose a config based on your hardware and model format:
 - Batch Size: 16 (for 3B models)
 - KV Pages: 256
 
-**Requires environment variable:**
 ```bash
-INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel ./build/inferfluxd --config config/server.cuda.safetensors.yaml
+./build/inferfluxd --config config/server.cuda.safetensors.yaml
 ```
 
 ### server.cuda.qwen14b.yaml
@@ -79,7 +78,7 @@ The startup advisor logs recommendations at startup when config is suboptimal.
 
 | Rule | Trigger | Recommendation | Config Fix |
 |------|---------|----------------|------------|
-| 1. Backend mismatch | safetensors + CUDA + universal | Use native kernel | `backend: cuda_native` + `INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel` |
+| 1. Backend mismatch | safetensors + CUDA + universal | Use native backend | `backend: cuda_native` |
 | 2. Attention kernel | GPU SM ≥ 8.0, FA disabled | Enable FA2 | `cuda.flash_attention.enabled: true` |
 | 3. Batch size vs VRAM | Large VRAM, small batch | Increase batch | `runtime.scheduler.max_batch_size: <higher>` |
 | 4. Phase overlap | CUDA, batch ≥ 4, disabled | Enable overlap | `cuda.phase_overlap.enabled: true` |
@@ -131,14 +130,28 @@ runtime:
   tensor_parallel: 2  # For multi-GPU
 ```
 
+### Optional Session Handle Layer (Stateless API stays default)
+
+```yaml
+runtime:
+  scheduler:
+    session_handles:
+      enabled: true
+      ttl_ms: 300000
+      max_sessions: 1024
+```
+
 ## Environment Variables
 
 | Variable | Purpose | Example |
 |----------|---------|---------|
 | `INFERFLUX_MODEL_PATH` | Override model path | `/models/llama3.gguf` |
 | `INFERFLUX_MODELS` | Multi-model config | `id=model1,path=/path/to/model.gguf,...` |
-| `INFERFLUX_NATIVE_CUDA_EXECUTOR` | Executor mode | `native_kernel` for safetensors |
+| `INFERFLUX_NATIVE_CUDA_STRICT` | Strict native mode | `1` to fail if native runtime reports fallback |
 | `INFERFLUX_BACKEND_PRIORITY` | Backend selection | `cuda,cpu` or `cpu,cuda` |
+| `INFERFLUX_SESSION_HANDLES_ENABLED` | Enable optional `session_id` mapping layer | `true` |
+| `INFERFLUX_SESSION_TTL_MS` | Session handle TTL (ms) | `300000` |
+| `INFERFLUX_SESSION_MAX` | Max tracked sessions | `1024` |
 | `INFERFLUX_DISABLE_STARTUP_ADVISOR` | Disable advisor | `true` |
 
 ## Suppressing Advisor Output
@@ -161,13 +174,13 @@ INFERFLUX_DISABLE_STARTUP_ADVISOR=true ./build/inferfluxd --config config/server
 ## Format-Specific Notes
 
 ### GGUF Format
-- Uses llama.cpp backend (`cuda_universal` or `cpu`)
+- Uses llama.cpp backend (`cuda_llama_cpp` or `cpu`)
 - Well-tested, production-ready
 - Supports quantization (Q4_K_M, Q5_K_M, Q6_K, Q8_0)
 
 ### Safetensors Format
 - Requires native CUDA backend (`cuda_native`)
-- Must set `INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel`
+- Use `backend: cuda_native`
 - Supports BF16/FP16 weights
 - Better for fine-tuned models from HuggingFace
 

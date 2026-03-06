@@ -90,6 +90,6 @@ registry:
   poll_interval_ms: 5000
 
 # NOTE: This config requires:
-#   INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
+#   backend: cuda_native
 #
 # For a better-documented version, see server.cuda.safetensors.yaml
