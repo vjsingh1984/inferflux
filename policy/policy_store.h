@@ -16,9 +16,15 @@ struct ApiKeyPolicy {
   std::vector<std::string> scopes;
 };
 
+struct PolicyStoreConfig {
+  std::string path;
+  std::string passphrase;
+};
+
 class PolicyStore : public PolicyBackend {
 public:
-  PolicyStore(std::string path, std::string passphrase = "");
+  explicit PolicyStore(std::string path);
+  explicit PolicyStore(PolicyStoreConfig config);
 
   bool Load() override;
   bool Save() const override;

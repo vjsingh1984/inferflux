@@ -13,12 +13,19 @@ enum class QuantizationType {
   kFp32,    // 32-bit float
   kFp16,    // 16-bit float
   kBf16,    // 16-bit bfloat
+  kQ8_1,    // 8-bit quantization (Q8_1)
   kQ8_0,    // 8-bit quantization
+  kQ8_K,    // 8-bit K-block quantization
   kQ6_K,    // 6-bit quantization
+  kQ5_1,    // 5-bit quantization (Q5_1)
+  kQ5_0,    // 5-bit quantization (Q5_0)
   kQ5_K_M,  // 5-bit quantization (medium)
   kQ5_K,    // 5-bit quantization
+  kQ4_1,    // 4-bit quantization (Q4_1)
+  kQ4_0,    // 4-bit quantization (Q4_0)
   kQ4_K_M,  // 4-bit quantization (medium)
   kQ4_K,    // 4-bit quantization
+  kQ3_K,    // 3-bit quantization
   kQ3_K_M,  // 3-bit quantization (medium)
   kQ2_K,    // 2-bit quantization
 };

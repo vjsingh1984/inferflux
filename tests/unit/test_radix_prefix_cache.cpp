@@ -9,74 +9,69 @@
 using namespace inferflux;
 
 TEST_CASE("RadixPrefixCache: miss on empty cache", "[radix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, 16, 12);
-  std::vector<int> out;
-  int out_seq = -1;
-  int matched = -1;
-  REQUIRE_FALSE(cache.Lookup({1, 2, 3}, nullptr, &out, &out_seq, &matched));
-  REQUIRE(matched == 0);
+  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{16, 12});
+  RadixLookupResult lookup;
+  lookup.matched_tokens = -1;
+  REQUIRE_FALSE(cache.Lookup({1, 2, 3}, nullptr, &lookup));
+  REQUIRE(lookup.matched_tokens == 0);
 }
 
 TEST_CASE("RadixPrefixCache: exact hit after insert", "[radix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, 16, 12);
+  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{16, 12});
   // Assume [1, 2, 3] covered by block 100, computed in seq 5.
   cache.Insert({1, 2, 3}, {100}, 5, nullptr);
-  std::vector<int> out;
-  int out_seq = -1;
-  int matched = 0;
-  bool hit = cache.Lookup({1, 2, 3}, nullptr, &out, &out_seq, &matched);
-  UNSCOPED_INFO("hit=" << hit << " matched=" << matched
-                       << " out_seq=" << out_seq);
+  RadixLookupResult lookup;
+  bool hit = cache.Lookup({1, 2, 3}, nullptr, &lookup);
+  UNSCOPED_INFO("hit=" << hit << " matched=" << lookup.matched_tokens
+                       << " out_seq=" << lookup.sequence_id);
   REQUIRE(hit);
-  REQUIRE(out == std::vector<int>{100});
-  REQUIRE(out_seq == 5);
-  REQUIRE(matched == 3);
+  REQUIRE(lookup.block_table == std::vector<int>{100});
+  REQUIRE(lookup.sequence_id == 5);
+  REQUIRE(lookup.matched_tokens == 3);
 }
 
 TEST_CASE("RadixPrefixCache: partial prefix match reports matched_tokens",
           "[radix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, 16, 12);
+  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{16, 12});
   cache.Insert({1, 2, 3}, {100}, 5, nullptr);
 
-  std::vector<int> out;
-  int out_seq = -1;
-  int matched = -1;
+  RadixLookupResult lookup;
+  lookup.matched_tokens = -1;
   // Query [1, 2, 4] — [1, 2] shares a prefix but divergences mid-edge [1, 2,
   // 3]. Correctness Fix (§ Item 3): matched_tokens should be 2, but hit is
   // false (no full node).
-  bool hit = cache.Lookup({1, 2, 4}, nullptr, &out, &out_seq, &matched);
+  bool hit = cache.Lookup({1, 2, 4}, nullptr, &lookup);
   REQUIRE_FALSE(hit);
-  REQUIRE(matched == 2);
+  REQUIRE(lookup.matched_tokens == 2);
 }
 
 TEST_CASE("RadixPrefixCache: deep radix tree with progressive prefixes",
           "[radix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, 32, 12);
+  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{32, 12});
   // Blocks of 16 tokens each.
   cache.Insert({1, 2}, {10}, 1, nullptr);
   cache.Insert({1, 2, 3, 4}, {10, 11}, 2, nullptr);
 
-  std::vector<int> out;
-  int out_seq = -1;
-  int matched = 0;
-  bool hit1 = cache.Lookup({1, 2}, nullptr, &out, &out_seq, &matched);
-  UNSCOPED_INFO("hit1=" << hit1 << " matched=" << matched
-                        << " out_seq=" << out_seq);
+  RadixLookupResult lookup;
+  bool hit1 = cache.Lookup({1, 2}, nullptr, &lookup);
+  UNSCOPED_INFO("hit1=" << hit1 << " matched=" << lookup.matched_tokens
+                        << " out_seq=" << lookup.sequence_id);
   REQUIRE(hit1);
-  REQUIRE(matched == 2);
-  REQUIRE(out_seq == 1);
+  REQUIRE(lookup.matched_tokens == 2);
+  REQUIRE(lookup.sequence_id == 1);
 
-  bool hit2 = cache.Lookup({1, 2, 3, 4}, nullptr, &out, &out_seq, &matched);
-  UNSCOPED_INFO("hit2=" << hit2 << " matched=" << matched
-                        << " out_seq=" << out_seq);
+  bool hit2 = cache.Lookup({1, 2, 3, 4}, nullptr, &lookup);
+  UNSCOPED_INFO("hit2=" << hit2 << " matched=" << lookup.matched_tokens
+                        << " out_seq=" << lookup.sequence_id);
   REQUIRE(hit2);
-  REQUIRE(matched == 4);
-  REQUIRE(out_seq == 2);
+  REQUIRE(lookup.matched_tokens == 4);
+  REQUIRE(lookup.sequence_id == 2);
 }
 
-TEST_CASE("RadixPrefixCache: reinserting existing node keeps suffix blocks only",
-          "[radix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, 64, 12);
+TEST_CASE(
+    "RadixPrefixCache: reinserting existing node keeps suffix blocks only",
+    "[radix_cache]") {
+  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{64, 12});
 
   std::vector<int> prefix_tokens;
   std::vector<int> full_tokens;
@@ -92,21 +87,21 @@ TEST_CASE("RadixPrefixCache: reinserting existing node keeps suffix blocks only"
   cache.Insert(full_tokens, {100, 200}, 2, nullptr);
   cache.Insert(full_tokens, {100, 201}, 3, nullptr);
 
-  std::vector<int> out;
-  int out_seq = -1;
-  int matched = 0;
-  bool hit = cache.Lookup(full_tokens, nullptr, &out, &out_seq, &matched);
+  RadixLookupResult lookup;
+  bool hit = cache.Lookup(full_tokens, nullptr, &lookup);
 
   REQUIRE(hit);
-  REQUIRE(matched == 32);
-  REQUIRE(out == std::vector<int>{100, 201});
-  REQUIRE(out_seq == 3);
+  REQUIRE(lookup.matched_tokens == 32);
+  REQUIRE(lookup.block_table == std::vector<int>{100, 201});
+  REQUIRE(lookup.sequence_id == 3);
 }
 
 TEST_CASE("RadixPrefixCache: sequence slot capping and eviction",
           "[radix_cache]") {
   int evicted_seq = -1;
-  RadixPrefixCache cache(nullptr, [&](int seq) { evicted_seq = seq; }, 100, 2);
+  RadixPrefixCache cache(
+      nullptr, [&](int seq) { evicted_seq = seq; },
+      RadixPrefixCacheLimits{100, 2});
 
   cache.Insert({1}, {10}, 101, nullptr);
   cache.Insert({2}, {11}, 102, nullptr);

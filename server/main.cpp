@@ -214,6 +214,7 @@ int main(int argc, char **argv) {
   bool cuda_flash_attention_enabled = false;
   int cuda_flash_attention_tile = 128;
   std::string cuda_attention_kernel = "auto";
+  std::string native_kv_cache_dtype = "auto";
   bool cuda_phase_overlap_scaffold = false;
   int cuda_phase_overlap_min_prefill_tokens = 256;
   bool cuda_phase_overlap_prefill_replica = false;
@@ -361,6 +362,12 @@ int main(int argc, char **argv) {
                           .as<std::string>());
         }
         if (config["runtime"]["cuda"] &&
+            config["runtime"]["cuda"]["kv_cache_dtype"] &&
+            config["runtime"]["cuda"]["kv_cache_dtype"].IsScalar()) {
+          native_kv_cache_dtype = ToLower(
+              config["runtime"]["cuda"]["kv_cache_dtype"].as<std::string>());
+        }
+        if (config["runtime"]["cuda"] &&
             config["runtime"]["cuda"]["phase_overlap"] &&
             config["runtime"]["cuda"]["phase_overlap"]["enabled"]) {
           cuda_phase_overlap_scaffold =
@@ -480,6 +487,21 @@ int main(int argc, char **argv) {
             scheduler_config.batch_accumulation_ms =
                 std::max(0, scheduler_node["batch_accumulation_ms"].as<int>());
           }
+          if (scheduler_node["session_handles"]) {
+            const auto &session_node = scheduler_node["session_handles"];
+            if (session_node["enabled"]) {
+              scheduler_config.session_handles.enabled =
+                  session_node["enabled"].as<bool>();
+            }
+            if (session_node["ttl_ms"]) {
+              scheduler_config.session_handles.ttl_ms =
+                  std::max(1, session_node["ttl_ms"].as<int>());
+            }
+            if (session_node["max_sessions"]) {
+              scheduler_config.session_handles.max_sessions =
+                  std::max(1, session_node["max_sessions"].as<int>());
+            }
+          }
         }
       }
 
@@ -569,8 +591,10 @@ int main(int argc, char **argv) {
     }
   }
 
+  bool has_env_model_path = false;
   if (const char *env_model = std::getenv("INFERFLUX_MODEL_PATH")) {
     model_path = env_model;
+    has_env_model_path = true;
   }
   if (const char *env_model_format = std::getenv("INFERFLUX_MODEL_FORMAT")) {
     auto normalized = inferflux::NormalizeModelFormat(env_model_format);
@@ -697,6 +721,10 @@ int main(int argc, char **argv) {
           std::getenv("INFERFLUX_CUDA_ATTENTION_KERNEL")) {
     cuda_attention_kernel = ToLower(env_cuda_attention_kernel);
   }
+  if (const char *env_native_kv_precision =
+          std::getenv("INFERFLUX_NATIVE_KV_DTYPE")) {
+    native_kv_cache_dtype = ToLower(env_native_kv_precision);
+  }
   if (const char *env_cuda_overlap =
           std::getenv("INFERFLUX_CUDA_PHASE_OVERLAP")) {
     cuda_phase_overlap_scaffold = ParseBool(env_cuda_overlap);
@@ -811,6 +839,23 @@ int main(int argc, char **argv) {
       scheduler_config.batch_accumulation_ms = static_cast<int>(accumulation);
     }
   }
+  if (const char *env_session_handles =
+          std::getenv("INFERFLUX_SESSION_HANDLES_ENABLED")) {
+    scheduler_config.session_handles.enabled = ParseBool(env_session_handles);
+  }
+  if (const char *env_session_ttl = std::getenv("INFERFLUX_SESSION_TTL_MS")) {
+    auto ttl = ParsePositiveSize(env_session_ttl);
+    if (ttl > 0) {
+      scheduler_config.session_handles.ttl_ms = static_cast<int>(ttl);
+    }
+  }
+  if (const char *env_session_max = std::getenv("INFERFLUX_SESSION_MAX")) {
+    auto max_sessions = ParsePositiveSize(env_session_max);
+    if (max_sessions > 0) {
+      scheduler_config.session_handles.max_sessions =
+          static_cast<int>(max_sessions);
+    }
+  }
   if (const char *env_kv_channel_cap =
           std::getenv("INFERFLUX_KV_CHANNEL_CAPACITY")) {
     auto cap = ParsePositiveSize(env_kv_channel_cap);
@@ -833,16 +878,17 @@ int main(int argc, char **argv) {
   }
 
   // INFERFLUX_MODEL_PATH overrides config file models (for testing/flexibility)
-  if (!model_path.empty()) {
-    inferflux::log::Info("server",
+  if (has_env_model_path && !model_path.empty()) {
+    inferflux::log::Info(
+        "server",
         "INFERFLUX_MODEL_PATH is set, overriding config file model path: " +
-        model_path + " (original config will be ignored)");
+            model_path + " (original config will be ignored)");
 
     ModelConfig cfg;
     cfg.path = model_path;
     cfg.format = legacy_model_format;
     cfg.make_default = true;
-    configured_models.clear();  // Clear any models from config file
+    configured_models.clear(); // Clear any models from config file
     configured_models.push_back(cfg);
   } else if (configured_models.empty() && !model_path.empty()) {
     ModelConfig cfg;
@@ -907,14 +953,22 @@ int main(int argc, char **argv) {
           inferflux::CapabilityFallbackScopeToString(
               routing_selection_options.capability_fallback_scope));
   inferflux::log::Info(
-      "server", "Scheduler batch policy: max_batch_size=" +
-                    std::to_string(scheduler_config.max_batch_size) +
-                    ", max_batch_tokens=" +
-                    std::to_string(scheduler_config.max_batch_tokens) +
-                    ", min_batch_size=" +
-                    std::to_string(scheduler_config.min_batch_size) +
-                    ", batch_accumulation_ms=" +
-                    std::to_string(scheduler_config.batch_accumulation_ms));
+      "server",
+      "Scheduler batch policy: max_batch_size=" +
+          std::to_string(scheduler_config.max_batch_size) +
+          ", max_batch_tokens=" +
+          std::to_string(scheduler_config.max_batch_tokens) +
+          ", min_batch_size=" +
+          std::to_string(scheduler_config.min_batch_size) +
+          ", batch_accumulation_ms=" +
+          std::to_string(scheduler_config.batch_accumulation_ms) +
+          ", session_handles.enabled=" +
+          std::string(scheduler_config.session_handles.enabled ? "true"
+                                                               : "false") +
+          ", session_handles.ttl_ms=" +
+          std::to_string(scheduler_config.session_handles.ttl_ms) +
+          ", session_handles.max_sessions=" +
+          std::to_string(scheduler_config.session_handles.max_sessions));
   inferflux::BackendManager backend_manager;
   std::string backend_label = "stub";
   std::string primary_model_id;
@@ -924,6 +978,7 @@ int main(int argc, char **argv) {
       cuda_enabled && cuda_flash_attention_enabled;
   primary_cfg.flash_attention_tile = cuda_flash_attention_tile;
   primary_cfg.cuda_attention_kernel = cuda_attention_kernel;
+  primary_cfg.native_kv_cache_dtype = native_kv_cache_dtype;
   primary_cfg.cuda_phase_overlap_scaffold =
       cuda_enabled && cuda_phase_overlap_scaffold;
   primary_cfg.cuda_phase_overlap_min_prefill_tokens =
@@ -971,6 +1026,10 @@ int main(int argc, char **argv) {
     cuda_phase_overlap_prefill_replica = false;
   }
 #ifdef INFERFLUX_HAS_CUDA
+  if (cuda_enabled) {
+    std::cout << "[server] Native CUDA KV cache precision policy: "
+              << native_kv_cache_dtype << ".\n";
+  }
   if (cuda_flash_attention_enabled) {
     std::cout << "[server] FlashAttention toggled on (kernel="
               << cuda_attention_kernel
@@ -1129,7 +1188,8 @@ int main(int argc, char **argv) {
   if (const char *env_pass = std::getenv("INFERFLUX_POLICY_PASSPHRASE")) {
     policy_passphrase = env_pass;
   }
-  inferflux::PolicyStore policy_store(policy_store_path, policy_passphrase);
+  inferflux::PolicyStore policy_store(
+      inferflux::PolicyStoreConfig{policy_store_path, policy_passphrase});
   policy_store.Load();
 
   // Keys from PolicyStore are already SHA-256 hashed on disk — load them
@@ -1231,13 +1291,16 @@ int main(int argc, char **argv) {
   // eviction. Using a pointer-to-scheduler to break the circular initialization
   // dependency.
   inferflux::Scheduler *sched_ptr = nullptr;
+  inferflux::RadixPrefixCacheLimits prefix_cache_limits;
+  prefix_cache_limits.capacity =
+      static_cast<std::size_t>(prefix_cache_capacity);
   auto prefix_cache = std::make_shared<inferflux::RadixPrefixCache>(
       cache,
       [&sched_ptr](int seq_id) {
         if (sched_ptr)
           sched_ptr->FreeSeqSlot(seq_id);
       },
-      prefix_cache_capacity);
+      prefix_cache_limits);
   std::shared_ptr<inferflux::disaggregated::IKVTransport> kv_transport;
   if (kv_transport_type == "shm") {
     kv_transport = std::make_shared<inferflux::disaggregated::ShmKVTransport>(
@@ -1344,7 +1407,7 @@ int main(int argc, char **argv) {
     inferflux::RunStartupAdvisor(advisor_ctx);
   }
 
-  int http_workers = 16;  // Increased from 4 for better concurrent throughput
+  int http_workers = 16; // Increased from 4 for better concurrent throughput
   if (const char *env_workers = std::getenv("INFERFLUX_HTTP_WORKERS")) {
     try {
       http_workers = std::stoi(env_workers);

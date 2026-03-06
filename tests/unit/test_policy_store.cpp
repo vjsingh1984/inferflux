@@ -52,7 +52,8 @@ TEST_CASE("PolicyStore round-trip with AES-GCM encryption", "[policy]") {
       std::filesystem::temp_directory_path() / "inferflux_policy_enc.conf";
 
   {
-    inferflux::PolicyStore store(tmp_path.string(), "my-secret-pass");
+    inferflux::PolicyStore store(
+        inferflux::PolicyStoreConfig{tmp_path.string(), "my-secret-pass"});
     store.SetApiKey("encrypted-key", {"generate"});
     store.SetGuardrailBlocklist({"secret"});
     store.SetRateLimitPerMinute(50);
@@ -66,7 +67,8 @@ TEST_CASE("PolicyStore round-trip with AES-GCM encryption", "[policy]") {
 
   // Re-open with same passphrase: should decrypt.
   {
-    inferflux::PolicyStore store(tmp_path.string(), "my-secret-pass");
+    inferflux::PolicyStore store(
+        inferflux::PolicyStoreConfig{tmp_path.string(), "my-secret-pass"});
     REQUIRE(store.Load());
     REQUIRE(store.ApiKeys().size() == 1);
     REQUIRE(store.GuardrailBlocklist().size() == 1);
@@ -80,7 +82,8 @@ TEST_CASE("PolicyStore round-trip with AES-GCM encryption", "[policy]") {
 
   // Wrong passphrase: should fail.
   {
-    inferflux::PolicyStore store(tmp_path.string(), "wrong-pass");
+    inferflux::PolicyStore store(
+        inferflux::PolicyStoreConfig{tmp_path.string(), "wrong-pass"});
     REQUIRE(!store.Load());
   }
 
@@ -125,7 +128,8 @@ TEST_CASE("PolicyStore Load falls back to backup when primary is corrupt",
   backup_path += ".bak";
 
   {
-    inferflux::PolicyStore store(tmp_path.string(), "my-secret-pass");
+    inferflux::PolicyStore store(
+        inferflux::PolicyStoreConfig{tmp_path.string(), "my-secret-pass"});
     store.SetRateLimitPerMinute(77);
     inferflux::RoutingPolicyEntry routing;
     routing.allow_default_fallback = false;
@@ -143,7 +147,8 @@ TEST_CASE("PolicyStore Load falls back to backup when primary is corrupt",
     out << "ENC\nnonce=broken\ntag=broken\ndata=broken\n";
   }
 
-  inferflux::PolicyStore restored(tmp_path.string(), "my-secret-pass");
+  inferflux::PolicyStore restored(
+      inferflux::PolicyStoreConfig{tmp_path.string(), "my-secret-pass"});
   REQUIRE(restored.Load());
   REQUIRE(restored.RateLimitPerMinute() == 77);
   auto routing = restored.RoutingPolicy();

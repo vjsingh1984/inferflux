@@ -19,32 +19,32 @@
 
 // Block structure declarations (from dequantization.cuh)
 extern "C" {
-  typedef struct {
-    unsigned short d;
-    unsigned short dmin;
-    unsigned char scales[K_SCALE_SIZE];
-    unsigned char qs[QK_K / 2];
-  } block_q4_k;
+typedef struct {
+  unsigned short d;
+  unsigned short dmin;
+  unsigned char scales[K_SCALE_SIZE];
+  unsigned char qs[QK_K / 2];
+} block_q4_k;
 
-  typedef struct {
-    unsigned short d;
-    unsigned short dmin;
-    unsigned char scales[K_SCALE_SIZE];
-    unsigned char qs[QK_K / 8];
-    unsigned char qh[QK_K / 2];
-  } block_q5_k;
+typedef struct {
+  unsigned short d;
+  unsigned short dmin;
+  unsigned char scales[K_SCALE_SIZE];
+  unsigned char qs[QK_K / 8];
+  unsigned char qh[QK_K / 2];
+} block_q5_k;
 
-  typedef struct {
-    unsigned short d;
-    unsigned char scales[QK_K / 4];
-    unsigned char qs[QK_K / 2];
-    unsigned char qh[QK_K / 16];
-  } block_q6_k;
+typedef struct {
+  unsigned short d;
+  unsigned char scales[QK_K / 4];
+  unsigned char qs[QK_K / 2];
+  unsigned char qh[QK_K / 16];
+} block_q6_k;
 
-  typedef struct {
-    unsigned short d;
-    signed char qs[QK8_0];
-  } block_q8_0;
+typedef struct {
+  unsigned short d;
+  signed char qs[QK8_0];
+} block_q8_0;
 }
 #endif
 
@@ -55,7 +55,8 @@ namespace {
 
 // Helper to create a temporary directory
 fs::path CreateTempDir(const std::string &suffix) {
-  const auto base = fs::temp_directory_path() / ("inferflux_test_" + suffix + "_" +
+  const auto base =
+      fs::temp_directory_path() / ("inferflux_test_" + suffix + "_" +
                                    std::to_string(std::hash<std::thread::id>{}(
                                        std::this_thread::get_id())));
   fs::create_directories(base);
@@ -74,25 +75,23 @@ bool WriteBinaryFile(const fs::path &path, const void *data, size_t size) {
 
 // Helper to create a minimal GGUF header
 std::vector<uint8_t> CreateGGUFHeader(uint32_t tensor_count = 1,
-                                        uint32_t kv_count = 0) {
-  std::vector<uint8_t> header(16);  // GGUF header is 16 bytes
+                                      uint32_t kv_count = 0) {
+  std::vector<uint8_t> header(24); // GGUF v3 header is 24 bytes
 
-  // Magic (8 bytes): "GGUF"
+  // Magic (4 bytes): "GGUF"
   memcpy(header.data(), "GGUF", 4);
-  header[4] = 0;
-  header[5] = 0;
-  header[6] = 0;
-  header[7] = 0;
 
-  // Version (4 bytes)
+  // Version (4 bytes) at offset 4
   uint32_t version = 3;
-  memcpy(header.data() + 8, &version, 4);
+  memcpy(header.data() + 4, &version, 4);
 
-  // Tensor count (4 bytes)
-  memcpy(header.data() + 12, &tensor_count, 4);
+  // Tensor count (8 bytes) at offset 8
+  int64_t tensors_i64 = tensor_count;
+  memcpy(header.data() + 8, &tensors_i64, 8);
 
-  // KV count (4 bytes) - comes after tensor count
-  memcpy(header.data() + 16, &kv_count, 4);
+  // KV count (8 bytes) at offset 16
+  int64_t kv_i64 = kv_count;
+  memcpy(header.data() + 16, &kv_i64, 8);
 
   return header;
 }
@@ -135,32 +134,38 @@ TEST_CASE("GGUF: Is quantized type detection", "[gguf][gguf_util]") {
 }
 
 TEST_CASE("GGUF: Get quantization type string", "[gguf][gguf_util]") {
+  REQUIRE(GetQuantizationType(GGUF::TensorType::Q4_0) == "q4_0");
+  REQUIRE(GetQuantizationType(GGUF::TensorType::Q4_1) == "q4_1");
   REQUIRE(GetQuantizationType(GGUF::TensorType::Q4_K) == "q4_k_m");
+  REQUIRE(GetQuantizationType(GGUF::TensorType::Q5_0) == "q5_0");
+  REQUIRE(GetQuantizationType(GGUF::TensorType::Q5_1) == "q5_1");
   REQUIRE(GetQuantizationType(GGUF::TensorType::Q5_K) == "q5_k_m");
   REQUIRE(GetQuantizationType(GGUF::TensorType::Q6_K) == "q6_k");
+  REQUIRE(GetQuantizationType(GGUF::TensorType::Q8_0) == "q8_0");
+  REQUIRE(GetQuantizationType(GGUF::TensorType::Q8_1) == "q8_1");
   REQUIRE(GetQuantizationType(GGUF::TensorType::F16) == "");
   REQUIRE(GetQuantizationType(GGUF::TensorType::F32) == "");
 }
 
 TEST_CASE("GGUF: Calculate tensor size", "[gguf][gguf_util]") {
   // Q4_K: 256 values per block, 144 bytes per block
-  std::vector<uint32_t> shape_256 = {256, 1};  // 256 values
+  std::vector<uint64_t> shape_256 = {256, 1}; // 256 values
   size_t size_256 = CalcTensorSize(GGUF::TensorType::Q4_K, shape_256);
-  REQUIRE(size_256 == 144);  // 1 block of Q4_K
+  REQUIRE(size_256 == 144); // 1 block of Q4_K
 
-  std::vector<uint32_t> shape_512 = {512, 1};  // 512 values
+  std::vector<uint64_t> shape_512 = {512, 1}; // 512 values
   size_t size_512 = CalcTensorSize(GGUF::TensorType::Q4_K, shape_512);
-  REQUIRE(size_512 == 288);  // 2 blocks of Q4_K
+  REQUIRE(size_512 == 288); // 2 blocks of Q4_K
 
   // F16: 2 bytes per value
-  std::vector<uint32_t> shape_f16 = {1024, 1};
+  std::vector<uint64_t> shape_f16 = {1024, 1};
   size_t size_f16 = CalcTensorSize(GGUF::TensorType::F16, shape_f16);
-  REQUIRE(size_f16 == 2048);  // 1024 * 2 bytes
+  REQUIRE(size_f16 == 2048); // 1024 * 2 bytes
 
   // F32: 4 bytes per value
-  std::vector<uint32_t> shape_f32 = {512, 1};
+  std::vector<uint64_t> shape_f32 = {512, 1};
   size_t size_f32 = CalcTensorSize(GGUF::TensorType::F32, shape_f32);
-  REQUIRE(size_f32 == 2048);  // 512 * 4 bytes
+  REQUIRE(size_f32 == 2048); // 512 * 4 bytes
 }
 
 TEST_CASE("GGUF: Tensor name parsing", "[gguf][gguf_util]") {
@@ -207,6 +212,14 @@ TEST_CASE("GGUF: Tensor name mapping for Qwen2", "[gguf][gguf_util]") {
           "model.layers.0.input_layernorm.weight");
   REQUIRE(GGUFReader::MapTensorName("blk.0.ffn_norm.weight", "qwen2") ==
           "model.layers.0.post_attention_layernorm.weight");
+
+  // Non-zero layer mapping is generated dynamically (not only layer 0).
+  REQUIRE(GGUFReader::MapTensorName("blk.5.attn_q.weight", "qwen2") ==
+          "model.layers.5.self_attn.q_proj.weight");
+  REQUIRE(GGUFReader::MapTensorName("blk.12.ffn_down.weight", "qwen2") ==
+          "model.layers.12.mlp.down_proj.weight");
+  REQUIRE(GGUFReader::MapTensorName("output_norm.weight", "qwen2") ==
+          "model.norm.weight");
 }
 
 TEST_CASE("GGUF: Tensor name mapping for Llama", "[gguf][gguf_util]") {
@@ -301,9 +314,10 @@ TEST_CASE("Quantization: Block size calculation", "[quantization][handler]") {
   REQUIRE(BaseQuantizationHandler::GetBlockSize("q6_k") == 256);
 }
 
-TEST_CASE("Quantization: Quantized size calculation", "[quantization][handler]") {
+TEST_CASE("Quantization: Quantized size calculation",
+          "[quantization][handler]") {
   // Calculate quantized size for different types
-  size_t num_elements = 256;  // One block
+  size_t num_elements = 256; // One block
 
   // Q4_K_M: 144 bytes per 256 values
   size_t q4_k_m_size =
@@ -329,14 +343,15 @@ TEST_CASE("Quantization: Quantized size calculation", "[quantization][handler]")
   // Non-quantized should use FP16 size
   size_t fp16_size =
       BaseQuantizationHandler::GetQuantizedSize(num_elements, "f16");
-  REQUIRE(fp16_size == 512);  // 256 * 2 bytes
+  REQUIRE(fp16_size == 512); // 256 * 2 bytes
 }
 
 //==============================================================================
 // Model Loader Factory Tests
 //==============================================================================
 
-TEST_CASE("ModelLoader: Factory detects format from path", "[model_loader][factory]") {
+TEST_CASE("ModelLoader: Factory detects format from path",
+          "[model_loader][factory]") {
   const auto temp_dir = CreateTempDir("model_loader");
 
   // Create safetensors directory marker
@@ -392,9 +407,9 @@ TEST_CASE("Q4_K_M: Block structure size", "[gguf][block_q4_k]") {
   REQUIRE(sizeof(block_q4_k) == 2 * sizeof(half) + K_SCALE_SIZE + QK_K / 2);
 
   // Verify: 4 + 12 + 128 = 144 bytes
-  REQUIRE(2 * sizeof(half) == 4);    // d + dmin
-  REQUIRE(K_SCALE_SIZE == 12);         // scales + mins
-  REQUIRE(QK_K / 2 == 128);            // quants
+  REQUIRE(2 * sizeof(half) == 4); // d + dmin
+  REQUIRE(K_SCALE_SIZE == 12);    // scales + mins
+  REQUIRE(QK_K / 2 == 128);       // quants
 
   size_t expected = 4 + 12 + 128;
   REQUIRE(sizeof(block_q4_k) == expected);
@@ -402,7 +417,8 @@ TEST_CASE("Q4_K_M: Block structure size", "[gguf][block_q4_k]") {
 
 TEST_CASE("Q5_K_M: Block structure size", "[gguf][block_q5_k]") {
   // Verify: 4 + 12 + 32 + 128 = 176 bytes
-  REQUIRE(sizeof(block_q5_k) == 2 * sizeof(half) + K_SCALE_SIZE + QK_K / 8 + QK_K / 2);
+  REQUIRE(sizeof(block_q5_k) ==
+          2 * sizeof(half) + K_SCALE_SIZE + QK_K / 8 + QK_K / 2);
 
   size_t expected = 4 + 12 + 32 + 128;
   REQUIRE(sizeof(block_q5_k) == expected);
@@ -487,7 +503,7 @@ TEST_CASE("Memory: Quantization compression ratio", "[gguf][memory]") {
 
   size_t params_3b = 3ULL * 1000 * 1000 * 1000;
 
-  size_t bf16_size = params_3b * 2;  // 2 bytes per param
+  size_t bf16_size = params_3b * 2; // 2 bytes per param
   size_t q4_k_m_size = params_3b * 144 / 256 * 2;
   size_t q5_k_m_size = params_3b * 176 / 256 * 2;
   size_t q6_k_size = params_3b * 210 / 256 * 2;

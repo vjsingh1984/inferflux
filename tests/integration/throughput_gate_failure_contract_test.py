@@ -167,6 +167,25 @@ class ThroughputGateFailureContractTests(unittest.TestCase):
         "(inferflux_scheduler_iterations_total phase=\"mixed\" delta must be > 0)",
         stderr)
 
+  def test_harness_exception_is_reported_without_traceback(self):
+    args = make_args()
+    stderr = io.StringIO()
+    stdout = io.StringIO()
+    with mock.patch.object(run_throughput_gate, "parse_args",
+                           return_value=args), \
+        mock.patch.object(run_throughput_gate, "wait_for_server",
+                          side_effect=RuntimeError(
+                              "[Errno 1] Operation not permitted")), \
+        contextlib.redirect_stderr(stderr), \
+        contextlib.redirect_stdout(stdout):
+      exit_code = run_throughput_gate.main()
+
+    self.assertEqual(exit_code, 1)
+    self.assertIn("[throughput-gate] FAILED", stderr.getvalue())
+    self.assertIn("Operation not permitted", stderr.getvalue())
+    self.assertIn("socket operations were blocked", stderr.getvalue())
+    self.assertNotIn("Traceback", stderr.getvalue())
+
 
 if __name__ == "__main__":
   unittest.main()

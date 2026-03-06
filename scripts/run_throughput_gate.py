@@ -75,6 +75,7 @@ class ManagedServer:
 
 @dataclass(frozen=True)
 class GpuProfileDefaults:
+  default_backend: str
   require_cuda_lanes: bool
   require_cuda_overlap: bool
   min_cuda_overlap_duration_ms: float
@@ -90,22 +91,103 @@ class GpuProfileDefaults:
   target_total_prefill_tokens: int
 
 
+def _nvidia_profile(*,
+                    min_cuda_overlap_duration_ms: float,
+                    min_batch_size_max: float,
+                    min_batch_size_utilization: float,
+                    target_total_prefill_tokens: int) -> GpuProfileDefaults:
+  return GpuProfileDefaults(
+      default_backend="cuda",
+      require_cuda_lanes=True,
+      require_cuda_overlap=True,
+      min_cuda_overlap_duration_ms=min_cuda_overlap_duration_ms,
+      max_cuda_attention_fallbacks=1.0,
+      min_batch_size_max=min_batch_size_max,
+      min_batch_size_utilization=min_batch_size_utilization,
+      max_batch_token_budget_skips=-1.0,
+      max_batch_token_budget_skip_ratio=-1.0,
+      require_mixed_scheduler_iterations=True,
+      expect_cuda_attention_kernel="",
+      mixed_prompt_workload=True,
+      unique_prompts=True,
+      target_total_prefill_tokens=target_total_prefill_tokens,
+  )
+
+
+def _non_cuda_profile(default_backend: str) -> GpuProfileDefaults:
+  return GpuProfileDefaults(
+      default_backend=default_backend,
+      require_cuda_lanes=False,
+      require_cuda_overlap=False,
+      min_cuda_overlap_duration_ms=-1.0,
+      max_cuda_attention_fallbacks=-1.0,
+      min_batch_size_max=2.0,
+      min_batch_size_utilization=0.05,
+      max_batch_token_budget_skips=-1.0,
+      max_batch_token_budget_skip_ratio=-1.0,
+      require_mixed_scheduler_iterations=True,
+      expect_cuda_attention_kernel="",
+      mixed_prompt_workload=True,
+      unique_prompts=True,
+      target_total_prefill_tokens=4096,
+  )
+
+
 GPU_PROFILE_DEFAULTS: Dict[str, GpuProfileDefaults] = {
-    "ada_rtx_4000": GpuProfileDefaults(
-        require_cuda_lanes=True,
-        require_cuda_overlap=True,
+    # NVIDIA CUDA profiles
+    "ada_rtx_4000": _nvidia_profile(
         min_cuda_overlap_duration_ms=5.0,
-        max_cuda_attention_fallbacks=1.0,
         min_batch_size_max=2.0,
         min_batch_size_utilization=0.06,
-        max_batch_token_budget_skips=-1.0,
-        max_batch_token_budget_skip_ratio=-1.0,
-        require_mixed_scheduler_iterations=True,
-        expect_cuda_attention_kernel="",
-        mixed_prompt_workload=True,
-        unique_prompts=True,
         target_total_prefill_tokens=4096,
     ),
+    "nvidia_rtx_6000_ada": _nvidia_profile(
+        min_cuda_overlap_duration_ms=7.0,
+        min_batch_size_max=3.0,
+        min_batch_size_utilization=0.08,
+        target_total_prefill_tokens=6144,
+    ),
+    "nvidia_l4": _nvidia_profile(
+        min_cuda_overlap_duration_ms=5.0,
+        min_batch_size_max=2.0,
+        min_batch_size_utilization=0.06,
+        target_total_prefill_tokens=4096,
+    ),
+    "nvidia_l40s": _nvidia_profile(
+        min_cuda_overlap_duration_ms=8.0,
+        min_batch_size_max=4.0,
+        min_batch_size_utilization=0.10,
+        target_total_prefill_tokens=6144,
+    ),
+    "nvidia_a100_80gb": _nvidia_profile(
+        min_cuda_overlap_duration_ms=10.0,
+        min_batch_size_max=4.0,
+        min_batch_size_utilization=0.10,
+        target_total_prefill_tokens=8192,
+    ),
+    "nvidia_h100_pcie": _nvidia_profile(
+        min_cuda_overlap_duration_ms=12.0,
+        min_batch_size_max=4.0,
+        min_batch_size_utilization=0.12,
+        target_total_prefill_tokens=8192,
+    ),
+    "nvidia_h100_sxm": _nvidia_profile(
+        min_cuda_overlap_duration_ms=14.0,
+        min_batch_size_max=5.0,
+        min_batch_size_utilization=0.14,
+        target_total_prefill_tokens=9216,
+    ),
+    # AMD ROCm profiles
+    "amd_mi210": _non_cuda_profile("rocm"),
+    "amd_mi250x": _non_cuda_profile("rocm"),
+    "amd_mi300x": _non_cuda_profile("rocm"),
+    # Intel profiles (Vulkan path today)
+    "intel_arc_a770": _non_cuda_profile("vulkan"),
+    "intel_max_1550": _non_cuda_profile("vulkan"),
+    # Apple MPS profiles
+    "apple_m2_max": _non_cuda_profile("mps"),
+    "apple_m3_max": _non_cuda_profile("mps"),
+    "apple_m4_max": _non_cuda_profile("mps"),
 }
 
 
@@ -241,6 +323,30 @@ def tail_file(path: str, max_bytes: int = 2048) -> str:
     return ""
 
 
+def emit_harness_failure(exc: Exception) -> None:
+  message = str(exc).strip() or exc.__class__.__name__
+  lines = [line.strip() for line in message.splitlines() if line.strip()]
+  if not lines:
+    lines = [exc.__class__.__name__]
+
+  print("[throughput-gate] FAILED", file=sys.stderr)
+  max_lines = 12
+  for line in lines[:max_lines]:
+    print(f"  - {line}", file=sys.stderr)
+  if len(lines) > max_lines:
+    print(f"  - ... ({len(lines) - max_lines} additional line(s))",
+          file=sys.stderr)
+
+  lowered = message.lower()
+  if "operation not permitted" in lowered and (
+      "socket" in lowered or "[errno 1]" in lowered):
+    print(
+        "  - hint: socket operations were blocked by this execution "
+        "environment; rerun with elevated permissions or target an "
+        "already-running server",
+        file=sys.stderr)
+
+
 def start_server(args: argparse.Namespace) -> ManagedServer:
   if not args.server_bin:
     raise ValueError("server_bin must be set to launch a managed server")
@@ -295,28 +401,36 @@ def start_server(args: argparse.Namespace) -> ManagedServer:
   return ManagedServer(process=proc, log_path=log_path)
 
 
-def stop_server(managed: ManagedServer) -> None:
+def stop_server(managed: ManagedServer) -> bool:
   proc = managed.process
   if proc.poll() is not None:
-    return
+    return True
   try:
     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
   except ProcessLookupError:
-    return
+    return True
   except Exception:  # noqa: BLE001
     try:
       proc.terminate()
     except Exception:
-      return
+      return proc.poll() is not None
 
   try:
     proc.wait(timeout=8)
+    return True
   except subprocess.TimeoutExpired:
     try:
       os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except Exception:
-      proc.kill()
-    proc.wait(timeout=5)
+      try:
+        proc.kill()
+      except Exception:
+        return proc.poll() is not None
+    try:
+      proc.wait(timeout=5)
+      return True
+    except subprocess.TimeoutExpired:
+      return proc.poll() is not None
 
 
 def build_request_payload(args: argparse.Namespace, request_index: int) -> Dict:
@@ -607,14 +721,15 @@ def apply_gpu_profile(args: argparse.Namespace) -> argparse.Namespace:
     args.target_total_prefill_tokens = max(args.target_total_prefill_tokens,
                                            defaults.target_total_prefill_tokens)
   if args.backend == "":
-    args.backend = "cuda"
+    args.backend = defaults.default_backend
   return args
 
 
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="Run InferFlux throughput gate.")
+  profile_choices = ["none"] + sorted(GPU_PROFILE_DEFAULTS.keys())
   parser.add_argument("--gpu-profile", default="none",
-                      choices=["none", "ada_rtx_4000"])
+                      choices=profile_choices)
   parser.add_argument("--host", default="127.0.0.1")
   parser.add_argument("--port", type=int, default=18081)
   parser.add_argument("--api-key", default="dev-key-123")
@@ -641,7 +756,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--require-cuda-lanes", action="store_true")
   parser.add_argument("--require-cuda-overlap", action="store_true")
   parser.add_argument("--require-backend-provider", default="any",
-                      choices=["any", "native", "universal"])
+                      choices=["any", "native", "llama_cpp", "universal"])
   parser.add_argument("--require-no-backend-fallback", action="store_true")
   parser.add_argument("--min-cuda-overlap-duration-ms", type=float, default=-1.0)
   parser.add_argument("--max-cuda-attention-fallbacks", type=float, default=-1.0)
@@ -704,6 +819,9 @@ def parse_args() -> argparse.Namespace:
     parser.error("--max-batch-token-budget-skip-ratio must be >= -1.0")
   if args.server_log_path and not args.server_bin:
     parser.error("--server-log-path requires --server-bin")
+  if args.require_backend_provider == "universal":
+    # Backward-compatible alias for older automation.
+    args.require_backend_provider = "llama_cpp"
   return apply_gpu_profile(args)
 
 
@@ -1046,9 +1164,15 @@ def main() -> int:
 
     print("[throughput-gate] PASSED")
     return 0
+  except Exception as exc:  # noqa: BLE001
+    emit_harness_failure(exc)
+    return 1
   finally:
     if managed_server is not None:
-      stop_server(managed_server)
+      stopped_cleanly = stop_server(managed_server)
+      if not stopped_cleanly:
+        print("[throughput-gate] WARN: managed server did not exit cleanly "
+              "during teardown", file=sys.stderr)
       print(f"[throughput-gate] server log: {managed_server.log_path}")
 
 

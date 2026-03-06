@@ -44,6 +44,10 @@ struct LlamaBackendConfig {
   // SerializeSequence/HydrateSequence. Disabled by default because it increases
   // memory footprint.
   bool cuda_phase_overlap_prefill_replica{false};
+  // KV cache precision policy for native CUDA runtime:
+  // auto | fp16 | bf16 | int8 | fp8
+  // `auto` keeps current behavior (match inference dtype).
+  std::string native_kv_cache_dtype{"auto"};
   std::string
       mmproj_path; // Path to multimodal projector; empty = vision disabled.
   // Maximum number of KV-cache sequences that can be live simultaneously.

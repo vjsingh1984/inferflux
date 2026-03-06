@@ -112,6 +112,7 @@ constexpr std::size_t kMaxResponseFormatBytes =
 struct CompletionRequestPayload {
   std::string prompt;
   std::string model{"unknown"};
+  std::string session_id;
   int max_tokens{256};
   std::vector<ChatMessage> messages;
   bool stream{false};
@@ -304,6 +305,9 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
     }
     if (j.contains("model") && j["model"].is_string()) {
       payload.model = j["model"].get<std::string>();
+    }
+    if (j.contains("session_id") && j["session_id"].is_string()) {
+      payload.session_id = j["session_id"].get<std::string>();
     }
     if (j.contains("max_tokens") && j["max_tokens"].is_number_integer()) {
       payload.max_tokens = j["max_tokens"].get<int>();
@@ -2350,6 +2354,10 @@ void HttpServer::HandleClient(ClientSession &session) {
       req.max_tokens = parsed.max_tokens;
     }
     req.model = parsed.model;
+    req.session_id = parsed.session_id;
+    if (req.session_id.empty()) {
+      req.session_id = GetHeaderValue(headers, "x-inferflux-session-id");
+    }
     req.json_mode = parsed.json_mode;
     if (parsed.has_response_format) {
       req.has_response_format = true;

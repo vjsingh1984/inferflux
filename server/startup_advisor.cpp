@@ -1,13 +1,19 @@
 #include "server/startup_advisor.h"
+#include "runtime/backends/cuda/native/gguf_util.h"
 #include "server/logging/logger.h"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef INFERFLUX_HAS_CUDA
@@ -27,6 +33,220 @@ constexpr std::uint64_t kMiB = kKiB * kKiB;
 constexpr std::uint64_t kGiB = kMiB * kKiB;
 constexpr std::uint32_t kLoadOverheadNumerator = 11U;
 constexpr std::uint32_t kLoadOverheadDenominator = 10U;
+
+using GgufTensorType = ::inferflux::runtime::cuda::native::GGUF::TensorType;
+
+bool IsQuantizedQuantizationType(QuantizationType q) {
+  switch (q) {
+  case QuantizationType::kQ8_1:
+  case QuantizationType::kQ8_0:
+  case QuantizationType::kQ8_K:
+  case QuantizationType::kQ6_K:
+  case QuantizationType::kQ5_1:
+  case QuantizationType::kQ5_0:
+  case QuantizationType::kQ5_K_M:
+  case QuantizationType::kQ5_K:
+  case QuantizationType::kQ4_1:
+  case QuantizationType::kQ4_0:
+  case QuantizationType::kQ4_K_M:
+  case QuantizationType::kQ4_K:
+  case QuantizationType::kQ3_K:
+  case QuantizationType::kQ3_K_M:
+  case QuantizationType::kQ2_K:
+    return true;
+  default:
+    return false;
+  }
+}
+
+QuantizationType QuantizationTypeFromGgufTensorType(GgufTensorType type) {
+  switch (type) {
+  case GgufTensorType::F32:
+    return QuantizationType::kFp32;
+  case GgufTensorType::F16:
+    return QuantizationType::kFp16;
+  case GgufTensorType::Q8_1:
+    return QuantizationType::kQ8_1;
+  case GgufTensorType::Q8_0:
+    return QuantizationType::kQ8_0;
+  case GgufTensorType::Q8_K:
+    return QuantizationType::kQ8_K;
+  case GgufTensorType::Q6_K:
+    return QuantizationType::kQ6_K;
+  case GgufTensorType::Q5_1:
+    return QuantizationType::kQ5_1;
+  case GgufTensorType::Q5_0:
+    return QuantizationType::kQ5_0;
+  case GgufTensorType::Q5_K:
+    return QuantizationType::kQ5_K;
+  case GgufTensorType::Q4_1:
+    return QuantizationType::kQ4_1;
+  case GgufTensorType::Q4_0:
+    return QuantizationType::kQ4_0;
+  case GgufTensorType::Q4_K:
+    return QuantizationType::kQ4_K;
+  case GgufTensorType::Q3_K:
+    return QuantizationType::kQ3_K;
+  case GgufTensorType::Q2_K:
+    return QuantizationType::kQ2_K;
+  default:
+    return QuantizationType::kUnknown;
+  }
+}
+
+bool ReadU32(FILE *file, uint32_t *out) {
+  if (!file || !out) {
+    return false;
+  }
+  return fread(out, sizeof(uint32_t), 1, file) == 1;
+}
+
+std::filesystem::path ResolveGgufPath(const std::filesystem::path &path) {
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(path, ec) &&
+      path.extension() == ".gguf") {
+    return path;
+  }
+  if (!std::filesystem::is_directory(path, ec)) {
+    return {};
+  }
+
+  std::filesystem::path first_gguf;
+  for (const auto &entry : std::filesystem::directory_iterator(path, ec)) {
+    if (ec) {
+      break;
+    }
+    if (!entry.is_regular_file(ec)) {
+      continue;
+    }
+    if (entry.path().extension() != ".gguf") {
+      continue;
+    }
+    if (first_gguf.empty() || entry.path().filename() < first_gguf.filename()) {
+      first_gguf = entry.path();
+    }
+  }
+  return first_gguf;
+}
+
+QuantizationType DetectQuantizationFromGgufMetadata(
+    const std::filesystem::path &path) {
+  const std::filesystem::path gguf_path = ResolveGgufPath(path);
+  if (gguf_path.empty()) {
+    return QuantizationType::kUnknown;
+  }
+
+  FILE *file = fopen(gguf_path.c_str(), "rb");
+  if (!file) {
+    return QuantizationType::kUnknown;
+  }
+
+  ::inferflux::runtime::cuda::native::GGUF::Header header{};
+  if (!ReadU32(file, &header.magic) || !ReadU32(file, &header.version) ||
+      !::inferflux::runtime::cuda::native::GGUFReader::ReadInt64(
+          file, &header.tensor_count) ||
+      !::inferflux::runtime::cuda::native::GGUFReader::ReadInt64(
+          file, &header.kv_count)) {
+    fclose(file);
+    return QuantizationType::kUnknown;
+  }
+
+  if (!::inferflux::runtime::cuda::native::ValidateGGUFHeader(header) ||
+      header.tensor_count < 0 || header.kv_count < 0) {
+    fclose(file);
+    return QuantizationType::kUnknown;
+  }
+
+  for (int64_t i = 0; i < header.kv_count; ++i) {
+    std::string key;
+    if (!::inferflux::runtime::cuda::native::GGUFReader::ReadString(file, &key)) {
+      fclose(file);
+      return QuantizationType::kUnknown;
+    }
+    uint32_t type_raw = 0;
+    if (!ReadU32(file, &type_raw)) {
+      fclose(file);
+      return QuantizationType::kUnknown;
+    }
+    const auto value_type = static_cast<::inferflux::runtime::cuda::native::GGUF::ValueType>(type_raw);
+    if (!::inferflux::runtime::cuda::native::GGUFReader::SkipValue(file, value_type)) {
+      fclose(file);
+      return QuantizationType::kUnknown;
+    }
+  }
+
+  constexpr std::size_t kTensorTypeCount =
+      static_cast<std::size_t>(GgufTensorType::Q8_K) + 1U;
+  std::array<std::size_t, kTensorTypeCount> type_counts{};
+
+  for (int64_t i = 0; i < header.tensor_count; ++i) {
+    std::string tensor_name;
+    if (!::inferflux::runtime::cuda::native::GGUFReader::ReadString(file,
+                                                                     &tensor_name)) {
+      fclose(file);
+      return QuantizationType::kUnknown;
+    }
+    uint32_t n_dims = 0;
+    if (!ReadU32(file, &n_dims)) {
+      fclose(file);
+      return QuantizationType::kUnknown;
+    }
+    for (uint32_t dim_idx = 0; dim_idx < n_dims; ++dim_idx) {
+      int64_t dim = 0;
+      if (!::inferflux::runtime::cuda::native::GGUFReader::ReadInt64(file, &dim)) {
+        fclose(file);
+        return QuantizationType::kUnknown;
+      }
+    }
+
+    uint32_t type_raw = 0;
+    if (!ReadU32(file, &type_raw)) {
+      fclose(file);
+      return QuantizationType::kUnknown;
+    }
+    uint64_t offset = 0;
+    if (!::inferflux::runtime::cuda::native::GGUFReader::ReadUint64(file,
+                                                                     &offset)) {
+      fclose(file);
+      return QuantizationType::kUnknown;
+    }
+    (void)offset;
+
+    if (type_raw >= kTensorTypeCount) {
+      continue;
+    }
+    ++type_counts[type_raw];
+  }
+
+  fclose(file);
+
+  std::size_t best_quantized_count = 0;
+  GgufTensorType best_quantized_type = GgufTensorType::F16;
+  for (std::size_t idx = 0; idx < kTensorTypeCount; ++idx) {
+    const auto type = static_cast<GgufTensorType>(idx);
+    if (!::inferflux::runtime::cuda::native::IsQuantizedType(type)) {
+      continue;
+    }
+    if (type_counts[idx] > best_quantized_count) {
+      best_quantized_count = type_counts[idx];
+      best_quantized_type = type;
+    }
+  }
+
+  if (best_quantized_count > 0) {
+    return QuantizationTypeFromGgufTensorType(best_quantized_type);
+  }
+
+  const std::size_t f16_count =
+      type_counts[static_cast<std::size_t>(GgufTensorType::F16)];
+  const std::size_t f32_count =
+      type_counts[static_cast<std::size_t>(GgufTensorType::F32)];
+  if (f16_count == 0 && f32_count == 0) {
+    return QuantizationType::kUnknown;
+  }
+  return f16_count >= f32_count ? QuantizationType::kFp16
+                                : QuantizationType::kFp32;
+}
 
 std::uint64_t ScaleByPercent(std::uint64_t value, std::uint32_t percent) {
 #if defined(__SIZEOF_INT128__)
@@ -106,26 +326,42 @@ QuantizationType DetectQuantizationFromFilename(const std::string &filename) {
       lower.begin(), lower.end(), lower.begin(),
       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
 
-  if (lower.find("q4_k_m") != std::string::npos)
-    return QuantizationType::kQ4_K_M;
-  if (lower.find("q4_k") != std::string::npos)
-    return QuantizationType::kQ4_K;
+  if (lower.find("q8_k") != std::string::npos)
+    return QuantizationType::kQ8_K;
+  if (lower.find("q8_1") != std::string::npos)
+    return QuantizationType::kQ8_1;
+  if (lower.find("q8_0") != std::string::npos)
+    return QuantizationType::kQ8_0;
+  if (lower.find("q6_k") != std::string::npos)
+    return QuantizationType::kQ6_K;
   if (lower.find("q5_k_m") != std::string::npos)
     return QuantizationType::kQ5_K_M;
   if (lower.find("q5_k") != std::string::npos)
     return QuantizationType::kQ5_K;
-  if (lower.find("q6_k") != std::string::npos)
-    return QuantizationType::kQ6_K;
-  if (lower.find("q8_0") != std::string::npos)
-    return QuantizationType::kQ8_0;
+  if (lower.find("q5_1") != std::string::npos)
+    return QuantizationType::kQ5_1;
+  if (lower.find("q5_0") != std::string::npos)
+    return QuantizationType::kQ5_0;
+  if (lower.find("q4_k_m") != std::string::npos)
+    return QuantizationType::kQ4_K_M;
+  if (lower.find("q4_k") != std::string::npos)
+    return QuantizationType::kQ4_K;
+  if (lower.find("q4_1") != std::string::npos)
+    return QuantizationType::kQ4_1;
+  if (lower.find("q4_0") != std::string::npos)
+    return QuantizationType::kQ4_0;
   if (lower.find("q3_k_m") != std::string::npos)
     return QuantizationType::kQ3_K_M;
+  if (lower.find("q3_k") != std::string::npos)
+    return QuantizationType::kQ3_K;
   if (lower.find("q2_k") != std::string::npos)
     return QuantizationType::kQ2_K;
-  if (lower.find("f16") != std::string::npos)
-    return QuantizationType::kFp16;
   if (lower.find("bf16") != std::string::npos)
     return QuantizationType::kBf16;
+  if (lower.find("fp16") != std::string::npos ||
+      lower.find("f16") != std::string::npos) {
+    return QuantizationType::kFp16;
+  }
   if (lower.find("fp32") != std::string::npos ||
       lower.find("f32") != std::string::npos) {
     return QuantizationType::kFp32;
@@ -196,8 +432,9 @@ int CheckQuantizationMismatch(const StartupAdvisorContext &ctx) {
     if (m.format == "gguf" && m.quantization == QuantizationType::kUnknown) {
       log::Info(kComponent,
                 "[RECOMMEND] quantization: Model '" + m.id +
-                    "' is GGUF but quantization type unknown — ensure filename "
-                    "contains quantization (e.g., q4_k_m, q5_k_m)");
+                    "' is GGUF but quantization type is unknown — ensure the "
+                    "path points to a valid GGUF file with readable tensor "
+                    "metadata");
       ++count;
     }
   }
@@ -262,7 +499,7 @@ CalculateOptimalSlotAllocation(const StartupAdvisorContext &ctx) {
   if (model.quantization == QuantizationType::kFp16 ||
       model.quantization == QuantizationType::kBf16) {
     activation_overhead_pct = 50;
-  } else if (model.quantization >= QuantizationType::kQ8_0) {
+  } else if (IsQuantizedQuantizationType(model.quantization)) {
     activation_overhead_pct = 20;
   }
 
@@ -393,6 +630,11 @@ CalculateOptimalSlotAllocation(const StartupAdvisorContext &ctx) {
 QuantizationType DetectQuantization(const std::string &model_path,
                                     const std::string &format) {
   if (format == "gguf") {
+    const auto from_metadata =
+        DetectQuantizationFromGgufMetadata(std::filesystem::path(model_path));
+    if (from_metadata != QuantizationType::kUnknown) {
+      return from_metadata;
+    }
     return DetectQuantizationFromFilename(
         std::filesystem::path(model_path).filename().string());
   }
@@ -411,18 +653,32 @@ std::string GetQuantizationString(QuantizationType q) {
     return "FP16";
   case QuantizationType::kBf16:
     return "BF16";
+  case QuantizationType::kQ8_1:
+    return "Q8_1";
   case QuantizationType::kQ8_0:
     return "Q8_0";
+  case QuantizationType::kQ8_K:
+    return "Q8_K";
   case QuantizationType::kQ6_K:
     return "Q6_K";
+  case QuantizationType::kQ5_1:
+    return "Q5_1";
+  case QuantizationType::kQ5_0:
+    return "Q5_0";
   case QuantizationType::kQ5_K_M:
     return "Q5_K_M";
   case QuantizationType::kQ5_K:
     return "Q5_K";
+  case QuantizationType::kQ4_1:
+    return "Q4_1";
+  case QuantizationType::kQ4_0:
+    return "Q4_0";
   case QuantizationType::kQ4_K_M:
     return "Q4_K_M";
   case QuantizationType::kQ4_K:
     return "Q4_K";
+  case QuantizationType::kQ3_K:
+    return "Q3_K";
   case QuantizationType::kQ3_K_M:
     return "Q3_K_M";
   case QuantizationType::kQ2_K:
@@ -448,11 +704,24 @@ std::uint64_t EstimateLoadedModelSize(const AdvisorModelInfo &model) {
   std::uint32_t compression_denominator = 1U;
 
   switch (model.quantization) {
+  case QuantizationType::kQ2_K:
+    compression_numerator = 8U;
+    compression_denominator = 1U;
+    break;
+  case QuantizationType::kQ3_K:
+  case QuantizationType::kQ3_K_M:
+    compression_numerator = 5U;
+    compression_denominator = 1U;
+    break;
+  case QuantizationType::kQ4_0:
+  case QuantizationType::kQ4_1:
   case QuantizationType::kQ4_K_M:
   case QuantizationType::kQ4_K:
     compression_numerator = 9U;
     compression_denominator = 2U; // ~4.5x compression from FP16
     break;
+  case QuantizationType::kQ5_0:
+  case QuantizationType::kQ5_1:
   case QuantizationType::kQ5_K_M:
   case QuantizationType::kQ5_K:
     compression_numerator = 7U;
@@ -462,7 +731,9 @@ std::uint64_t EstimateLoadedModelSize(const AdvisorModelInfo &model) {
     compression_numerator = 3U;
     compression_denominator = 1U;
     break;
+  case QuantizationType::kQ8_1:
   case QuantizationType::kQ8_0:
+  case QuantizationType::kQ8_K:
     compression_numerator = 2U;
     compression_denominator = 1U;
     break;
@@ -476,16 +747,16 @@ std::uint64_t EstimateLoadedModelSize(const AdvisorModelInfo &model) {
     compression_denominator = 1U;
     break;
   default:
-    // Estimate from filename if unknown
     if (model.format == "gguf") {
-      QuantizationType detected = DetectQuantizationFromFilename(model.path);
-      if (detected == QuantizationType::kQ4_K_M ||
-          detected == QuantizationType::kQ4_K) {
-        compression_numerator = 9U;
-        compression_denominator = 2U;
-      } else {
+      const QuantizationType detected =
+          DetectQuantization(model.path, model.format);
+      if (detected == QuantizationType::kUnknown) {
         compression_numerator = 2U;
         compression_denominator = 1U;
+      } else {
+        AdvisorModelInfo inferred = model;
+        inferred.quantization = detected;
+        return EstimateLoadedModelSize(inferred);
       }
     }
     break;
@@ -541,7 +812,7 @@ int CheckBackendMismatch(const StartupAdvisorContext &ctx) {
         m.backend_provider == "llama_cpp") {
       log::Info(kComponent, "[RECOMMEND] backend: Model '" + m.id +
                                 "' uses safetensors on CUDA — set "
-                                "INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel");
+                                "backend to cuda_native");
       ++count;
     }
   }

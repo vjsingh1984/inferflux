@@ -27,9 +27,6 @@ BackendExposurePolicy LoadPolicy() {
 }
 
 bool SupportsNativeBackend(LlamaBackendTarget target) {
-  // Policy-path native selection remains disabled until native kernels are
-  // implemented and stable. Explicit backend hints (cuda_native) are still
-  // routable for scaffold/testing.
   if (target == LlamaBackendTarget::kCuda) {
     return NativeCudaBackend::NativeKernelsReady();
   }
@@ -70,7 +67,7 @@ BackendFactoryResult CpuFallback(const std::string &reason) {
 }
 
 BackendFactoryResult LlamaCppForTarget(LlamaBackendTarget target,
-                                      const std::string &hint) {
+                                       const std::string &hint) {
   BackendFactoryResult out;
   out.target = target;
   out.traits = DescribeLlamaBackendTarget(target);
@@ -214,13 +211,29 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
 
   if (hint == "cuda" || hint == "mps" || hint == "rocm" || hint == "vulkan") {
     if (force_native) {
-      if (policy.strict_native_request && !SupportsNativeBackend(target)) {
+      if (!SupportsNativeBackend(target)) {
+        if (policy.strict_native_request) {
+          return NativeUnavailableResult(
+              target, traits,
+              "backend_policy_violation: strict_native_request enabled; "
+              "native backend explicitly requested but native kernels are not "
+              "ready");
+        }
+        if (policy.allow_llama_cpp_fallback) {
+          auto out = LlamaCppForTarget(target, hint);
+          out.used_fallback = true;
+          out.fallback_reason =
+              "native backend explicitly requested but unavailable; exposed "
+              "llama.cpp backend";
+          log::Warn("backend_factory", out.fallback_reason);
+          return out;
+        }
         return NativeUnavailableResult(
             target, traits,
-            "backend_policy_violation: strict_native_request enabled; "
-            "native backend explicitly requested but native kernels are not "
-            "ready");
+            "native backend explicitly requested but unavailable; "
+            "llama.cpp fallback disabled");
       }
+
       auto backend = CreateNativeBackendForTarget(target);
       if (backend) {
         BackendFactoryResult out;
@@ -231,14 +244,7 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
         out.provider = BackendProvider::kNative;
         out.backend = std::move(backend);
         out.config = TuneLlamaBackendConfig(target, {});
-        if (!SupportsNativeBackend(target)) {
-          out.used_fallback = true;
-          out.fallback_reason =
-              "native backend scaffold mode active; native kernels are not "
-              "wired yet";
-          log::Warn("backend_factory", "Using native scaffold backend for '" +
-                                           hint + "': " + out.fallback_reason);
-        }
+        out.require_strict_native_execution = policy.strict_native_request;
         return out;
       }
       return NativeUnavailableResult(
@@ -253,20 +259,30 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
     if (policy.prefer_native && SupportsNativeBackend(target)) {
       // Native kernels are ready - create native backend
       auto backend = CreateNativeBackendForTarget(target);
-      if (!backend) {
-        return NativeUnavailableResult(
-            target, traits,
-            "native backend indicated as ready but creation failed");
+      if (backend) {
+        BackendFactoryResult out;
+        out.target = target;
+        out.traits = traits;
+        out.capabilities = traits.capabilities;
+        out.backend_label = traits.label;
+        out.provider = BackendProvider::kNative;
+        out.backend = std::move(backend);
+        out.config = TuneLlamaBackendConfig(target, {});
+        return out;
       }
-      BackendFactoryResult out;
-      out.target = target;
-      out.traits = traits;
-      out.capabilities = traits.capabilities;
-      out.backend_label = traits.label;
-      out.provider = BackendProvider::kNative;
-      out.backend = std::move(backend);
-      out.config = TuneLlamaBackendConfig(target, {});
-      return out;
+      if (policy.allow_llama_cpp_fallback) {
+        auto out = LlamaCppForTarget(target, hint);
+        out.used_fallback = true;
+        out.fallback_reason =
+            "native backend reported ready but creation failed; exposed "
+            "llama.cpp backend";
+        log::Warn("backend_factory", out.fallback_reason);
+        return out;
+      }
+      return NativeUnavailableResult(
+          target, traits,
+          "native backend indicated as ready but creation failed; "
+          "llama.cpp fallback disabled");
     }
 
     if (policy.prefer_native && !policy.allow_llama_cpp_fallback) {

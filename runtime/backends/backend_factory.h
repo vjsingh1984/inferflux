@@ -31,6 +31,7 @@ struct BackendFactoryResult {
   BackendProvider provider{BackendProvider::kLlamaCpp};
   bool used_fallback{false};
   std::string fallback_reason;
+  bool require_strict_native_execution{false};
   LlamaBackendConfig config{};
 };
 

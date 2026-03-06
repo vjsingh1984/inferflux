@@ -132,8 +132,8 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
   auto device = std::make_shared<CPUDeviceContext>();
   auto cache = std::make_shared<PagedKVCache>(
       10, 1024, PagedKVCache::EvictionPolicy::kLRU);
-  auto prefix_cache =
-      std::make_shared<RadixPrefixCache>(cache, [](int) {}, 1024, 12);
+  auto prefix_cache = std::make_shared<RadixPrefixCache>(
+      cache, [](int) {}, RadixPrefixCacheLimits{1024, 12});
   auto router = std::make_shared<SingleModelRouter>();
   auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
                                                   router, nullptr);
@@ -436,7 +436,8 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     REQUIRE_FALSE(saw_auto_lane);
   }
 
-  SECTION("ExecuteUnifiedBatchStep respects backend token capacity for prefill") {
+  SECTION(
+      "ExecuteUnifiedBatchStep respects backend token capacity for prefill") {
     auto async_backend = std::make_shared<MockAsyncUnifiedBackend>();
     async_backend->token_capacity = 6;
 

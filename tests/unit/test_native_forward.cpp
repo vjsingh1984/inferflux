@@ -81,7 +81,7 @@ TEST_CASE("NativeTokenizer: Load returns false for missing file",
 
 TEST_CASE("NativeKernelExecutor: Name and fallback state", "[native_forward]") {
   NativeKernelExecutor executor;
-  REQUIRE(executor.Name() == "native_cuda_kernels");
+  REQUIRE(executor.Name() == "native_cuda");
   REQUIRE_FALSE(executor.IsFallback());
   REQUIRE(executor.FallbackReason().empty());
   REQUIRE(executor.BackendHandle() == nullptr);

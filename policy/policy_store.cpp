@@ -89,12 +89,16 @@ bool ParseBoolValue(const std::string &value, bool *parsed) {
 }
 } // namespace
 
-PolicyStore::PolicyStore(std::string path, std::string passphrase)
-    : path_(std::move(path)), encryption_enabled_(!passphrase.empty()) {
+PolicyStore::PolicyStore(std::string path)
+    : PolicyStore(PolicyStoreConfig{std::move(path), ""}) {}
+
+PolicyStore::PolicyStore(PolicyStoreConfig config)
+    : path_(std::move(config.path)),
+      encryption_enabled_(!config.passphrase.empty()) {
   if (encryption_enabled_) {
     unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256(reinterpret_cast<const unsigned char *>(passphrase.data()),
-           passphrase.size(), hash);
+    SHA256(reinterpret_cast<const unsigned char *>(config.passphrase.data()),
+           config.passphrase.size(), hash);
     std::copy(hash, hash + key_.size(), key_.begin());
   }
 }

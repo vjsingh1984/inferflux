@@ -26,7 +26,7 @@ TEST_CASE("PrefixCache hit after insert", "[prefix_cache]") {
 }
 
 TEST_CASE("RadixPrefixCache LRU eviction", "[prefix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, 4, 12);
+  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{4, 12});
   // Fill capacity.
   cache.Insert({1}, {10}, 1, nullptr);
   cache.Insert({2}, {11}, 2, nullptr);
@@ -35,18 +35,16 @@ TEST_CASE("RadixPrefixCache LRU eviction", "[prefix_cache]") {
   REQUIRE(cache.Size() == 4);
 
   // Use {1}.
-  std::vector<int> out;
-  int out_seq = -1;
-  int matched = 0;
+  RadixLookupResult lookup;
   // Node hit on {1}.
-  REQUIRE(cache.Lookup({1}, nullptr, &out, &out_seq, &matched));
+  REQUIRE(cache.Lookup({1}, nullptr, &lookup));
 
   // Insert {5} — should evict {2} (LRU).
   cache.Insert({5}, {14}, 5, nullptr);
   REQUIRE(cache.Size() == 4);
   // {2} was pruned from trie.
-  REQUIRE_FALSE(cache.Lookup({2}, nullptr, &out, &out_seq, &matched));
-  REQUIRE(cache.Lookup({1}, nullptr, &out, &out_seq, &matched));
+  REQUIRE_FALSE(cache.Lookup({2}, nullptr, &lookup));
+  REQUIRE(cache.Lookup({1}, nullptr, &lookup));
 }
 
 TEST_CASE("PrefixCache thread safety", "[prefix_cache]") {

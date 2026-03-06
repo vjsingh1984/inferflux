@@ -108,27 +108,35 @@ TEST_CASE(
   BackendFactory::SetExposurePolicy({true, true});
 }
 
-TEST_CASE("BackendFactory explicit cuda_native hint requires native provider",
+TEST_CASE("BackendFactory explicit cuda_native hint uses native or deterministic fallback",
           "[backend_factory]") {
   BackendFactory::SetExposurePolicy({false, true});
   auto selection = BackendFactory::Create("cuda_native");
 
-  REQUIRE(selection.provider == BackendProvider::kNative);
 #ifdef INFERFLUX_HAS_CUDA
-  REQUIRE(selection.backend != nullptr);
-  REQUIRE(selection.backend_label == "cuda");
-  REQUIRE(dynamic_cast<NativeCudaBackend *>(selection.backend.get()) !=
-          nullptr);
   if (NativeCudaBackend::NativeKernelsReady()) {
+    REQUIRE(selection.provider == BackendProvider::kNative);
+    REQUIRE(selection.backend != nullptr);
+    REQUIRE(selection.backend_label == "cuda");
+    REQUIRE(dynamic_cast<NativeCudaBackend *>(selection.backend.get()) !=
+            nullptr);
     REQUIRE_FALSE(selection.used_fallback);
     REQUIRE(selection.fallback_reason.empty());
   } else {
+    REQUIRE(selection.provider == BackendProvider::kLlamaCpp);
+    REQUIRE(selection.backend != nullptr);
+    REQUIRE(selection.backend_label == "cuda");
+    REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) != nullptr);
     REQUIRE(selection.used_fallback);
-    REQUIRE(selection.fallback_reason.find("scaffold mode") !=
+    REQUIRE(selection.fallback_reason.find("explicitly requested") !=
             std::string::npos);
   }
 #else
-  REQUIRE(selection.backend == nullptr);
+  REQUIRE(selection.provider == BackendProvider::kLlamaCpp);
+  REQUIRE(selection.backend != nullptr);
+  REQUIRE(selection.backend_label == "cpu");
+  REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) == nullptr);
+  REQUIRE(selection.used_fallback);
   REQUIRE(selection.fallback_reason.find("explicitly requested") !=
           std::string::npos);
 #endif
