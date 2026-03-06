@@ -1,9 +1,12 @@
 #pragma once
 
-#include "runtime/backends/cuda/native_cuda_executor.h"
+#include "runtime/backends/cuda/native_cuda_runtime.h"
+#include "runtime/backends/cuda/native/model_loader.h"
+#include "runtime/backends/cuda/native/strategy_registry.h"
 #include <atomic>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -21,6 +24,7 @@ class GpuSampler;
 template <typename T> class WeightMapTyped;
 using WeightMap = WeightMapTyped<half>;
 class NativeTokenizer;
+class QuantizedWeightMap;
 } // namespace inferflux
 
 namespace inferflux {
@@ -155,13 +159,13 @@ private:
  * - CUTLASS/cuBLAS for GEMM
  * - NO llama.cpp dependency
  */
-class NativeKernelExecutor final : public NativeCudaExecutor {
+class NativeKernelExecutor final : public NativeCudaRuntime {
 public:
   NativeKernelExecutor();
   ~NativeKernelExecutor() override;
 
-  // NativeCudaExecutor interface
-  std::string Name() const override { return "native_cuda_kernels"; }
+  // NativeCudaRuntime interface
+  std::string Name() const override { return "native_cuda"; }
   bool IsFallback() const override { return false; } // We use native kernels!
   const std::string &FallbackReason() const override {
     static const std::string no_reason;
@@ -215,6 +219,9 @@ public:
 private:
   // Model loading
   std::unique_ptr<SafetensorsLoader> loader_;
+  std::unique_ptr<runtime::cuda::native::IModelLoader> model_loader_;
+  runtime::cuda::native::ModelInfo model_info_;
+  std::filesystem::path loaded_model_path_;
   bool model_loaded_{false};
 
   // CUDA state
@@ -232,6 +239,9 @@ private:
   bool has_flash_attention_2_{true};
   bool use_flash_attention_{true};
   InferenceDtype inference_dtype_{InferenceDtype::kFP16};
+  runtime::cuda::native::KvPrecision kv_precision_{
+      runtime::cuda::native::KvPrecision::kFp16};
+  std::string kv_precision_hint_{"auto"};
 
   // Native kernel pipeline components (only available with CUDA)
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
@@ -240,6 +250,7 @@ private:
   std::unique_ptr<CublasGemm> gemm_;
   std::unique_ptr<GpuSampler> sampler_;
   std::unique_ptr<WeightMap> weight_map_;
+  std::unique_ptr<QuantizedWeightMap> quantized_weight_map_;
 #endif
   std::unique_ptr<NativeTokenizer> tokenizer_;
 

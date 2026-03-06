@@ -1,10 +1,7 @@
 #pragma once
 
-#include "runtime/backends/common/backend_interface.h"
 #include "runtime/backends/common/backend_types.h"
 #include "runtime/backends/cpu/llama_backend.h"
-#include "runtime/backends/cuda/cuda_backend.h"
-#include "runtime/backends/llama/llama_backend_traits.h"
 
 #include <filesystem>
 #include <memory>
@@ -13,11 +10,8 @@
 
 namespace inferflux {
 
-class NativeCudaExecutor {
+class NativeCudaRuntime {
 public:
-  // When INFERFLUX_USE_COMMON_BACKEND_TYPES is enabled, use common types
-  // directly. Otherwise, use type aliases to LlamaCPUBackend for backward
-  // compatibility.
 #ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
   using UnifiedBatchHandle = ::inferflux::UnifiedBatchHandle;
   using UnifiedBatchInput = ::inferflux::UnifiedBatchInput;
@@ -30,7 +24,7 @@ public:
   using UnifiedBatchOutput = LlamaCPUBackend::UnifiedBatchOutput;
 #endif
 
-  virtual ~NativeCudaExecutor() = default;
+  virtual ~NativeCudaRuntime() = default;
 
   virtual std::string Name() const = 0;
   virtual bool IsFallback() const = 0;
@@ -49,7 +43,6 @@ public:
                               std::vector<UnifiedBatchOutput> *outputs) = 0;
   virtual std::shared_ptr<LlamaCPUBackend> BackendHandle() const = 0;
 
-  // Native perf snapshot for backends without a llama.cpp BackendHandle().
   struct NativePerfSnapshot {
     double prefill_ms{0.0};
     double decode_ms{0.0};
@@ -58,35 +51,37 @@ public:
   };
   virtual NativePerfSnapshot NativeTakePerf() { return {}; }
 
-  // Native* methods: allow NativeKernelExecutor to provide tokenization,
-  // readiness, and sequence management without a llama.cpp BackendHandle().
-  // Default implementations delegate to BackendHandle() for backward compat.
   virtual std::vector<int> NativeTokenize(const std::string &prompt) const {
-    auto bh = BackendHandle();
-    return bh ? bh->TokenizeForCache(prompt) : std::vector<int>{};
+    auto backend = BackendHandle();
+    return backend ? backend->TokenizeForCache(prompt) : std::vector<int>{};
   }
+
   virtual int NativeTokenCount(const std::string &text) const {
-    auto bh = BackendHandle();
-    return bh ? bh->TokenCount(text) : 0;
+    auto backend = BackendHandle();
+    return backend ? backend->TokenCount(text) : 0;
   }
+
   virtual bool NativeIsReady() const {
-    auto bh = BackendHandle();
-    return bh && bh->IsReady();
+    auto backend = BackendHandle();
+    return backend && backend->IsReady();
   }
+
   virtual void NativeFreeSequence(int sequence_id) {
-    auto bh = BackendHandle();
-    if (bh)
-      bh->FreeSequence(sequence_id);
+    auto backend = BackendHandle();
+    if (backend) {
+      backend->FreeSequence(sequence_id);
+    }
   }
+
   virtual void NativeCopySequencePrefix(int src_seq, int dst_seq,
                                         int n_tokens) {
-    auto bh = BackendHandle();
-    if (bh)
-      bh->CopySequencePrefix(src_seq, dst_seq, n_tokens);
+    auto backend = BackendHandle();
+    if (backend) {
+      backend->CopySequencePrefix(src_seq, dst_seq, n_tokens);
+    }
   }
 };
 
-std::unique_ptr<NativeCudaExecutor>
-CreateNativeCudaExecutor(const std::string &executor_hint);
+std::unique_ptr<NativeCudaRuntime> CreateNativeCudaRuntime();
 
 } // namespace inferflux

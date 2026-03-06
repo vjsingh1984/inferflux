@@ -1,10 +1,12 @@
 #include "runtime/backends/cuda/native_cuda_backend.h"
 
-#include "runtime/backends/cuda/native_cuda_executor.h"
-#include "model/model_format.h"
+#include "runtime/backends/cuda/native_cuda_runtime.h"
 #include "server/logging/logger.h"
 
-#include <algorithm>
+#ifdef INFERFLUX_HAS_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 #include <cctype>
 #include <cstdlib>
 #include <string>
@@ -13,17 +15,25 @@ namespace inferflux {
 
 namespace {
 
+bool ParseBoolValue(const char *raw) {
+  if (!raw) {
+    return false;
+  }
+  std::string lowered(raw);
+  for (auto &ch : lowered) {
+    ch = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(ch)));
+  }
+  return lowered == "1" || lowered == "true" || lowered == "yes" ||
+         lowered == "on";
+}
+
 bool ParseBoolEnv(const char *name, bool default_value) {
   const char *raw = std::getenv(name);
   if (!raw) {
     return default_value;
   }
-  std::string lowered = raw;
-  std::transform(
-      lowered.begin(), lowered.end(), lowered.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return lowered == "1" || lowered == "true" || lowered == "yes" ||
-         lowered == "on";
+  return ParseBoolValue(raw);
 }
 
 } // namespace
@@ -35,58 +45,44 @@ NativeCudaBackend::~NativeCudaBackend() = default;
 bool NativeCudaBackend::LoadModel(const std::filesystem::path &model_path,
                                   const LlamaBackendConfig &config) {
 #ifdef INFERFLUX_HAS_CUDA
-  // Default executor kind
-  executor_kind_ = "delegate";
+  const bool strict_native_execution =
+      ParseBoolEnv("INFERFLUX_NATIVE_CUDA_STRICT", false);
 
-  // Check environment variable override
-  const char *executor_hint = std::getenv("INFERFLUX_NATIVE_CUDA_EXECUTOR");
-  if (executor_hint) {
-    executor_kind_ = executor_hint;
-    log::Info("native_cuda_backend",
-              "Executor hint from env: INFERFLUX_NATIVE_CUDA_EXECUTOR=" +
-                  std::string(executor_hint));
-  } else {
-    // Auto-detect: use native kernels for safetensors models
-    std::string detected_format = DetectModelFormat(model_path.string());
-    if (detected_format == "safetensors") {
-      executor_kind_ = "native_kernel";
-      log::Info("native_cuda_backend",
-                "Auto-detected safetensors format, using native CUDA kernels");
-    } else {
-      log::Info("native_cuda_backend",
-                "Model format '" + detected_format +
-                    "', using llama.cpp CUDA backend (delegate mode)");
-    }
-  }
-
-  if (ParseBoolEnv("INFERFLUX_NATIVE_CUDA_STRICT", false) &&
-      !NativeKernelsReady()) {
+  if (!NativeKernelsReady()) {
     log::Error("native_cuda_backend",
-               "native CUDA strict mode enabled but native kernels are not "
-               "implemented yet");
+               "native CUDA backend requested but native kernels are not "
+               "ready");
     return false;
   }
 
-  executor_ = CreateNativeCudaExecutor(executor_kind_);
-  if (!executor_) {
+  runtime_ = CreateNativeCudaRuntime();
+  if (!runtime_) {
     log::Error("native_cuda_backend",
-               "failed to create native CUDA executor '" + executor_kind_ +
-                   "'");
+               "failed to create native CUDA runtime");
     return false;
   }
 
-  if (!executor_->LoadModel(model_path, config)) {
-    log::Error("native_cuda_backend", "failed to load model using executor '" +
-                                          executor_->Name() + "'");
+  if (!runtime_->LoadModel(model_path, config)) {
+    log::Error("native_cuda_backend",
+               "failed to load model using runtime '" + runtime_->Name() + "'");
     return false;
   }
 
-  fallback_mode_ = executor_->IsFallback() || !NativeKernelsReady();
-  fallback_reason_ = executor_->FallbackReason();
-  executor_kind_ = executor_->Name();
+  fallback_mode_ = runtime_->IsFallback();
+  fallback_reason_ = runtime_->FallbackReason();
+  runtime_kind_ = runtime_->Name();
+  if (strict_native_execution && fallback_mode_) {
+    std::string strict_reason =
+        fallback_reason_.empty()
+            ? "native CUDA strict mode rejected runtime '" + runtime_kind_ + "'"
+            : fallback_reason_;
+    log::Error("native_cuda_backend",
+               "native CUDA strict mode rejected model load: " + strict_reason);
+    return false;
+  }
   if (fallback_mode_ && !fallback_reason_.empty()) {
-    log::Warn("native_cuda_backend",
-              fallback_reason_ + " (executor=" + executor_kind_ + ")");
+    log::Warn("native_cuda_backend", fallback_reason_ +
+                                      " (runtime=" + runtime_kind_ + ")");
   }
   return true;
 #else
@@ -101,16 +97,21 @@ bool NativeCudaBackend::LoadModel(const std::filesystem::path &model_path,
 
 bool NativeCudaBackend::NativeKernelsReady() {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-  // Compile-time check: native CUDA kernels are compiled in.
-  // Also require the executor hint to be set.
-  const char *executor_hint = std::getenv("INFERFLUX_NATIVE_CUDA_EXECUTOR");
-  if (executor_hint) {
-    std::string hint = executor_hint;
-    std::transform(hint.begin(), hint.end(), hint.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return hint == "native" || hint == "native_kernel";
+#ifdef INFERFLUX_HAS_CUDA
+  // Allow explicit opt-out for emergency fallback operation.
+  if (ParseBoolValue(std::getenv("INFERFLUX_DISABLE_NATIVE_CUDA"))) {
+    return false;
   }
+
+  int device_count = 0;
+  const cudaError_t err = cudaGetDeviceCount(&device_count);
+  if (err != cudaSuccess) {
+    return false;
+  }
+  return device_count > 0;
+#else
   return false;
+#endif
 #else
   return false;
 #endif
@@ -119,33 +120,33 @@ bool NativeCudaBackend::NativeKernelsReady() {
 std::vector<LlamaCPUBackend::UnifiedBatchOutput>
 NativeCudaBackend::ExecuteUnifiedBatch(
     const std::vector<UnifiedBatchInput> &inputs) {
-  if (!executor_) {
+  if (!runtime_) {
     return {};
   }
-  return executor_->ExecuteUnifiedBatch(inputs);
+  return runtime_->ExecuteUnifiedBatch(inputs);
 }
 
 bool NativeCudaBackend::SupportsAsyncUnifiedBatch() const {
-  if (!executor_) {
+  if (!runtime_) {
     return false;
   }
-  return executor_->SupportsAsyncUnifiedBatch();
+  return runtime_->SupportsAsyncUnifiedBatch();
 }
 
 LlamaCPUBackend::UnifiedBatchHandle NativeCudaBackend::SubmitUnifiedBatchAsync(
     const std::vector<UnifiedBatchInput> &inputs, UnifiedBatchLane lane) {
-  if (!executor_) {
+  if (!runtime_) {
     return 0;
   }
-  return executor_->SubmitUnifiedBatchAsync(inputs, lane);
+  return runtime_->SubmitUnifiedBatchAsync(inputs, lane);
 }
 
 bool NativeCudaBackend::TryCollectUnifiedBatchAsync(
     UnifiedBatchHandle handle, std::vector<UnifiedBatchOutput> *outputs) {
-  if (!executor_) {
+  if (!runtime_) {
     return false;
   }
-  return executor_->TryCollectUnifiedBatchAsync(handle, outputs);
+  return runtime_->TryCollectUnifiedBatchAsync(handle, outputs);
 }
 
 int NativeCudaBackend::UnifiedBatchTokenCapacity() const {
@@ -177,14 +178,14 @@ NativeCudaBackend::PrefillPartial(const std::string &prompt, int sequence_id,
 
 void NativeCudaBackend::CopySequencePrefix(int src_seq, int dst_seq,
                                            int n_tokens) {
-  if (executor_) {
-    executor_->NativeCopySequencePrefix(src_seq, dst_seq, n_tokens);
+  if (runtime_) {
+    runtime_->NativeCopySequencePrefix(src_seq, dst_seq, n_tokens);
   }
 }
 
 void NativeCudaBackend::FreeSequence(int sequence_id) {
-  if (executor_) {
-    executor_->NativeFreeSequence(sequence_id);
+  if (runtime_) {
+    runtime_->NativeFreeSequence(sequence_id);
   }
 }
 
@@ -258,9 +259,9 @@ LlamaCPUBackend::PerfSnapshot NativeCudaBackend::TakePerf() {
   if (backend) {
     return backend->TakePerf();
   }
-  // Native path: build PerfSnapshot from executor's accumulator
-  if (executor_) {
-    auto native = executor_->NativeTakePerf();
+  // Native path: build PerfSnapshot from runtime accumulator.
+  if (runtime_) {
+    auto native = runtime_->NativeTakePerf();
     PerfSnapshot snap;
     snap.prefill_ms = native.prefill_ms;
     snap.decode_ms = native.decode_ms;
@@ -282,32 +283,32 @@ LlamaCPUBackend::ChatTemplateResult NativeCudaBackend::FormatChatMessages(
 }
 
 int NativeCudaBackend::TokenCount(const std::string &text) const {
-  if (executor_) {
-    return executor_->NativeTokenCount(text);
+  if (runtime_) {
+    return runtime_->NativeTokenCount(text);
   }
   return 0;
 }
 
 std::vector<int>
 NativeCudaBackend::TokenizeForCache(const std::string &prompt) const {
-  if (executor_) {
-    return executor_->NativeTokenize(prompt);
+  if (runtime_) {
+    return runtime_->NativeTokenize(prompt);
   }
   return {};
 }
 
 bool NativeCudaBackend::IsReady() const {
-  if (executor_) {
-    return executor_->NativeIsReady();
+  if (runtime_) {
+    return runtime_->NativeIsReady();
   }
   return false;
 }
 
 std::shared_ptr<LlamaCPUBackend> NativeCudaBackend::DelegateBackend() const {
-  if (!executor_) {
+  if (!runtime_) {
     return nullptr;
   }
-  return executor_->BackendHandle();
+  return runtime_->BackendHandle();
 }
 
 } // namespace inferflux

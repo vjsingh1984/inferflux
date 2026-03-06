@@ -7,12 +7,10 @@
 
 namespace inferflux {
 
-class NativeCudaExecutor;
+class NativeCudaRuntime;
 
-// NativeCudaBackend is the forward-compatibility entry point for a true
-// InferFlux-native CUDA runtime. In the current scaffold phase it supports
-// pluggable scaffold executors while preserving a distinct provider path and
-// explicit diagnostics about fallback/delegation status.
+// NativeCudaBackend is the provider entry point for the InferFlux native CUDA
+// runtime.
 // PHASE 1 NOTE: Still inherits from LlamaCPUBackend due to extensive method
 // set.
 // TODO: Phase 1.5 - Extract ILlamaBackend interface with full method set
@@ -69,18 +67,19 @@ public:
   std::vector<int> TokenizeForCache(const std::string &prompt) const override;
   bool IsReady() const override;
 
-  std::string ExecutorKind() const { return executor_kind_; }
+  std::string ExecutorKind() const { return runtime_kind_; }
   bool IsFallbackExecutor() const { return fallback_mode_; }
   const std::string &FallbackReason() const { return fallback_reason_; }
 
-  // Returns true only when native CUDA kernels are implemented and wired.
+  // Returns true when native CUDA kernels are compiled and CUDA runtime is
+  // available.
   static bool NativeKernelsReady();
 
 private:
   std::shared_ptr<LlamaCPUBackend> DelegateBackend() const;
 
-  std::unique_ptr<NativeCudaExecutor> executor_;
-  std::string executor_kind_{"delegate"};
+  std::unique_ptr<NativeCudaRuntime> runtime_;
+  std::string runtime_kind_{"native_cuda"};
   bool fallback_mode_{true};
   std::string fallback_reason_;
 };

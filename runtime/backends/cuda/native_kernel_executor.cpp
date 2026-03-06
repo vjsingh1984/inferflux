@@ -1,6 +1,9 @@
 #include "runtime/backends/cuda/native_kernel_executor.h"
+#include "runtime/backends/cuda/native/gguf_model_loader.h"
+#include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/native_tokenizer.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
+#include "runtime/backends/cuda/native/quantized_forward.h"
 #include "runtime/backends/cuda/native/safetensors_parser.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
@@ -14,6 +17,8 @@
 #include "runtime/backends/cuda/native/weight_map.h"
 #endif
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
@@ -97,6 +102,38 @@ bool CheckedMulSize(std::size_t a, std::size_t b, std::size_t *out) {
   }
   *out = a * b;
   return true;
+}
+
+std::string ToLowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  return value;
+}
+
+inferflux::SafetensorsLoader::ModelConfig
+ConvertModelInfo(const inferflux::runtime::cuda::native::ModelInfo &info) {
+  inferflux::SafetensorsLoader::ModelConfig cfg;
+  cfg.hidden_size = info.hidden_size;
+  cfg.num_hidden_layers = info.num_hidden_layers;
+  cfg.num_attention_heads = info.num_attention_heads;
+  cfg.num_key_value_heads = info.num_key_value_heads;
+  cfg.head_dim = info.head_dim;
+  if (cfg.head_dim == 0 && cfg.num_attention_heads > 0 && cfg.hidden_size > 0) {
+    cfg.head_dim = cfg.hidden_size / cfg.num_attention_heads;
+  }
+  cfg.intermediate_size = info.intermediate_size;
+  cfg.vocab_size = info.vocab_size;
+  cfg.max_position_embeddings = info.max_position_embeddings;
+  cfg.rope_freq_base = info.rope_freq_base;
+  cfg.rope_freq_scale = info.rope_freq_scale;
+  cfg.rope_dim = info.rope_dim;
+  cfg.model_type = info.model_type;
+  cfg.activation = info.activation;
+  cfg.torch_dtype = info.torch_dtype;
+  cfg.rms_norm_eps = info.rms_norm_eps;
+  return cfg;
 }
 
 } // namespace
@@ -713,25 +750,57 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   }
   inference_dtype_ = want_bf16 ? InferenceDtype::kBF16 : InferenceDtype::kFP16;
 
-  log::Info("native_kernel_executor",
-            "Inference dtype: " + std::string(want_bf16 ? "bf16" : "fp16") +
-                " (torch_dtype=" + config.torch_dtype + ")");
-
-  // 1. Build WeightMap from loader (always FP16 typed — gpu_data is raw)
-  weight_map_ = std::make_unique<WeightMap>();
-  if (!weight_map_->Build(*loader_, config)) {
-    log::Error("native_kernel_executor", "Failed to build weight map");
-    return false;
+  std::string kv_precision_choice = kv_precision_hint_;
+  if (const char *env_kv_precision = std::getenv("INFERFLUX_NATIVE_KV_DTYPE")) {
+    kv_precision_choice = env_kv_precision;
+  }
+  kv_precision_choice = ToLowerAscii(kv_precision_choice);
+  if (kv_precision_choice.empty()) {
+    kv_precision_choice = "auto";
   }
 
-  // 2. Initialize cuBLAS wrapper
+  if (kv_precision_choice == "auto") {
+    kv_precision_ =
+        want_bf16 ? runtime::cuda::native::KvPrecision::kBf16
+                  : runtime::cuda::native::KvPrecision::kFp16;
+  } else if (!runtime::cuda::native::ParseKvPrecision(kv_precision_choice,
+                                                       &kv_precision_)) {
+    log::Warn("native_kernel_executor",
+              "Invalid KV precision '" + kv_precision_choice +
+                  "', falling back to auto");
+    kv_precision_ =
+        want_bf16 ? runtime::cuda::native::KvPrecision::kBf16
+                  : runtime::cuda::native::KvPrecision::kFp16;
+  }
+
+  if (kv_precision_ == runtime::cuda::native::KvPrecision::kBf16 &&
+      !CheckBF16Support()) {
+    log::Warn("native_kernel_executor",
+              "BF16 KV cache requested but GPU SM < 80; using FP16 KV cache");
+    kv_precision_ = runtime::cuda::native::KvPrecision::kFp16;
+  }
+  if (kv_precision_ == runtime::cuda::native::KvPrecision::kInt8 ||
+      kv_precision_ == runtime::cuda::native::KvPrecision::kFp8) {
+    log::Warn("native_kernel_executor",
+              "KV precision '" +
+                  runtime::cuda::native::KvPrecisionToString(kv_precision_) +
+                  "' is not implemented yet; using FP16 KV cache");
+    kv_precision_ = runtime::cuda::native::KvPrecision::kFp16;
+  }
+
+  log::Info("native_kernel_executor",
+            "Inference dtype: " + std::string(want_bf16 ? "bf16" : "fp16") +
+                " (torch_dtype=" + config.torch_dtype + "), kv_dtype=" +
+                runtime::cuda::native::KvPrecisionToString(kv_precision_));
+
+  // 1. Initialize cuBLAS wrapper
   gemm_ = std::make_unique<CublasGemm>();
   if (!gemm_->Initialize(compute_stream_)) {
     log::Error("native_kernel_executor", "Failed to initialize cuBLAS");
     return false;
   }
 
-  // 3. Allocate KV cache (typed based on inference dtype)
+  // 2. Allocate KV cache (independent precision policy)
   int max_batch = 32;
   int max_seq = 4096;
   if (config.max_position_embeddings > 0 &&
@@ -739,7 +808,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     max_seq = config.max_position_embeddings;
   }
 
-  if (want_bf16) {
+  if (kv_precision_ == runtime::cuda::native::KvPrecision::kBf16) {
     auto cache = std::make_unique<KvCacheGpuTyped<__nv_bfloat16>>();
     if (!cache->Allocate(config.num_hidden_layers, config.num_key_value_heads,
                          config.head_dim, max_seq, max_batch)) {
@@ -757,33 +826,102 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     kv_cache_ = std::move(cache);
   }
 
-  // 4. Create ModelForward via typed factory
-  if (want_bf16) {
-    model_forward_ = CreateModelForwardTyped<__nv_bfloat16>(config.model_type);
+  // 2.5. Strategy selection (foundation layer for native quantized runtime).
+  runtime::cuda::native::QuantizedRuntimeStrategyRegistry &registry =
+      runtime::cuda::native::QuantizedRuntimeStrategyRegistry::Instance();
+  registry.RegisterDefaults();
+
+  if (model_loader_ && model_loader_->GetFormat() == "gguf") {
+    cudaDeviceProp prop{};
+    int sm_major = 0;
+    int sm_minor = 0;
+    if (CheckCudaStatus(cudaGetDeviceProperties(&prop, device_id_),
+                        "cudaGetDeviceProperties(strategy selection)")) {
+      sm_major = prop.major;
+      sm_minor = prop.minor;
+    }
+
+    std::string quantization_type = model_loader_->GetQuantizationType();
+    if (!quantization_type.empty()) {
+      const auto tensor_type =
+          runtime::cuda::native::StringToTensorType(quantization_type);
+      const auto selection =
+          registry.Select(tensor_type, kv_precision_, sm_major, sm_minor);
+      if (selection.weight_layout && selection.matmul && selection.attention) {
+        log::Info("native_kernel_executor",
+                  "Selected GGUF strategies: layout=" +
+                      selection.weight_layout->Id() +
+                      ", matmul=" + selection.matmul->Id() +
+                      ", attention=" + selection.attention->Id() + " (" +
+                      selection.reason + ")");
+      } else {
+        log::Warn("native_kernel_executor",
+                  "Incomplete GGUF strategy selection: " + selection.reason);
+      }
+    } else if (model_loader_->IsQuantized()) {
+      log::Warn("native_kernel_executor",
+                "Quantized GGUF model loaded but quantization type is unknown; "
+                "strategy selection skipped");
+    }
+  }
+
+  // 3. Create weights + forward implementation
+  if (model_loader_) {
+    quantized_weight_map_ = std::make_unique<QuantizedWeightMap>();
+    if (!quantized_weight_map_->Build(model_loader_.get(), model_info_,
+                                      compute_stream_)) {
+      log::Error("native_kernel_executor",
+                 "Failed to build quantized weight map");
+      return false;
+    }
+    model_forward_ = CreateQuantizedForwardAsModelForward(config.model_type);
+    auto *quantized_forward =
+        dynamic_cast<QuantizedForward *>(model_forward_.get());
+    if (!quantized_forward) {
+      log::Error("native_kernel_executor",
+                 "Failed to create quantized forward for model_type: " +
+                     config.model_type);
+      return false;
+    }
+    if (!quantized_forward->Initialize(model_info_, quantized_weight_map_.get(),
+                                       kv_cache_.get(), gemm_.get(),
+                                       compute_stream_)) {
+      log::Error("native_kernel_executor",
+                 "Failed to initialize quantized forward");
+      return false;
+    }
   } else {
-    model_forward_ = CreateModelForward(config.model_type);
-  }
-  if (!model_forward_) {
-    log::Error("native_kernel_executor",
-               "Unsupported model_type: " + config.model_type);
-    return false;
+    weight_map_ = std::make_unique<WeightMap>();
+    if (!weight_map_->Build(*loader_, config)) {
+      log::Error("native_kernel_executor", "Failed to build weight map");
+      return false;
+    }
+    if (want_bf16) {
+      model_forward_ =
+          CreateModelForwardTyped<__nv_bfloat16>(config.model_type);
+    } else {
+      model_forward_ = CreateModelForward(config.model_type);
+    }
+    if (!model_forward_) {
+      log::Error("native_kernel_executor",
+                 "Unsupported model_type: " + config.model_type);
+      return false;
+    }
+    if (!model_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
+                                    gemm_.get(), compute_stream_)) {
+      log::Error("native_kernel_executor", "Failed to initialize forward pass");
+      return false;
+    }
   }
 
-  // 5. Initialize transformer forward pass
-  if (!model_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
-                                  gemm_.get(), compute_stream_)) {
-    log::Error("native_kernel_executor", "Failed to initialize forward pass");
-    return false;
-  }
-
-  // 6. Initialize GPU sampler
+  // 4. Initialize GPU sampler
   sampler_ = std::make_unique<GpuSampler>();
   if (!sampler_->Initialize(config.vocab_size, compute_stream_)) {
     log::Error("native_kernel_executor", "Failed to initialize GPU sampler");
     return false;
   }
 
-  // 7. Allocate device logits buffer (sized for batched decode)
+  // 5. Allocate device logits buffer (sized for batched decode)
   if (config.vocab_size <= 0) {
     log::Error("native_kernel_executor",
                "Invalid vocab_size for logits buffer");
@@ -804,11 +942,26 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     return false;
   }
 
-  // 8. Load NativeTokenizer from model directory
+  // 6. Load NativeTokenizer from model directory
   tokenizer_ = std::make_unique<NativeTokenizer>();
-  if (!tokenizer_->Load(loader_->GetModelPath())) {
-    log::Warn("native_kernel_executor",
-              "Failed to load tokenizer from " + loader_->GetModelPath());
+  const std::string tokenizer_path =
+      model_loader_ ? loaded_model_path_.string() : loader_->GetModelPath();
+  bool tokenizer_ready = tokenizer_->Load(tokenizer_path);
+  if (!tokenizer_ready && model_loader_ &&
+      model_loader_->GetFormat() == "gguf") {
+    auto *gguf_loader = dynamic_cast<runtime::cuda::native::GGUFModelLoader *>(
+        model_loader_.get());
+    if (gguf_loader && !gguf_loader->TokenizerPieces().empty()) {
+      tokenizer_ready = tokenizer_->LoadFromPieces(
+          gguf_loader->TokenizerPieces(), gguf_loader->TokenizerEosTokenId(),
+          gguf_loader->TokenizerBosTokenId());
+    }
+  }
+  if (!tokenizer_ready) {
+    log::Error("native_kernel_executor",
+               "Failed to initialize tokenizer for model path: " +
+                   tokenizer_path);
+    return false;
   }
 
   // 9. Create cudaEvent pairs for forward/sampling timing
@@ -861,61 +1014,99 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
                                      const LlamaBackendConfig &config) {
   log::Info("native_kernel_executor",
             "Loading native CUDA model from: " + model_path.string());
+  loaded_model_path_ = model_path;
+  loader_.reset();
+  model_loader_.reset();
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  weight_map_.reset();
+  quantized_weight_map_.reset();
+#endif
 
   // Initialize phase overlap settings from config
   overlap_enabled_ = config.cuda_phase_overlap_scaffold;
   min_prefill_tokens_ = config.cuda_phase_overlap_min_prefill_tokens;
+  kv_precision_hint_ = config.native_kv_cache_dtype;
   log::Info("native_kernel_executor",
             "Phase overlap: " +
                 std::string(overlap_enabled_ ? "enabled" : "disabled") +
-                ", min_prefill_tokens=" + std::to_string(min_prefill_tokens_));
+                ", min_prefill_tokens=" + std::to_string(min_prefill_tokens_) +
+                ", kv_dtype_hint=" + kv_precision_hint_);
 
   // Initialize CUDA
   if (!InitializeCUDA()) {
     return false;
   }
 
-  // Create loader
-  loader_ = std::make_unique<SafetensorsLoader>();
-  if (!loader_->LoadModel(model_path.string())) {
-    log::Error("native_kernel_executor", "Failed to load safetensors model");
+  auto detected_loader = runtime::cuda::native::CreateModelLoader(model_path);
+  if (!detected_loader) {
+    log::Error("native_kernel_executor",
+               "Failed to detect model loader for path: " +
+                   model_path.string());
     return false;
   }
 
-  // Get model config
-  model_config_ = loader_->GetConfig();
-
-  // Decide whether to skip BF16→FP16 conversion
-  // If model is BF16 and GPU supports it, keep BF16 for native pipeline
-  // Env var INFERFLUX_NATIVE_DTYPE=fp16 forces FP16 conversion
-  bool skip_bf16 = false;
-#ifdef INFERFLUX_NATIVE_KERNELS_READY
-  {
-    const char *dtype_override = std::getenv("INFERFLUX_NATIVE_DTYPE");
-    bool force_fp16 = dtype_override && std::string(dtype_override) == "fp16";
-    if (model_config_.torch_dtype == "bfloat16" && CheckBF16Support() &&
-        !force_fp16) {
-      skip_bf16 = true;
-      log::Info("native_kernel_executor",
-                "BF16 model detected with SM >= 80; uploading weights as BF16");
-    } else if (model_config_.torch_dtype == "bfloat16" && force_fp16) {
-      log::Info("native_kernel_executor",
-                "BF16 model with FP16 override; converting BF16→FP16 on CPU");
+  const std::string detected_format = detected_loader->GetFormat();
+  if (detected_format == "safetensors") {
+    // Keep legacy safetensors loader path until the generic loader path is
+    // feature-parity validated for BF16/FP16 conversion controls.
+    loader_ = std::make_unique<SafetensorsLoader>();
+    if (!loader_->LoadModel(model_path.string())) {
+      log::Error("native_kernel_executor", "Failed to load safetensors model");
+      return false;
     }
-  }
+    model_config_ = loader_->GetConfig();
+
+    // Decide whether to skip BF16→FP16 conversion
+    // If model is BF16 and GPU supports it, keep BF16 for native pipeline
+    // Env var INFERFLUX_NATIVE_DTYPE=fp16 forces FP16 conversion
+    bool skip_bf16 = false;
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+    {
+      const char *dtype_override = std::getenv("INFERFLUX_NATIVE_DTYPE");
+      bool force_fp16 = dtype_override && std::string(dtype_override) == "fp16";
+      if (model_config_.torch_dtype == "bfloat16" && CheckBF16Support() &&
+          !force_fp16) {
+        skip_bf16 = true;
+        log::Info(
+            "native_kernel_executor",
+            "BF16 model detected with SM >= 80; uploading weights as BF16");
+      } else if (model_config_.torch_dtype == "bfloat16" && force_fp16) {
+        log::Info("native_kernel_executor",
+                  "BF16 model with FP16 override; converting BF16→FP16 on CPU");
+      }
+    }
 #endif
 
-  // Upload weights to GPU
-  log::Info("native_kernel_executor", "Uploading weights to GPU...");
-  if (!loader_->UploadToGPU(compute_stream_, skip_bf16)) {
-    log::Error("native_kernel_executor", "Failed to upload weights to GPU");
-    return false;
+    // Upload weights to GPU
+    log::Info("native_kernel_executor", "Uploading weights to GPU...");
+    if (!loader_->UploadToGPU(compute_stream_, skip_bf16)) {
+      log::Error("native_kernel_executor", "Failed to upload weights to GPU");
+      return false;
+    }
+  } else {
+    model_loader_ = std::move(detected_loader);
+    if (!model_loader_->Load(model_path)) {
+      log::Error("native_kernel_executor",
+                 "Failed to load model via loader: " + detected_format);
+      return false;
+    }
+    model_info_ = model_loader_->GetModelInfo();
+    model_config_ = ConvertModelInfo(model_info_);
+    log::Info("native_kernel_executor", "Uploading model weights to GPU via " +
+                                            detected_format + " loader...");
+    if (!model_loader_->UploadToGPU(compute_stream_)) {
+      log::Error("native_kernel_executor",
+                 "Failed to upload model weights via " + detected_format +
+                     " loader");
+      return false;
+    }
   }
 
   // Initialize native inference pipeline
   if (!InitializeNativePipeline()) {
-    log::Warn("native_kernel_executor",
-              "Native pipeline init failed; inference will return empty");
+    log::Error("native_kernel_executor",
+               "Native pipeline initialization failed");
+    return false;
   }
 
   // Report native backend uses FA2 attention kernel
@@ -1636,7 +1827,7 @@ bool NativeKernelExecutor::RunNativeInference(
 // NativeTakePerf (works on all build paths)
 // ==========================================================================
 
-NativeCudaExecutor::NativePerfSnapshot NativeKernelExecutor::NativeTakePerf() {
+NativeCudaRuntime::NativePerfSnapshot NativeKernelExecutor::NativeTakePerf() {
   NativePerfSnapshot snap;
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   snap.prefill_ms = perf_accum_.prefill_ms.exchange(0.0);
