@@ -1,7 +1,7 @@
 #!/bin/bash
 # Startup Advisor Tests - FINAL VERSION
-# Safetensors → cuda_native + INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel
-# GGUF → cuda_universal (llama.cpp CUDA)
+# Safetensors → cuda_native
+# GGUF → cuda_llama_cpp (llama.cpp CUDA)
 
 set -e
 
@@ -29,14 +29,10 @@ test_case() {
     local overlap="$6"
     local batch="$7"
     local kv="$8"
-    local executor_hint="$9"  # NEW: executor hint for native CUDA
 
     echo -e "\033[1;33mTest: $name\033[0m"
     echo "  Model: $model"
     echo "  Format: $format → Backend: $backend"
-    if [ -n "$executor_hint" ]; then
-        echo "  Executor: $executor_hint"
-    fi
     echo "  Config: FA=$fa, Overlap=$overlap, Batch=$batch, KV=$kv"
     echo
 
@@ -79,18 +75,8 @@ logging:
   format: text
 EOF
 
-    # Set executor hint if provided
-    local env_vars=""
-    if [ -n "$executor_hint" ]; then
-        env_vars="INFERFLUX_NATIVE_CUDA_EXECUTOR=$executor_hint"
-    fi
-
-    # Start server with optional env vars
-    if [ -n "$env_vars" ]; then
-        env $env_vars "$INFERFLUXD" --config "$config_file" > "$log_file" 2>&1 &
-    else
-        "$INFERFLUXD" --config "$config_file" > "$log_file" 2>&1 &
-    fi
+    # Start server
+    "$INFERFLUXD" --config "$config_file" > "$log_file" 2>&1 &
     local pid=$!
 
     # Wait for startup
@@ -144,7 +130,7 @@ EOF
 }
 
 echo "========================================="
-echo "SAFETENSORS BF16 (cuda_native + native_kernel)"
+echo "SAFETENSORS BF16 (cuda_native)"
 echo "========================================="
 echo
 
@@ -154,8 +140,7 @@ test_case \
     "models/qwen2.5-3b-instruct-safetensors" \
     "auto" \
     "cuda_native" \
-    "true" "true" "16" "128" \
-    "native_kernel"
+    "true" "true" "16" "128"
 
 # Safetensors BF16 with FA disabled (should recommend FA2)
 test_case \
@@ -163,12 +148,11 @@ test_case \
     "models/qwen2.5-3b-instruct-safetensors" \
     "auto" \
     "cuda_native" \
-    "false" "true" "16" "128" \
-    "native_kernel"
+    "false" "true" "16" "128"
 
 echo
 echo "========================================="
-echo "GGUF FP16 (cuda_universal)"
+echo "GGUF FP16 (cuda_llama_cpp)"
 echo "========================================="
 echo
 
@@ -177,13 +161,12 @@ test_case \
     "gguf_fp16_well_tuned" \
     "models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-f16.gguf" \
     "gguf" \
-    "cuda_universal" \
-    "true" "true" "16" "128" \
-    ""
+    "cuda_llama_cpp" \
+    "true" "true" "16" "128"
 
 echo
 echo "========================================="
-echo "GGUF Q4 QUANTIZED (cuda_universal)"
+echo "GGUF Q4 QUANTIZED (cuda_llama_cpp)"
 echo "========================================="
 echo
 
@@ -192,9 +175,8 @@ test_case \
     "gguf_q4_suboptimal" \
     "models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf" \
     "gguf" \
-    "cuda_universal" \
-    "true" "true" "8" "32" \
-    ""
+    "cuda_llama_cpp" \
+    "true" "true" "8" "32"
 
 echo
 echo "========================================="
@@ -207,9 +189,8 @@ test_case \
     "gguf_q4_well_tuned" \
     "models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf" \
     "gguf" \
-    "cuda_universal" \
-    "true" "true" "32" "256" \
-    ""
+    "cuda_llama_cpp" \
+    "true" "true" "32" "256"
 
 echo
 echo "========================================="

@@ -58,12 +58,12 @@ start_server() {
     local env_vars=""
     case "$backend" in
         "native")
-            env_vars="INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel"
+            env_vars="INFERFLUX_BACKEND_PREFER_NATIVE=1"
             log_info "Starting server with cuda_native backend..."
             ;;
         "universal")
-            env_vars="INFERFLUX_NATIVE_CUDA_EXECUTOR=delegate"
-            log_info "Starting server with cuda_universal backend..."
+            env_vars="INFERFLUX_BACKEND_PREFER_NATIVE=0"
+            log_info "Starting server with cuda_llama_cpp backend..."
             ;;
         *)
             log_error "Unknown backend: $backend"
@@ -204,7 +204,7 @@ compare_backends() {
     echo "========================================"
     echo "COMPARISON"
     echo "========================================"
-    echo "cuda_universal: ${universal_tok} tok/s"
+    echo "cuda_llama_cpp: ${universal_tok} tok/s"
     echo "cuda_native:    ${native_tok} tok/s"
 
     local improvement=$(echo "scale=1; (($native_tok - $universal_tok) / $universal_tok) * 100" | bc)
@@ -213,7 +213,7 @@ compare_backends() {
     if [ $(echo "$native_tok > $universal_tok" | bc) -eq 1 ]; then
         log_success "cuda_native is ${speedup}x faster (+${improvement}%)"
     else
-        log_warn "cuda_universal is faster by ${improvement}%"
+        log_warn "cuda_llama_cpp is faster by ${improvement}%"
     fi
 }
 
@@ -259,7 +259,7 @@ main() {
             universal_tok=$(run_benchmark "universal" $CONCURRENT)
             stop_server
         else
-            log_error "Failed to test cuda_universal"
+            log_error "Failed to test cuda_llama_cpp"
         fi
     fi
 

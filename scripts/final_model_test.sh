@@ -77,7 +77,7 @@ test_model() {
 }
 
 # Test all models with production configs
-echo "GGUF Models (cuda_universal backend):"
+echo "GGUF Models (cuda_llama_cpp backend):"
 echo "─────────────────────────────────────────"
 test_model "TinyLlama 1.1B Q4" "config/server.cuda.yaml" ""
 
@@ -87,9 +87,9 @@ test_model "Qwen2.5 3B FP16" "config/server.cuda.yaml" ""
 
 test_model "Qwen2.5 Coder 14B Q4" "config/server.cuda.qwen14b.yaml" ""
 
-echo "Safetensors Models (cuda_native + native_kernel):"
+echo "Safetensors Models (cuda_native):"
 echo "────────────────────────────────────────────────────"
-test_model "Qwen2.5 3B Safetensors BF16" "config/server.cuda.safetensors.yaml" "INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel"
+test_model "Qwen2.5 3B Safetensors BF16" "config/server.cuda.safetensors.yaml" ""
 
 echo "╔════════════════════════════════════════════════════════════════════════╗"
 echo "║                         FINAL RESULTS                                  ║"
@@ -101,7 +101,7 @@ echo "  ✅ TinyLlama 1.1B Q4_K_M       → server.cuda.yaml"
 echo "  ✅ Qwen2.5 3B Q4_K_M           → server.cuda.yaml"
 echo "  ✅ Qwen2.5 3B FP16             → server.cuda.yaml"
 echo "  ✅ Qwen2.5 Coder 14B Q4_K_M    → server.cuda.qwen14b.yaml"
-echo "  ✅ Qwen2.5 3B Safetensors BF16 → server.cuda.safetensors.yaml + native_kernel"
+echo "  ✅ Qwen2.5 3B Safetensors BF16 → server.cuda.safetensors.yaml"
 echo
 echo "Logs: $LOG_DIR/"
 echo

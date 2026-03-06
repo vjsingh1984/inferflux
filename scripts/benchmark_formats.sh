@@ -54,7 +54,7 @@ models:
   - id: test-model
     path: $model
     format: $format
-    backend: cuda_universal
+    backend: cuda_llama_cpp
     default: true
 runtime:
   backend_priority: [cuda, cpu]

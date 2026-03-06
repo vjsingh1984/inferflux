@@ -21,10 +21,10 @@ echo
 
 # Array of models to test (format, backend, path, label)
 declare -a MODELS=(
-    "gguf:cuda_universal:models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf:tinyllama-1.1b-q4"
-    "gguf:cuda_universal:models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf:qwen2.5-3b-q4"
-    "gguf:cuda_universal:models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-f16.gguf:qwen2.5-3b-fp16"
-    "gguf:cuda_universal:models/qwen2.5-coder-14b-instruct-q4_k_m.gguf:qwen2.5-coder-14b-q4"
+    "gguf:cuda_llama_cpp:models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf:tinyllama-1.1b-q4"
+    "gguf:cuda_llama_cpp:models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf:qwen2.5-3b-q4"
+    "gguf:cuda_llama_cpp:models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-f16.gguf:qwen2.5-3b-fp16"
+    "gguf:cuda_llama_cpp:models/qwen2.5-coder-14b-instruct-q4_k_m.gguf:qwen2.5-coder-14b-q4"
     "auto:cuda_native:models/qwen2.5-3b-instruct-safetensors:qwen2.5-3b-safetensors-bf16"
 )
 
@@ -76,18 +76,8 @@ logging:
   level: warn
 EOF
 
-    # Set executor for native backend
-    local env=""
-    if [[ "$backend" == "cuda_native" ]]; then
-        env="INFERFLUX_NATIVE_CUDA_EXECUTOR=native_kernel"
-    fi
-
     # Start server
-    if [ -n "$env" ]; then
-        env $env "$INFERFLUXD" --config "$config_file" > "$log_file" 2>&1 &
-    else
-        "$INFERFLUXD" --config "$config_file" > "$log_file" 2>&1 &
-    fi
+    "$INFERFLUXD" --config "$config_file" > "$log_file" 2>&1 &
     local pid=$!
 
     # Wait for result

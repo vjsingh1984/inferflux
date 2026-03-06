@@ -41,7 +41,7 @@ models:
   - id: test-model
     path: $model_path
     format: $format
-    backend: cuda_universal
+    backend: cuda_llama_cpp
     default: true
 runtime:
   cuda:

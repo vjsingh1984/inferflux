@@ -237,16 +237,16 @@ def find_optimization_opportunities() -> List[Dict]:
         })
 
     # Check for native kernels
-    native_executor = Path("runtime/backends/cuda/native_cuda_executor.cpp")
-    if native_executor.exists():
-        with open(native_executor, 'r', encoding='utf-8', errors='ignore') as f:
+    native_runtime = Path("runtime/backends/cuda/native_cuda_runtime.cpp")
+    if native_runtime.exists():
+        with open(native_runtime, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
         if "delegate" in content:
             opportunities.append({
                 "area": "Native Kernels",
                 "status": "IN_PROGRESS",
                 "potential_gain": "+57-96% throughput",
-                "description": "Currently in scaffold/delegate mode, needs true CUDA kernels"
+                "description": "Native runtime still has delegate code paths"
             })
 
     return opportunities

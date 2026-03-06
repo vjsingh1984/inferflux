@@ -56,7 +56,6 @@ echo "Test 1: Native Kernel Auto-Detection"
 echo "--------------------------------------"
 
 export INFERCTL_API_KEY=dev-key-123
-export INFERFLUX_NATIVE_CUDA_EXECUTOR=""  # Empty to test auto-detection
 
 # Create test config
 cat > /tmp/test_native_kernels.yaml <<EOF
@@ -104,12 +103,6 @@ fi
 echo -e "${GREEN}✓ Server started (PID: $SERVER_PID)${NC}"
 
 # Check logs for native kernel usage
-if grep -q "Auto-detected safetensors format, using native CUDA kernels" /tmp/native_test_server.log; then
-    echo -e "${GREEN}✓ Native kernels auto-detected for safetensors${NC}"
-else
-    echo -e "${YELLOW}⚠ Native kernel auto-detection message not found${NC}"
-fi
-
 if grep -q "Native CUDA model loaded successfully" /tmp/native_test_server.log; then
     echo -e "${GREEN}✓ Native kernels loaded successfully${NC}"
 else
@@ -224,7 +217,7 @@ echo ""
 echo "Test 6: No llama.cpp Dependency"
 echo "--------------------------------"
 
-if grep -q "native_cuda_kernels" /tmp/native_test_server.log; then
+if grep -q "native_cuda" /tmp/native_test_server.log; then
     echo -e "${GREEN}✓ Using native CUDA kernels (not llama.cpp delegate)${NC}"
 else
     echo -e "${YELLOW}⚠ Could not verify native kernel usage${NC}"

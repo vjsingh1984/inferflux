@@ -1,7 +1,7 @@
 #!/bin/bash
 # Startup Advisor Tests - CORRECTED
 # Safetensors → cuda_native (native CUDA implementation)
-# GGUF → cuda_universal (llama.cpp CUDA backend)
+# GGUF → cuda_llama_cpp (llama.cpp CUDA backend)
 
 set -e
 
@@ -158,26 +158,26 @@ test_case \
     "1"
 
 echo
-echo "--- GGUF FP16 (cuda_universal) ---"
+echo "--- GGUF FP16 (cuda_llama_cpp) ---"
 
 # Well-tuned GGUF FP16
 test_case \
     "gguf_fp16_well_tuned" \
     "models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-f16.gguf" \
     "gguf" \
-    "cuda_universal" \
+    "cuda_llama_cpp" \
     "true" "true" "16" "128" \
     "0-2"
 
 echo
-echo "--- GGUF Q4 QUANTIZED (cuda_universal) ---"
+echo "--- GGUF Q4 QUANTIZED (cuda_llama_cpp) ---"
 
 # Suboptimal Q4 config (small batch, few KV pages)
 test_case \
     "gguf_q4_suboptimal" \
     "models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf" \
     "gguf" \
-    "cuda_universal" \
+    "cuda_llama_cpp" \
     "true" "true" "8" "32" \
     "2-4"
 

@@ -28,7 +28,7 @@ def generate_dependency_diagram():
 │ cuda/cuda_backend.h       │                    │ cpu/llama_backend.h        │
 │ cuda/cuda_backend.cpp     │                    │                            │
 │ cuda/native_cuda_backend.h│                    │                            │
-│ cuda/native_cuda_executor.h│ ◄─────────────────╮ │                            │
+│ cuda/native_cuda_runtime.h│ ◄─────────────────╮ │                            │
 │ cuda/kernels/             │                   │ │                            │
 │   flash_attention.cpp     │                   │ │                            │
 └──────────┬─────────────────┘                   │ └────────────────────────────┘
@@ -42,7 +42,7 @@ def generate_dependency_diagram():
 │  │ 1. cuda_backend.h   │─┼───────────────────╯
 │  │    → llama_backend.h│
 │  │ 2. native_cuda_     │
-│  │    executor.h       │
+│  │    runtime.h        │
 │  │    → llama_backend.h│
 │  │ 3. native_cuda_     │
 │  │    backend.h        │

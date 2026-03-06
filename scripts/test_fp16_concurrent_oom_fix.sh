@@ -170,8 +170,8 @@ test_backend() {
 # Create logs directory
 mkdir -p logs
 
-# Test cuda_universal backend first (baseline)
-test_backend "cuda_universal" "config/server.cuda.universal.yaml"
+# Test cuda_llama_cpp backend first (baseline)
+test_backend "cuda_llama_cpp" "config/server.cuda.universal.yaml"
 
 # Test cuda_native backend
 test_backend "cuda_native" "config/server.cuda.yaml"
@@ -186,5 +186,5 @@ echo "  - No std::bad_alloc errors detected"
 echo "  - Graceful degradation prevented OOM crashes"
 echo ""
 echo "Logs saved to:"
-echo "  - logs/server_fp16_cuda_universal.log"
+echo "  - logs/server_fp16_cuda_llama_cpp.log"
 echo "  - logs/server_fp16_cuda_native.log"

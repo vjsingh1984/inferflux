@@ -212,7 +212,7 @@ def generate_refactoring_roadmap(coupling: Dict, cycles: List) -> Dict:
         })
         roadmap["phase_1"]["tasks"].append({
             "task": "Create ILlamaBackend interface",
-            "files": ["cuda_backend.cpp", "native_cuda_executor.cpp"],
+            "files": ["cuda_backend.cpp", "native_cuda_runtime.cpp"],
             "action": "Use dependency injection instead of direct includes"
         })
 

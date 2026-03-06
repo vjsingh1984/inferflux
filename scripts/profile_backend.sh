@@ -16,11 +16,12 @@ echo "Output: $OUTPUT_DIR/$BACKEND/"
 echo "Duration: ${DURATION_SEC}s"
 echo ""
 
-# Set environment for backend
+# Set backend exposure policy for profile mode
+env_vars=""
 if [ "$BACKEND" = "native" ]; then
-    export INFERFLUX_NATIVE_CUDA_EXECUTOR=native
+    env_vars="INFERFLUX_BACKEND_PREFER_NATIVE=1"
 elif [ "$BACKEND" = "llamacpp" ]; then
-    export INFERFLUX_NATIVE_CUDA_EXECUTOR=delegate
+    env_vars="INFERFLUX_BACKEND_PREFER_NATIVE=0"
 else
     echo "Unknown backend: $BACKEND (use 'native' or 'llamacpp')"
     exit 1
@@ -32,7 +33,7 @@ sleep 2
 
 # Start server in background
 echo "Starting server..."
-./build/inferfluxd --config "$CONFIG" > /tmp/profile_server.log 2>&1 &
+env $env_vars ./build/inferfluxd --config "$CONFIG" > /tmp/profile_server.log 2>&1 &
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
 
