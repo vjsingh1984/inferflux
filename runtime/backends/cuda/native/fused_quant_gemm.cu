@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <mutex>
 
 namespace inferflux {
@@ -215,6 +216,18 @@ bool FusedQuantGemm::Gemv(const QuantizedWeightInfo &weight,
                           const half *activation, half *output, int M, int N,
                           int K, cudaStream_t stream) {
   if (!weight.data || weight.quant_type < 0)
+    return false;
+
+  // Allow disabling fused kernels for debugging (forces cuBLAS fallback)
+  static const bool disabled = [] {
+    const char *env = std::getenv("INFERFLUX_DISABLE_FUSED_GEMV");
+    bool d = env && (std::string(env) == "1" || std::string(env) == "true");
+    if (d)
+      log::Warn("fused_quant_gemm",
+                "Fused dequant-GEMV DISABLED by INFERFLUX_DISABLE_FUSED_GEMV");
+    return d;
+  }();
+  if (disabled)
     return false;
 
   auto qtype = static_cast<GGUF::TensorType>(weight.quant_type);

@@ -19,6 +19,8 @@ typedef struct {
   unsigned char scales[K_SCALE_SIZE]; // scales and mins, quantized with 6 bits
   unsigned char qs[QK_K / 2];         // 4-bit quants
 } block_q4_k;
+static_assert(sizeof(block_q4_k) == 2 * sizeof(unsigned short) + K_SCALE_SIZE + QK_K / 2,
+              "block_q4_k size mismatch with GGML");
 
 // Q5_K block: 5.5 bits per weight
 typedef struct {
@@ -28,6 +30,8 @@ typedef struct {
   unsigned char qh[QK_K / 8];         // quants, high bit
   unsigned char qs[QK_K / 2];         // quants, low 4 bits
 } block_q5_k;
+static_assert(sizeof(block_q5_k) == 2 * sizeof(unsigned short) + K_SCALE_SIZE + QK_K / 2 + QK_K / 8,
+              "block_q5_k size mismatch with GGML");
 
 // Q6_K block: 6.5625 bits per weight
 // Field order matches llama.cpp block_q6_K: ql, qh, scales, d (d is LAST)
@@ -37,6 +41,8 @@ typedef struct {
   char scales[QK_K / 16];     // scales, quantized with 8 bits (16 bytes)
   unsigned short d;            // super-block scale (as uint16, 2 bytes)
 } block_q6_k;
+static_assert(sizeof(block_q6_k) == sizeof(unsigned short) + QK_K / 16 + 3 * QK_K / 4,
+              "block_q6_k size mismatch with GGML");
 
 //==============================================================================
 // Q4_K Dequantization
@@ -111,6 +117,8 @@ typedef struct {
   unsigned short d;      // scale (delta), 2 bytes
   signed char qs[QK8_0]; // 8-bit quants, 32 bytes
 } block_q8_0;
+static_assert(sizeof(block_q8_0) == sizeof(unsigned short) + QK8_0,
+              "block_q8_0 size mismatch with GGML");
 
 /**
  * @brief CUDA kernel for Q8_0 dequantization
@@ -144,6 +152,8 @@ typedef struct {
   signed char qs[QK_K];   // 8-bit quants, 256 bytes
   short bsums[QK_K / 16]; // sum of quants in groups of 16, 32 bytes
 } block_q8_k;
+static_assert(sizeof(block_q8_k) == sizeof(float) + QK_K + QK_K / 16 * sizeof(short),
+              "block_q8_k size mismatch with GGML");
 // Total: 4 + 256 + 32 = 292 bytes
 
 /**

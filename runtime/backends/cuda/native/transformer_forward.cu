@@ -13,25 +13,44 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <unordered_map>
 #include <vector>
 
 namespace inferflux {
 
 namespace {
 
+// One-shot per-projection path logger. Logs which GEMM path (fused vs cuBLAS)
+// is taken for each projection name on first invocation only.
+void LogGemmPath(const char *proj_name, bool fused) {
+  // Hash projection name pointer (string literals have fixed addresses)
+  static std::unordered_map<const char *, bool> logged;
+  if (logged.count(proj_name))
+    return;
+  logged[proj_name] = true;
+  log::Info("llama_forward",
+            std::string(proj_name) +
+                (fused ? ": using fused dequant-GEMV"
+                       : ": using cuBLAS (dequantized FP16)"));
+}
+
 // Fused dequant-GEMV dispatch: only valid for half (FP16) type.
 // Returns true if the fused kernel was launched.
 template <typename T>
 bool TryFusedGemv(const QuantizedWeightInfo &, const T *, T *, int, int, int,
-                  cudaStream_t) {
+                  cudaStream_t, const char * = nullptr) {
   return false; // BF16 and other types: no fused path
 }
 
 template <>
 bool TryFusedGemv<half>(const QuantizedWeightInfo &raw, const half *input,
                         half *output, int M, int N, int K,
-                        cudaStream_t stream) {
-  return raw.data && FusedQuantGemm::Gemv(raw, input, output, M, N, K, stream);
+                        cudaStream_t stream, const char *proj_name) {
+  bool ok =
+      raw.data && FusedQuantGemm::Gemv(raw, input, output, M, N, K, stream);
+  if (proj_name)
+    LogGemmPath(proj_name, ok);
+  return ok;
 }
 
 } // namespace
@@ -228,7 +247,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       NVTX_SCOPE("QKV_Projection");
       auto q_raw = weights_->LayerQProjRaw(layer);
       if (!TryFusedGemv<T>(q_raw, d_norm_out_, d_q_, seq_len,
-                           num_heads_ * head_dim_, hidden_size_, stream_)) {
+                           num_heads_ * head_dim_, hidden_size_, stream_,
+                           "q_proj")) {
         const T *q_proj =
             reinterpret_cast<const T *>(weights_->LayerQProj(layer));
         if (!gemm_->GemmTyped<T>(seq_len, num_heads_ * head_dim_, hidden_size_,
@@ -240,7 +260,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
       auto k_raw = weights_->LayerKProjRaw(layer);
       if (!TryFusedGemv<T>(k_raw, d_norm_out_, d_k_new_, seq_len,
-                           num_kv_heads_ * head_dim_, hidden_size_, stream_)) {
+                           num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                           "k_proj")) {
         const T *k_proj =
             reinterpret_cast<const T *>(weights_->LayerKProj(layer));
         if (!gemm_->GemmTyped<T>(seq_len, num_kv_heads_ * head_dim_,
@@ -251,7 +272,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       }
       auto v_raw = weights_->LayerVProjRaw(layer);
       if (!TryFusedGemv<T>(v_raw, d_norm_out_, d_v_new_, seq_len,
-                           num_kv_heads_ * head_dim_, hidden_size_, stream_)) {
+                           num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                           "v_proj")) {
         const T *v_proj =
             reinterpret_cast<const T *>(weights_->LayerVProj(layer));
         if (!gemm_->GemmTyped<T>(seq_len, num_kv_heads_ * head_dim_,
@@ -344,7 +366,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       NVTX_SCOPE("O_Projection");
       auto o_raw = weights_->LayerOProjRaw(layer);
       if (!TryFusedGemv<T>(o_raw, d_attn_out_, d_norm_out_, seq_len,
-                           hidden_size_, num_heads_ * head_dim_, stream_)) {
+                           hidden_size_, num_heads_ * head_dim_, stream_,
+                           "o_proj")) {
         const T *o_proj =
             reinterpret_cast<const T *>(weights_->LayerOProj(layer));
         if (!gemm_->GemmTyped<T>(seq_len, hidden_size_, num_heads_ * head_dim_,
@@ -378,7 +401,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       // Gate and up projections
       auto gate_raw = weights_->LayerGateProjRaw(layer);
       if (!TryFusedGemv<T>(gate_raw, d_norm_out_, d_ffn_gate_, seq_len,
-                           intermediate_size_, hidden_size_, stream_)) {
+                           intermediate_size_, hidden_size_, stream_,
+                           "gate_proj")) {
         const T *gate_proj =
             reinterpret_cast<const T *>(weights_->LayerGateProj(layer));
         if (!gemm_->GemmTyped<T>(seq_len, intermediate_size_, hidden_size_,
@@ -389,7 +413,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       }
       auto up_raw = weights_->LayerUpProjRaw(layer);
       if (!TryFusedGemv<T>(up_raw, d_norm_out_, d_ffn_up_, seq_len,
-                           intermediate_size_, hidden_size_, stream_)) {
+                           intermediate_size_, hidden_size_, stream_,
+                           "up_proj")) {
         const T *up_proj =
             reinterpret_cast<const T *>(weights_->LayerUpProj(layer));
         if (!gemm_->GemmTyped<T>(seq_len, intermediate_size_, hidden_size_,
@@ -410,7 +435,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       // Down projection
       auto down_raw = weights_->LayerDownProjRaw(layer);
       if (!TryFusedGemv<T>(down_raw, d_ffn_gate_, d_ffn_down_, seq_len,
-                           hidden_size_, intermediate_size_, stream_)) {
+                           hidden_size_, intermediate_size_, stream_,
+                           "down_proj")) {
         const T *down_proj =
             reinterpret_cast<const T *>(weights_->LayerDownProj(layer));
         if (!gemm_->GemmTyped<T>(seq_len, hidden_size_, intermediate_size_,
@@ -445,7 +471,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     // Step 6: LM head projection -> logits [1, vocab_size] typed
     auto lm_raw = weights_->LmHeadRaw();
     if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, 1, vocab_size_,
-                         hidden_size_, stream_)) {
+                         hidden_size_, stream_, "lm_head")) {
       const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
       if (!gemm_->GemmTyped<T>(1, vocab_size_, hidden_size_, d_norm_out_,
                                lm_head, d_logits_typed_)) {
@@ -539,7 +565,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       NVTX_SCOPE("QKV_Projection");
       auto q_raw = weights_->LayerQProjRaw(layer);
       if (!TryFusedGemv<T>(q_raw, d_norm_out_, d_q_, B, num_heads_ * head_dim_,
-                           hidden_size_, stream_)) {
+                           hidden_size_, stream_, "q_proj")) {
         const T *q_proj =
             reinterpret_cast<const T *>(weights_->LayerQProj(layer));
         if (!gemm_->GemmTyped<T>(B, num_heads_ * head_dim_, hidden_size_,
@@ -550,7 +576,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       }
       auto k_raw = weights_->LayerKProjRaw(layer);
       if (!TryFusedGemv<T>(k_raw, d_norm_out_, d_k_new_, B,
-                           num_kv_heads_ * head_dim_, hidden_size_, stream_)) {
+                           num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                           "k_proj")) {
         const T *k_proj =
             reinterpret_cast<const T *>(weights_->LayerKProj(layer));
         if (!gemm_->GemmTyped<T>(B, num_kv_heads_ * head_dim_, hidden_size_,
@@ -561,7 +588,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       }
       auto v_raw = weights_->LayerVProjRaw(layer);
       if (!TryFusedGemv<T>(v_raw, d_norm_out_, d_v_new_, B,
-                           num_kv_heads_ * head_dim_, hidden_size_, stream_)) {
+                           num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                           "v_proj")) {
         const T *v_proj =
             reinterpret_cast<const T *>(weights_->LayerVProj(layer));
         if (!gemm_->GemmTyped<T>(B, num_kv_heads_ * head_dim_, hidden_size_,
@@ -642,7 +670,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       NVTX_SCOPE("O_Projection");
       auto o_raw = weights_->LayerOProjRaw(layer);
       if (!TryFusedGemv<T>(o_raw, d_attn_out_, d_norm_out_, B, hidden_size_,
-                           num_heads_ * head_dim_, stream_)) {
+                           num_heads_ * head_dim_, stream_, "o_proj")) {
         const T *o_proj =
             reinterpret_cast<const T *>(weights_->LayerOProj(layer));
         if (!gemm_->GemmTyped<T>(B, hidden_size_, num_heads_ * head_dim_,
@@ -669,7 +697,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
 
       auto gate_raw = weights_->LayerGateProjRaw(layer);
       if (!TryFusedGemv<T>(gate_raw, d_norm_out_, d_ffn_gate_, B,
-                           intermediate_size_, hidden_size_, stream_)) {
+                           intermediate_size_, hidden_size_, stream_,
+                           "gate_proj")) {
         const T *gate_proj =
             reinterpret_cast<const T *>(weights_->LayerGateProj(layer));
         if (!gemm_->GemmTyped<T>(B, intermediate_size_, hidden_size_,
@@ -678,7 +707,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       }
       auto up_raw = weights_->LayerUpProjRaw(layer);
       if (!TryFusedGemv<T>(up_raw, d_norm_out_, d_ffn_up_, B,
-                           intermediate_size_, hidden_size_, stream_)) {
+                           intermediate_size_, hidden_size_, stream_,
+                           "up_proj")) {
         const T *up_proj =
             reinterpret_cast<const T *>(weights_->LayerUpProj(layer));
         if (!gemm_->GemmTyped<T>(B, intermediate_size_, hidden_size_,
@@ -693,7 +723,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
 
       auto down_raw = weights_->LayerDownProjRaw(layer);
       if (!TryFusedGemv<T>(down_raw, d_ffn_gate_, d_ffn_down_, B, hidden_size_,
-                           intermediate_size_, stream_)) {
+                           intermediate_size_, stream_, "down_proj")) {
         const T *down_proj =
             reinterpret_cast<const T *>(weights_->LayerDownProj(layer));
         if (!gemm_->GemmTyped<T>(B, hidden_size_, intermediate_size_,
@@ -722,7 +752,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
     // vocab_size]
     auto lm_raw = weights_->LmHeadRaw();
     if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, B, vocab_size_,
-                         hidden_size_, stream_)) {
+                         hidden_size_, stream_, "lm_head")) {
       const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
       if (!gemm_->GemmTyped<T>(B, vocab_size_, hidden_size_, d_norm_out_,
                                lm_head, d_logits_typed_))
