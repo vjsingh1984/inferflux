@@ -171,8 +171,8 @@ bool FlashAttentionForward(const FlashAttentionConfig &config, const void *q,
     if (use_fp16) {
       return FlashAttention2ForwardNativeTyped<half>(
           static_cast<const half *>(q), static_cast<const half *>(k),
-          static_cast<const half *>(v), static_cast<half *>(output),
-          batch_size, seq_len, seq_len, config.num_heads, config.num_kv_heads,
+          static_cast<const half *>(v), static_cast<half *>(output), batch_size,
+          seq_len, seq_len, config.num_heads, config.num_kv_heads,
           config.head_dim, config.use_causal_mask, stream);
     } else {
       log::Error("flash_attention",

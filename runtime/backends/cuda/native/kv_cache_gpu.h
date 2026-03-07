@@ -14,7 +14,7 @@ namespace inferflux {
 class IKvCacheGpu {
 public:
   virtual ~IKvCacheGpu() = default;
-  virtual void ClearSequence(int seq_id) = 0;
+  virtual void ClearSequence(int seq_id, cudaStream_t stream = nullptr) = 0;
   virtual size_t GetMemoryUsage() const = 0;
   virtual int MaxSeqLen() const = 0;
   virtual int MaxBatchSize() const = 0;
@@ -43,7 +43,21 @@ public:
   cudaError_t Append(int layer, int seq_id, int start_pos, int seq_len,
                      const T *k_new, const T *v_new, cudaStream_t stream);
 
-  void ClearSequence(int seq_id) override;
+  void ClearSequence(int seq_id, cudaStream_t stream = nullptr) override;
+
+  /**
+   * Batched KV append: scatter B sequences' K/V into their cache slots with a
+   * single kernel launch (replaces B x 2 cudaMemcpyAsync D2D calls).
+   */
+  cudaError_t BatchAppend(int layer, const int *d_seq_ids, const int *d_n_past,
+                          int batch_size, const T *k_new, const T *v_new,
+                          cudaStream_t stream);
+
+  T *Buffer() const { return buffer_; }
+  size_t SlotStride() const { return slot_stride_; }
+  size_t LayerStride() const { return layer_stride_; }
+  size_t KvStride() const { return kv_stride_; }
+  int KvDim() const { return kv_dim_; }
 
   size_t GetMemoryUsage() const override { return total_bytes_; }
   int MaxSeqLen() const override { return max_seq_len_; }

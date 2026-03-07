@@ -107,7 +107,7 @@ private:
   std::unique_ptr<SafetensorsLoader> loader_;
   ModelInfo model_info_;
   DequantizedCachePolicy dequantized_cache_policy_{
-      DequantizedCachePolicy::kBatchLifetime};
+      DequantizedCachePolicy::kModelLifetime};
 
   // Cache of weight accessors
   mutable std::unordered_map<std::string, std::shared_ptr<IWeightAccessor>>

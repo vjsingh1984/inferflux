@@ -1,7 +1,9 @@
 #include "runtime/backends/cuda/native_kernel_executor.h"
+#include "model/hf_tokenizer.h"
+#include "model/llama_tokenizer.h"
+#include "model/tokenizer.h"
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
 #include "runtime/backends/cuda/native/model_loader.h"
-#include "runtime/backends/cuda/native/native_tokenizer.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
 #include "runtime/backends/cuda/native/quantized_weight_map_adapter.h"
 #include "runtime/backends/cuda/native/safetensors_parser.h"
@@ -47,6 +49,7 @@ inferflux::SafetensorsLoader::ModelConfig ModelInfoToModelConfig(
   config.rope_freq_base = info.rope_freq_base;
   config.rope_freq_scale = info.rope_freq_scale;
   config.rope_dim = info.rope_dim;
+  config.rope_type = static_cast<int>(info.rope_type);
   config.model_type = info.model_type;
   config.activation = info.activation;
   config.torch_dtype = info.torch_dtype;
@@ -430,6 +433,14 @@ bool SafetensorsLoader::ParseConfig(const std::string &config_path) {
     // RoPE settings
     if (config.contains("rope_theta")) {
       config_.rope_freq_base = config["rope_theta"];
+    }
+    if (config.contains("rope_scaling") && config["rope_scaling"].is_object()) {
+      const auto &rs = config["rope_scaling"];
+      if (rs.contains("factor") && rs["factor"].is_number_float()) {
+        float f = rs["factor"].get<float>();
+        if (f > 0.0f)
+          config_.rope_freq_scale = 1.0f / f;
+      }
     }
 
     // Model type
@@ -1084,26 +1095,33 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     return false;
   }
 
-  // 6. Load NativeTokenizer from model directory
-  tokenizer_ = std::make_unique<NativeTokenizer>();
-  const std::string tokenizer_path =
-      model_loader_ ? loaded_model_path_.string() : loader_->GetModelPath();
-  bool tokenizer_ready = tokenizer_->Load(tokenizer_path);
-  if (!tokenizer_ready && model_loader_ &&
-      model_loader_->GetFormat() == "gguf") {
-    auto *gguf_loader = dynamic_cast<runtime::cuda::native::GGUFModelLoader *>(
-        model_loader_.get());
-    if (gguf_loader && !gguf_loader->TokenizerPieces().empty()) {
-      tokenizer_ready = tokenizer_->LoadFromPieces(
-          gguf_loader->TokenizerPieces(), gguf_loader->TokenizerEosTokenId(),
-          gguf_loader->TokenizerBosTokenId());
+  // 6. Load tokenizer via strategy pattern (LlamaTokenizer by default)
+  {
+    const std::string model_path_str = loaded_model_path_.string();
+    auto llama_tok = std::make_unique<LlamaTokenizer>();
+    if (llama_tok->Load(model_path_str)) {
+      tokenizer_ = std::move(llama_tok);
+      log::Info("native_kernel_executor",
+                "Using LlamaTokenizer (llama.cpp) for model: " +
+                    model_path_str);
+    } else {
+      // Fallback: HFTokenizer (adapter over MlxTokenizer) for safetensors
+      auto hf_tok = std::make_unique<HFTokenizer>();
+      const std::string tok_path =
+          model_loader_ ? model_path_str : loader_->GetModelPath();
+      if (hf_tok->Load(tok_path)) {
+        tokenizer_ = std::move(hf_tok);
+        log::Info("native_kernel_executor",
+                  "Using HFTokenizer (tokenizer.json BPE) for model: " +
+                      tok_path);
+      } else {
+        log::Error(
+            "native_kernel_executor",
+            "Failed to initialize tokenizer for model path: " + tok_path +
+                " (no GGUF vocab and no tokenizer.json found)");
+        return false;
+      }
     }
-  }
-  if (!tokenizer_ready) {
-    log::Error("native_kernel_executor",
-               "Failed to initialize tokenizer for model path: " +
-                   tokenizer_path);
-    return false;
   }
 
   // 9. Create cudaEvent pairs for forward/sampling timing
@@ -1139,6 +1157,9 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
           "cudaStreamCreateWithFlags(prefill_stream_)")) {
     return false;
   }
+
+  // 11. Create per-stream cuBLAS handles to avoid SetStream serialization
+  gemm_->InitializeMultiStream({decode_stream_, prefill_stream_});
 
   log::Info("native_kernel_executor",
             "Native inference pipeline initialized successfully");
@@ -1423,20 +1444,52 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
                                                batch_seq_ids, d_logits_, B);
 
     if (fwd_ok) {
+      // Apply per-sequence logit bias and repetition penalty
+      for (int b = 0; b < B; ++b) {
+        float *logits_b = d_logits_ + b * model_forward_->VocabSize();
+        const auto &input = inputs[decode_group[b].input_idx];
+
+        if (!input.sampling.logit_bias.empty()) {
+          std::vector<int> bias_ids;
+          std::vector<float> bias_vals;
+          bias_ids.reserve(input.sampling.logit_bias.size());
+          bias_vals.reserve(input.sampling.logit_bias.size());
+          for (const auto &[tok, val] : input.sampling.logit_bias) {
+            bias_ids.push_back(tok);
+            bias_vals.push_back(val);
+          }
+          sampler_->ApplyLogitBias(logits_b, bias_ids, bias_vals);
+        }
+
+        if (input.sampling.repetition_penalty != 1.0f) {
+          int seq_id = decode_group[b].sequence_id;
+          auto &history = sequence_token_history_[seq_id];
+          int window = input.sampling.penalty_last_n;
+          if (window > 0 && !history.empty()) {
+            int start = std::max(0, static_cast<int>(history.size()) - window);
+            std::vector<int> window_hist(history.begin() + start,
+                                         history.end());
+            sampler_->ApplyRepetitionPenalty(logits_b, window_hist,
+                                             input.sampling.repetition_penalty);
+          }
+        }
+      }
+
       // Batched sampling on decode stream (non-blocking)
       std::vector<int> sampled_tokens;
       sampler_->SampleBatch(d_logits_, B, batch_temps, batch_top_ks,
                             batch_top_ps, &sampled_tokens);
 
-      // Fill outputs
+      // Fill outputs and track token history
       for (int b = 0; b < B; ++b) {
         const auto &de = decode_group[b];
         auto &output = outputs[de.input_idx];
         output.token = sampled_tokens[b];
         output.piece =
-            tokenizer_ ? tokenizer_->IdToString(sampled_tokens[b]) : "";
+            tokenizer_ ? tokenizer_->TokenToString(sampled_tokens[b]) : "";
         output.ok = true;
         perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+        sequence_token_history_[de.sequence_id].push_back(sampled_tokens[b]);
       }
     } else {
       for (const auto &de : decode_group) {
@@ -1471,7 +1524,7 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
           d_logits_, input.sampling.temperature, input.sampling.top_k,
           input.sampling.top_p, input.sampling.seed);
       output.token = token_id;
-      output.piece = tokenizer_ ? tokenizer_->IdToString(token_id) : "";
+      output.piece = tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
       perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -1677,6 +1730,39 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         }
         return outputs;
       }
+      // Apply per-sequence logit bias and repetition penalty
+      for (int b = 0; b < B; ++b) {
+        float *logits_b = d_logits_ + b * model_forward_->VocabSize();
+        const auto &input = inputs[decode_group[b].input_idx];
+
+        // Logit bias
+        if (!input.sampling.logit_bias.empty()) {
+          std::vector<int> bias_ids;
+          std::vector<float> bias_vals;
+          bias_ids.reserve(input.sampling.logit_bias.size());
+          bias_vals.reserve(input.sampling.logit_bias.size());
+          for (const auto &[tok, val] : input.sampling.logit_bias) {
+            bias_ids.push_back(tok);
+            bias_vals.push_back(val);
+          }
+          sampler_->ApplyLogitBias(logits_b, bias_ids, bias_vals);
+        }
+
+        // Repetition penalty
+        if (input.sampling.repetition_penalty != 1.0f) {
+          int seq_id = decode_group[b].sequence_id;
+          auto &history = sequence_token_history_[seq_id];
+          int window = input.sampling.penalty_last_n;
+          if (window > 0 && !history.empty()) {
+            int start = std::max(0, static_cast<int>(history.size()) - window);
+            std::vector<int> window_hist(history.begin() + start,
+                                         history.end());
+            sampler_->ApplyRepetitionPenalty(logits_b, window_hist,
+                                             input.sampling.repetition_penalty);
+          }
+        }
+      }
+
       std::vector<int> sampled_tokens;
       sampler_->SampleBatch(d_logits_, B, batch_temps, batch_top_ks,
                             batch_top_ps, &sampled_tokens);
@@ -1703,7 +1789,7 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       }
       GlobalMetrics().RecordNativeSampling(B, samp_ms);
 
-      // Fill outputs
+      // Fill outputs and track token history
       for (int b = 0; b < B; ++b) {
         int idx = decode_group[b].input_idx;
         int token_id = sampled_tokens[b];
@@ -1713,8 +1799,10 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         } else {
           outputs[idx].token = token_id;
           outputs[idx].piece =
-              tokenizer_ ? tokenizer_->IdToString(token_id) : "";
+              tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
           perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+          sequence_token_history_[decode_group[b].sequence_id].push_back(
+              token_id);
         }
         outputs[idx].ok = true;
       }
@@ -1835,7 +1923,7 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         output.piece = "";
       } else {
         output.token = token_id;
-        output.piece = tokenizer_ ? tokenizer_->IdToString(token_id) : "";
+        output.piece = tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
         perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
       }
       output.ok = true;
@@ -2014,16 +2102,32 @@ NativeCudaRuntime::NativePerfSnapshot NativeKernelExecutor::NativeTakePerf() {
 std::vector<int>
 NativeKernelExecutor::NativeTokenize(const std::string &prompt) const {
   if (tokenizer_) {
-    return tokenizer_->Encode(prompt);
+    return tokenizer_->Tokenize(prompt, true);
   }
   return {};
 }
 
 int NativeKernelExecutor::NativeTokenCount(const std::string &text) const {
   if (tokenizer_) {
-    return static_cast<int>(tokenizer_->Encode(text).size());
+    return tokenizer_->TokenCount(text);
   }
   return 0;
+}
+
+NativeCudaRuntime::NativeChatResult NativeKernelExecutor::NativeFormatChat(
+    const std::vector<std::pair<std::string, std::string>> &messages,
+    bool add_assistant_prefix) const {
+  NativeChatResult result;
+  if (tokenizer_) {
+    auto chat = tokenizer_->ApplyChatTemplate(messages, add_assistant_prefix);
+    result.prompt = std::move(chat.prompt);
+    result.valid = chat.valid;
+  }
+  return result;
+}
+
+const ITokenizer *NativeKernelExecutor::NativeGetTokenizer() const {
+  return tokenizer_.get();
 }
 
 bool NativeKernelExecutor::NativeIsReady() const { return model_loaded_; }
@@ -2031,9 +2135,14 @@ bool NativeKernelExecutor::NativeIsReady() const { return model_loaded_; }
 void NativeKernelExecutor::NativeFreeSequence(int sequence_id) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (kv_cache_) {
-    kv_cache_->ClearSequence(sequence_id);
+    // Pass compute_stream_ to avoid race condition: cudaMemset on the NULL
+    // stream does NOT synchronize with cudaStreamNonBlocking streams.
+    // Using cudaMemsetAsync on compute_stream_ ensures the clear is ordered
+    // before subsequent forward pass kernels on the same stream.
+    kv_cache_->ClearSequence(sequence_id, compute_stream_);
   }
 #endif
+  sequence_token_history_.erase(sequence_id);
 }
 
 void NativeKernelExecutor::NativeCopySequencePrefix(int /*src_seq*/,

@@ -157,7 +157,7 @@ private:
   size_t quantized_buffer_size_{0};
   size_t dequantized_buffer_size_{0};
   DequantizedCachePolicy dequantized_cache_policy_{
-      DequantizedCachePolicy::kBatchLifetime};
+      DequantizedCachePolicy::kModelLifetime};
 
   // File path
   std::filesystem::path model_path_;

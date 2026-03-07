@@ -29,6 +29,36 @@ enum class DequantizedCachePolicy {
   kBatchLifetime,
 };
 
+/**
+ * RoPE pairing strategy.
+ * - kNorm: consecutive pairs (0,1),(2,3),... — LLaMA, Mistral, Baichuan, etc.
+ * - kNeox: split-half pairs (0,d/2),(1,d/2+1),... — Falcon, Qwen, GPT-NeoX,
+ * etc.
+ */
+enum class RopeType {
+  kNorm = 0, // GGML_ROPE_TYPE_NORMAL — default for LLaMA family
+  kNeox = 2, // GGML_ROPE_TYPE_NEOX   — Falcon, Qwen, GPT-NeoX, etc.
+};
+
+/** Infer RoPE type from model architecture name (matches llama.cpp). */
+inline RopeType InferRopeType(const std::string &model_type) {
+  // NEOX-style: split-half pairing
+  if (model_type == "falcon" || model_type == "gptneox" ||
+      model_type == "qwen" || model_type == "qwen2" ||
+      model_type == "qwen2moe" || model_type == "qwen3" ||
+      model_type == "qwen3moe" || model_type == "phi2" ||
+      model_type == "phi3" || model_type == "stablelm" ||
+      model_type == "starcoder2" || model_type == "gemma" ||
+      model_type == "gemma2" || model_type == "gemma3" ||
+      model_type == "codeshell" || model_type == "openelm" ||
+      model_type == "plamo" || model_type == "bert" ||
+      model_type == "nomic-bert") {
+    return RopeType::kNeox;
+  }
+  // NORM-style: consecutive pairing (default for LLaMA and most models)
+  return RopeType::kNorm;
+}
+
 std::string DequantizedCachePolicyToString(DequantizedCachePolicy policy);
 bool ParseDequantizedCachePolicy(const std::string &raw,
                                  DequantizedCachePolicy *out);
@@ -56,6 +86,7 @@ struct ModelInfo {
   float rope_freq_base{10000.0f};
   float rope_freq_scale{1.0f};
   int rope_dim{0};
+  RopeType rope_type{RopeType::kNorm};
 
   // Model type
   std::string model_type; // "qwen2", "llama", etc.

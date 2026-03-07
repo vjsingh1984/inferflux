@@ -559,6 +559,18 @@ bool GGUFModelLoader::ParseKeyValuePairs(FILE *file) {
       model_info_.rope_freq_base = v;
       continue;
     }
+    // rope.scaling.factor → inverse gives freq_scale (matches llama.cpp)
+    if (key.find(".rope.scaling.factor") != std::string::npos ||
+        key.find(".rope.scale_linear") != std::string::npos) {
+      float v = 0.0f;
+      if (!read_float_value(&v)) {
+        return false;
+      }
+      if (v > 0.0f) {
+        model_info_.rope_freq_scale = 1.0f / v;
+      }
+      continue;
+    }
     if (key.find(".attention.layer_norm_rms_epsilon") != std::string::npos) {
       float v = 0.0f;
       if (!read_float_value(&v)) {
@@ -863,6 +875,7 @@ bool GGUFModelLoader::ExtractModelInfo() {
   if (model_info_.rope_dim <= 0 && model_info_.head_dim > 0) {
     model_info_.rope_dim = model_info_.head_dim;
   }
+  model_info_.rope_type = InferRopeType(model_info_.model_type);
 
   log::Info("gguf_loader",
             "Model info: type=" + model_info_.model_type +
@@ -968,9 +981,16 @@ DequantizedCachePolicy GGUFModelLoader::GetDequantizedCachePolicy() const {
 void GGUFModelLoader::ClearDequantizedCache() {
   for (auto &[name, tensor] : tensors_) {
     if (tensor.dequantized_gpu) {
-      CheckCudaStatus(cudaFree(tensor.dequantized_gpu), "gguf_loader",
-                      "cudaFree(tensor.dequantized_gpu:" + name + ")");
-      tensor.dequantized_gpu = nullptr;
+      // Only free dequantized caches for quantized tensors (large projection
+      // weights). Non-quantized tensors (embeddings, norms, LM head) produce
+      // small F32→FP16 conversions that should persist — freeing them causes a
+      // use-after-free when the forward pass accesses these weights via cached
+      // pointers in QuantizedWeightMap.
+      if (tensor.info.is_quantized()) {
+        CheckCudaStatus(cudaFree(tensor.dequantized_gpu), "gguf_loader",
+                        "cudaFree(tensor.dequantized_gpu:" + name + ")");
+        tensor.dequantized_gpu = nullptr;
+      }
     }
   }
 }

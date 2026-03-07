@@ -79,6 +79,13 @@ add_library(inferflux_core
   runtime/prefix_cache/radix_prefix_cache.h
   model/tokenizer/simple_tokenizer.cpp
   model/tokenizer/simple_tokenizer.h
+  model/tokenizer.h
+  model/llama_tokenizer.cpp
+  model/llama_tokenizer.h
+  model/hf_tokenizer.cpp
+  model/hf_tokenizer.h
+  runtime/backends/mlx/mlx_tokenizer.cpp
+  runtime/backends/mlx/mlx_tokenizer.h
   model/model_format.cpp
   model/model_format.h
   runtime/scheduler/sequence_slot_manager.cpp
@@ -306,7 +313,6 @@ if(ENABLE_MLX)
     runtime/backends/mlx/mlx_backend.cpp
     runtime/backends/mlx/mlx_loader.cpp
     runtime/backends/mlx/mlx_execution.cpp
-    runtime/backends/mlx/mlx_tokenizer.cpp
   )
   message(STATUS "ENABLE_MLX=ON — configuring mlx-c dependency")
   set(MLX_C_HINTS $ENV{MLX_C_ROOT} ${MLX_C_ROOT})

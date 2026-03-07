@@ -6,9 +6,12 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace inferflux {
+
+class ITokenizer;
 
 class NativeCudaRuntime {
 public:
@@ -80,6 +83,19 @@ public:
       backend->CopySequencePrefix(src_seq, dst_seq, n_tokens);
     }
   }
+
+  struct NativeChatResult {
+    std::string prompt;
+    bool valid{false};
+  };
+
+  virtual NativeChatResult NativeFormatChat(
+      const std::vector<std::pair<std::string, std::string>> &messages,
+      bool add_assistant_prefix = true) const {
+    return {};
+  }
+
+  virtual const ITokenizer *NativeGetTokenizer() const { return nullptr; }
 };
 
 std::unique_ptr<NativeCudaRuntime> CreateNativeCudaRuntime();

@@ -21,8 +21,7 @@ bool ParseBoolValue(const char *raw) {
   }
   std::string lowered(raw);
   for (auto &ch : lowered) {
-    ch = static_cast<char>(
-        std::tolower(static_cast<unsigned char>(ch)));
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
   }
   return lowered == "1" || lowered == "true" || lowered == "yes" ||
          lowered == "on";
@@ -57,8 +56,7 @@ bool NativeCudaBackend::LoadModel(const std::filesystem::path &model_path,
 
   runtime_ = CreateNativeCudaRuntime();
   if (!runtime_) {
-    log::Error("native_cuda_backend",
-               "failed to create native CUDA runtime");
+    log::Error("native_cuda_backend", "failed to create native CUDA runtime");
     return false;
   }
 
@@ -81,8 +79,8 @@ bool NativeCudaBackend::LoadModel(const std::filesystem::path &model_path,
     return false;
   }
   if (fallback_mode_ && !fallback_reason_.empty()) {
-    log::Warn("native_cuda_backend", fallback_reason_ +
-                                      " (runtime=" + runtime_kind_ + ")");
+    log::Warn("native_cuda_backend",
+              fallback_reason_ + " (runtime=" + runtime_kind_ + ")");
   }
   return true;
 #else
@@ -275,6 +273,17 @@ LlamaCPUBackend::PerfSnapshot NativeCudaBackend::TakePerf() {
 LlamaCPUBackend::ChatTemplateResult NativeCudaBackend::FormatChatMessages(
     const std::vector<std::pair<std::string, std::string>> &messages,
     bool add_assistant_prefix) {
+  // Prefer runtime's native tokenizer (LlamaTokenizer with chat templates)
+  if (runtime_) {
+    auto native = runtime_->NativeFormatChat(messages, add_assistant_prefix);
+    if (native.valid) {
+      ChatTemplateResult result;
+      result.prompt = std::move(native.prompt);
+      result.valid = true;
+      return result;
+    }
+  }
+  // Fallback to llama.cpp backend (if available)
   auto backend = DelegateBackend();
   if (!backend) {
     return {};

@@ -25,27 +25,17 @@ void EnsureCudaQuantizationHandlersRegistered(
     return;
   // Explicit registration — do not rely on static initializers in handler
   // translation units, which the linker may strip from the static library.
-  registry->Register("q4_k_m", []() {
-    return std::make_shared<Q4_K_M_Handler>();
-  });
-  registry->Register("q4_k", []() {
-    return std::make_shared<Q4_K_M_Handler>();
-  });
-  registry->Register("q5_k_m", []() {
-    return std::make_shared<Q5_K_M_Handler>();
-  });
-  registry->Register("q5_k", []() {
-    return std::make_shared<Q5_K_M_Handler>();
-  });
-  registry->Register("q6_k", []() {
-    return std::make_shared<Q6_K_Handler>();
-  });
-  registry->Register("q8_0", []() {
-    return std::make_shared<Q8_0_Handler>();
-  });
-  registry->Register("q8_k", []() {
-    return std::make_shared<Q8_K_Handler>();
-  });
+  registry->Register("q4_k_m",
+                     []() { return std::make_shared<Q4_K_M_Handler>(); });
+  registry->Register("q4_k",
+                     []() { return std::make_shared<Q4_K_M_Handler>(); });
+  registry->Register("q5_k_m",
+                     []() { return std::make_shared<Q5_K_M_Handler>(); });
+  registry->Register("q5_k",
+                     []() { return std::make_shared<Q5_K_M_Handler>(); });
+  registry->Register("q6_k", []() { return std::make_shared<Q6_K_Handler>(); });
+  registry->Register("q8_0", []() { return std::make_shared<Q8_0_Handler>(); });
+  registry->Register("q8_k", []() { return std::make_shared<Q8_K_Handler>(); });
 }
 #endif
 
