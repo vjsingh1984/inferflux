@@ -3,12 +3,51 @@
 #include "server/logging/logger.h"
 #include <algorithm>
 
+#ifdef INFERFLUX_HAS_CUDA
+#include "runtime/backends/cuda/native/q4_k_m_handler.h"
+#include "runtime/backends/cuda/native/q5_k_m_handler.h"
+#include "runtime/backends/cuda/native/q6_k_handler.h"
+#include "runtime/backends/cuda/native/q8_0_handler.h"
+#include "runtime/backends/cuda/native/q8_k_handler.h"
+#endif
+
 namespace inferflux {
 namespace runtime {
 namespace cuda {
 namespace native {
 
 namespace {
+
+#ifdef INFERFLUX_HAS_CUDA
+void EnsureCudaQuantizationHandlersRegistered(
+    QuantizationHandlerRegistry *registry) {
+  if (!registry)
+    return;
+  // Explicit registration — do not rely on static initializers in handler
+  // translation units, which the linker may strip from the static library.
+  registry->Register("q4_k_m", []() {
+    return std::make_shared<Q4_K_M_Handler>();
+  });
+  registry->Register("q4_k", []() {
+    return std::make_shared<Q4_K_M_Handler>();
+  });
+  registry->Register("q5_k_m", []() {
+    return std::make_shared<Q5_K_M_Handler>();
+  });
+  registry->Register("q5_k", []() {
+    return std::make_shared<Q5_K_M_Handler>();
+  });
+  registry->Register("q6_k", []() {
+    return std::make_shared<Q6_K_Handler>();
+  });
+  registry->Register("q8_0", []() {
+    return std::make_shared<Q8_0_Handler>();
+  });
+  registry->Register("q8_k", []() {
+    return std::make_shared<Q8_K_Handler>();
+  });
+}
+#endif
 
 #ifndef INFERFLUX_HAS_CUDA
 class StaticQuantizationHandler final : public IQuantizationHandler {
@@ -77,13 +116,15 @@ void EnsureCpuQuantizationHandlersRegistered(
 
 QuantizationHandlerRegistry &QuantizationHandlerRegistry::Instance() {
   static QuantizationHandlerRegistry instance;
-#ifndef INFERFLUX_HAS_CUDA
   static const bool kRegistered = []() {
+#ifdef INFERFLUX_HAS_CUDA
+    EnsureCudaQuantizationHandlersRegistered(&instance);
+#else
     EnsureCpuQuantizationHandlersRegistered(&instance);
+#endif
     return true;
   }();
   (void)kRegistered;
-#endif
   return instance;
 }
 
