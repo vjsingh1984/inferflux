@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/model_loader.h"
+#include "runtime/backends/cuda/native/weight_map.h"
 
 #ifdef INFERFLUX_HAS_CUDA
 #include <cuda_runtime_api.h>
@@ -113,6 +114,17 @@ public:
   int NumLayers() const { return num_layers_; }
   bool IsQuantized() const { return is_quantized_; }
   std::string GetQuantizationType() const { return quantization_type_; }
+
+  // --- Raw quantized weight accessors (for fused dequant-GEMV) ---
+
+  QuantizedWeightInfo GetRawLayerQProj(int layer) const;
+  QuantizedWeightInfo GetRawLayerKProj(int layer) const;
+  QuantizedWeightInfo GetRawLayerVProj(int layer) const;
+  QuantizedWeightInfo GetRawLayerOProj(int layer) const;
+  QuantizedWeightInfo GetRawLayerGateProj(int layer) const;
+  QuantizedWeightInfo GetRawLayerUpProj(int layer) const;
+  QuantizedWeightInfo GetRawLayerDownProj(int layer) const;
+  QuantizedWeightInfo GetRawLmHead() const;
 
   /**
    * @brief Check if a weight tensor exists

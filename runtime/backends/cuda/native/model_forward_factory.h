@@ -6,11 +6,6 @@
 
 namespace inferflux {
 
-// Forward declaration for QuantizedForward (defined in quantized_forward.h)
-// Note: This must be a full include where QuantizedForward is used as a
-// complete type
-class QuantizedForward;
-
 /**
  * Create a ModelForward implementation based on model_type string.
  *
@@ -28,18 +23,5 @@ std::unique_ptr<ModelForward> CreateModelForward(const std::string &model_type);
 template <typename T>
 std::unique_ptr<ModelForward>
 CreateModelForwardTyped(const std::string &model_type);
-
-/**
- * Create a QuantizedForward for GGUF quantized models.
- *
- * Returns a QuantizedForward instance that can handle GGUF quantization.
- * Returns nullptr for unsupported model types.
- *
- * Note: This function returns std::unique_ptr<ModelForward> (base class)
- * to maintain compatibility with the existing factory interface.
- * The actual object is a QuantizedForward instance.
- */
-std::unique_ptr<ModelForward>
-CreateQuantizedForwardAsModelForward(const std::string &model_type);
 
 } // namespace inferflux

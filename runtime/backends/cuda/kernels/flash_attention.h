@@ -56,37 +56,10 @@ FlashAttentionCapabilities QueryFlashAttentionCapabilities(int device_id = 0);
 AttentionKernelType SelectOptimalKernel(const FlashAttentionConfig &config,
                                         const FlashAttentionCapabilities &caps);
 
-// FlashAttention-2 forward pass (Ada/Ampere)
-bool FlashAttention2Forward(
-    const FlashAttentionConfig &config,
-    const float *q, // Query [batch_size, seq_len, num_heads, head_dim]
-    const float *k, // Key [batch_size, seq_len, num_kv_heads, head_dim]
-    const float *v, // Value [batch_size, seq_len, num_kv_heads, head_dim]
-    float *output,  // Output [batch_size, seq_len, num_heads, head_dim]
-    float
-        *lse, // Log-sum-exp for backward pass [batch_size, num_heads, seq_len]
-    int batch_size, int seq_len, cudaStream_t stream = 0);
-
-// FlashAttention-2 forward pass with FP16 (faster, less memory)
-bool FlashAttention2ForwardFP16(
-    const FlashAttentionConfig &config,
-    const half *q, // Query [batch_size, seq_len, num_heads, head_dim]
-    const half *k, // Key [batch_size, seq_len, num_kv_heads, head_dim]
-    const half *v, // Value [batch_size, seq_len, num_kv_heads, head_dim]
-    half *output,  // Output [batch_size, seq_len, num_heads, head_dim]
-    float *lse,    // Log-sum-exp for backward pass
-    int batch_size, int seq_len, cudaStream_t stream = 0);
-
-// Standard attention fallback (works on any GPU)
-bool StandardAttentionForward(const FlashAttentionConfig &config,
-                              const float *q, const float *k, const float *v,
-                              float *output, int batch_size, int seq_len,
-                              cudaStream_t stream = 0);
-
 // Get kernel type name for logging/metrics
 std::string GetKernelTypeName(AttentionKernelType type);
 
-// Unified forward entry point (auto-selects kernel based on type)
+// Unified forward entry point (auto-selects kernel, uses tiled FA2)
 bool FlashAttentionForward(
     const FlashAttentionConfig &config, const void *q, const void *k,
     const void *v, void *output, void *lse, int batch_size, int seq_len,

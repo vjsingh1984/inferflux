@@ -11,6 +11,16 @@
 namespace inferflux {
 
 /**
+ * Info about a raw quantized weight tensor on GPU.
+ * Used by fused dequant-GEMV kernels to bypass full dequantization.
+ */
+struct QuantizedWeightInfo {
+  const void *data{nullptr}; // Raw quantized GPU pointer
+  int quant_type{-1};        // GGUF::TensorType enum value (-1 = unknown)
+  int64_t num_elements{0};   // Logical element count (rows * cols)
+};
+
+/**
  * WeightMapTyped<T>: typed GPU pointer accessors for safetensors model weights.
  *
  * Wraps SafetensorsLoader to provide const T* accessors organized by
@@ -19,32 +29,50 @@ namespace inferflux {
 template <typename T> class WeightMapTyped {
 public:
   WeightMapTyped() = default;
+  virtual ~WeightMapTyped() = default;
 
   bool Build(const SafetensorsLoader &loader,
              const SafetensorsLoader::ModelConfig &config);
 
   // --- Per-layer accessors ---
-  const T *LayerQProj(int layer) const;
-  const T *LayerKProj(int layer) const;
-  const T *LayerVProj(int layer) const;
-  const T *LayerOProj(int layer) const;
-  const T *LayerInputNorm(int layer) const;
-  const T *LayerPostAttnNorm(int layer) const;
-  const T *LayerGateProj(int layer) const;
-  const T *LayerUpProj(int layer) const;
-  const T *LayerDownProj(int layer) const;
+  virtual const T *LayerQProj(int layer) const;
+  virtual const T *LayerKProj(int layer) const;
+  virtual const T *LayerVProj(int layer) const;
+  virtual const T *LayerOProj(int layer) const;
+  virtual const T *LayerInputNorm(int layer) const;
+  virtual const T *LayerPostAttnNorm(int layer) const;
+  virtual const T *LayerGateProj(int layer) const;
+  virtual const T *LayerUpProj(int layer) const;
+  virtual const T *LayerDownProj(int layer) const;
 
   // --- Per-layer bias accessors (nullptr if model has no biases) ---
-  const T *LayerQProjBias(int layer) const;
-  const T *LayerKProjBias(int layer) const;
-  const T *LayerVProjBias(int layer) const;
+  virtual const T *LayerQProjBias(int layer) const;
+  virtual const T *LayerKProjBias(int layer) const;
+  virtual const T *LayerVProjBias(int layer) const;
 
   // --- Global accessors ---
-  const T *EmbedTokens() const { return embed_tokens_; }
-  const T *FinalNorm() const { return final_norm_; }
-  const T *LmHead() const { return lm_head_; }
+  virtual const T *EmbedTokens() const { return embed_tokens_; }
+  virtual const T *FinalNorm() const { return final_norm_; }
+  virtual const T *LmHead() const { return lm_head_; }
 
-  int NumLayers() const { return num_layers_; }
+  virtual int NumLayers() const { return num_layers_; }
+
+  // --- Raw quantized weight accessors (for fused dequant-GEMV) ---
+  // Default implementations return empty info (safetensors models).
+  // Overridden by QuantizedWeightMapAdapter for GGUF models.
+  virtual QuantizedWeightInfo LayerQProjRaw(int /*layer*/) const { return {}; }
+  virtual QuantizedWeightInfo LayerKProjRaw(int /*layer*/) const { return {}; }
+  virtual QuantizedWeightInfo LayerVProjRaw(int /*layer*/) const { return {}; }
+  virtual QuantizedWeightInfo LayerOProjRaw(int /*layer*/) const { return {}; }
+  virtual QuantizedWeightInfo LayerGateProjRaw(int /*layer*/) const {
+    return {};
+  }
+  virtual QuantizedWeightInfo LayerUpProjRaw(int /*layer*/) const { return {}; }
+  virtual QuantizedWeightInfo LayerDownProjRaw(int /*layer*/) const {
+    return {};
+  }
+  virtual QuantizedWeightInfo LmHeadRaw() const { return {}; }
+  virtual bool HasQuantizedWeights() const { return false; }
 
 private:
   struct LayerWeights {

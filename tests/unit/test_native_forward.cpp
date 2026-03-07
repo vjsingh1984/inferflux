@@ -4,8 +4,10 @@
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
 #include "runtime/backends/cuda/native/cublas_gemm.h"
+#include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/model_forward_factory.h"
 #include "runtime/backends/cuda/native/native_tokenizer.h"
+#include "runtime/backends/cuda/native/quantized_weight_map_adapter.h"
 #include "runtime/backends/cuda/native/weight_map.h"
 #endif
 
@@ -166,5 +168,125 @@ TEST_CASE("SafetensorsLoader: ModelConfig defaults for torch_dtype and "
   REQUIRE(config.torch_dtype.empty());
   REQUIRE(config.rms_norm_eps == Catch::Approx(1e-6f));
 }
+
+// ============================================================================
+// QuantizedWeightMapAdapter Tests
+// ============================================================================
+
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+
+// ============================================================================
+// QuantizedWeightInfo & Raw Accessor Tests
+// ============================================================================
+
+TEST_CASE("QuantizedWeightInfo: default-constructed has null data",
+          "[native_forward]") {
+  QuantizedWeightInfo info;
+  REQUIRE(info.data == nullptr);
+  REQUIRE(info.quant_type == -1);
+  REQUIRE(info.num_elements == 0);
+}
+
+TEST_CASE("WeightMapTyped: HasQuantizedWeights returns false by default",
+          "[native_forward]") {
+  WeightMap wm;
+  REQUIRE_FALSE(wm.HasQuantizedWeights());
+  REQUIRE(wm.LayerQProjRaw(0).data == nullptr);
+  REQUIRE(wm.LmHeadRaw().data == nullptr);
+}
+
+TEST_CASE(
+    "QuantizedWeightMapAdapter: HasQuantizedWeights delegates to underlying",
+    "[native_forward]") {
+  QuantizedWeightMap qwm;
+  QuantizedWeightMapAdapter adapter(&qwm);
+
+  // Without Build(), IsQuantized() returns false
+  REQUIRE_FALSE(adapter.HasQuantizedWeights());
+
+  // Raw accessors should return empty info
+  REQUIRE(adapter.LayerQProjRaw(0).data == nullptr);
+  REQUIRE(adapter.LayerKProjRaw(0).data == nullptr);
+  REQUIRE(adapter.LayerVProjRaw(0).data == nullptr);
+  REQUIRE(adapter.LayerOProjRaw(0).data == nullptr);
+  REQUIRE(adapter.LayerGateProjRaw(0).data == nullptr);
+  REQUIRE(adapter.LayerUpProjRaw(0).data == nullptr);
+  REQUIRE(adapter.LayerDownProjRaw(0).data == nullptr);
+  REQUIRE(adapter.LmHeadRaw().data == nullptr);
+}
+
+// ============================================================================
+// FusedQuantGemm Dispatch Tests
+// ============================================================================
+
+TEST_CASE("FusedQuantGemm: returns false for null data", "[native_forward]") {
+  QuantizedWeightInfo info;
+  // Should return false (no data), not crash
+  bool used = FusedQuantGemm::Gemv(info, nullptr, nullptr, 1, 128, 64, nullptr);
+  REQUIRE_FALSE(used);
+}
+
+TEST_CASE("FusedQuantGemm: returns false for unsupported quant type",
+          "[native_forward]") {
+  QuantizedWeightInfo info;
+  info.data = reinterpret_cast<const void *>(0x1); // Non-null dummy
+  info.quant_type = 0; // F32 — not a quantized type we support
+  info.num_elements = 128 * 64;
+
+  bool used = FusedQuantGemm::Gemv(info, nullptr, nullptr, 1, 128, 64, nullptr);
+  REQUIRE_FALSE(used);
+}
+
+TEST_CASE("FusedQuantGemm: returns false for large M", "[native_forward]") {
+  QuantizedWeightInfo info;
+  info.data = reinterpret_cast<const void *>(0x1);
+  info.quant_type = 12; // Q4_K
+  info.num_elements = 128 * 64;
+
+  // M=64 always exceeds the adaptive threshold (capped at kFusedGemmMaxM=32)
+  bool used =
+      FusedQuantGemm::Gemv(info, nullptr, nullptr, 64, 128, 64, nullptr);
+  REQUIRE_FALSE(used);
+}
+
+TEST_CASE("FusedQuantGemm: adaptive threshold varies by quant type",
+          "[native_forward]") {
+  // Lower bits per weight → higher threshold (fused saves more bandwidth)
+  int q4k_threshold = FusedQuantGemm::GetAdaptiveThreshold(12); // Q4_K
+  int q8_0_threshold = FusedQuantGemm::GetAdaptiveThreshold(8); // Q8_0
+  REQUIRE(q4k_threshold >= q8_0_threshold);
+  REQUIRE(q4k_threshold >= 4);
+  REQUIRE(q4k_threshold <= 32);
+}
+
+// ============================================================================
+// QuantizedWeightMapAdapter Tests
+// ============================================================================
+
+TEST_CASE("QuantizedWeightMapAdapter: delegates NumLayers to underlying map",
+          "[native_forward]") {
+  // QuantizedWeightMap without Build() returns 0 layers
+  QuantizedWeightMap qwm;
+  QuantizedWeightMapAdapter adapter(&qwm);
+
+  // Adapter should delegate to the underlying map
+  REQUIRE(adapter.NumLayers() == 0);
+  REQUIRE(adapter.EmbedTokens() == nullptr);
+  REQUIRE(adapter.FinalNorm() == nullptr);
+  REQUIRE(adapter.LmHead() == nullptr);
+}
+
+TEST_CASE("QuantizedWeightMapAdapter: is a WeightMapTyped<half>",
+          "[native_forward]") {
+  QuantizedWeightMap qwm;
+  QuantizedWeightMapAdapter adapter(&qwm);
+
+  // Verify polymorphism: adapter can be used as WeightMapTyped<half>*
+  const WeightMap *base = &adapter;
+  REQUIRE(base->NumLayers() == 0);
+  REQUIRE(base->EmbedTokens() == nullptr);
+}
+
+#endif // INFERFLUX_NATIVE_KERNELS_READY
 
 } // namespace inferflux

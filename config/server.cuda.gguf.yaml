@@ -34,17 +34,11 @@ auth:
 
 # Model configuration
 models:
-  # Example Qwen2.5 3B GGUF model
-  - id: qwen2.5-3b-gguf
-    path: "models/qwen2.5-3b-instruct-q4_k_m.gguf"
+  - id: tinyllama
+    path: "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
     format: gguf                    # Explicitly specify GGUF format
-    backend: cuda_native            # Use native CUDA kernels
+    backend: cuda_native            # Use native CUDA kernels (fused dequant-GEMV)
     default: true
-
-    # Optional: Override model metadata if not in GGUF
-    metadata:
-      name: "Qwen2.5 3B Instruct (GGUF Q4_K_M)"
-      max_sequence_length: 32768
 
   # Example for multiple GGUF models
   # - id: qwen2.5-7b-gguf

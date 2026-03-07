@@ -3,7 +3,7 @@
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/native_tokenizer.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
-#include "runtime/backends/cuda/native/quantized_forward.h"
+#include "runtime/backends/cuda/native/quantized_weight_map_adapter.h"
 #include "runtime/backends/cuda/native/safetensors_parser.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
@@ -32,6 +32,27 @@
 #include <nlohmann/json.hpp>
 
 namespace {
+
+inferflux::SafetensorsLoader::ModelConfig ModelInfoToModelConfig(
+    const inferflux::runtime::cuda::native::ModelInfo &info) {
+  inferflux::SafetensorsLoader::ModelConfig config;
+  config.hidden_size = info.hidden_size;
+  config.num_hidden_layers = info.num_hidden_layers;
+  config.num_attention_heads = info.num_attention_heads;
+  config.num_key_value_heads = info.num_key_value_heads;
+  config.head_dim = info.head_dim;
+  config.intermediate_size = info.intermediate_size;
+  config.vocab_size = info.vocab_size;
+  config.max_position_embeddings = info.max_position_embeddings;
+  config.rope_freq_base = info.rope_freq_base;
+  config.rope_freq_scale = info.rope_freq_scale;
+  config.rope_dim = info.rope_dim;
+  config.model_type = info.model_type;
+  config.activation = info.activation;
+  config.torch_dtype = info.torch_dtype;
+  config.rms_norm_eps = info.rms_norm_eps;
+  return config;
+}
 
 constexpr std::size_t kKiB = 1024ULL;
 constexpr std::size_t kMiB = kKiB * kKiB;
@@ -993,20 +1014,22 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
                  "Failed to build quantized weight map");
       return false;
     }
-    model_forward_ = CreateQuantizedForwardAsModelForward(config.model_type);
-    auto *quantized_forward =
-        dynamic_cast<QuantizedForward *>(model_forward_.get());
-    if (!quantized_forward) {
+    quantized_weight_adapter_ = std::make_unique<QuantizedWeightMapAdapter>(
+        quantized_weight_map_.get());
+    // GGUF always dequantizes to FP16, so use LlamaForwardTyped<half>
+    model_forward_ = CreateModelForward(config.model_type);
+    if (!model_forward_) {
       log::Error("native_kernel_executor",
-                 "Failed to create quantized forward for model_type: " +
+                 "Failed to create forward for model_type: " +
                      config.model_type);
       return false;
     }
-    if (!quantized_forward->Initialize(model_info_, quantized_weight_map_.get(),
-                                       kv_cache_.get(), gemm_.get(),
-                                       compute_stream_)) {
+    auto gguf_config = ModelInfoToModelConfig(model_info_);
+    if (!model_forward_->Initialize(gguf_config, *quantized_weight_adapter_,
+                                    kv_cache_.get(), gemm_.get(),
+                                    compute_stream_)) {
       log::Error("native_kernel_executor",
-                 "Failed to initialize quantized forward");
+                 "Failed to initialize forward pass for GGUF model");
       return false;
     }
   } else {

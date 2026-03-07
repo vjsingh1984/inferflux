@@ -1,7 +1,6 @@
 #include "runtime/backends/cuda/native/model_forward_factory.h"
 #include "runtime/backends/cuda/common/dtype_traits.cuh"
 #include "runtime/backends/cuda/native/llama_forward.h"
-#include "runtime/backends/cuda/native/quantized_forward.h"
 #include "server/logging/logger.h"
 
 #include <algorithm>
@@ -45,28 +44,6 @@ CreateModelForwardTyped(const std::string &model_type) {
   }
 
   log::Error("model_forward_factory", "Unsupported model_type: " + model_type);
-  return nullptr;
-}
-
-/**
- * @brief Create QuantizedForward for GGUF models
- *
- * Factory function specifically for quantized models.
- * Returns a QuantizedForward instance that can handle GGUF quantization.
- * Returned as std::unique_ptr<ModelForward> for compatibility.
- */
-std::unique_ptr<ModelForward>
-CreateQuantizedForwardAsModelForward(const std::string &model_type) {
-  std::string type = NormalizeType(model_type);
-
-  if (IsLlamaFamily(type)) {
-    log::Info("model_forward_factory",
-              "Creating QuantizedForward for model_type=" + model_type);
-    return std::make_unique<QuantizedForward>();
-  }
-
-  log::Error("model_forward_factory",
-             "Unsupported model_type for quantized: " + model_type);
   return nullptr;
 }
 

@@ -1,4 +1,5 @@
 #include "runtime/backends/cuda/native/quantized_weight_map.h"
+#include "runtime/backends/cuda/native/gguf_util.h"
 #include "server/logging/logger.h"
 
 namespace inferflux {
@@ -233,6 +234,71 @@ const half *QuantizedWeightMap::FinalNorm() const {
 
 const half *QuantizedWeightMap::LmHead() const {
   return GetDequantizedWeights(lm_head_accessor, lm_head_);
+}
+
+// --- Raw quantized weight accessors ---
+
+namespace {
+QuantizedWeightInfo MakeRawInfo(std::shared_ptr<IWeightAccessor> accessor,
+                                cudaStream_t stream) {
+  if (!accessor || !accessor->IsQuantized()) {
+    return {};
+  }
+  auto dims = accessor->GetDimensions();
+  auto type_str = accessor->GetDataType();
+  auto tensor_type = runtime::cuda::native::StringToTensorType(type_str);
+  QuantizedWeightInfo info;
+  info.data = accessor->GetGpuWeights(stream);
+  info.quant_type = static_cast<int>(tensor_type);
+  info.num_elements = static_cast<int64_t>(dims.first * dims.second);
+  return info;
+}
+} // namespace
+
+QuantizedWeightInfo QuantizedWeightMap::GetRawLayerQProj(int layer) const {
+  if (layer < 0 || layer >= num_layers_)
+    return {};
+  return MakeRawInfo(layers_[layer].q_proj_accessor, stream_);
+}
+
+QuantizedWeightInfo QuantizedWeightMap::GetRawLayerKProj(int layer) const {
+  if (layer < 0 || layer >= num_layers_)
+    return {};
+  return MakeRawInfo(layers_[layer].k_proj_accessor, stream_);
+}
+
+QuantizedWeightInfo QuantizedWeightMap::GetRawLayerVProj(int layer) const {
+  if (layer < 0 || layer >= num_layers_)
+    return {};
+  return MakeRawInfo(layers_[layer].v_proj_accessor, stream_);
+}
+
+QuantizedWeightInfo QuantizedWeightMap::GetRawLayerOProj(int layer) const {
+  if (layer < 0 || layer >= num_layers_)
+    return {};
+  return MakeRawInfo(layers_[layer].o_proj_accessor, stream_);
+}
+
+QuantizedWeightInfo QuantizedWeightMap::GetRawLayerGateProj(int layer) const {
+  if (layer < 0 || layer >= num_layers_)
+    return {};
+  return MakeRawInfo(layers_[layer].gate_proj_accessor, stream_);
+}
+
+QuantizedWeightInfo QuantizedWeightMap::GetRawLayerUpProj(int layer) const {
+  if (layer < 0 || layer >= num_layers_)
+    return {};
+  return MakeRawInfo(layers_[layer].up_proj_accessor, stream_);
+}
+
+QuantizedWeightInfo QuantizedWeightMap::GetRawLayerDownProj(int layer) const {
+  if (layer < 0 || layer >= num_layers_)
+    return {};
+  return MakeRawInfo(layers_[layer].down_proj_accessor, stream_);
+}
+
+QuantizedWeightInfo QuantizedWeightMap::GetRawLmHead() const {
+  return MakeRawInfo(lm_head_accessor, stream_);
 }
 
 // --- Utility ---

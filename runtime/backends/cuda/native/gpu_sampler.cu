@@ -13,16 +13,17 @@ namespace inferflux {
 // ============================================================================
 
 // Temperature scaling: logits /= temperature
-__global__ void TemperatureScaleKernel(float* __restrict__ logits,
+__global__ void TemperatureScaleKernel(float *__restrict__ logits,
                                        int vocab_size, float temperature) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= vocab_size) return;
+  if (idx >= vocab_size)
+    return;
   logits[idx] /= temperature;
 }
 
 // Softmax: two-pass (find max, then exp and sum)
-__global__ void SoftmaxMaxKernel(const float* __restrict__ logits,
-                                 float* __restrict__ max_val, int vocab_size) {
+__global__ void SoftmaxMaxKernel(const float *__restrict__ logits,
+                                 float *__restrict__ max_val, int vocab_size) {
   extern __shared__ float smem[];
   int tid = threadIdx.x;
 
@@ -45,10 +46,10 @@ __global__ void SoftmaxMaxKernel(const float* __restrict__ logits,
   }
 }
 
-__global__ void SoftmaxExpSumKernel(const float* __restrict__ logits,
-                                    float* __restrict__ probs,
-                                    const float* __restrict__ max_val,
-                                    float* __restrict__ sum_val,
+__global__ void SoftmaxExpSumKernel(const float *__restrict__ logits,
+                                    float *__restrict__ probs,
+                                    const float *__restrict__ max_val,
+                                    float *__restrict__ sum_val,
                                     int vocab_size) {
   extern __shared__ float smem[];
   int tid = threadIdx.x;
@@ -75,20 +76,21 @@ __global__ void SoftmaxExpSumKernel(const float* __restrict__ logits,
   }
 }
 
-__global__ void SoftmaxNormKernel(float* __restrict__ probs,
-                                  const float* __restrict__ sum_val,
+__global__ void SoftmaxNormKernel(float *__restrict__ probs,
+                                  const float *__restrict__ sum_val,
                                   int vocab_size) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= vocab_size) return;
+  if (idx >= vocab_size)
+    return;
   probs[idx] /= *sum_val;
 }
 
 // Argmax: find token with highest probability
-__global__ void ArgmaxKernel(const float* __restrict__ logits,
-                             int* __restrict__ result, int vocab_size) {
+__global__ void ArgmaxKernel(const float *__restrict__ logits,
+                             int *__restrict__ result, int vocab_size) {
   extern __shared__ char smem_raw[];
-  float* s_vals = reinterpret_cast<float*>(smem_raw);
-  int* s_idxs = reinterpret_cast<int*>(s_vals + blockDim.x);
+  float *s_vals = reinterpret_cast<float *>(smem_raw);
+  int *s_idxs = reinterpret_cast<int *>(s_vals + blockDim.x);
   int tid = threadIdx.x;
 
   float best_val = -FLT_MAX;
@@ -120,10 +122,11 @@ __global__ void ArgmaxKernel(const float* __restrict__ logits,
 
 // Top-k: zero out all entries below the k-th largest
 // Simple approach: find k-th threshold then zero below it
-__global__ void TopKMaskKernel(float* __restrict__ probs, int vocab_size,
+__global__ void TopKMaskKernel(float *__restrict__ probs, int vocab_size,
                                int top_k, float threshold) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= vocab_size) return;
+  if (idx >= vocab_size)
+    return;
   if (probs[idx] < threshold) {
     probs[idx] = 0.0f;
   }
@@ -131,10 +134,11 @@ __global__ void TopKMaskKernel(float* __restrict__ probs, int vocab_size,
 
 // Top-p: zero out entries where cumulative sum exceeds p
 // Requires sorted probs. Simple single-thread approach for correctness.
-__global__ void TopPMaskKernel(float* __restrict__ probs, int vocab_size,
+__global__ void TopPMaskKernel(float *__restrict__ probs, int vocab_size,
                                float top_p) {
   // Single thread scans sorted probs
-  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  if (threadIdx.x != 0 || blockIdx.x != 0)
+    return;
 
   // Simple bubble-sort approach for small vocab isn't practical.
   // Instead, scan from max prob downward using the unsorted array.
@@ -157,28 +161,30 @@ __global__ void TopPMaskKernel(float* __restrict__ probs, int vocab_size,
         max_idx = i;
       }
     }
-    if (max_idx < 0) break;
+    if (max_idx < 0)
+      break;
     cumsum += max_val;
     threshold = max_val;
-    probs[max_idx] = -probs[max_idx];  // Mark as visited
+    probs[max_idx] = -probs[max_idx]; // Mark as visited
   }
 
   // Restore marked entries, zero those below threshold
   for (int i = 0; i < vocab_size; i++) {
     if (probs[i] < 0.0f) {
-      probs[i] = -probs[i];  // Restore
+      probs[i] = -probs[i]; // Restore
     } else {
-      probs[i] = 0.0f;  // Zero out
+      probs[i] = 0.0f; // Zero out
     }
   }
 }
 
 // Multinomial sample: walk CDF until uniform < cumsum
-__global__ void MultinomialSampleKernel(const float* __restrict__ probs,
-                                        const float* __restrict__ uniform,
-                                        int* __restrict__ result,
+__global__ void MultinomialSampleKernel(const float *__restrict__ probs,
+                                        const float *__restrict__ uniform,
+                                        int *__restrict__ result,
                                         int vocab_size) {
-  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  if (threadIdx.x != 0 || blockIdx.x != 0)
+    return;
 
   float u = *uniform;
   float cumsum = 0.0f;
@@ -199,7 +205,7 @@ __global__ void MultinomialSampleKernel(const float* __restrict__ probs,
       return;
     }
   }
-  *result = vocab_size - 1;  // Fallback to last token
+  *result = vocab_size - 1; // Fallback to last token
 }
 
 // ============================================================================
@@ -207,14 +213,22 @@ __global__ void MultinomialSampleKernel(const float* __restrict__ probs,
 // ============================================================================
 
 GpuSampler::~GpuSampler() {
-  if (d_probs_) cudaFree(d_probs_);
-  if (d_indices_) cudaFree(d_indices_);
-  if (d_temp_) cudaFree(d_temp_);
-  if (d_result_) cudaFree(d_result_);
-  if (d_max_val_) cudaFree(d_max_val_);
-  if (d_max_idx_) cudaFree(d_max_idx_);
-  if (d_uniform_) cudaFree(d_uniform_);
-  if (rng_initialized_) curandDestroyGenerator(rng_);
+  if (d_probs_)
+    cudaFree(d_probs_);
+  if (d_indices_)
+    cudaFree(d_indices_);
+  if (d_temp_)
+    cudaFree(d_temp_);
+  if (d_result_)
+    cudaFree(d_result_);
+  if (d_max_val_)
+    cudaFree(d_max_val_);
+  if (d_max_idx_)
+    cudaFree(d_max_idx_);
+  if (d_uniform_)
+    cudaFree(d_uniform_);
+  if (rng_initialized_)
+    curandDestroyGenerator(rng_);
 }
 
 bool GpuSampler::Initialize(int vocab_size, cudaStream_t stream) {
@@ -223,20 +237,27 @@ bool GpuSampler::Initialize(int vocab_size, cudaStream_t stream) {
 
   cudaError_t err;
   err = cudaMalloc(&d_probs_, vocab_size * sizeof(float));
-  if (err != cudaSuccess) return false;
+  if (err != cudaSuccess)
+    return false;
   err = cudaMalloc(&d_temp_, vocab_size * sizeof(float));
-  if (err != cudaSuccess) return false;
+  if (err != cudaSuccess)
+    return false;
   err = cudaMalloc(&d_result_, sizeof(int));
-  if (err != cudaSuccess) return false;
+  if (err != cudaSuccess)
+    return false;
   err = cudaMalloc(&d_max_val_, sizeof(float));
-  if (err != cudaSuccess) return false;
+  if (err != cudaSuccess)
+    return false;
   err = cudaMalloc(&d_max_idx_, sizeof(int));
-  if (err != cudaSuccess) return false;
+  if (err != cudaSuccess)
+    return false;
   err = cudaMalloc(&d_uniform_, sizeof(float));
-  if (err != cudaSuccess) return false;
+  if (err != cudaSuccess)
+    return false;
 
   // Initialize cuRAND
-  curandStatus_t rng_st = curandCreateGenerator(&rng_, CURAND_RNG_PSEUDO_DEFAULT);
+  curandStatus_t rng_st =
+      curandCreateGenerator(&rng_, CURAND_RNG_PSEUDO_DEFAULT);
   if (rng_st != CURAND_STATUS_SUCCESS) {
     log::Error("gpu_sampler", "curandCreateGenerator failed");
     return false;
@@ -249,13 +270,12 @@ bool GpuSampler::Initialize(int vocab_size, cudaStream_t stream) {
   return true;
 }
 
-int GpuSampler::GreedyArgmax(const float* d_logits) {
+int GpuSampler::GreedyArgmax(const float *d_logits) {
   NVTX_SCOPE("Sampler_Argmax");
   int threads = 256;
   int smem = threads * (sizeof(float) + sizeof(int));
 
-  ArgmaxKernel<<<1, threads, smem, stream_>>>(d_logits, d_result_,
-                                               vocab_size_);
+  ArgmaxKernel<<<1, threads, smem, stream_>>>(d_logits, d_result_, vocab_size_);
 
   cudaMemcpyAsync(&h_result_, d_result_, sizeof(int), cudaMemcpyDeviceToHost,
                   stream_);
@@ -263,8 +283,8 @@ int GpuSampler::GreedyArgmax(const float* d_logits) {
   return h_result_;
 }
 
-int GpuSampler::StochasticSample(const float* d_logits, float temperature,
-                                  int top_k, float top_p) {
+int GpuSampler::StochasticSample(const float *d_logits, float temperature,
+                                 int top_k, float top_p) {
   NVTX_SCOPE("Sampler_Stochastic");
   int threads = 256;
   int blocks = (vocab_size_ + threads - 1) / threads;
@@ -282,7 +302,7 @@ int GpuSampler::StochasticSample(const float* d_logits, float temperature,
   // Step 3: Softmax
   int smem = threads * sizeof(float);
   SoftmaxMaxKernel<<<1, threads, smem, stream_>>>(d_probs_, d_max_val_,
-                                                    vocab_size_);
+                                                  vocab_size_);
   SoftmaxExpSumKernel<<<1, threads, smem, stream_>>>(
       d_probs_, d_temp_, d_max_val_, d_max_val_, vocab_size_);
   // d_max_val_ reused as sum_val
@@ -292,7 +312,7 @@ int GpuSampler::StochasticSample(const float* d_logits, float temperature,
   cudaStreamSynchronize(stream_);
   if (h_sum > 0.0f) {
     SoftmaxNormKernel<<<blocks, threads, 0, stream_>>>(d_temp_, d_max_val_,
-                                                        vocab_size_);
+                                                       vocab_size_);
   }
 
   // Copy normalized probs back
@@ -315,8 +335,8 @@ int GpuSampler::StochasticSample(const float* d_logits, float temperature,
   curandGenerateUniform(rng_, d_uniform_, 1);
 
   // Step 7: Multinomial sample
-  MultinomialSampleKernel<<<1, 1, 0, stream_>>>(d_probs_, d_uniform_,
-                                                  d_result_, vocab_size_);
+  MultinomialSampleKernel<<<1, 1, 0, stream_>>>(d_probs_, d_uniform_, d_result_,
+                                                vocab_size_);
 
   cudaMemcpyAsync(&h_result_, d_result_, sizeof(int), cudaMemcpyDeviceToHost,
                   stream_);
@@ -324,7 +344,7 @@ int GpuSampler::StochasticSample(const float* d_logits, float temperature,
   return h_result_;
 }
 
-int GpuSampler::Sample(const float* d_logits, float temperature, int top_k,
+int GpuSampler::Sample(const float *d_logits, float temperature, int top_k,
                        float top_p, uint32_t seed) {
   if (seed != UINT32_MAX && rng_initialized_) {
     curandSetPseudoRandomGeneratorSeed(rng_, seed);
@@ -337,20 +357,19 @@ int GpuSampler::Sample(const float* d_logits, float temperature, int top_k,
   return StochasticSample(d_logits, temperature, top_k, top_p);
 }
 
-void GpuSampler::SampleBatch(const float* d_logits, int batch_size,
-                              const std::vector<float>& temperatures,
-                              const std::vector<int>& top_ks,
-                              const std::vector<float>& top_ps,
-                              std::vector<int>* out_tokens) {
+void GpuSampler::SampleBatch(const float *d_logits, int batch_size,
+                             const std::vector<float> &temperatures,
+                             const std::vector<int> &top_ks,
+                             const std::vector<float> &top_ps,
+                             std::vector<int> *out_tokens) {
   NVTX_SCOPE("SampleBatch");
   out_tokens->resize(batch_size);
   // Loop per-sequence using existing Sample with offset pointer.
   // Sampling is not a bottleneck — this is simple and correct.
   for (int i = 0; i < batch_size; ++i) {
-    const float* logits_i = d_logits + i * vocab_size_;
-    (*out_tokens)[i] =
-        Sample(logits_i, temperatures[i], top_ks[i], top_ps[i]);
+    const float *logits_i = d_logits + i * vocab_size_;
+    (*out_tokens)[i] = Sample(logits_i, temperatures[i], top_ks[i], top_ps[i]);
   }
 }
 
-}  // namespace inferflux
+} // namespace inferflux

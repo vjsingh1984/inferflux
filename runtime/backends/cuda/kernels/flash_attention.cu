@@ -1,10 +1,8 @@
 #include "flash_attention.cuh"
 #include "runtime/backends/cuda/common/dtype_traits.cuh"
-#include <cooperative_groups.h>
 #include <cmath>
 #include <cuda_runtime.h>
 
-namespace cg = cooperative_groups;
 namespace inferflux {
 namespace cuda_kernel {
 
@@ -31,275 +29,143 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 }
 
 // ============================================================================
-// Standard Scaled Dot-Product Attention (FP32, kept for reference)
+// Tiled FlashAttention-2 kernel (BF16 + FP16)
+//
+// Properly tiled implementation with:
+// - K/V tiles loaded into shared memory (amortized global reads)
+// - Warp-shuffle dot product reduction (no per-position barriers)
+// - Batched cross-warp reduction (1 barrier per tile, not per KV position)
+// - Online softmax with rescaling
+//
+// Grid: (query_len, num_heads, batch_size)
+// Block: next_pow2(head_dim) threads
+// Shared memory: (2 * Bc * d + num_warps * Bc + Bc) * sizeof(float)
+//
+// For kv_len=1024, d=128: 128 barriers vs 8192 in the scalar version.
 // ============================================================================
 
-__global__ void ScaledDotProductAttentionKernel(
-    const float* __restrict__ Q, const float* __restrict__ K,
-    const float* __restrict__ V, float* __restrict__ O, int batch_size,
-    int num_heads, int seq_len, int head_dim, float scale) {
-  const int batch_idx = blockIdx.z;
-  const int head_idx = blockIdx.y;
-  const int seq_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (batch_idx >= batch_size || head_idx >= num_heads || seq_idx >= seq_len)
-    return;
-
-  const size_t batch_offset = batch_idx * num_heads * seq_len * head_dim;
-  const size_t head_offset = head_idx * seq_len * head_dim;
-  const size_t seq_offset = seq_idx * head_dim;
-
-  const float* q_ptr = Q + batch_offset + head_offset + seq_offset;
-  float* o_ptr = O + batch_offset + head_offset + seq_offset;
-
-  extern __shared__ float attention_scores[];
-
-  float max_score = -INFINITY;
-  float sum_exp = 0.0f;
-
-  for (int k_idx = 0; k_idx < seq_len; k_idx++) {
-    const float* k_ptr = K + batch_offset + head_offset + k_idx * head_dim;
-    float dot = 0.0f;
-    for (int d = 0; d < head_dim; d++) {
-      dot += q_ptr[d] * k_ptr[d];
-    }
-    float score = dot * scale;
-    if (score > max_score) {
-      sum_exp = expf(max_score - score) * sum_exp + 1.0f;
-      max_score = score;
-    } else {
-      sum_exp += expf(score - max_score);
-    }
-    attention_scores[k_idx] = score;
-  }
-
-  for (int d = 0; d < head_dim; d++) {
-    float acc = 0.0f;
-    for (int k_idx = 0; k_idx < seq_len; k_idx++) {
-      float weight = expf(attention_scores[k_idx] - max_score) / sum_exp;
-      const float* v_ptr = V + batch_offset + head_offset + k_idx * head_dim;
-      acc += weight * v_ptr[d];
-    }
-    o_ptr[d] = acc;
-  }
-}
-
-// ============================================================================
-// FlashAttention-2 (FP32, simplified tiled)
-// ============================================================================
-
-__global__ void FlashAttention2Kernel(const float* __restrict__ Q,
-                                      const float* __restrict__ K,
-                                      const float* __restrict__ V,
-                                      float* __restrict__ O, int batch_size,
-                                      int num_heads, int seq_len, int head_dim,
-                                      float scale) {
-  const int tid = threadIdx.x;
-  const int batch_idx = blockIdx.z;
-  const int head_idx = blockIdx.y;
-  const int seq_start = blockIdx.x * blockDim.x;
-
-  if (batch_idx >= batch_size || head_idx >= num_heads || seq_start >= seq_len)
-    return;
-
-  const int seq_idx = seq_start + tid;
-  const size_t batch_offset = batch_idx * num_heads * seq_len * head_dim;
-  const size_t head_offset = head_idx * seq_len * head_dim;
-
-  float row_max = -INFINITY;
-  float row_sum = 0.0f;
-  float O_acc[256] = {0.0f};
-
-  const int TILE_SIZE = blockDim.x;
-  for (int j = 0; j < seq_len; j += TILE_SIZE) {
-    __syncthreads();
-    for (int k_idx = j; k_idx < min(j + TILE_SIZE, seq_len); k_idx++) {
-      if (seq_idx >= seq_len) continue;
-
-      const float* q_ptr = Q + batch_offset + head_offset + seq_idx * head_dim;
-      const float* k_ptr = K + batch_offset + head_offset + k_idx * head_dim;
-
-      float qk = 0.0f;
-      for (int d = 0; d < head_dim; d++) {
-        qk += q_ptr[d] * k_ptr[d];
-      }
-      float score = qk * scale;
-
-      float prev_max = row_max;
-      row_max = fmaxf(row_max, score);
-      row_sum = row_sum * expf(prev_max - row_max) + expf(score - row_max);
-
-      const float* v_ptr = V + batch_offset + head_offset + k_idx * head_dim;
-      float weight = expf(score - row_max);
-      for (int d = 0; d < head_dim; d++) {
-        O_acc[d] += weight * v_ptr[d];
-      }
-    }
-  }
-
-  if (seq_idx < seq_len) {
-    float* o_ptr = O + batch_offset + head_offset + seq_idx * head_dim;
-    for (int d = 0; d < head_dim; d++) {
-      o_ptr[d] = O_acc[d] / row_sum;
-    }
-  }
-}
-
-// ============================================================================
-// FlashAttention-2 FP16 with Causal Mask + GQA (legacy non-templated)
-// ============================================================================
-
-__global__ void FlashAttention2FP16KernelV2(
-    const half* __restrict__ Q, const half* __restrict__ K,
-    const half* __restrict__ V, half* __restrict__ O, int query_len,
-    int kv_len, int num_heads, int num_kv_heads, int head_dim, float scale,
-    bool causal) {
-  const int batch_idx = blockIdx.z;
-  const int head_idx = blockIdx.y;
-  const int q_pos = blockIdx.x;
-  const int d = threadIdx.x;
-
-  if (q_pos >= query_len || d >= head_dim) return;
-
-  const int kv_head_ratio =
-      (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 1;
-  const int kv_head_idx = head_idx / kv_head_ratio;
-
-  const size_t q_base =
-      ((size_t)batch_idx * num_heads + head_idx) * query_len * head_dim;
-  const size_t kv_base =
-      ((size_t)batch_idx * num_kv_heads + kv_head_idx) * kv_len * head_dim;
-  const size_t o_base =
-      ((size_t)batch_idx * num_heads + head_idx) * query_len * head_dim;
-
-  float q_val = __half2float(Q[q_base + (size_t)q_pos * head_dim + d]);
-  const int causal_limit = causal ? (kv_len - query_len + q_pos + 1) : kv_len;
-
-  extern __shared__ float smem[];
-
-  float row_max = -INFINITY;
-  float row_sum = 0.0f;
-  float o_acc = 0.0f;
-
-  for (int kv_pos = 0; kv_pos < causal_limit; kv_pos++) {
-    float k_val =
-        __half2float(K[kv_base + (size_t)kv_pos * head_dim + d]);
-    float partial_dot = q_val * k_val;
-
-    smem[d] = partial_dot;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-      if (d < s && d + s < head_dim) {
-        smem[d] += smem[d + s];
-      }
-      __syncthreads();
-    }
-
-    float score = smem[0] * scale;
-
-    float prev_max = row_max;
-    float new_max = fmaxf(row_max, score);
-    float rescale = expf(prev_max - new_max);
-    float exp_score = expf(score - new_max);
-
-    o_acc = o_acc * rescale +
-            exp_score *
-                __half2float(V[kv_base + (size_t)kv_pos * head_dim + d]);
-
-    row_sum = row_sum * rescale + exp_score;
-    row_max = new_max;
-  }
-
-  if (row_sum > 0.0f) {
-    O[o_base + (size_t)q_pos * head_dim + d] =
-        __float2half(o_acc / row_sum);
-  } else {
-    O[o_base + (size_t)q_pos * head_dim + d] = __float2half(0.0f);
-  }
-}
-
-// ============================================================================
-// Templated FlashAttention-2 kernel (BF16 + FP16)
-// ============================================================================
+constexpr int FA2_TILE_KV = 32;
 
 template <typename T>
 __global__ void FlashAttention2TypedKernel(
-    const T* __restrict__ Q, const T* __restrict__ K,
-    const T* __restrict__ V, T* __restrict__ O, int query_len,
-    int kv_len, int num_heads, int num_kv_heads, int head_dim, float scale,
-    bool causal) {
+    const T *__restrict__ Q, const T *__restrict__ K, const T *__restrict__ V,
+    T *__restrict__ O, int query_len, int kv_len, int num_heads,
+    int num_kv_heads, int head_dim, float scale, bool causal) {
   const int batch_idx = blockIdx.z;
   const int head_idx = blockIdx.y;
   const int q_pos = blockIdx.x;
+
+  if (q_pos >= query_len)
+    return;
+
   const int d = threadIdx.x;
+  const int num_threads = blockDim.x;
+  const int warp_id = d / 32;
+  const int lane = d & 31;
+  const int num_warps = num_threads / 32;
 
-  if (q_pos >= query_len || d >= head_dim) return;
-
-  const int kv_head_ratio =
-      (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 1;
+  const int kv_head_ratio = (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 1;
   const int kv_head_idx = head_idx / kv_head_ratio;
 
-  // SHD (Sequence, Head, Dim) layout — matches GEMM output and KV cache.
-  // Q/O: [batch, query_len, num_heads, head_dim]
-  // K/V: [batch, kv_len, num_kv_heads, head_dim]
-  const int q_stride = num_heads * head_dim;    // per-position stride for Q/O
-  const int kv_stride = num_kv_heads * head_dim; // per-position stride for K/V
+  // SHD layout strides
+  const int q_stride = num_heads * head_dim;
+  const int kv_stride = num_kv_heads * head_dim;
 
-  const size_t q_offset =
-      (size_t)batch_idx * query_len * q_stride +
-      (size_t)q_pos * q_stride + head_idx * head_dim + d;
-  const size_t o_offset =
-      (size_t)batch_idx * query_len * q_stride +
-      (size_t)q_pos * q_stride + head_idx * head_dim + d;
+  // Load this thread's Q dimension into register
+  float q_reg = 0.0f;
+  if (d < head_dim) {
+    size_t q_offset = (size_t)batch_idx * query_len * q_stride +
+                      (size_t)q_pos * q_stride + head_idx * head_dim + d;
+    q_reg = DtypeTraits<T>::to_float(Q[q_offset]);
+  }
 
-  float q_val = DtypeTraits<T>::to_float(Q[q_offset]);
   const int causal_limit = causal ? (kv_len - query_len + q_pos + 1) : kv_len;
 
+  // Dynamic shared memory layout:
+  //   s_k:         [FA2_TILE_KV * head_dim] floats — K tile
+  //   s_v:         [FA2_TILE_KV * head_dim] floats — V tile
+  //   s_warp_dots: [num_warps * FA2_TILE_KV] floats — per-warp partial sums
+  //   s_scores:    [FA2_TILE_KV] floats — final attention scores
   extern __shared__ float smem[];
+  float *s_k = smem;
+  float *s_v = smem + FA2_TILE_KV * head_dim;
+  float *s_warp_dots = smem + 2 * FA2_TILE_KV * head_dim;
+  float *s_scores = s_warp_dots + num_warps * FA2_TILE_KV;
 
+  // KV base pointer (this batch, this kv_head)
+  const size_t kv_base =
+      (size_t)batch_idx * kv_len * kv_stride + kv_head_idx * head_dim;
+
+  // Online softmax state
   float row_max = -INFINITY;
   float row_sum = 0.0f;
   float o_acc = 0.0f;
 
-  for (int kv_pos = 0; kv_pos < causal_limit; kv_pos++) {
-    size_t kv_offset =
-        (size_t)batch_idx * kv_len * kv_stride +
-        (size_t)kv_pos * kv_stride + kv_head_idx * head_dim + d;
-    float k_val = DtypeTraits<T>::to_float(K[kv_offset]);
-    float partial_dot = q_val * k_val;
+  // Tile loop over KV positions
+  for (int kv_start = 0; kv_start < causal_limit; kv_start += FA2_TILE_KV) {
+    int tile_len = min(FA2_TILE_KV, causal_limit - kv_start);
+    int total_elements = tile_len * head_dim;
 
-    smem[d] = partial_dot;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-      if (d < s && d + s < head_dim) {
-        smem[d] += smem[d + s];
-      }
-      __syncthreads();
+    // Phase 1: Cooperatively load K and V tiles into shared memory.
+    // Access is coalesced: consecutive threads load consecutive dimensions.
+    for (int i = d; i < total_elements; i += num_threads) {
+      int t = i / head_dim;
+      int dim = i % head_dim;
+      size_t kv_offset = kv_base + (size_t)(kv_start + t) * kv_stride + dim;
+      s_k[i] = DtypeTraits<T>::to_float(K[kv_offset]);
+      s_v[i] = DtypeTraits<T>::to_float(V[kv_offset]);
     }
+    __syncthreads(); // BARRIER 1: tiles loaded
 
-    float score = smem[0] * scale;
+    // Phase 2: Compute tile_len dot products using warp-level reduction.
+    // Each thread multiplies its Q dimension with the corresponding K
+    // dimension, then warp shuffle reduces across 32 lanes. Lane 0 writes to
+    // shared memory.
+    for (int t = 0; t < tile_len; t++) {
+      float partial = (d < head_dim) ? q_reg * s_k[t * head_dim + d] : 0.0f;
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xFFFFFFFF, partial, offset);
+      if (lane == 0)
+        s_warp_dots[warp_id * FA2_TILE_KV + t] = partial;
+    }
+    __syncthreads(); // BARRIER 2: warp partials ready
 
-    float prev_max = row_max;
-    float new_max = fmaxf(row_max, score);
-    float rescale = expf(prev_max - new_max);
-    float exp_score = expf(score - new_max);
+    // Phase 3: Cross-warp reduction — sum partial dot products across warps.
+    // First tile_len threads each reduce one score.
+    if (d < tile_len) {
+      float dot_sum = 0.0f;
+      for (int w = 0; w < num_warps; w++)
+        dot_sum += s_warp_dots[w * FA2_TILE_KV + d];
+      s_scores[d] = dot_sum * scale;
+    }
+    __syncthreads(); // BARRIER 3: scores ready
 
-    size_t v_offset =
-        (size_t)batch_idx * kv_len * kv_stride +
-        (size_t)kv_pos * kv_stride + kv_head_idx * head_dim + d;
-    o_acc = o_acc * rescale +
-            exp_score * DtypeTraits<T>::to_float(V[v_offset]);
+    // Phase 4: Online softmax + V accumulation.
+    // All threads read the same scores and independently update their
+    // o_acc dimension. Since all threads see identical scores, they compute
+    // identical row_max/row_sum — no broadcast needed.
+    for (int t = 0; t < tile_len; t++) {
+      float score = s_scores[t];
+      float new_max = fmaxf(row_max, score);
+      float rescale = expf(row_max - new_max);
+      float exp_w = expf(score - new_max);
 
-    row_sum = row_sum * rescale + exp_score;
-    row_max = new_max;
+      if (d < head_dim)
+        o_acc = o_acc * rescale + exp_w * s_v[t * head_dim + d];
+
+      row_sum = row_sum * rescale + exp_w;
+      row_max = new_max;
+    }
+    __syncthreads(); // BARRIER 4: safe to overwrite smem in next iteration
   }
 
-  if (row_sum > 0.0f) {
-    O[o_offset] = DtypeTraits<T>::from_float(o_acc / row_sum);
-  } else {
-    O[o_offset] = DtypeTraits<T>::from_float(0.0f);
+  // Write output
+  if (d < head_dim) {
+    size_t o_offset = (size_t)batch_idx * query_len * q_stride +
+                      (size_t)q_pos * q_stride + head_idx * head_dim + d;
+    O[o_offset] =
+        DtypeTraits<T>::from_float((row_sum > 0.0f) ? (o_acc / row_sum) : 0.0f);
   }
 }
 
@@ -307,71 +173,26 @@ __global__ void FlashAttention2TypedKernel(
 // Host wrappers
 // ============================================================================
 
-cudaError_t ScaledDotProductAttention(const float* d_Q, const float* d_K,
-                                      const float* d_V, float* d_O,
-                                      int batch_size, int num_heads,
-                                      int seq_len, int head_dim,
-                                      cudaStream_t stream) {
-  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-  const int threads_per_block = 256;
-  const int blocks_x = (seq_len + threads_per_block - 1) / threads_per_block;
-  const dim3 grid(blocks_x, num_heads, batch_size);
-  const int smem_size = seq_len * sizeof(float);
-
-  ScaledDotProductAttentionKernel<<<grid, threads_per_block, smem_size,
-                                    stream>>>(d_Q, d_K, d_V, d_O, batch_size,
-                                              num_heads, seq_len, head_dim,
-                                              scale);
-  return cudaGetLastError();
-}
-
-cudaError_t FlashAttention2(const float* d_Q, const float* d_K,
-                            const float* d_V, float* d_O, int batch_size,
-                            int num_heads, int seq_len, int head_dim,
-                            cudaStream_t stream) {
-  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-  const int threads_per_block = 256;
-  const int blocks_x = (seq_len + threads_per_block - 1) / threads_per_block;
-  const dim3 grid(blocks_x, num_heads, batch_size);
-
-  FlashAttention2Kernel<<<grid, threads_per_block, 0, stream>>>(
-      d_Q, d_K, d_V, d_O, batch_size, num_heads, seq_len, head_dim, scale);
-  return cudaGetLastError();
-}
-
-cudaError_t FlashAttention2FP16(const half* Q, const half* K, const half* V,
-                                half* O, int batch_size, int query_len,
-                                int kv_len, int num_heads, int num_kv_heads,
-                                int head_dim, float scale, bool causal,
-                                cudaStream_t stream) {
-  int threads = head_dim;
-  int t = 1;
-  while (t < threads) t <<= 1;
-  threads = min(t, 1024);
-
-  dim3 grid(query_len, num_heads, batch_size);
-  int smem = threads * sizeof(float);
-
-  FlashAttention2FP16KernelV2<<<grid, threads, smem, stream>>>(
-      Q, K, V, O, query_len, kv_len, num_heads, num_kv_heads, head_dim, scale,
-      causal);
-  return cudaGetLastError();
-}
-
-// Templated FlashAttention-2 host wrapper
+// Templated FlashAttention-2 host wrapper (tiled)
 template <typename T>
-cudaError_t FlashAttention2Typed(const T* Q, const T* K, const T* V, T* O,
+cudaError_t FlashAttention2Typed(const T *Q, const T *K, const T *V, T *O,
                                  int batch_size, int query_len, int kv_len,
                                  int num_heads, int num_kv_heads, int head_dim,
                                  float scale, bool causal,
                                  cudaStream_t stream) {
-  int threads = head_dim;
-  int t = 1;
-  while (t < threads) t <<= 1;
-  threads = min(t, 1024);
+  // Thread count = next power of 2 >= head_dim
+  int threads = 1;
+  while (threads < head_dim)
+    threads <<= 1;
+  threads = min(threads, 1024);
+  int num_warps = threads / 32;
+
+  // Shared memory: K tile + V tile + warp partials + scores
+  int smem =
+      (2 * FA2_TILE_KV * head_dim + num_warps * FA2_TILE_KV + FA2_TILE_KV) *
+      sizeof(float);
 
   dim3 grid(query_len, num_heads, batch_size);
-  int smem = threads * sizeof(float);
 
   FlashAttention2TypedKernel<T><<<grid, threads, smem, stream>>>(
       Q, K, V, O, query_len, kv_len, num_heads, num_kv_heads, head_dim, scale,
@@ -380,12 +201,13 @@ cudaError_t FlashAttention2Typed(const T* Q, const T* K, const T* V, T* O,
 }
 
 // Explicit instantiations
-template cudaError_t FlashAttention2Typed<half>(
-    const half*, const half*, const half*, half*, int, int, int, int, int, int,
-    float, bool, cudaStream_t);
+template cudaError_t FlashAttention2Typed<half>(const half *, const half *,
+                                                const half *, half *, int, int,
+                                                int, int, int, int, float, bool,
+                                                cudaStream_t);
 template cudaError_t FlashAttention2Typed<__nv_bfloat16>(
-    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
-    __nv_bfloat16*, int, int, int, int, int, int, float, bool, cudaStream_t);
+    const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *,
+    __nv_bfloat16 *, int, int, int, int, int, int, float, bool, cudaStream_t);
 
-}  // namespace cuda_kernel
-}  // namespace inferflux
+} // namespace cuda_kernel
+} // namespace inferflux

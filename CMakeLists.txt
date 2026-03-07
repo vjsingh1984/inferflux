@@ -188,6 +188,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/weight_map.cpp
     runtime/backends/cuda/native/model_forward_factory.cpp
     runtime/backends/cuda/native/transformer_forward.cu
+    runtime/backends/cuda/native/fused_quant_gemm.cu
     # GGUF quantization support (Phase 1-5: Foundation, GGUF Parsing, Handlers, CUDA Kernels, Forward Pass)
     runtime/backends/cuda/native/safetensors_adapter.cpp
     runtime/backends/cuda/native/gguf_model_loader.cpp
@@ -195,8 +196,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/q5_k_m_handler.cpp
     runtime/backends/cuda/native/q6_k_handler.cpp
     runtime/backends/cuda/native/q8_0_handler.cpp
-    runtime/backends/cuda/native/quantized_forward.cpp
-    runtime/backends/cuda/native/quantized_gemm.cpp
+    runtime/backends/cuda/native/q8_k_handler.cpp
   )
   target_link_libraries(inferflux_core PUBLIC inferflux_cuda_kernels CUDA::cublas CUDA::nvToolsExt)
   set_target_properties(inferflux_core PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
@@ -223,7 +223,6 @@ else()
   target_sources(inferflux_core PRIVATE
     runtime/backends/cuda/native/safetensors_adapter_stub.cpp
     runtime/backends/cuda/native/gguf_model_loader_stub.cpp
-    runtime/backends/cuda/native/quantized_gemm_stub.cpp
   )
   set(LLAMA_CUDA OFF CACHE BOOL "" FORCE)
 endif()
@@ -485,7 +484,6 @@ add_executable(inferflux_tests
   tests/unit/test_gguf_parsing.cpp
   tests/unit/test_gguf_model_loader.cpp
   tests/unit/test_quantized_weight_map.cpp
-  tests/unit/test_quantized_gemm.cpp
   tests/unit/test_strategy_registry.cpp
   tests/integration/test_gguf_quantization.cpp
   external/catch2/catch_amalgamated.cpp

@@ -29,6 +29,7 @@ template <typename T> class WeightMapTyped;
 using WeightMap = WeightMapTyped<half>;
 class NativeTokenizer;
 class QuantizedWeightMap;
+class QuantizedWeightMapAdapter;
 } // namespace inferflux
 
 namespace inferflux {
@@ -259,6 +260,7 @@ private:
   std::unique_ptr<GpuSampler> sampler_;
   std::unique_ptr<WeightMap> weight_map_;
   std::unique_ptr<QuantizedWeightMap> quantized_weight_map_;
+  std::unique_ptr<QuantizedWeightMapAdapter> quantized_weight_adapter_;
 #endif
   std::unique_ptr<NativeTokenizer> tokenizer_;
 
