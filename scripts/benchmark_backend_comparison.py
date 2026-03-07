@@ -307,8 +307,10 @@ def run_workload(port: int, prompts: List[str], max_tokens: int,
 
 
 # ============================================================================
-# Similarity analysis
+# Similarity & coherence analysis
 # ============================================================================
+
+COHERENCE_THRESHOLD = 0.67  # Min cosine similarity for "coherent" response
 
 def tokenize_simple(text: str) -> List[str]:
     """Simple whitespace + punctuation tokenizer for similarity."""
@@ -326,20 +328,44 @@ def jaccard_similarity(a: List[str], b: List[str]) -> float:
     return len(sa & sb) / len(union)
 
 
-def token_overlap(a: List[str], b: List[str]) -> float:
-    """Fraction of tokens in common (order-independent)."""
-    if not a and not b:
-        return 1.0
-    if not a or not b:
+def load_sentence_model():
+    """Load sentence-transformers model for semantic similarity."""
+    try:
+        from sentence_transformers import SentenceTransformer
+        log("INFO", "Loading sentence-transformer model for semantic similarity...")
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        return model
+    except ImportError:
+        log("WARN", "sentence-transformers not installed — "
+            "skipping semantic similarity (pip install sentence-transformers)")
+        return None
+    except Exception as exc:
+        log("WARN", f"Failed to load sentence model: {exc}")
+        return None
+
+
+def cosine_sim(a, b) -> float:
+    """Cosine similarity between two vectors."""
+    import numpy as np
+    a, b = np.array(a), np.array(b)
+    norm = np.linalg.norm(a) * np.linalg.norm(b)
+    if norm < 1e-9:
         return 0.0
-    sa, sb = set(a), set(b)
-    return 2.0 * len(sa & sb) / (len(sa) + len(sb))
+    return float(np.dot(a, b) / norm)
 
 
 def compute_similarity(results_a: BackendResults,
                        results_b: BackendResults) -> Dict:
-    """Compare responses from two backends for the same prompts."""
-    # Build prompt -> response maps
+    """Compare responses from two backends for the same prompts.
+
+    Metrics:
+    - exact_match: identical text
+    - jaccard: token-level set similarity
+    - cosine_similarity: semantic similarity via sentence embeddings
+    - coherence_a/b: cosine(prompt, response) — is the response on-topic?
+    - coherent: cosine >= COHERENCE_THRESHOLD (0.67)
+    """
+    # Build prompt -> response maps (first occurrence per prompt)
     map_a: Dict[str, str] = {}
     map_b: Dict[str, str] = {}
     for r in results_a.successful:
@@ -353,12 +379,33 @@ def compute_similarity(results_a: BackendResults,
     if not common_prompts:
         return {"error": "No common prompts with successful responses"}
 
+    # Load sentence model
+    st_model = load_sentence_model()
+
+    # Pre-compute all embeddings in batch for efficiency
+    prompts_list = sorted(common_prompts)
+    texts_a = [map_a[p] for p in prompts_list]
+    texts_b = [map_b[p] for p in prompts_list]
+
+    emb_prompts = emb_a = emb_b = None
+    if st_model is not None:
+        all_texts = prompts_list + texts_a + texts_b
+        # Replace empty strings to avoid embedding issues
+        all_texts = [t if t.strip() else "(empty)" for t in all_texts]
+        all_embs = st_model.encode(all_texts, show_progress_bar=False)
+        n = len(prompts_list)
+        emb_prompts = all_embs[:n]
+        emb_a = all_embs[n:2*n]
+        emb_b = all_embs[2*n:3*n]
+
     exact_matches = 0
     jaccard_scores = []
-    overlap_scores = []
+    cosine_scores = []
+    coherence_a_scores = []
+    coherence_b_scores = []
     comparisons = []
 
-    for prompt in sorted(common_prompts):
+    for i, prompt in enumerate(prompts_list):
         resp_a = map_a[prompt]
         resp_b = map_b[prompt]
 
@@ -369,26 +416,56 @@ def compute_similarity(results_a: BackendResults,
         toks_a = tokenize_simple(resp_a)
         toks_b = tokenize_simple(resp_b)
         jac = jaccard_similarity(toks_a, toks_b)
-        ovl = token_overlap(toks_a, toks_b)
         jaccard_scores.append(jac)
-        overlap_scores.append(ovl)
+
+        # Semantic similarity between the two responses
+        cos = -1.0
+        coh_a = -1.0
+        coh_b = -1.0
+        if emb_a is not None:
+            cos = cosine_sim(emb_a[i], emb_b[i])
+            cosine_scores.append(cos)
+            # Coherence: is each response semantically related to its prompt?
+            coh_a = cosine_sim(emb_prompts[i], emb_a[i])
+            coh_b = cosine_sim(emb_prompts[i], emb_b[i])
+            coherence_a_scores.append(coh_a)
+            coherence_b_scores.append(coh_b)
+
+        len_ratio = 0.0
+        if resp_a and resp_b:
+            len_ratio = min(len(resp_a), len(resp_b)) / max(len(resp_a), len(resp_b))
 
         comparisons.append({
             "prompt": prompt[:60],
             "exact_match": exact,
             "jaccard": jac,
-            "overlap": ovl,
+            "cosine": cos,
+            "coherence_a": coh_a,
+            "coherence_b": coh_b,
+            "len_ratio": len_ratio,
             "response_a": resp_a[:80],
             "response_b": resp_b[:80],
         })
 
-    return {
+    result = {
         "num_compared": len(common_prompts),
         "exact_match_rate": exact_matches / len(common_prompts),
         "mean_jaccard": sum(jaccard_scores) / len(jaccard_scores),
-        "mean_token_overlap": sum(overlap_scores) / len(overlap_scores),
         "comparisons": comparisons,
     }
+
+    if cosine_scores:
+        result["mean_cosine_similarity"] = sum(cosine_scores) / len(cosine_scores)
+        result["mean_coherence_a"] = sum(coherence_a_scores) / len(coherence_a_scores)
+        result["mean_coherence_b"] = sum(coherence_b_scores) / len(coherence_b_scores)
+        result["coherent_a_count"] = sum(1 for c in coherence_a_scores
+                                         if c >= COHERENCE_THRESHOLD)
+        result["coherent_b_count"] = sum(1 for c in coherence_b_scores
+                                         if c >= COHERENCE_THRESHOLD)
+        result["similar_count"] = sum(1 for c in cosine_scores
+                                      if c >= COHERENCE_THRESHOLD)
+
+    return result
 
 
 # ============================================================================
@@ -485,19 +562,58 @@ def print_report(all_results: Dict[str, BackendResults],
     if "error" not in similarity:
         print(f"{C.BOLD}  Response Similarity{C.NC}")
         print(f"  Prompts compared:   {similarity['num_compared']}")
+        n = similarity['num_compared']
         emr = similarity['exact_match_rate']
         color = C.G if emr >= 0.8 else C.Y if emr >= 0.5 else C.R
         print(f"  Exact match rate:   {color}{emr:.1%}{C.NC}")
         print(f"  Mean Jaccard:       {similarity['mean_jaccard']:.3f}")
-        print(f"  Mean token overlap: {similarity['mean_token_overlap']:.3f}")
+
+        if "mean_cosine_similarity" in similarity:
+            mcs = similarity['mean_cosine_similarity']
+            color = C.G if mcs >= 0.67 else C.Y if mcs >= 0.4 else C.R
+            print(f"  Mean cosine sim:    {color}{mcs:.3f}{C.NC} "
+                  f"(semantic, threshold={COHERENCE_THRESHOLD})")
+
+            coh_a = similarity.get('mean_coherence_a', 0)
+            coh_b = similarity.get('mean_coherence_b', 0)
+            ca_count = similarity.get('coherent_a_count', 0)
+            cb_count = similarity.get('coherent_b_count', 0)
+            sim_count = similarity.get('similar_count', 0)
+
+            color_a = C.G if coh_a >= 0.67 else C.R
+            color_b = C.G if coh_b >= 0.67 else C.R
+            print(f"  Coherence (llama):  {color_a}{coh_a:.3f}{C.NC} "
+                  f"({ca_count}/{n} above {COHERENCE_THRESHOLD})")
+            print(f"  Coherence (native): {color_b}{coh_b:.3f}{C.NC} "
+                  f"({cb_count}/{n} above {COHERENCE_THRESHOLD})")
+            color_s = C.G if sim_count == n else C.Y if sim_count > 0 else C.R
+            print(f"  Similar responses:  {color_s}{sim_count}/{n}{C.NC} "
+                  f"(cosine >= {COHERENCE_THRESHOLD})")
         print()
 
-        print(f"  {'Prompt':<40} {'Match':>6} {'Jaccard':>8} {'Overlap':>8}")
-        print(f"  {'-' * 66}")
+        has_cosine = any(c.get("cosine", -1) >= 0
+                         for c in similarity["comparisons"])
+        header_fmt = f"  {'Prompt':<40} {'Match':>6} {'Jaccard':>8}"
+        if has_cosine:
+            header_fmt += f" {'Cosine':>8} {'Coh-A':>7} {'Coh-B':>7}"
+        print(header_fmt)
+        print(f"  {'-' * (66 + (24 if has_cosine else 0))}")
+
         for comp in similarity["comparisons"]:
             match_str = f"{C.G}YES{C.NC}" if comp["exact_match"] else f"{C.R}NO{C.NC}"
-            print(f"  {comp['prompt']:<40} {match_str:>15} "
-                  f"{comp['jaccard']:>8.3f} {comp['overlap']:>8.3f}")
+            line = (f"  {comp['prompt']:<40} {match_str:>15} "
+                    f"{comp['jaccard']:>8.3f}")
+            if has_cosine:
+                cos = comp.get('cosine', -1)
+                ca = comp.get('coherence_a', -1)
+                cb = comp.get('coherence_b', -1)
+                cos_c = C.G if cos >= 0.67 else C.R
+                ca_c = C.G if ca >= 0.67 else C.R
+                cb_c = C.G if cb >= 0.67 else C.R
+                line += (f" {cos_c}{cos:>8.3f}{C.NC}"
+                         f" {ca_c}{ca:>7.3f}{C.NC}"
+                         f" {cb_c}{cb:>7.3f}{C.NC}")
+            print(line)
 
         # Show divergent responses
         divergent = [c for c in similarity["comparisons"]
@@ -510,6 +626,17 @@ def print_report(all_results: Dict[str, BackendResults],
                 print(f"    llama.cpp: {comp['response_a']}")
                 print(f"    native:    {comp['response_b']}")
                 print()
+
+        # Coherence verdict
+        if "mean_coherence_b" in similarity:
+            coh_b = similarity['mean_coherence_b']
+            if coh_b < COHERENCE_THRESHOLD:
+                print(f"  {C.R}{C.BOLD}VERDICT: Native backend responses "
+                      f"are NOT coherent (coherence {coh_b:.3f} < "
+                      f"{COHERENCE_THRESHOLD}){C.NC}")
+            else:
+                print(f"  {C.G}{C.BOLD}VERDICT: Both backends produce "
+                      f"coherent responses{C.NC}")
     else:
         print(f"  {C.Y}Similarity: {similarity['error']}{C.NC}")
 
