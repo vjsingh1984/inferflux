@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
@@ -668,11 +669,31 @@ NativeKernelExecutor::NativeKernelExecutor() = default;
 
 NativeKernelExecutor::~NativeKernelExecutor() {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
+  // Drain async work before tearing down shared CUDA resources.
+  std::unordered_map<UnifiedBatchHandle, AsyncBatchState> pending_async;
+  {
+    std::lock_guard<std::mutex> lock(async_batches_mutex_);
+    pending_async.swap(async_batches_);
+  }
+  for (auto &entry : pending_async) {
+    auto &state = entry.second;
+    if (state.future.valid()) {
+      try {
+        (void)state.future.get();
+      } catch (...) {
+        // Best-effort shutdown path.
+      }
+    }
+  }
+
+  DestroyLaneOverlapResources();
   model_forward_.reset();
   sampler_.reset();
   kv_cache_.reset();
   gemm_.reset();
   weight_map_.reset();
+  quantized_weight_adapter_.reset();
+  quantized_weight_map_.reset();
   if (d_logits_) {
     if (cudaFree(d_logits_) != cudaSuccess) {
       log::Warn("native_kernel_executor", "cudaFree(d_logits_) failed");
@@ -687,27 +708,10 @@ NativeKernelExecutor::~NativeKernelExecutor() {
     cudaEventDestroy(sampling_start_);
   if (sampling_stop_)
     cudaEventDestroy(sampling_stop_);
-  if (prefill_start_event_)
-    cudaEventDestroy(prefill_start_event_);
-  if (prefill_end_event_)
-    cudaEventDestroy(prefill_end_event_);
-  if (decode_start_event_)
-    cudaEventDestroy(decode_start_event_);
-  if (decode_end_event_)
-    cudaEventDestroy(decode_end_event_);
   if (decode_stream_)
     cudaStreamDestroy(decode_stream_);
   if (prefill_stream_)
     cudaStreamDestroy(prefill_stream_);
-  // Cleanup async batch events
-  {
-    std::lock_guard<std::mutex> lock(async_batches_mutex_);
-    for (auto &[handle, state] : async_batches_) {
-      if (state.completion_event)
-        cudaEventDestroy(state.completion_event);
-    }
-    async_batches_.clear();
-  }
 #endif
   tokenizer_.reset();
   loader_.reset();
@@ -841,6 +845,160 @@ void NativeKernelExecutor::ReleaseBatchScopedDequantizedCache() {
 }
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
+void NativeKernelExecutor::DestroyLaneOverlapResources() {
+  lane_overlap_ready_ = false;
+  decode_lane_forward_.reset();
+  prefill_lane_forward_.reset();
+  decode_lane_sampler_.reset();
+  prefill_lane_sampler_.reset();
+  decode_lane_gemm_.reset();
+  prefill_lane_gemm_.reset();
+  if (d_decode_logits_) {
+    if (cudaFree(d_decode_logits_) != cudaSuccess) {
+      log::Warn("native_kernel_executor", "cudaFree(d_decode_logits_) failed");
+    }
+    d_decode_logits_ = nullptr;
+  }
+  if (d_prefill_logits_) {
+    if (cudaFree(d_prefill_logits_) != cudaSuccess) {
+      log::Warn("native_kernel_executor", "cudaFree(d_prefill_logits_) failed");
+    }
+    d_prefill_logits_ = nullptr;
+  }
+}
+
+bool NativeKernelExecutor::CanRunLaneOverlap() const {
+  return lane_overlap_ready_ && decode_lane_forward_ && prefill_lane_forward_ &&
+         decode_lane_sampler_ && prefill_lane_sampler_ && decode_lane_gemm_ &&
+         prefill_lane_gemm_ && d_decode_logits_ && d_prefill_logits_;
+}
+
+NativeKernelExecutor::LaneExecutionResources
+NativeKernelExecutor::PrimaryLaneResources() {
+  LaneExecutionResources resources;
+  resources.forward = model_forward_.get();
+  resources.sampler = sampler_.get();
+  resources.gemm = gemm_.get();
+  resources.quantized_weights = quantized_weight_map_.get();
+  resources.logits = d_logits_;
+  resources.stream = compute_stream_;
+  return resources;
+}
+
+NativeKernelExecutor::LaneExecutionResources
+NativeKernelExecutor::GetLaneResources(bool decode_lane) {
+  if (CanRunLaneOverlap()) {
+    LaneExecutionResources lane_resources;
+    lane_resources.forward =
+        decode_lane ? decode_lane_forward_.get() : prefill_lane_forward_.get();
+    lane_resources.sampler =
+        decode_lane ? decode_lane_sampler_.get() : prefill_lane_sampler_.get();
+    lane_resources.gemm =
+        decode_lane ? decode_lane_gemm_.get() : prefill_lane_gemm_.get();
+    lane_resources.quantized_weights = nullptr;
+    lane_resources.logits = decode_lane ? d_decode_logits_ : d_prefill_logits_;
+    lane_resources.stream = decode_lane ? decode_stream_ : prefill_stream_;
+    return lane_resources;
+  }
+  return PrimaryLaneResources();
+}
+
+bool NativeKernelExecutor::InitializeLaneOverlapResources(
+    const SafetensorsLoader::ModelConfig &config, bool want_bf16,
+    int max_batch) {
+  DestroyLaneOverlapResources();
+  if (!overlap_enabled_) {
+    return false;
+  }
+  if (!decode_stream_ || !prefill_stream_) {
+    return false;
+  }
+  // GGUF quantized path currently relies on shared dequant scratch/cache state.
+  if (model_loader_ && model_loader_->GetFormat() == "gguf") {
+    log::Info("native_kernel_executor",
+              "Lane-overlap replicas disabled for GGUF path; shared quantized "
+              "dequant scratch is not lane-safe yet");
+    return false;
+  }
+  if (!weight_map_ || !kv_cache_) {
+    return false;
+  }
+
+  decode_lane_gemm_ = std::make_unique<CublasGemm>();
+  prefill_lane_gemm_ = std::make_unique<CublasGemm>();
+  if (!decode_lane_gemm_->Initialize(decode_stream_) ||
+      !prefill_lane_gemm_->Initialize(prefill_stream_)) {
+    log::Warn("native_kernel_executor",
+              "Failed to initialize lane-overlap cuBLAS handles");
+    DestroyLaneOverlapResources();
+    return false;
+  }
+
+  if (want_bf16) {
+    decode_lane_forward_ =
+        CreateModelForwardTyped<__nv_bfloat16>(config.model_type);
+    prefill_lane_forward_ =
+        CreateModelForwardTyped<__nv_bfloat16>(config.model_type);
+  } else {
+    decode_lane_forward_ = CreateModelForward(config.model_type);
+    prefill_lane_forward_ = CreateModelForward(config.model_type);
+  }
+  if (!decode_lane_forward_ || !prefill_lane_forward_) {
+    log::Warn("native_kernel_executor",
+              "Failed to create lane-overlap forward replicas");
+    DestroyLaneOverlapResources();
+    return false;
+  }
+  if (!decode_lane_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
+                                        decode_lane_gemm_.get(),
+                                        decode_stream_) ||
+      !prefill_lane_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
+                                         prefill_lane_gemm_.get(),
+                                         prefill_stream_)) {
+    log::Warn("native_kernel_executor",
+              "Failed to initialize lane-overlap forward replicas");
+    DestroyLaneOverlapResources();
+    return false;
+  }
+
+  decode_lane_sampler_ = std::make_unique<GpuSampler>();
+  prefill_lane_sampler_ = std::make_unique<GpuSampler>();
+  if (!decode_lane_sampler_->Initialize(config.vocab_size, decode_stream_) ||
+      !prefill_lane_sampler_->Initialize(config.vocab_size, prefill_stream_)) {
+    log::Warn("native_kernel_executor",
+              "Failed to initialize lane-overlap samplers");
+    DestroyLaneOverlapResources();
+    return false;
+  }
+
+  std::size_t logits_elements = 0;
+  std::size_t logits_bytes = 0;
+  if (!CheckedMulSize(static_cast<std::size_t>(max_batch),
+                      static_cast<std::size_t>(config.vocab_size),
+                      &logits_elements) ||
+      !CheckedMulSize(logits_elements, sizeof(float), &logits_bytes)) {
+    log::Warn("native_kernel_executor",
+              "Lane-overlap logits allocation overflow");
+    DestroyLaneOverlapResources();
+    return false;
+  }
+  if (!CheckCudaStatus(cudaMalloc(&d_decode_logits_, logits_bytes),
+                       "cudaMalloc(d_decode_logits_)") ||
+      !CheckCudaStatus(cudaMalloc(&d_prefill_logits_, logits_bytes),
+                       "cudaMalloc(d_prefill_logits_)")) {
+    log::Warn("native_kernel_executor",
+              "Failed to allocate lane-overlap logits buffers");
+    DestroyLaneOverlapResources();
+    return false;
+  }
+
+  lane_overlap_ready_ = true;
+  log::Info("native_kernel_executor",
+            "Lane-overlap replicas initialized (decode/prefill forward + "
+            "sampler + logits)");
+  return true;
+}
+
 bool NativeKernelExecutor::InitializeNativePipeline() {
   const auto &config = model_config_;
 
@@ -1112,18 +1270,6 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     return false;
   }
 
-  // 9.5. Create cudaEvent pairs for phase overlap tracking
-  if (!CheckCudaStatus(cudaEventCreate(&prefill_start_event_),
-                       "cudaEventCreate(prefill_start_event_)") ||
-      !CheckCudaStatus(cudaEventCreate(&prefill_end_event_),
-                       "cudaEventCreate(prefill_end_event_)") ||
-      !CheckCudaStatus(cudaEventCreate(&decode_start_event_),
-                       "cudaEventCreate(decode_start_event_)") ||
-      !CheckCudaStatus(cudaEventCreate(&decode_end_event_),
-                       "cudaEventCreate(decode_end_event_)")) {
-    return false;
-  }
-
   // 10. Create lane-specific streams for async overlap
   if (!CheckCudaStatus(
           cudaStreamCreateWithFlags(&decode_stream_, cudaStreamNonBlocking),
@@ -1132,6 +1278,13 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
           cudaStreamCreateWithFlags(&prefill_stream_, cudaStreamNonBlocking),
           "cudaStreamCreateWithFlags(prefill_stream_)")) {
     return false;
+  }
+
+  if (!InitializeLaneOverlapResources(config, want_bf16, max_batch) &&
+      overlap_enabled_) {
+    log::Warn("native_kernel_executor",
+              "Lane-overlap resources unavailable; mixed workloads will use "
+              "single-lane execution");
   }
 
   log::Info("native_kernel_executor",
@@ -1322,6 +1475,265 @@ void NativeKernelExecutor::SplitBatchByType(
   }
 }
 
+NativeKernelExecutor::LaneExecutionResult
+NativeKernelExecutor::ExecuteLaneBatch(
+    const std::vector<UnifiedBatchInput> &inputs,
+    const LaneExecutionResources &resources) {
+  LaneExecutionResult result;
+  result.outputs.resize(inputs.size());
+
+  if (inputs.empty()) {
+    return result;
+  }
+  if (!resources.forward || !resources.sampler || !resources.gemm ||
+      !resources.logits || !resources.stream) {
+    log::Error("native_kernel_executor",
+               "ExecuteLaneBatch invoked without valid lane resources");
+    for (auto &output : result.outputs) {
+      output.ok = false;
+      output.token = -1;
+    }
+    return result;
+  }
+
+  const bool uses_primary_pipeline =
+      (resources.forward == model_forward_.get());
+  resources.forward->SetStream(resources.stream);
+  resources.gemm->SetStream(resources.stream);
+  if (resources.quantized_weights) {
+    resources.quantized_weights->SetStream(resources.stream);
+  }
+
+  struct DecodeEntry {
+    int input_idx;
+    int token_id;
+    int n_past;
+    int sequence_id;
+    float temperature;
+    int top_k;
+    float top_p;
+    uint32_t seed;
+  };
+  std::vector<DecodeEntry> decode_group;
+  std::vector<int> prefill_indices;
+  decode_group.reserve(inputs.size());
+  prefill_indices.reserve(inputs.size());
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const auto &input = inputs[i];
+    if (input.tokens.size() == 1 && input.request_logits) {
+      decode_group.push_back({static_cast<int>(i), input.tokens[0],
+                              input.n_past, input.sequence_id,
+                              input.sampling.temperature, input.sampling.top_k,
+                              input.sampling.top_p, input.sampling.seed});
+    } else {
+      prefill_indices.push_back(static_cast<int>(i));
+    }
+  }
+
+  double decode_ms_total = 0.0;
+  double sample_ms_total = 0.0;
+  int decode_tokens_total = 0;
+  const int decode_batch_capacity =
+      kv_cache_ ? std::max(1, kv_cache_->MaxBatchSize()) : 32;
+  if (!decode_group.empty()) {
+    for (size_t offset = 0; offset < decode_group.size();
+         offset += static_cast<size_t>(decode_batch_capacity)) {
+      const int B = static_cast<int>(
+          std::min(decode_group.size() - offset,
+                   static_cast<size_t>(decode_batch_capacity)));
+      std::vector<int> batch_tokens(B);
+      std::vector<int> batch_n_past(B);
+      std::vector<int> batch_seq_ids(B);
+      std::vector<float> batch_temps(B);
+      std::vector<int> batch_top_ks(B);
+      std::vector<float> batch_top_ps(B);
+      for (int b = 0; b < B; ++b) {
+        const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+        batch_tokens[b] = entry.token_id;
+        batch_n_past[b] = entry.n_past;
+        batch_seq_ids[b] = entry.sequence_id;
+        batch_temps[b] = entry.temperature;
+        batch_top_ks[b] = entry.top_k;
+        batch_top_ps[b] = entry.top_p;
+      }
+
+      const auto forward_start = std::chrono::steady_clock::now();
+      const bool fwd_ok = resources.forward->BatchForward(
+          batch_tokens, batch_n_past, batch_seq_ids, resources.logits, B);
+      const auto forward_end = std::chrono::steady_clock::now();
+      decode_ms_total +=
+          std::chrono::duration<double, std::milli>(forward_end - forward_start)
+              .count();
+
+      if (!fwd_ok) {
+        log::Error("native_kernel_executor", "Lane BatchForward failed");
+        for (int b = 0; b < B; ++b) {
+          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+          auto &output = result.outputs[entry.input_idx];
+          output.ok = false;
+          output.token = -1;
+          output.piece.clear();
+        }
+        continue;
+      }
+
+      std::vector<int> sampled_tokens;
+      const auto sample_start = std::chrono::steady_clock::now();
+      resources.sampler->SampleBatch(resources.logits, B, batch_temps,
+                                     batch_top_ks, batch_top_ps,
+                                     &sampled_tokens);
+      const auto sample_end = std::chrono::steady_clock::now();
+      sample_ms_total +=
+          std::chrono::duration<double, std::milli>(sample_end - sample_start)
+              .count();
+
+      for (int b = 0; b < B; ++b) {
+        const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+        int token_id = sampled_tokens[b];
+        auto &output = result.outputs[entry.input_idx];
+        if (tokenizer_ && token_id == tokenizer_->EosTokenId()) {
+          output.token = -1;
+          output.piece.clear();
+        } else {
+          output.token = token_id;
+          output.piece = tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
+          perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+        }
+        output.ok = true;
+      }
+
+      decode_tokens_total += B;
+    }
+  }
+
+  double prefill_ms_total = 0.0;
+  int prompt_tokens_total = 0;
+  int sampled_prefill_total = 0;
+  for (int idx : prefill_indices) {
+    const auto &input = inputs[static_cast<size_t>(idx)];
+    auto &output = result.outputs[static_cast<size_t>(idx)];
+    output.ok = false;
+    output.token = -1;
+    output.piece.clear();
+
+    const int token_count = static_cast<int>(input.tokens.size());
+    const auto forward_start = std::chrono::steady_clock::now();
+    if (!resources.forward->Forward(input.tokens, input.n_past,
+                                    input.sequence_id, resources.logits)) {
+      log::Error("native_kernel_executor", "Lane Forward failed");
+      continue;
+    }
+    const auto forward_end = std::chrono::steady_clock::now();
+    prefill_ms_total +=
+        std::chrono::duration<double, std::milli>(forward_end - forward_start)
+            .count();
+    prompt_tokens_total += token_count;
+
+    if (input.request_logits) {
+      const auto sample_start = std::chrono::steady_clock::now();
+      const int token_id = resources.sampler->Sample(
+          resources.logits, input.sampling.temperature, input.sampling.top_k,
+          input.sampling.top_p, input.sampling.seed);
+      const auto sample_end = std::chrono::steady_clock::now();
+      sample_ms_total +=
+          std::chrono::duration<double, std::milli>(sample_end - sample_start)
+              .count();
+      ++sampled_prefill_total;
+
+      if (tokenizer_ && token_id == tokenizer_->EosTokenId()) {
+        output.token = -1;
+        output.piece.clear();
+      } else {
+        output.token = token_id;
+        output.piece = tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
+        perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+
+    output.ok = true;
+  }
+
+  if (!CheckCudaStatus(cudaStreamSynchronize(resources.stream),
+                       "cudaStreamSynchronize(lane_execution)")) {
+    for (auto &output : result.outputs) {
+      output.ok = false;
+      output.token = -1;
+      output.piece.clear();
+    }
+  }
+
+  if (decode_tokens_total > 0) {
+    GlobalMetrics().RecordNativeForwardPass(
+        /*is_decode=*/true, decode_tokens_total, decode_ms_total);
+    perf_accum_.decode_ms.store(
+        perf_accum_.decode_ms.load(std::memory_order_relaxed) + decode_ms_total,
+        std::memory_order_relaxed);
+  }
+  if (prompt_tokens_total > 0) {
+    GlobalMetrics().RecordNativeForwardPass(
+        /*is_decode=*/false, prompt_tokens_total, prefill_ms_total);
+    perf_accum_.prefill_ms.store(
+        perf_accum_.prefill_ms.load(std::memory_order_relaxed) +
+            prefill_ms_total,
+        std::memory_order_relaxed);
+    perf_accum_.prompt_tokens.fetch_add(prompt_tokens_total,
+                                        std::memory_order_relaxed);
+  }
+  if (decode_tokens_total + sampled_prefill_total > 0 &&
+      sample_ms_total > 0.0) {
+    GlobalMetrics().RecordNativeSampling(
+        decode_tokens_total + sampled_prefill_total, sample_ms_total);
+  }
+
+  result.elapsed_ms = decode_ms_total + prefill_ms_total + sample_ms_total;
+
+  if (uses_primary_pipeline) {
+    model_forward_->SetStream(compute_stream_);
+    gemm_->SetStream(compute_stream_);
+    if (quantized_weight_map_) {
+      quantized_weight_map_->SetStream(compute_stream_);
+    }
+  }
+
+  return result;
+}
+
+NativeKernelExecutor::LaneExecutionResult
+NativeKernelExecutor::ExecuteLaneBatchForAsync(
+    const std::vector<UnifiedBatchInput> &inputs, bool decode_lane) {
+  LaneExecutionResult result;
+  if (inputs.empty()) {
+    return result;
+  }
+
+  const LaneExecutionResources lane_resources = GetLaneResources(decode_lane);
+  const bool shares_quantized_map =
+      quantized_weight_map_ &&
+      lane_resources.quantized_weights == quantized_weight_map_.get();
+  const bool shared_pipeline = lane_resources.forward == model_forward_.get() ||
+                               lane_resources.gemm == gemm_.get() ||
+                               shares_quantized_map ||
+                               lane_resources.logits == d_logits_;
+
+  GlobalMetrics().RecordCudaLaneExecutionStart(decode_lane);
+  struct ScopedLaneStop {
+    bool decode_lane;
+    ~ScopedLaneStop() {
+      GlobalMetrics().RecordCudaLaneExecutionStop(decode_lane);
+    }
+  } scoped_stop{decode_lane};
+
+  std::unique_lock<std::mutex> pipeline_lock(shared_pipeline_mutex_,
+                                             std::defer_lock);
+  if (shared_pipeline) {
+    pipeline_lock.lock();
+  }
+
+  result = ExecuteLaneBatch(inputs, lane_resources);
+  ReleaseBatchScopedDequantizedCache();
+  return result;
+}
+
 std::vector<LlamaCPUBackend::UnifiedBatchOutput>
 NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
     const std::vector<UnifiedBatchInput> &inputs) {
@@ -1342,13 +1754,19 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
   if (total_prefill_tokens < min_prefill_tokens_ || prefill_indices.empty() ||
       decode_indices.empty()) {
     // Fall back to standard execution
-    log::Debug("native_kernel_executor",
-               "Skipping overlap: prefill_tokens=" +
-                   std::to_string(total_prefill_tokens) +
-                   ", min=" + std::to_string(min_prefill_tokens_) +
-                   ", prefill_count=" + std::to_string(prefill_indices.size()) +
-                   ", decode_count=" + std::to_string(decode_indices.size()));
-    return ExecuteUnifiedBatch(inputs);
+    log::Info("native_kernel_executor",
+              "Skipping overlap: prefill_tokens=" +
+                  std::to_string(total_prefill_tokens) +
+                  ", min=" + std::to_string(min_prefill_tokens_) +
+                  ", prefill_count=" + std::to_string(prefill_indices.size()) +
+                  ", decode_count=" + std::to_string(decode_indices.size()));
+    return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
+  }
+
+  if (!CanRunLaneOverlap()) {
+    log::Info("native_kernel_executor",
+              "Skipping overlap: lane replicas unavailable");
+    return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
   }
 
   log::Info("native_kernel_executor",
@@ -1358,179 +1776,92 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
                 ", prefill_tokens=" + std::to_string(total_prefill_tokens) +
                 ")");
 
-  // Record start events on both streams
-  if (!CheckCudaStatus(cudaEventRecord(prefill_start_event_, prefill_stream_),
-                       "cudaEventRecord(prefill_start_event_)") ||
-      !CheckCudaStatus(cudaEventRecord(decode_start_event_, decode_stream_),
-                       "cudaEventRecord(decode_start_event_)")) {
-    return outputs;
-  }
-
-  // Execute decode on decode_stream_ (concurrently with prefill)
-  struct DecodeEntry {
-    size_t input_idx;
-    int token_id;
-    int n_past;
-    int sequence_id;
-    float temperature;
-    int top_k;
-    float top_p;
-    uint32_t seed;
-  };
-  std::vector<DecodeEntry> decode_group;
-  decode_group.reserve(decode_indices.size());
-
+  std::vector<UnifiedBatchInput> decode_inputs;
+  std::vector<UnifiedBatchInput> prefill_inputs;
+  decode_inputs.reserve(decode_indices.size());
+  prefill_inputs.reserve(prefill_indices.size());
   for (size_t idx : decode_indices) {
-    const auto &input = inputs[idx];
-    decode_group.push_back({idx, input.tokens[0], input.n_past,
-                            input.sequence_id, input.sampling.temperature,
-                            input.sampling.top_k, input.sampling.top_p,
-                            input.sampling.seed});
+    decode_inputs.push_back(inputs[idx]);
   }
-
-  // Switch to decode stream and launch decode kernels
-  model_forward_->SetStream(decode_stream_);
-  gemm_->SetStream(decode_stream_);
-
-  if (!decode_group.empty()) {
-    int B = static_cast<int>(decode_group.size());
-
-    // Collect batch vectors
-    std::vector<int> batch_tokens(B);
-    std::vector<int> batch_n_past(B);
-    std::vector<int> batch_seq_ids(B);
-    std::vector<float> batch_temps(B);
-    std::vector<int> batch_top_ks(B);
-    std::vector<float> batch_top_ps(B);
-
-    for (int b = 0; b < B; ++b) {
-      batch_tokens[b] = decode_group[b].token_id;
-      batch_n_past[b] = decode_group[b].n_past;
-      batch_seq_ids[b] = decode_group[b].sequence_id;
-      batch_temps[b] = decode_group[b].temperature;
-      batch_top_ks[b] = decode_group[b].top_k;
-      batch_top_ps[b] = decode_group[b].top_p;
-    }
-
-    // Batched forward pass on decode stream (non-blocking)
-    bool fwd_ok = model_forward_->BatchForward(batch_tokens, batch_n_past,
-                                               batch_seq_ids, d_logits_, B);
-
-    if (fwd_ok) {
-      // Batched sampling on decode stream (non-blocking)
-      std::vector<int> sampled_tokens;
-      sampler_->SampleBatch(d_logits_, B, batch_temps, batch_top_ks,
-                            batch_top_ps, &sampled_tokens);
-
-      // Fill outputs
-      for (int b = 0; b < B; ++b) {
-        const auto &de = decode_group[b];
-        auto &output = outputs[de.input_idx];
-        output.token = sampled_tokens[b];
-        output.piece =
-            tokenizer_ ? tokenizer_->TokenToString(sampled_tokens[b]) : "";
-        output.ok = true;
-        perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
-      }
-    } else {
-      for (const auto &de : decode_group) {
-        outputs[de.input_idx].ok = false;
-        outputs[de.input_idx].token = -1;
-      }
-    }
-  }
-
-  // Execute prefill on prefill_stream_ (concurrently with decode)
-  model_forward_->SetStream(prefill_stream_);
-  gemm_->SetStream(prefill_stream_);
-
   for (size_t idx : prefill_indices) {
-    const auto &input = inputs[idx];
-    auto &output = outputs[idx];
+    prefill_inputs.push_back(inputs[idx]);
+  }
+
+  GlobalMetrics().RecordCudaLaneSubmission(/*decode_lane=*/true);
+  GlobalMetrics().RecordCudaLaneSubmission(/*decode_lane=*/false);
+  auto decode_future = std::async(std::launch::async, [this, decode_inputs]() {
+    return ExecuteLaneBatchForAsync(decode_inputs, /*decode_lane=*/true);
+  });
+  auto prefill_future =
+      std::async(std::launch::async, [this, prefill_inputs]() {
+        return ExecuteLaneBatchForAsync(prefill_inputs, /*decode_lane=*/false);
+      });
+
+  LaneExecutionResult decode_result;
+  LaneExecutionResult prefill_result;
+  bool decode_ok = true;
+  bool prefill_ok = true;
+  try {
+    decode_result = decode_future.get();
+  } catch (const std::exception &e) {
+    decode_ok = false;
+    log::Error("native_kernel_executor",
+               "Decode lane overlap execution failed: " +
+                   std::string(e.what()));
+  } catch (...) {
+    decode_ok = false;
+    log::Error("native_kernel_executor",
+               "Decode lane overlap execution failed with unknown error");
+  }
+  GlobalMetrics().RecordCudaLaneCompletion(/*decode_lane=*/true);
+
+  try {
+    prefill_result = prefill_future.get();
+  } catch (const std::exception &e) {
+    prefill_ok = false;
+    log::Error("native_kernel_executor",
+               "Prefill lane overlap execution failed: " +
+                   std::string(e.what()));
+  } catch (...) {
+    prefill_ok = false;
+    log::Error("native_kernel_executor",
+               "Prefill lane overlap execution failed with unknown error");
+  }
+  GlobalMetrics().RecordCudaLaneCompletion(/*decode_lane=*/false);
+
+  if (!decode_ok || !prefill_ok) {
+    return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
+  }
+
+  for (auto &output : outputs) {
     output.ok = false;
     output.token = -1;
-
-    int batch_tokens = static_cast<int>(input.tokens.size());
-
-    // Forward pass on prefill stream (non-blocking)
-    if (!model_forward_->Forward(input.tokens, input.n_past, input.sequence_id,
-                                 d_logits_)) {
-      log::Error("native_kernel_executor", "Prefill forward pass failed");
-      continue;
-    }
-
-    if (input.request_logits) {
-      // Sampling on prefill stream (non-blocking)
-      int token_id = sampler_->Sample(
-          d_logits_, input.sampling.temperature, input.sampling.top_k,
-          input.sampling.top_p, input.sampling.seed);
-      output.token = token_id;
-      output.piece = tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
-      perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    perf_accum_.prompt_tokens.fetch_add(batch_tokens,
-                                        std::memory_order_relaxed);
-    output.ok = true;
+    output.piece.clear();
+  }
+  for (size_t i = 0;
+       i < decode_indices.size() && i < decode_result.outputs.size(); ++i) {
+    outputs[decode_indices[i]] = std::move(decode_result.outputs[i]);
+  }
+  for (size_t i = 0;
+       i < prefill_indices.size() && i < prefill_result.outputs.size(); ++i) {
+    outputs[prefill_indices[i]] = std::move(prefill_result.outputs[i]);
   }
 
-  // Record end events on both streams
-  if (!CheckCudaStatus(cudaEventRecord(prefill_end_event_, prefill_stream_),
-                       "cudaEventRecord(prefill_end_event_)") ||
-      !CheckCudaStatus(cudaEventRecord(decode_end_event_, decode_stream_),
-                       "cudaEventRecord(decode_end_event_)")) {
-    return outputs;
-  }
-
-  // Synchronize both streams before returning
-  if (!CheckCudaStatus(cudaStreamSynchronize(prefill_stream_),
-                       "cudaStreamSynchronize(prefill_stream_)") ||
-      !CheckCudaStatus(cudaStreamSynchronize(decode_stream_),
-                       "cudaStreamSynchronize(decode_stream_)")) {
-    return outputs;
-  }
-
-  // Calculate overlap duration
-  float prefill_ms = 0.0f;
-  float decode_ms = 0.0f;
-  if (!CheckCudaStatus(cudaEventElapsedTime(&prefill_ms, prefill_start_event_,
-                                            prefill_end_event_),
-                       "cudaEventElapsedTime(prefill)") ||
-      !CheckCudaStatus(cudaEventElapsedTime(&decode_ms, decode_start_event_,
-                                            decode_end_event_),
-                       "cudaEventElapsedTime(decode)")) {
-    return outputs;
-  }
-
-  // Record metrics
-  GlobalMetrics().RecordNativeForwardPass(/*is_decode=*/false,
-                                          total_prefill_tokens, prefill_ms);
-  GlobalMetrics().RecordNativeForwardPass(
-      /*is_decode=*/true, static_cast<int>(decode_indices.size()), decode_ms);
-  perf_accum_.prefill_ms.store(
-      perf_accum_.prefill_ms.load(std::memory_order_relaxed) + prefill_ms,
-      std::memory_order_relaxed);
-  perf_accum_.decode_ms.store(
-      perf_accum_.decode_ms.load(std::memory_order_relaxed) + decode_ms,
-      std::memory_order_relaxed);
-
-  // Calculate overlap (how much time was saved by concurrent execution)
-  float total_sequential_ms = prefill_ms + decode_ms;
-  float actual_concurrent_ms = std::max(prefill_ms, decode_ms);
-  float overlap_ms = total_sequential_ms - actual_concurrent_ms;
-
-  if (overlap_ms > 0) {
+  const double total_sequential_ms =
+      decode_result.elapsed_ms + prefill_result.elapsed_ms;
+  const double actual_concurrent_ms =
+      std::max(decode_result.elapsed_ms, prefill_result.elapsed_ms);
+  const double overlap_ms = total_sequential_ms - actual_concurrent_ms;
+  if (overlap_ms > 0.0) {
     GlobalMetrics().RecordCudaLaneOverlap(overlap_ms);
+    const int reduction_pct =
+        total_sequential_ms > 0.0
+            ? static_cast<int>((100.0 * overlap_ms) / total_sequential_ms)
+            : 0;
     log::Info("native_kernel_executor",
               "Phase overlap: " + std::to_string(overlap_ms) + "ms saved (" +
-                  std::to_string(static_cast<int>(100.0 * overlap_ms /
-                                                  total_sequential_ms)) +
-                  "% reduction)");
+                  std::to_string(reduction_pct) + "% reduction)");
   }
-
-  // Restore compute stream for next execution
-  model_forward_->SetStream(compute_stream_);
-  gemm_->SetStream(compute_stream_);
 
   return outputs;
 }
@@ -1540,6 +1871,13 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
 std::vector<LlamaCPUBackend::UnifiedBatchOutput>
 NativeKernelExecutor::ExecuteUnifiedBatch(
     const std::vector<LlamaCPUBackend::UnifiedBatchInput> &inputs) {
+  return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/true);
+}
+
+std::vector<LlamaCPUBackend::UnifiedBatchOutput>
+NativeKernelExecutor::ExecuteUnifiedBatch(
+    const std::vector<LlamaCPUBackend::UnifiedBatchInput> &inputs,
+    bool allow_overlap) {
   if (!model_loaded_) {
     log::Error("native_kernel_executor", "Model not loaded");
     return {};
@@ -1563,8 +1901,14 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
   NVTX_SCOPE("NativeExecuteUnifiedBatch");
 
   // Check for mixed workload and use overlap path if enabled
-  if (HasMixedWorkload(inputs)) {
+  if (allow_overlap && HasMixedWorkload(inputs)) {
     return ExecuteUnifiedBatchWithOverlap(inputs);
+  }
+
+  std::unique_lock<std::mutex> shared_pipeline_lock(shared_pipeline_mutex_,
+                                                    std::defer_lock);
+  if (!CanRunLaneOverlap()) {
+    shared_pipeline_lock.lock();
   }
 
   // Standard execution path for non-mixed workloads
@@ -1598,77 +1942,86 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
   }
 
   // === Batched decode group ===
+  const int decode_batch_capacity =
+      kv_cache_ ? std::max(1, kv_cache_->MaxBatchSize()) : 32;
   if (!decode_group.empty()) {
-    int B = static_cast<int>(decode_group.size());
-    NVTX_SCOPE("BatchedDecode");
+    for (size_t offset = 0; offset < decode_group.size();
+         offset += static_cast<size_t>(decode_batch_capacity)) {
+      NVTX_SCOPE("BatchedDecode");
+      const int B = static_cast<int>(
+          std::min(decode_group.size() - offset,
+                   static_cast<size_t>(decode_batch_capacity)));
 
-    // Collect batch vectors
-    std::vector<int> batch_tokens(B);
-    std::vector<int> batch_n_past(B);
-    std::vector<int> batch_seq_ids(B);
-    std::vector<float> batch_temps(B);
-    std::vector<int> batch_top_ks(B);
-    std::vector<float> batch_top_ps(B);
+      std::vector<int> batch_tokens(B);
+      std::vector<int> batch_n_past(B);
+      std::vector<int> batch_seq_ids(B);
+      std::vector<float> batch_temps(B);
+      std::vector<int> batch_top_ks(B);
+      std::vector<float> batch_top_ps(B);
 
-    for (int b = 0; b < B; ++b) {
-      batch_tokens[b] = decode_group[b].token_id;
-      batch_n_past[b] = decode_group[b].n_past;
-      batch_seq_ids[b] = decode_group[b].sequence_id;
-      batch_temps[b] = decode_group[b].temperature;
-      batch_top_ks[b] = decode_group[b].top_k;
-      batch_top_ps[b] = decode_group[b].top_p;
-    }
-
-    // Batched forward pass
-    if (!CheckCudaStatus(cudaEventRecord(forward_start_, compute_stream_),
-                         "cudaEventRecord(forward_start_,decode_batch)")) {
-      for (const auto &de : decode_group) {
-        outputs[de.input_idx].ok = false;
-        outputs[de.input_idx].token = -1;
+      for (int b = 0; b < B; ++b) {
+        const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+        batch_tokens[b] = entry.token_id;
+        batch_n_past[b] = entry.n_past;
+        batch_seq_ids[b] = entry.sequence_id;
+        batch_temps[b] = entry.temperature;
+        batch_top_ks[b] = entry.top_k;
+        batch_top_ps[b] = entry.top_p;
       }
-      return outputs;
-    }
-    bool fwd_ok = model_forward_->BatchForward(batch_tokens, batch_n_past,
-                                               batch_seq_ids, d_logits_, B);
-    if (!CheckCudaStatus(cudaEventRecord(forward_stop_, compute_stream_),
-                         "cudaEventRecord(forward_stop_,decode_batch)")) {
-      for (const auto &de : decode_group) {
-        outputs[de.input_idx].ok = false;
-        outputs[de.input_idx].token = -1;
-      }
-      return outputs;
-    }
 
-    if (!fwd_ok) {
-      log::Error("native_kernel_executor", "BatchForward failed");
-      for (const auto &de : decode_group) {
-        outputs[de.input_idx].ok = false;
-        outputs[de.input_idx].token = -1;
+      if (!CheckCudaStatus(cudaEventRecord(forward_start_, compute_stream_),
+                           "cudaEventRecord(forward_start_,decode_batch)")) {
+        for (int b = 0; b < B; ++b) {
+          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+          outputs[entry.input_idx].ok = false;
+          outputs[entry.input_idx].token = -1;
+        }
+        return outputs;
       }
-    } else {
-      // Batched sampling
+      bool fwd_ok = model_forward_->BatchForward(batch_tokens, batch_n_past,
+                                                 batch_seq_ids, d_logits_, B);
+      if (!CheckCudaStatus(cudaEventRecord(forward_stop_, compute_stream_),
+                           "cudaEventRecord(forward_stop_,decode_batch)")) {
+        for (int b = 0; b < B; ++b) {
+          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+          outputs[entry.input_idx].ok = false;
+          outputs[entry.input_idx].token = -1;
+        }
+        return outputs;
+      }
+
+      if (!fwd_ok) {
+        log::Error("native_kernel_executor", "BatchForward failed");
+        for (int b = 0; b < B; ++b) {
+          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+          outputs[entry.input_idx].ok = false;
+          outputs[entry.input_idx].token = -1;
+        }
+        continue;
+      }
+
       if (!CheckCudaStatus(cudaEventRecord(sampling_start_, compute_stream_),
                            "cudaEventRecord(sampling_start_,decode_batch)")) {
-        for (const auto &de : decode_group) {
-          outputs[de.input_idx].ok = false;
-          outputs[de.input_idx].token = -1;
+        for (int b = 0; b < B; ++b) {
+          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+          outputs[entry.input_idx].ok = false;
+          outputs[entry.input_idx].token = -1;
         }
         return outputs;
       }
       std::vector<int> sampled_tokens;
       sampler_->SampleBatch(d_logits_, B, batch_temps, batch_top_ks,
                             batch_top_ps, &sampled_tokens);
-      // SampleBatch already synchronizes the stream before returning results
       if (!CheckCudaStatus(cudaEventRecord(sampling_stop_, compute_stream_),
                            "cudaEventRecord(sampling_stop_,decode_batch)")) {
-        for (const auto &de : decode_group) {
-          outputs[de.input_idx].ok = false;
-          outputs[de.input_idx].token = -1;
+        for (int b = 0; b < B; ++b) {
+          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+          outputs[entry.input_idx].ok = false;
+          outputs[entry.input_idx].token = -1;
         }
         return outputs;
       }
 
-      // Compute timing from events (deferred — events already recorded)
       float fwd_ms = 0.0f;
       cudaEventSynchronize(forward_stop_);
       if (CheckCudaStatus(
@@ -1686,20 +2039,19 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         GlobalMetrics().RecordNativeSampling(B, samp_ms);
       }
 
-      // Fill outputs
       for (int b = 0; b < B; ++b) {
-        int idx = decode_group[b].input_idx;
+        const auto &entry = decode_group[offset + static_cast<size_t>(b)];
         int token_id = sampled_tokens[b];
         if (tokenizer_ && token_id == tokenizer_->EosTokenId()) {
-          outputs[idx].token = -1;
-          outputs[idx].piece = "";
+          outputs[entry.input_idx].token = -1;
+          outputs[entry.input_idx].piece = "";
         } else {
-          outputs[idx].token = token_id;
-          outputs[idx].piece =
+          outputs[entry.input_idx].token = token_id;
+          outputs[entry.input_idx].piece =
               tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
           perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
         }
-        outputs[idx].ok = true;
+        outputs[entry.input_idx].ok = true;
       }
     }
   }
@@ -1840,41 +2192,31 @@ bool NativeKernelExecutor::SupportsAsyncUnifiedBatch() const {
 UnifiedBatchHandle NativeKernelExecutor::SubmitUnifiedBatchAsync(
     const std::vector<UnifiedBatchInput> &inputs, UnifiedBatchLane lane) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-  if (!model_forward_)
-    return 0;
-
-  bool is_decode = (lane == UnifiedBatchLane::kDecode) ||
-                   (lane == UnifiedBatchLane::kAuto && !inputs.empty() &&
-                    inputs[0].tokens.size() == 1);
-  cudaStream_t target_stream = is_decode ? decode_stream_ : prefill_stream_;
-
-  // Lock the pipeline, switch stream, execute, restore
-  std::lock_guard<std::mutex> lock(lane_mutex_);
-  model_forward_->SetStream(target_stream);
-  gemm_->SetStream(target_stream);
-
-  auto results = ExecuteUnifiedBatch(inputs);
-
-  // Restore compute stream
-  model_forward_->SetStream(compute_stream_);
-  gemm_->SetStream(compute_stream_);
-
-  // Record completion event
-  cudaEvent_t event;
-  if (!CheckCudaStatus(cudaEventCreate(&event),
-                       "cudaEventCreate(async_completion_event)")) {
-    return 0;
-  }
-  if (!CheckCudaStatus(cudaEventRecord(event, target_stream),
-                       "cudaEventRecord(async_completion_event)")) {
-    cudaEventDestroy(event);
+  if (!model_forward_ || inputs.empty()) {
     return 0;
   }
 
-  UnifiedBatchHandle handle = next_handle_.fetch_add(1);
+  const bool is_decode =
+      (lane == UnifiedBatchLane::kDecode) ||
+      (lane == UnifiedBatchLane::kAuto &&
+       std::all_of(inputs.begin(), inputs.end(),
+                   [](const UnifiedBatchInput &in) {
+                     return in.tokens.size() == 1 && in.request_logits;
+                   }));
+
+  auto future = std::async(
+      std::launch::async,
+      [this, captured_inputs = inputs, is_decode]() -> LaneExecutionResult {
+        return ExecuteLaneBatchForAsync(captured_inputs, is_decode);
+      });
+
+  const UnifiedBatchHandle handle = next_handle_.fetch_add(1);
   {
-    std::lock_guard<std::mutex> alock(async_batches_mutex_);
-    async_batches_[handle] = {std::move(results), event, is_decode};
+    std::lock_guard<std::mutex> lock(async_batches_mutex_);
+    AsyncBatchState state;
+    state.future = std::move(future);
+    state.is_decode = is_decode;
+    async_batches_.emplace(handle, std::move(state));
   }
 
   GlobalMetrics().RecordCudaLaneSubmission(is_decode);
@@ -1889,35 +2231,45 @@ UnifiedBatchHandle NativeKernelExecutor::SubmitUnifiedBatchAsync(
 bool NativeKernelExecutor::TryCollectUnifiedBatchAsync(
     UnifiedBatchHandle handle, std::vector<UnifiedBatchOutput> *outputs) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-  std::lock_guard<std::mutex> lock(async_batches_mutex_);
-  auto it = async_batches_.find(handle);
-  if (it == async_batches_.end())
-    return false;
-
-  cudaError_t status = cudaEventQuery(it->second.completion_event);
-  if (status == cudaErrorNotReady) {
-    return false;
+  AsyncBatchState state;
+  {
+    std::lock_guard<std::mutex> lock(async_batches_mutex_);
+    auto it = async_batches_.find(handle);
+    if (it == async_batches_.end()) {
+      return false;
+    }
+    if (!it->second.future.valid()) {
+      async_batches_.erase(it);
+      return false;
+    }
+    const auto wait_status =
+        it->second.future.wait_for(std::chrono::milliseconds(0));
+    if (wait_status != std::future_status::ready) {
+      return false;
+    }
+    state = std::move(it->second);
+    async_batches_.erase(it);
   }
-  if (status != cudaSuccess) {
+
+  LaneExecutionResult completed;
+  try {
+    completed = state.future.get();
+  } catch (const std::exception &e) {
     log::Error("native_kernel_executor",
-               "cudaEventQuery(async_completion_event) failed: " +
-                   std::string(cudaGetErrorString(status)));
-    cudaEventDestroy(it->second.completion_event);
-    async_batches_.erase(it);
+               "Async lane execution failed: " + std::string(e.what()));
+    GlobalMetrics().RecordCudaLaneCompletion(state.is_decode);
+    return false;
+  } catch (...) {
+    log::Error("native_kernel_executor",
+               "Async lane execution failed with unknown error");
+    GlobalMetrics().RecordCudaLaneCompletion(state.is_decode);
     return false;
   }
 
-  // Completed
   if (outputs) {
-    *outputs = std::move(it->second.outputs);
+    *outputs = std::move(completed.outputs);
   }
-  GlobalMetrics().RecordCudaLaneCompletion(it->second.is_decode);
-  if (!CheckCudaStatus(cudaEventDestroy(it->second.completion_event),
-                       "cudaEventDestroy(async_completion_event)")) {
-    async_batches_.erase(it);
-    return false;
-  }
-  async_batches_.erase(it);
+  GlobalMetrics().RecordCudaLaneCompletion(state.is_decode);
   return true;
 #else
   (void)handle;
@@ -2015,10 +2367,58 @@ void NativeKernelExecutor::NativeFreeSequence(int sequence_id) {
 #endif
 }
 
-void NativeKernelExecutor::NativeCopySequencePrefix(int /*src_seq*/,
-                                                    int /*dst_seq*/,
-                                                    int /*n_tokens*/) {
-  // No-op stub — full implementation needs KV cache copy support
+void NativeKernelExecutor::NativeCopySequencePrefix(int src_seq, int dst_seq,
+                                                    int n_tokens) {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!kv_cache_ || n_tokens <= 0 || src_seq < 0 || dst_seq < 0) {
+    return;
+  }
+  if (src_seq == dst_seq) {
+    return;
+  }
+  if (!kv_cache_->CopySequencePrefix(src_seq, dst_seq, n_tokens,
+                                     compute_stream_)) {
+    log::Warn("native_kernel_executor",
+              "NativeCopySequencePrefix failed (src=" +
+                  std::to_string(src_seq) + ", dst=" + std::to_string(dst_seq) +
+                  ", tokens=" + std::to_string(n_tokens) + ")");
+  }
+#else
+  (void)src_seq;
+  (void)dst_seq;
+  (void)n_tokens;
+#endif
+}
+
+std::vector<uint8_t>
+NativeKernelExecutor::NativeSerializeSequence(int sequence_id) const {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!kv_cache_ || sequence_id < 0) {
+    return {};
+  }
+  std::vector<uint8_t> blob;
+  if (!kv_cache_->SerializeSequence(sequence_id, &blob)) {
+    return {};
+  }
+  return blob;
+#else
+  (void)sequence_id;
+  return {};
+#endif
+}
+
+bool NativeKernelExecutor::NativeHydrateSequence(
+    int dest_sequence_id, const std::vector<uint8_t> &blob) {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!kv_cache_ || dest_sequence_id < 0 || blob.empty()) {
+    return false;
+  }
+  return kv_cache_->HydrateSequence(dest_sequence_id, blob, compute_stream_);
+#else
+  (void)dest_sequence_id;
+  (void)blob;
+  return false;
+#endif
 }
 
 NativeCudaRuntime::NativeChatResult NativeKernelExecutor::NativeFormatChat(

@@ -131,11 +131,27 @@ TEST_CASE("NativeKernelExecutor: NativeFreeSequence does not crash when no "
   REQUIRE(true);
 }
 
-TEST_CASE("NativeKernelExecutor: NativeCopySequencePrefix is a no-op stub",
-          "[native_forward]") {
+TEST_CASE(
+    "NativeKernelExecutor: NativeCopySequencePrefix is safe with no model",
+    "[native_forward]") {
   NativeKernelExecutor executor;
   executor.NativeCopySequencePrefix(0, 1, 10); // Should not crash
   REQUIRE(true);
+}
+
+TEST_CASE("NativeKernelExecutor: NativeSerializeSequence returns empty with no "
+          "model",
+          "[native_forward]") {
+  NativeKernelExecutor executor;
+  auto blob = executor.NativeSerializeSequence(0);
+  REQUIRE(blob.empty());
+}
+
+TEST_CASE("NativeKernelExecutor: NativeHydrateSequence returns false with no "
+          "model",
+          "[native_forward]") {
+  NativeKernelExecutor executor;
+  REQUIRE_FALSE(executor.NativeHydrateSequence(0, {}));
 }
 
 // ============================================================================

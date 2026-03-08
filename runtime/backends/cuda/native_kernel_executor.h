@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -213,6 +214,9 @@ public:
   void NativeFreeSequence(int sequence_id) override;
   void NativeCopySequencePrefix(int src_seq, int dst_seq,
                                 int n_tokens) override;
+  std::vector<uint8_t> NativeSerializeSequence(int sequence_id) const override;
+  bool NativeHydrateSequence(int dest_sequence_id,
+                             const std::vector<uint8_t> &blob) override;
   NativeChatResult NativeFormatChat(
       const std::vector<std::pair<std::string, std::string>> &messages,
       bool add_assistant_prefix = true) const override;
@@ -277,14 +281,41 @@ private:
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   cudaStream_t decode_stream_{nullptr};
   cudaStream_t prefill_stream_{nullptr};
-  std::mutex lane_mutex_;
+
+  struct LaneExecutionResources {
+    ModelForward *forward{nullptr};
+    GpuSampler *sampler{nullptr};
+    CublasGemm *gemm{nullptr};
+    QuantizedWeightMap *quantized_weights{nullptr};
+    float *logits{nullptr};
+    cudaStream_t stream{nullptr};
+  };
+
+  struct LaneExecutionResult {
+    std::vector<UnifiedBatchOutput> outputs;
+    double elapsed_ms{0.0};
+  };
+
+  bool lane_overlap_ready_{false};
+  std::mutex shared_pipeline_mutex_;
+  std::unique_ptr<ModelForward> decode_lane_forward_;
+  std::unique_ptr<ModelForward> prefill_lane_forward_;
+  std::unique_ptr<GpuSampler> decode_lane_sampler_;
+  std::unique_ptr<GpuSampler> prefill_lane_sampler_;
+  std::unique_ptr<CublasGemm> decode_lane_gemm_;
+  std::unique_ptr<CublasGemm> prefill_lane_gemm_;
+  float *d_decode_logits_{nullptr};
+  float *d_prefill_logits_{nullptr};
+
   struct AsyncBatchState {
+    std::future<LaneExecutionResult> future;
     std::vector<UnifiedBatchOutput> outputs;
     cudaEvent_t completion_event{nullptr};
     bool is_decode{false};
   };
   std::unordered_map<UnifiedBatchHandle, AsyncBatchState> async_batches_;
   std::mutex async_batches_mutex_;
+  std::mutex lane_mutex_;
   std::atomic<UnifiedBatchHandle> next_handle_{1};
 #endif
 
@@ -294,12 +325,6 @@ private:
   cudaEvent_t forward_stop_{nullptr};
   cudaEvent_t sampling_start_{nullptr};
   cudaEvent_t sampling_stop_{nullptr};
-
-  // Phase overlap tracking events
-  cudaEvent_t prefill_start_event_{nullptr};
-  cudaEvent_t prefill_end_event_{nullptr};
-  cudaEvent_t decode_start_event_{nullptr};
-  cudaEvent_t decode_end_event_{nullptr};
 
   struct NativePerfAccumulator {
     std::atomic<double> prefill_ms{0.0};
@@ -322,6 +347,24 @@ private:
                           std::vector<UnifiedBatchOutput> *outputs);
   bool ConfigureDequantizedCachePolicy(const std::string &raw_policy);
   void ReleaseBatchScopedDequantizedCache();
+  std::vector<UnifiedBatchOutput>
+  ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs,
+                      bool allow_overlap);
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  bool
+  InitializeLaneOverlapResources(const SafetensorsLoader::ModelConfig &config,
+                                 bool want_bf16, int max_batch);
+  void DestroyLaneOverlapResources();
+  bool CanRunLaneOverlap() const;
+  LaneExecutionResources PrimaryLaneResources();
+  LaneExecutionResources GetLaneResources(bool decode_lane);
+  LaneExecutionResult
+  ExecuteLaneBatch(const std::vector<UnifiedBatchInput> &inputs,
+                   const LaneExecutionResources &resources);
+  LaneExecutionResult
+  ExecuteLaneBatchForAsync(const std::vector<UnifiedBatchInput> &inputs,
+                           bool decode_lane);
+#endif
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   // Phase overlap helpers

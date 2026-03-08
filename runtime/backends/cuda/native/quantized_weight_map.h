@@ -49,6 +49,9 @@ public:
   bool Build(IModelLoader *loader, const ModelInfo &config,
              cudaStream_t stream);
 
+  /** Switch the CUDA stream used for dequantization operations. */
+  void SetStream(cudaStream_t stream) { stream_ = stream; }
+
   // --- Per-layer accessors (returns dequantized FP16 weights) ---
 
   /**
