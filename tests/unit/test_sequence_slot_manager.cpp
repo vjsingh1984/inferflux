@@ -25,7 +25,7 @@ TEST_CASE("SequenceSlotManager basic operations", "[slot_manager]") {
 
     auto slot2 = manager.AcquireSlot(101);
     REQUIRE(slot2.has_value());
-    REQUIRE(*slot2 != *slot1);  // Different slots
+    REQUIRE(*slot2 != *slot1); // Different slots
     REQUIRE(manager.GetUsedSlotCount() == 2);
 
     manager.ReleaseSlot(*slot1);
@@ -84,7 +84,7 @@ TEST_CASE("SequenceSlotManager timeout-based eviction", "[slot_manager]") {
   // Run eviction - should evict the idle slot
   auto evicted = manager.EvictIdleSlots(std::chrono::milliseconds(100));
   REQUIRE(evicted.size() == 1);
-  REQUIRE(evicted[0].first == *slot);  // Evicted slot ID matches
+  REQUIRE(evicted[0].first == *slot); // Evicted slot ID matches
 
   // Slot should now be available
   REQUIRE(manager.GetUsedSlotCount() == 0);

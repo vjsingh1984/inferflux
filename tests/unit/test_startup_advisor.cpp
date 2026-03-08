@@ -28,12 +28,14 @@ static inferflux::StartupAdvisorContext WellTunedCudaContext() {
 
   inferflux::AdvisorModelInfo m;
   m.id = "llama3-8b";
-  m.path = "/models/llama3-8b-q4_k_m.gguf";  // Include quantization to avoid recommendation
+  m.path = "/models/llama3-8b-q4_k_m.gguf"; // Include quantization to avoid
+                                            // recommendation
   m.format = "gguf";
   m.backend = "cuda";
   m.backend_provider = "native";
   m.file_size_bytes = 4ULL * 1024 * 1024 * 1024;
-  m.quantization = inferflux::DetectQuantization(m.path, m.format);  // Detect from filename
+  m.quantization =
+      inferflux::DetectQuantization(m.path, m.format); // Detect from filename
   ctx.models.push_back(m);
 
   return ctx;
@@ -112,8 +114,7 @@ TEST_CASE("Multi-GPU with TP=1 and large model triggers tensor_parallel",
   REQUIRE(count >= 1);
 }
 
-TEST_CASE("No models loaded produces 0 recommendations",
-          "[startup_advisor]") {
+TEST_CASE("No models loaded produces 0 recommendations", "[startup_advisor]") {
   inferflux::StartupAdvisorContext ctx;
   ctx.gpu.available = true;
   ctx.gpu.device_count = 1;

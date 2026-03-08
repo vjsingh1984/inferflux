@@ -278,10 +278,10 @@ void LlamaCPUBackend::SetupSampler(const std::string &grammar,
     for (const auto &[token_id, bias] : sp.logit_bias) {
       llama_logit_biases.push_back({static_cast<llama_token>(token_id), bias});
     }
-    llama_sampler_chain_add(chain,
-                            llama_sampler_init_logit_bias(
-                                llama_vocab_n_tokens(vocab_), llama_logit_biases.size(),
-                                llama_logit_biases.data()));
+    llama_sampler_chain_add(
+        chain, llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab_),
+                                             llama_logit_biases.size(),
+                                             llama_logit_biases.data()));
   }
 
   // Top-K filtering.

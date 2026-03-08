@@ -31,9 +31,9 @@ TEST_CASE("BatchAnalyzer detects empty input", "[batch_analyzer]") {
 
 TEST_CASE("BatchAnalyzer detects prefill-only batch", "[batch_analyzer]") {
   std::vector<UnifiedBatchInput> inputs(3);
-  inputs[0].tokens = {1, 2};      // prefill
-  inputs[1].tokens = {3, 4, 5};   // prefill
-  inputs[2].tokens = {6, 7, 8};   // prefill
+  inputs[0].tokens = {1, 2};    // prefill
+  inputs[1].tokens = {3, 4, 5}; // prefill
+  inputs[2].tokens = {6, 7, 8}; // prefill
 
   REQUIRE(BatchAnalyzer::IsPrefillOnlyBatch(inputs) == true);
   REQUIRE(BatchAnalyzer::IsDecodeOnlyBatch(inputs) == false);
@@ -42,9 +42,9 @@ TEST_CASE("BatchAnalyzer detects prefill-only batch", "[batch_analyzer]") {
 
 TEST_CASE("BatchAnalyzer detects decode-only batch", "[batch_analyzer]") {
   std::vector<UnifiedBatchInput> inputs(3);
-  inputs[0].tokens = {1};    // decode
-  inputs[1].tokens = {2};    // decode
-  inputs[2].tokens = {3};    // decode
+  inputs[0].tokens = {1}; // decode
+  inputs[1].tokens = {2}; // decode
+  inputs[2].tokens = {3}; // decode
 
   REQUIRE(BatchAnalyzer::IsPrefillOnlyBatch(inputs) == false);
   REQUIRE(BatchAnalyzer::IsDecodeOnlyBatch(inputs) == true);
@@ -53,9 +53,9 @@ TEST_CASE("BatchAnalyzer detects decode-only batch", "[batch_analyzer]") {
 
 TEST_CASE("BatchAnalyzer detects mixed workload", "[batch_analyzer]") {
   std::vector<UnifiedBatchInput> inputs(3);
-  inputs[0].tokens = {1, 2};   // prefill
-  inputs[1].tokens = {3};      // decode
-  inputs[2].tokens = {4, 5};   // prefill
+  inputs[0].tokens = {1, 2}; // prefill
+  inputs[1].tokens = {3};    // decode
+  inputs[2].tokens = {4, 5}; // prefill
 
   REQUIRE(BatchAnalyzer::IsPrefillOnlyBatch(inputs) == false);
   REQUIRE(BatchAnalyzer::IsDecodeOnlyBatch(inputs) == false);
@@ -111,8 +111,8 @@ TEST_CASE("BatchAnalyzer handles empty batch token count", "[batch_analyzer]") {
 
 TEST_CASE("BatchAnalyzer checks token capacity", "[batch_analyzer]") {
   std::vector<UnifiedBatchInput> inputs(2);
-  inputs[0].tokens = {1, 2, 3};    // 3 tokens
-  inputs[1].tokens = {4, 5};      // 2 tokens
+  inputs[0].tokens = {1, 2, 3}; // 3 tokens
+  inputs[1].tokens = {4, 5};    // 2 tokens
 
   REQUIRE(BatchAnalyzer::CountTotalTokens(inputs) == 5);
   REQUIRE(BatchAnalyzer::ExceedsTokenCapacity(inputs, 5) == false);
@@ -123,9 +123,9 @@ TEST_CASE("BatchAnalyzer checks token capacity", "[batch_analyzer]") {
 TEST_CASE("BatchAnalyzer early exit on mixed workload", "[batch_analyzer]") {
   // Create a large batch where first two are prefill, third is decode
   std::vector<UnifiedBatchInput> inputs(100);
-  inputs[0].tokens = {1, 2};    // prefill
-  inputs[1].tokens = {3, 4};   // prefill
-  inputs[2].tokens = {5};       // decode - should trigger early exit
+  inputs[0].tokens = {1, 2}; // prefill
+  inputs[1].tokens = {3, 4}; // prefill
+  inputs[2].tokens = {5};    // decode - should trigger early exit
   // Rest don't matter for early exit test
 
   // Should return true after finding both prefill and decode

@@ -108,7 +108,8 @@ TEST_CASE(
   BackendFactory::SetExposurePolicy({true, true});
 }
 
-TEST_CASE("BackendFactory explicit cuda_native hint uses native or deterministic fallback",
+TEST_CASE("BackendFactory explicit cuda_native hint uses native or "
+          "deterministic fallback",
           "[backend_factory]") {
   BackendFactory::SetExposurePolicy({false, true});
   auto selection = BackendFactory::Create("cuda_native");

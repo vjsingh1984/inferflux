@@ -49,8 +49,9 @@ struct LlamaBackendConfig {
   // `auto` keeps current behavior (match inference dtype).
   std::string native_kv_cache_dtype{"auto"};
   // Dequantized GGUF weight cache lifecycle in native CUDA runtime:
-  // batch (default, memory efficient) | model (higher reuse, higher VRAM).
-  std::string native_dequantized_cache_policy{"batch"};
+  // model (default, correct with fused GEMV) | batch (memory efficient but
+  // causes use-after-free when embeddings/norms are freed between batches).
+  std::string native_dequantized_cache_policy{"model"};
   // When true, quantized GGUF model-load fails unless fused dequant-tile GEMM
   // strategy is selected for this GPU/runtime capability set.
   bool native_require_fused_quantized_matmul{false};

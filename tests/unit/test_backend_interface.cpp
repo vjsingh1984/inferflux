@@ -2,7 +2,7 @@
 #include <memory>
 
 #include "runtime/backends/common/backend_interface.h"
-#include "runtime/backends/cpu/llama_backend.h"  // For LlamaBackendConfig
+#include "runtime/backends/cpu/llama_backend.h" // For LlamaBackendConfig
 
 using namespace inferflux;
 
@@ -27,36 +27,28 @@ public:
     return outputs;
   }
 
-  int UnifiedBatchTokenCapacity() const override {
-    return capacity_;
-  }
+  int UnifiedBatchTokenCapacity() const override { return capacity_; }
 
-  bool SupportsAsyncUnifiedBatch() const override {
-    return supports_async_;
-  }
+  bool SupportsAsyncUnifiedBatch() const override { return supports_async_; }
 
   UnifiedBatchHandle
   SubmitUnifiedBatchAsync(const std::vector<UnifiedBatchInput> &inputs,
                           UnifiedBatchLane lane) override {
     if (!supports_async_) {
-      return 0;  // Not supported
+      return 0; // Not supported
     }
     return next_handle_++;
   }
 
-  bool
-  TryCollectUnifiedBatchAsync(UnifiedBatchHandle handle,
-                              std::vector<UnifiedBatchOutput> *outputs) override {
-    return false;  // Not implemented in mock
+  bool TryCollectUnifiedBatchAsync(
+      UnifiedBatchHandle handle,
+      std::vector<UnifiedBatchOutput> *outputs) override {
+    return false; // Not implemented in mock
   }
 
-  std::string Name() const override {
-    return "mock_backend";
-  }
+  std::string Name() const override { return "mock_backend"; }
 
-  bool IsFallback() const override {
-    return is_fallback_;
-  }
+  bool IsFallback() const override { return is_fallback_; }
 
   const std::string &FallbackReason() const override {
     return fallback_reason_;
@@ -65,7 +57,7 @@ public:
   // Mock setters
   void SetCapacity(int capacity) { capacity_ = capacity; }
   void SetSupportsAsync(bool supports) { supports_async_ = supports; }
-  void SetFallback(bool fallback, const std::string& reason = "") {
+  void SetFallback(bool fallback, const std::string &reason = "") {
     is_fallback_ = fallback;
     fallback_reason_ = reason;
   }
@@ -98,7 +90,8 @@ TEST_CASE("BackendInterface LoadModel implementation", "[backend_interface]") {
   REQUIRE(result == true);
 }
 
-TEST_CASE("BackendInterface ExecuteUnifiedBatch implementation", "[backend_interface]") {
+TEST_CASE("BackendInterface ExecuteUnifiedBatch implementation",
+          "[backend_interface]") {
   MockBackend backend;
 
   std::vector<UnifiedBatchInput> inputs(2);
@@ -125,30 +118,35 @@ TEST_CASE("BackendInterface handles empty batch", "[backend_interface]") {
   REQUIRE(outputs.size() == 0);
 }
 
-TEST_CASE("BackendInterface UnifiedBatchTokenCapacity default", "[backend_interface]") {
+TEST_CASE("BackendInterface UnifiedBatchTokenCapacity default",
+          "[backend_interface]") {
   MockBackend backend;
 
   REQUIRE(backend.UnifiedBatchTokenCapacity() == 2048);
 }
 
-TEST_CASE("BackendInterface UnifiedBatchTokenCapacity custom", "[backend_interface]") {
+TEST_CASE("BackendInterface UnifiedBatchTokenCapacity custom",
+          "[backend_interface]") {
   MockBackend backend;
   backend.SetCapacity(4096);
 
   REQUIRE(backend.UnifiedBatchTokenCapacity() == 4096);
 }
 
-TEST_CASE("BackendInterface async methods default implementation", "[backend_interface]") {
+TEST_CASE("BackendInterface async methods default implementation",
+          "[backend_interface]") {
   MockBackend backend;
 
   REQUIRE(backend.SupportsAsyncUnifiedBatch() == false);
 
   std::vector<UnifiedBatchInput> inputs;
-  auto handle = backend.SubmitUnifiedBatchAsync(inputs, UnifiedBatchLane::kAuto);
-  REQUIRE(handle == 0);  // Default returns 0 (not supported)
+  auto handle =
+      backend.SubmitUnifiedBatchAsync(inputs, UnifiedBatchLane::kAuto);
+  REQUIRE(handle == 0); // Default returns 0 (not supported)
 }
 
-TEST_CASE("BackendInterface async methods with support", "[backend_interface]") {
+TEST_CASE("BackendInterface async methods with support",
+          "[backend_interface]") {
   MockBackend backend;
   backend.SetSupportsAsync(true);
 
@@ -156,8 +154,9 @@ TEST_CASE("BackendInterface async methods with support", "[backend_interface]") 
 
   std::vector<UnifiedBatchInput> inputs(1);
   inputs[0].tokens = {1, 2};
-  auto handle = backend.SubmitUnifiedBatchAsync(inputs, UnifiedBatchLane::kPrefill);
-  REQUIRE(handle == 1);  // Should return non-zero handle
+  auto handle =
+      backend.SubmitUnifiedBatchAsync(inputs, UnifiedBatchLane::kPrefill);
+  REQUIRE(handle == 1); // Should return non-zero handle
 }
 
 TEST_CASE("BackendInterface fallback metadata", "[backend_interface]") {
@@ -174,7 +173,7 @@ TEST_CASE("BackendInterface fallback metadata", "[backend_interface]") {
 
 TEST_CASE("BackendInterface is polymorphic", "[backend_interface]") {
   MockBackend backend;
-  BackendInterface* interface = &backend;
+  BackendInterface *interface = &backend;
 
   // Test that we can call methods through interface pointer
   REQUIRE(interface->Name() == "mock_backend");
@@ -185,7 +184,8 @@ TEST_CASE("BackendInterface is polymorphic", "[backend_interface]") {
   REQUIRE(outputs.size() == 0);
 }
 
-TEST_CASE("UnifiedBatchLane enum works through interface", "[backend_interface]") {
+TEST_CASE("UnifiedBatchLane enum works through interface",
+          "[backend_interface]") {
   MockBackend backend;
 
   // Test all lane types compile and work

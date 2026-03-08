@@ -3,9 +3,9 @@
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
 
-#include <fstream>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #include <vector>
 
@@ -58,23 +58,19 @@ std::vector<uint8_t> CreateGGUFHeader(uint32_t tensor_count = 1,
 }
 
 // Helper to create a GGUF tensor info entry
-std::vector<uint8_t> CreateTensorInfo(
-    const std::string &name,
-    uint32_t n_dims,
-    const uint32_t *ne,
-    GGUF::TensorType type,
-    size_t offset) {
+std::vector<uint8_t> CreateTensorInfo(const std::string &name, uint32_t n_dims,
+                                      const uint32_t *ne, GGUF::TensorType type,
+                                      size_t offset) {
 
   // Calculate total size needed
-  size_t name_len = name.size() + 1; // null terminator
-  size_t total_size =
-    sizeof(uint32_t) + // name length
-    name_len +         // name string
-    sizeof(uint32_t) + // n_dims
-    n_dims * sizeof(uint32_t) + // ne array
-    sizeof(uint32_t) + // type
-    sizeof(uint8_t) +   // type_flags
-    sizeof(uint64_t);   // offset
+  size_t name_len = name.size() + 1;              // null terminator
+  size_t total_size = sizeof(uint32_t) +          // name length
+                      name_len +                  // name string
+                      sizeof(uint32_t) +          // n_dims
+                      n_dims * sizeof(uint32_t) + // ne array
+                      sizeof(uint32_t) +          // type
+                      sizeof(uint8_t) +           // type_flags
+                      sizeof(uint64_t);           // offset
 
   std::vector<uint8_t> data(total_size);
   size_t pos = 0;
@@ -129,7 +125,8 @@ TEST_CASE("GGUFModelLoader: Default construction", "[gguf][loader]") {
   REQUIRE(loader.GetQuantizationType().empty());
 }
 
-TEST_CASE("GGUFModelLoader: Destructor handles unloaded model", "[gguf][loader]") {
+TEST_CASE("GGUFModelLoader: Destructor handles unloaded model",
+          "[gguf][loader]") {
   // Test that destructor doesn't crash on unintialized loader
   GGUFModelLoader loader;
   // Destructor called automatically when going out of scope
@@ -154,13 +151,15 @@ TEST_CASE("GGUFModelLoader: Reject invalid GGUF magic", "[gguf][loader]") {
   std::vector<uint8_t> invalid_header(24);
   memcpy(invalid_header.data(), "XXXX", 4); // Wrong magic
 
-  REQUIRE(WriteBinaryFile(test_file, invalid_header.data(), invalid_header.size()));
+  REQUIRE(
+      WriteBinaryFile(test_file, invalid_header.data(), invalid_header.size()));
 
   GGUFModelLoader loader;
   REQUIRE_FALSE(loader.Load(test_file));
 }
 
-TEST_CASE("GGUFModelLoader: Reject unsupported GGUF version", "[gguf][loader]") {
+TEST_CASE("GGUFModelLoader: Reject unsupported GGUF version",
+          "[gguf][loader]") {
   auto temp_dir = CreateTempDir("bad_version");
   fs::path test_file = temp_dir / "test.gguf";
 
@@ -175,7 +174,8 @@ TEST_CASE("GGUFModelLoader: Reject unsupported GGUF version", "[gguf][loader]") 
   REQUIRE_FALSE(loader.Load(test_file));
 }
 
-TEST_CASE("GGUFModelLoader: Parse valid GGUF header with tensors", "[gguf][loader]") {
+TEST_CASE("GGUFModelLoader: Parse valid GGUF header with tensors",
+          "[gguf][loader]") {
   auto temp_dir = CreateTempDir("valid_header");
   fs::path test_file = temp_dir / "test.gguf";
 
@@ -185,8 +185,10 @@ TEST_CASE("GGUFModelLoader: Parse valid GGUF header with tensors", "[gguf][loade
   // Add tensor info section
   uint32_t n_dims = 2;
   uint32_t ne[2] = {768, 768}; // 2D tensor
-  auto tensor1_info = CreateTensorInfo("tensor1", n_dims, ne, GGUF::TensorType::F16, 24);
-  auto tensor2_info = CreateTensorInfo("tensor2", n_dims, ne, GGUF::TensorType::Q4_K, 100);
+  auto tensor1_info =
+      CreateTensorInfo("tensor1", n_dims, ne, GGUF::TensorType::F16, 24);
+  auto tensor2_info =
+      CreateTensorInfo("tensor2", n_dims, ne, GGUF::TensorType::Q4_K, 100);
 
   // Calculate total file size and write
   size_t data_size = header.size() + tensor1_info.size() + tensor2_info.size();
@@ -202,8 +204,9 @@ TEST_CASE("GGUFModelLoader: Parse valid GGUF header with tensors", "[gguf][loade
   REQUIRE(WriteBinaryFile(test_file, file_data.data(), file_data.size()));
 
   GGUFModelLoader loader;
-  // Note: This may still fail if tensor data section is missing, but header parsing should work
-  // For now, we're testing that the file can be opened and header parsed
+  // Note: This may still fail if tensor data section is missing, but header
+  // parsing should work For now, we're testing that the file can be opened and
+  // header parsed
   bool result = loader.Load(test_file);
 
   // We expect this to potentially fail due to missing tensor data,
@@ -248,7 +251,8 @@ TEST_CASE("GGUFModelLoader: Tensor name mapping for output", "[gguf][loader]") {
   (void)result;
 }
 
-TEST_CASE("GGUFModelLoader: Tensor name mapping unknown types", "[gguf][loader]") {
+TEST_CASE("GGUFModelLoader: Tensor name mapping unknown types",
+          "[gguf][loader]") {
   using namespace inferflux::runtime::cuda::native;
 
   // Test that unknown names pass through with warning
@@ -262,7 +266,8 @@ TEST_CASE("GGUFModelLoader: Tensor name mapping unknown types", "[gguf][loader]"
 // Test Suite: Quantization Detection (CPU-only)
 // =============================================================================
 
-TEST_CASE("GGUFModelLoader: Detect Q4_K_M quantization", "[gguf][loader][quantization]") {
+TEST_CASE("GGUFModelLoader: Detect Q4_K_M quantization",
+          "[gguf][loader][quantization]") {
   // Create a GGUF file with Q4_K_M tensors
   auto temp_dir = CreateTempDir("q4_k_m_detect");
   fs::path test_file = temp_dir / "q4_k_m.gguf";
@@ -272,7 +277,8 @@ TEST_CASE("GGUFModelLoader: Detect Q4_K_M quantization", "[gguf][loader][quantiz
   // Add Q4_K_M tensor
   uint32_t n_dims = 2;
   uint32_t ne[2] = {768, 768};
-  auto tensor_info = CreateTensorInfo("weight", n_dims, ne, GGUF::TensorType::Q4_K, 24);
+  auto tensor_info =
+      CreateTensorInfo("weight", n_dims, ne, GGUF::TensorType::Q4_K, 24);
 
   size_t data_size = header.size() + tensor_info.size();
   std::vector<uint8_t> file_data(data_size);
@@ -290,7 +296,8 @@ TEST_CASE("GGUFModelLoader: Detect Q4_K_M quantization", "[gguf][loader][quantiz
   (void)result;
 }
 
-TEST_CASE("GGUFModelLoader: Detect Q5_K_M quantization", "[gguf][loader][quantization]") {
+TEST_CASE("GGUFModelLoader: Detect Q5_K_M quantization",
+          "[gguf][loader][quantization]") {
   // Similar test for Q5_K_M
   auto temp_dir = CreateTempDir("q5_k_m_detect");
   fs::path test_file = temp_dir / "q5_k_m.gguf";
@@ -299,7 +306,8 @@ TEST_CASE("GGUFModelLoader: Detect Q5_K_M quantization", "[gguf][loader][quantiz
 
   uint32_t n_dims = 2;
   uint32_t ne[2] = {768, 768};
-  auto tensor_info = CreateTensorInfo("weight", n_dims, ne, GGUF::TensorType::Q5_K, 24);
+  auto tensor_info =
+      CreateTensorInfo("weight", n_dims, ne, GGUF::TensorType::Q5_K, 24);
 
   size_t data_size = header.size() + tensor_info.size();
   std::vector<uint8_t> file_data(data_size);
@@ -316,7 +324,8 @@ TEST_CASE("GGUFModelLoader: Detect Q5_K_M quantization", "[gguf][loader][quantiz
   (void)result;
 }
 
-TEST_CASE("GGUFModelLoader: Detect Q6_K quantization", "[gguf][loader][quantization]") {
+TEST_CASE("GGUFModelLoader: Detect Q6_K quantization",
+          "[gguf][loader][quantization]") {
   // Similar test for Q6_K
   auto temp_dir = CreateTempDir("q6_k_detect");
   fs::path test_file = temp_dir / "q6_k.gguf";
@@ -325,7 +334,8 @@ TEST_CASE("GGUFModelLoader: Detect Q6_K quantization", "[gguf][loader][quantizat
 
   uint32_t n_dims = 2;
   uint32_t ne[2] = {768, 768};
-  auto tensor_info = CreateTensorInfo("weight", n_dims, ne, GGUF::TensorType::Q6_K, 24);
+  auto tensor_info =
+      CreateTensorInfo("weight", n_dims, ne, GGUF::TensorType::Q6_K, 24);
 
   size_t data_size = header.size() + tensor_info.size();
   std::vector<uint8_t> file_data(data_size);
@@ -350,7 +360,8 @@ TEST_CASE("GGUFModelLoader: Detect FP16 (non-quantized)", "[gguf][loader]") {
 
   uint32_t n_dims = 2;
   uint32_t ne[2] = {768, 768};
-  auto tensor_info = CreateTensorInfo("weight", n_dims, ne, GGUF::TensorType::F16, 24);
+  auto tensor_info =
+      CreateTensorInfo("weight", n_dims, ne, GGUF::TensorType::F16, 24);
 
   size_t data_size = header.size() + tensor_info.size();
   std::vector<uint8_t> file_data(data_size);
@@ -371,7 +382,8 @@ TEST_CASE("GGUFModelLoader: Detect FP16 (non-quantized)", "[gguf][loader]") {
 // Test Suite: GetTensorNames (CPU-only)
 // =============================================================================
 
-TEST_CASE("GGUFModelLoader: GetTensorNames returns empty before load", "[gguf][loader]") {
+TEST_CASE("GGUFModelLoader: GetTensorNames returns empty before load",
+          "[gguf][loader]") {
   GGUFModelLoader loader;
 
   auto names = loader.GetTensorNames();
@@ -383,7 +395,7 @@ TEST_CASE("GGUFModelLoader: GetTensorNames returns empty before load", "[gguf][l
 // =============================================================================
 
 TEST_CASE("GGUFModelLoader: Tokenizer methods return defaults before load",
-      "[gguf][loader]") {
+          "[gguf][loader]") {
   GGUFModelLoader loader;
 
   REQUIRE(loader.TokenizerEosTokenId() == -1);
@@ -398,16 +410,18 @@ TEST_CASE("GGUFModelLoader: Tokenizer methods return defaults before load",
 // =============================================================================
 
 TEST_CASE("GGUFModelLoader: GetTensorByGGUFName returns nullptr before load",
-      "[gguf][loader]") {
+          "[gguf][loader]") {
   GGUFModelLoader loader;
 
   const auto *tensor = loader.GetTensorByGGUFName("some.weight");
   REQUIRE(tensor == nullptr);
 }
 
-TEST_CASE("GGUFModelLoader: GetTensorByGGUFName returns nullptr for unknown tensor",
-      "[gguf][loader]") {
-  // Even after loading (if we had a valid file), unknown tensors should return nullptr
+TEST_CASE(
+    "GGUFModelLoader: GetTensorByGGUFName returns nullptr for unknown tensor",
+    "[gguf][loader]") {
+  // Even after loading (if we had a valid file), unknown tensors should return
+  // nullptr
   GGUFModelLoader loader;
 
   const auto *tensor = loader.GetTensorByGGUFName("nonexistent.weight");
@@ -419,15 +433,16 @@ TEST_CASE("GGUFModelLoader: GetTensorByGGUFName returns nullptr for unknown tens
 // =============================================================================
 
 TEST_CASE("GGUFModelLoader: GetWeightAccessor returns nullptr before load",
-      "[gguf][loader]") {
+          "[gguf][loader]") {
   GGUFModelLoader loader;
 
   auto accessor = loader.GetWeightAccessor("some.weight");
   REQUIRE(accessor == nullptr);
 }
 
-TEST_CASE("GGUFModelLoader: GetWeightAccessor returns nullptr for unknown tensor",
-      "[gguf][loader]") {
+TEST_CASE(
+    "GGUFModelLoader: GetWeightAccessor returns nullptr for unknown tensor",
+    "[gguf][loader]") {
   GGUFModelLoader loader;
 
   auto accessor = loader.GetWeightAccessor("unknown.weight");
@@ -439,7 +454,7 @@ TEST_CASE("GGUFModelLoader: GetWeightAccessor returns nullptr for unknown tensor
 // =============================================================================
 
 TEST_CASE("GGUFModelLoader: GetTensorNameMapping returns empty before load",
-      "[gguf][loader]") {
+          "[gguf][loader]") {
   GGUFModelLoader loader;
 
   const auto &mapping = loader.GetTensorNameMapping();
@@ -452,18 +467,19 @@ TEST_CASE("GGUFModelLoader: GetTensorNameMapping returns empty before load",
 
 #ifdef INFERFLUX_HAS_CUDA
 
-TEST_CASE("GGUFModelLoader: UploadToGPU with no model loaded", "[gguf][loader][gpu]") {
+TEST_CASE("GGUFModelLoader: UploadToGPU with no model loaded",
+          "[gguf][loader][gpu]") {
   // This test will only compile and run when CUDA is available
   GGUFModelLoader loader;
 
   // Before loading a model, UploadToGPU succeeds (uploads 0 bytes)
   cudaStream_t stream = nullptr;
-  REQUIRE(loader.UploadToGPU(stream));  // Should succeed (no-op)
-  REQUIRE(loader.GetGPUSize() == 0);     // No data uploaded
+  REQUIRE(loader.UploadToGPU(stream)); // Should succeed (no-op)
+  REQUIRE(loader.GetGPUSize() == 0);   // No data uploaded
 }
 
 TEST_CASE("GGUFModelLoader: FreeGPUMemory is safe without CUDA init",
-      "[gguf][loader][gpu]") {
+          "[gguf][loader][gpu]") {
   GGUFModelLoader loader;
 
   // Should not crash even if no CUDA memory allocated
@@ -477,7 +493,7 @@ TEST_CASE("GGUFModelLoader: FreeGPUMemory is safe without CUDA init",
 // =============================================================================
 
 TEST_CASE("GGUFModelLoader: GetModelInfo returns defaults before load",
-      "[gguf][loader]") {
+          "[gguf][loader]") {
   GGUFModelLoader loader;
 
   const auto &info = loader.GetModelInfo();
@@ -491,21 +507,23 @@ TEST_CASE("GGUFModelLoader: GetModelInfo returns defaults before load",
 // Test Suite: Memory Management (CPU-only)
 // =============================================================================
 
-TEST_CASE("GGUFModelLoader: FreeCPUMemory is safe before load", "[gguf][loader]") {
+TEST_CASE("GGUFModelLoader: FreeCPUMemory is safe before load",
+          "[gguf][loader]") {
   GGUFModelLoader loader;
 
   // Should not crash even with no data loaded
   loader.FreeCPUMemory();
 }
 
-TEST_CASE("GGUFModelLoader: GetGPUSize returns 0 before load", "[gguf][loader]") {
+TEST_CASE("GGUFModelLoader: GetGPUSize returns 0 before load",
+          "[gguf][loader]") {
   GGUFModelLoader loader;
 
   REQUIRE(loader.GetGPUSize() == 0);
 }
 
 TEST_CASE("GGUFModelLoader: GetGPUBuffer returns nullptr before load",
-      "[gguf][loader]") {
+          "[gguf][loader]") {
   GGUFModelLoader loader;
 
   REQUIRE(loader.GetGPUBuffer() == nullptr);
@@ -516,7 +534,7 @@ TEST_CASE("GGUFModelLoader: GetGPUBuffer returns nullptr before load",
 // =============================================================================
 
 TEST_CASE("GGUFModelLoader: Multiple load attempts handled gracefully",
-      "[gguf][loader]") {
+          "[gguf][loader]") {
   auto temp_dir = CreateTempDir("multi_load");
   fs::path test_file1 = temp_dir / "test1.gguf";
   fs::path test_file2 = temp_dir / "test2.gguf";

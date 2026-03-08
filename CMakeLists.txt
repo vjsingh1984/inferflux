@@ -52,8 +52,8 @@ add_library(inferflux_core
   runtime/backends/cuda/native/safetensors_parser.h
   runtime/backends/cuda/native_kernel_executor.cpp
   runtime/backends/cuda/native_kernel_executor.h
-  runtime/backends/cuda/native/native_tokenizer.cpp
-  runtime/backends/cuda/native/native_tokenizer.h
+  model/tokenizer_factory.cpp
+  model/tokenizer_factory.h
   runtime/backends/backend_capabilities.cpp
   runtime/backends/backend_capabilities.h
   runtime/backends/common/backend_types.h
@@ -482,6 +482,7 @@ add_executable(inferflux_tests
   tests/unit/test_batch_analyzer.cpp
   tests/unit/test_backend_interface.cpp
   tests/unit/test_native_forward.cpp
+  tests/unit/test_tokenizer_factory.cpp
   tests/unit/test_dtype_traits.cpp
   tests/unit/test_gpu_kv_cache.cpp
   tests/unit/test_gpu_sampler.cpp
@@ -549,6 +550,8 @@ add_test(NAME StopSequenceTests COMMAND inferflux_tests "[stop_sequences]")
 set_tests_properties(StopSequenceTests PROPERTIES LABELS stop_sequences)
 add_test(NAME NativeForwardTests COMMAND inferflux_tests "[native_forward]")
 set_tests_properties(NativeForwardTests PROPERTIES LABELS native_forward)
+add_test(NAME TokenizerFactoryTests COMMAND inferflux_tests "[tokenizer_factory]")
+set_tests_properties(TokenizerFactoryTests PROPERTIES LABELS tokenizer_factory)
 add_test(NAME DtypeTraitsTests COMMAND inferflux_tests "[dtype_traits]")
 set_tests_properties(DtypeTraitsTests PROPERTIES LABELS dtype_traits)
 add_test(NAME GpuKvCacheTests COMMAND inferflux_tests "[gpu_kv_cache]")

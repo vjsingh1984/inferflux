@@ -71,7 +71,6 @@ public:
     float rope_freq_base{10000.0f};
     float rope_freq_scale{1.0f};
     int rope_dim{0};
-    int rope_type{0}; // 0=NORM (consecutive), 2=NEOX (split-half)
 
     // Model type
     std::string model_type; // "qwen2", "llama", etc.
@@ -253,8 +252,8 @@ private:
       runtime::cuda::native::KvPrecision::kFp16};
   std::string kv_precision_hint_{"auto"};
   runtime::cuda::native::DequantizedCachePolicy dequantized_cache_policy_{
-      runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime};
-  std::string dequantized_cache_policy_hint_{"batch"};
+      runtime::cuda::native::DequantizedCachePolicy::kModelLifetime};
+  std::string dequantized_cache_policy_hint_{"model"};
   bool require_fused_quantized_matmul_{false};
 
   // Native kernel pipeline components (only available with CUDA)
@@ -314,9 +313,6 @@ private:
   bool overlap_enabled_{true};
   int min_prefill_tokens_{256};
 #endif
-
-  // Token history for repetition penalty (per sequence)
-  std::unordered_map<int, std::vector<int>> sequence_token_history_;
 
   // Internal helpers
   bool InitializeCUDA();

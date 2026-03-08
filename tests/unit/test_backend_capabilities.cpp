@@ -17,8 +17,8 @@ TEST_CASE("CheckBackendCapabilities succeeds when requirements are empty",
 
 TEST_CASE("BuildGenerationFeatureRequirements maps request features",
           "[backend_capabilities]") {
-  auto requirements = BuildGenerationFeatureRequirements(
-      true, true, false, true, true, true);
+  auto requirements =
+      BuildGenerationFeatureRequirements(true, true, false, true, true, true);
 
   REQUIRE(requirements.needs_streaming);
   REQUIRE(requirements.needs_logprobs);

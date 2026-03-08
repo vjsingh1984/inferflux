@@ -215,7 +215,7 @@ int main(int argc, char **argv) {
   int cuda_flash_attention_tile = 128;
   std::string cuda_attention_kernel = "auto";
   std::string native_kv_cache_dtype = "auto";
-  std::string native_dequantized_cache_policy = "batch";
+  std::string native_dequantized_cache_policy = "model";
   bool native_require_fused_quantized_matmul = false;
   bool cuda_phase_overlap_scaffold = false;
   int cuda_phase_overlap_min_prefill_tokens = 256;
@@ -1060,7 +1060,7 @@ int main(int argc, char **argv) {
               << native_kv_cache_dtype << ".\n";
     std::cout << "[server] Native CUDA dequant cache policy: "
               << native_dequantized_cache_policy
-              << " (batch default, memory-efficient).\n";
+              << " (model default, required for fused GEMV correctness).\n";
     std::cout << "[server] Native CUDA strict fused quantized matmul: "
               << (native_require_fused_quantized_matmul ? "enabled"
                                                         : "disabled")
