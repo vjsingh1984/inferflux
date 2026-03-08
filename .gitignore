@@ -25,4 +25,5 @@ __pycache__/
 
 # Local profiling outputs and backup scratch files.
 nsys_reports/
+gguf_benchmark_results/
 *.old
