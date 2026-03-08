@@ -209,5 +209,151 @@ template cudaError_t FlashAttention2Typed<__nv_bfloat16>(
     const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *,
     __nv_bfloat16 *, int, int, int, int, int, int, float, bool, cudaStream_t);
 
+// ============================================================================
+// FlashDecodeMultiSeq: Batched decode attention for B sequences with
+// variable KV cache lengths. Each query has query_len=1.
+//
+// Grid: (batch_size, num_heads)
+// Block: next_pow2(head_dim) threads
+// Each block handles one (batch, head) pair.
+// ============================================================================
+
+template <typename T>
+__global__ void FlashDecodeMultiSeqKernel(
+    const T *__restrict__ Q, const T *const *__restrict__ K_ptrs,
+    const T *const *__restrict__ V_ptrs, T *__restrict__ O,
+    const int *__restrict__ kv_lens, int num_heads, int num_kv_heads,
+    int head_dim, float scale) {
+  const int b = blockIdx.x;
+  const int head_idx = blockIdx.y;
+
+  const int d = threadIdx.x;
+  const int num_threads = blockDim.x;
+  const int warp_id = d / 32;
+  const int lane = d & 31;
+  const int num_warps = num_threads / 32;
+
+  const int kv_len = kv_lens[b];
+  if (kv_len <= 0)
+    return;
+
+  const int kv_head_ratio =
+      (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 1;
+  const int kv_head_idx = head_idx / kv_head_ratio;
+
+  // Q is [B, num_heads * head_dim]
+  float q_reg = 0.0f;
+  if (d < head_dim) {
+    q_reg = DtypeTraits<T>::to_float(
+        Q[b * num_heads * head_dim + head_idx * head_dim + d]);
+  }
+
+  // K/V pointers for this batch element: [kv_len, num_kv_heads * head_dim]
+  const T *K = K_ptrs[b];
+  const T *V = V_ptrs[b];
+  const int kv_stride = num_kv_heads * head_dim;
+
+  // Shared memory layout: same as FA2
+  extern __shared__ float smem[];
+  float *s_k = smem;
+  float *s_v = smem + FA2_TILE_KV * head_dim;
+  float *s_warp_dots = smem + 2 * FA2_TILE_KV * head_dim;
+  float *s_scores = s_warp_dots + num_warps * FA2_TILE_KV;
+
+  float row_max = -INFINITY;
+  float row_sum = 0.0f;
+  float o_acc = 0.0f;
+
+  for (int kv_start = 0; kv_start < kv_len; kv_start += FA2_TILE_KV) {
+    int tile_len = min(FA2_TILE_KV, kv_len - kv_start);
+    int total_elements = tile_len * head_dim;
+
+    // Load K and V tiles
+    for (int i = d; i < total_elements; i += num_threads) {
+      int t = i / head_dim;
+      int dim = i % head_dim;
+      size_t kv_offset =
+          (size_t)(kv_start + t) * kv_stride + kv_head_idx * head_dim + dim;
+      s_k[i] = DtypeTraits<T>::to_float(K[kv_offset]);
+      s_v[i] = DtypeTraits<T>::to_float(V[kv_offset]);
+    }
+    __syncthreads();
+
+    // Dot products with warp reduction
+    for (int t = 0; t < tile_len; t++) {
+      float partial = (d < head_dim) ? q_reg * s_k[t * head_dim + d] : 0.0f;
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xFFFFFFFF, partial, offset);
+      if (lane == 0)
+        s_warp_dots[warp_id * FA2_TILE_KV + t] = partial;
+    }
+    __syncthreads();
+
+    // Cross-warp reduction
+    if (d < tile_len) {
+      float dot_sum = 0.0f;
+      for (int w = 0; w < num_warps; w++)
+        dot_sum += s_warp_dots[w * FA2_TILE_KV + d];
+      s_scores[d] = dot_sum * scale;
+    }
+    __syncthreads();
+
+    // Online softmax + V accumulation
+    for (int t = 0; t < tile_len; t++) {
+      float score = s_scores[t];
+      float new_max = fmaxf(row_max, score);
+      float rescale = expf(row_max - new_max);
+      float exp_w = expf(score - new_max);
+
+      if (d < head_dim)
+        o_acc = o_acc * rescale + exp_w * s_v[t * head_dim + d];
+
+      row_sum = row_sum * rescale + exp_w;
+      row_max = new_max;
+    }
+    __syncthreads();
+  }
+
+  // Write output: O is [B, num_heads * head_dim]
+  if (d < head_dim) {
+    O[b * num_heads * head_dim + head_idx * head_dim + d] =
+        DtypeTraits<T>::from_float((row_sum > 0.0f) ? (o_acc / row_sum) : 0.0f);
+  }
+}
+
+template <typename T>
+cudaError_t FlashDecodeMultiSeq(const T *Q, const T *const *d_k_ptrs,
+                                const T *const *d_v_ptrs, T *O,
+                                const int *d_kv_lens, int batch_size,
+                                int num_heads, int num_kv_heads, int head_dim,
+                                float scale, cudaStream_t stream) {
+  int threads = 1;
+  while (threads < head_dim)
+    threads <<= 1;
+  threads = min(threads, 1024);
+  int num_warps = threads / 32;
+
+  int smem =
+      (2 * FA2_TILE_KV * head_dim + num_warps * FA2_TILE_KV + FA2_TILE_KV) *
+      sizeof(float);
+
+  dim3 grid(batch_size, num_heads);
+
+  FlashDecodeMultiSeqKernel<T><<<grid, threads, smem, stream>>>(
+      Q, d_k_ptrs, d_v_ptrs, O, d_kv_lens, num_heads, num_kv_heads, head_dim,
+      scale);
+  return cudaGetLastError();
+}
+
+template cudaError_t FlashDecodeMultiSeq<half>(const half *, const half *const *,
+                                               const half *const *, half *,
+                                               const int *, int, int, int, int,
+                                               float, cudaStream_t);
+template cudaError_t FlashDecodeMultiSeq<__nv_bfloat16>(
+    const __nv_bfloat16 *, const __nv_bfloat16 *const *,
+    const __nv_bfloat16 *const *, __nv_bfloat16 *, const int *, int, int, int,
+    int, float, cudaStream_t);
+
 } // namespace cuda_kernel
 } // namespace inferflux

@@ -858,6 +858,20 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           inf.bpe_prompt_tokens =
               pending->resolved_backend->TokenizeForCache(inf.prompt);
         }
+        // Keep logprobs/structured-output requests on the full Generate()
+        // path so the backend can apply a single consistent sampler/grammar
+        // state. Phased prefill + Decode() would split sampler state across
+        // phases and force sequence-state handoff between heterogeneous paths.
+        if (inf.collect_logprobs || inf.has_response_format) {
+          inf.n_past = -1;
+          inf.prompt_bpe_tokens = 0;
+          inf.sequence_id = -1;
+          inf.first_token = -1;
+          inf.first_piece.clear();
+          inf.prefill_offset = 0;
+          staged_decode.push_back(pending);
+          continue;
+        }
         // KV prefix reuse (§ Item 5): if we have a warm sequence whose BPE
         // tokens are a strict prefix of this request's BPE prompt tokens, copy
         // that KV state and only evaluate the suffix — skipping repeated prompt

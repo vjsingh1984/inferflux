@@ -1,4 +1,5 @@
 #include "net/http_client.h"
+#include "runtime/string_utils.h"
 
 #include <nlohmann/json.hpp>
 
@@ -33,14 +34,8 @@ namespace {
 #define PATH_MAX 4096
 #endif
 
-std::string Trim(const std::string &input) {
-  auto start = input.find_first_not_of(" \t");
-  auto end = input.find_last_not_of(" \t\r\n");
-  if (start == std::string::npos || end == std::string::npos) {
-    return "";
-  }
-  return input.substr(start, end - start + 1);
-}
+using inferflux::ToLower;
+using inferflux::Trim;
 
 struct ChatMessage {
   std::string role;
@@ -556,8 +551,7 @@ bool ResolveBestGguf(inferflux::HttpClient &client, const std::string &repo,
         if (!s.contains("rfilename"))
           continue;
         std::string fname = s["rfilename"].get<std::string>();
-        std::string lower = fname;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        std::string lower = ToLower(fname);
         if (lower.find(".gguf") != std::string::npos) {
           gguf_files.push_back(fname);
         }
@@ -599,8 +593,7 @@ int CmdQuickstart(const std::string &repo, const std::string &profile,
   }
   std::string model_id = repo;
   std::replace(model_id.begin(), model_id.end(), '/', '_');
-  std::string backend = backend_hint.empty() ? "cpu" : backend_hint;
-  std::transform(backend.begin(), backend.end(), backend.begin(), ::tolower);
+  std::string backend = ToLower(backend_hint.empty() ? "cpu" : backend_hint);
   cfg << "# InferFlux quickstart config (profile: " << profile << ")\n"
       << "server:\n"
       << "  host: 0.0.0.0\n"
@@ -650,8 +643,7 @@ std::filesystem::path ModelsDir() { return InferfluxHome() / "models"; }
 // Q5_K_M > Q5 > Q8 > any .gguf
 std::string SelectBestGguf(const std::vector<std::string> &files) {
   auto score = [](const std::string &name) -> int {
-    std::string lower = name;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::string lower = ToLower(name);
     if (lower.find("q4_k_m") != std::string::npos)
       return 100;
     if (lower.find("q4_k_s") != std::string::npos)
@@ -732,9 +724,7 @@ DownloadHeaders ParseDownloadHeaders(const std::string &header_block) {
       continue;
     std::string key = Trim(line.substr(0, colon));
     std::string val = Trim(line.substr(colon + 1));
-    std::string key_lower = key;
-    std::transform(key_lower.begin(), key_lower.end(), key_lower.begin(),
-                   ::tolower);
+    std::string key_lower = ToLower(key);
     if (key_lower == "location")
       h.location = val;
     else if (key_lower == "content-length") {

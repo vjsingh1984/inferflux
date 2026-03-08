@@ -87,6 +87,28 @@ sequenceDiagram
 
 This contract is reflected in `/v1/models`, `/v1/models/{id}`, and `inferctl models` JSON/table outputs.
 
+## 6.1) Two-CUDA-Backend Value Matrix
+
+```mermaid
+flowchart LR
+    A[cuda hint] --> B{Native ready?}
+    B -->|yes| C[native_cuda provider]
+    B -->|no / policy fallback| D[cuda_llama_cpp provider]
+```
+
+| Axis | `native_cuda` provider | `cuda_llama_cpp` provider |
+|---|---|---|
+| Primary value | Throughput-core + kernel control path | Compatibility + broad feature coverage |
+| Runtime core | InferFlux native runtime (`NativeCudaRuntime`) | llama.cpp runtime (`LlamaCPUBackend` CUDA target) |
+| Model format posture | First-class safetensors; GGUF path in active maturity work | Strong GGUF compatibility path |
+| Feature surface today | Generation core + mixed decode/prefill overlap path + KV prefix/serialize contracts; endpoint parity for completion/chat/embeddings is contract-closed via native parity delegate paths when available | Full mature llama.cpp feature surface used as compatibility baseline |
+| Concurrency contract today | Async unified-batch API is intentionally disabled in native runtime (`SupportsAsyncUnifiedBatch()==false`), so overlap is currently delivered through synchronous mixed-batch execution | Async unified-batch contract is available through llama.cpp path |
+| Policy semantics | Capability routing is explicit; if native parity contract is unavailable, fallback/422 behavior is policy-driven and observable in backend exposure fields | Serves as deterministic fallback/safety net under policy and capability checks |
+| Fallback role | Preferred when ready and policy allows | Deterministic fallback when native is unavailable or policy routes to llama.cpp |
+| Operational risk profile | Faster-moving, higher upside, active maturity backlog | Lower risk, stable baseline for OSS users and production fallback |
+
+Keeping both backends is intentional: one maximizes control/performance headroom (`native_cuda`), the other maximizes compatibility/stability (`cuda_llama_cpp`).
+
 ## 7) Prefix/KV Reuse Contract
 
 | Area | Contract |

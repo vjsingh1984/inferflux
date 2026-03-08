@@ -1,26 +1,14 @@
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
 #include "runtime/backends/cuda/native/safetensors_adapter.h"
+#include "runtime/string_utils.h"
 #include "server/logging/logger.h"
-#include <algorithm>
-#include <cctype>
 #include <filesystem>
 
 namespace inferflux {
 namespace runtime {
 namespace cuda {
 namespace native {
-
-namespace {
-
-std::string ToLowerAscii(std::string value) {
-  std::transform(
-      value.begin(), value.end(), value.begin(),
-      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-  return value;
-}
-
-} // namespace
 
 std::string DequantizedCachePolicyToString(DequantizedCachePolicy policy) {
   switch (policy) {
@@ -37,7 +25,7 @@ bool ParseDequantizedCachePolicy(const std::string &raw,
   if (!out) {
     return false;
   }
-  const std::string lowered = ToLowerAscii(raw);
+  const std::string lowered = inferflux::ToLower(raw);
   if (lowered == "model" || lowered == "model_lifetime") {
     *out = DequantizedCachePolicy::kModelLifetime;
     return true;

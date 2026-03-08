@@ -136,6 +136,135 @@ TEST_CASE("KvCacheGpu: copy prefix + serialize hydrate",
 
   REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
 }
+
+TEST_CASE("KvCacheGpu: out-of-bounds seq_id is safely rejected",
+          "[gpu_kv_cache][cuda]") {
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count == 0) {
+    SKIP("No CUDA device available");
+  }
+
+  KvCacheGpu cache;
+  int max_batch = 4;
+  REQUIRE(cache.Allocate(/*num_layers=*/1, /*num_kv_heads=*/2, /*head_dim=*/8,
+                         /*max_seq=*/16, max_batch));
+
+  // In-bounds: should succeed
+  cache.ClearSequence(0);
+  cache.ClearSequence(3);
+
+  // Out-of-bounds: ClearSequence should not crash (it has a bounds check)
+  cache.ClearSequence(4);   // seq_id == max_batch
+  cache.ClearSequence(100); // far out of range
+
+  // Verify MaxBatchSize is correctly reported
+  REQUIRE(cache.MaxBatchSize() == max_batch);
+}
+
+TEST_CASE("KvCacheGpu: seq slot IDs must fit within max_batch",
+          "[gpu_kv_cache][cuda]") {
+  // This test validates the invariant that the scheduler's sequence slot IDs
+  // (0..kMaxSequenceSlots-1) must all fit within the KV cache's max_batch.
+  // The scheduler uses kMaxSequenceSlots=16, so KV cache needs ≥16 slots.
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count == 0) {
+    SKIP("No CUDA device available");
+  }
+
+  constexpr int kSchedulerMaxSlots = 16; // mirrors scheduler's kMaxSequenceSlots
+
+  // Allocate with enough slots for the scheduler
+  KvCacheGpu cache;
+  REQUIRE(cache.Allocate(/*num_layers=*/1, /*num_kv_heads=*/1, /*head_dim=*/8,
+                         /*max_seq=*/8, /*max_batch=*/kSchedulerMaxSlots));
+
+  // All scheduler slot IDs should produce valid, distinct pointers
+  std::vector<half *> k_ptrs(kSchedulerMaxSlots);
+  std::vector<half *> v_ptrs(kSchedulerMaxSlots);
+  for (int i = 0; i < kSchedulerMaxSlots; ++i) {
+    k_ptrs[i] = cache.GetK(0, i);
+    v_ptrs[i] = cache.GetV(0, i);
+    REQUIRE(k_ptrs[i] != nullptr);
+    REQUIRE(v_ptrs[i] != nullptr);
+  }
+
+  // Each slot should have distinct K and V pointers
+  for (int i = 0; i < kSchedulerMaxSlots; ++i) {
+    for (int j = i + 1; j < kSchedulerMaxSlots; ++j) {
+      REQUIRE(k_ptrs[i] != k_ptrs[j]);
+      REQUIRE(v_ptrs[i] != v_ptrs[j]);
+    }
+  }
+
+  // Write distinct values to each slot's K cache and read them back
+  // to verify no overlap between slots
+  cudaStream_t stream = nullptr;
+  REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
+
+  constexpr int kKvDim = 8; // num_kv_heads * head_dim
+  for (int i = 0; i < kSchedulerMaxSlots; ++i) {
+    std::vector<half> data(kKvDim);
+    for (int j = 0; j < kKvDim; ++j) {
+      data[j] = __float2half(static_cast<float>(i * 100 + j));
+    }
+    REQUIRE(cudaMemcpyAsync(cache.GetK(0, i), data.data(),
+                            kKvDim * sizeof(half), cudaMemcpyHostToDevice,
+                            stream) == cudaSuccess);
+  }
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+  // Read back and verify each slot has its own data (no corruption)
+  for (int i = 0; i < kSchedulerMaxSlots; ++i) {
+    std::vector<half> readback(kKvDim);
+    REQUIRE(cudaMemcpy(readback.data(), cache.GetK(0, i),
+                       kKvDim * sizeof(half),
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    for (int j = 0; j < kKvDim; ++j) {
+      float expected = static_cast<float>(i * 100 + j);
+      REQUIRE(__half2float(readback[j]) == Catch::Approx(expected));
+    }
+  }
+
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+}
+
+TEST_CASE("KvCacheGpu: undersized max_batch causes slot collision",
+          "[gpu_kv_cache][cuda]") {
+  // Demonstrates the failure mode that caused the correctness regression:
+  // if KV cache max_batch < scheduler slots, higher slot IDs alias lower ones
+  // or access out-of-bounds GPU memory.
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count == 0) {
+    SKIP("No CUDA device available");
+  }
+
+  constexpr int kSmallBatch = 4;
+  KvCacheGpu cache;
+  REQUIRE(cache.Allocate(/*num_layers=*/1, /*num_kv_heads=*/1, /*head_dim=*/8,
+                         /*max_seq=*/8, /*max_batch=*/kSmallBatch));
+
+  // Slots 0..3 are valid
+  half *k0 = cache.GetK(0, 0);
+  half *k3 = cache.GetK(0, 3);
+  REQUIRE(k0 != nullptr);
+  REQUIRE(k3 != nullptr);
+  REQUIRE(k0 != k3);
+
+  // Slot 4 would be out-of-bounds. The pointer arithmetic still "works" but
+  // points past the allocated buffer. This is the dangerous case that the
+  // executor's max_batch clamp (≥16) prevents.
+  half *k4 = cache.GetK(0, 4);
+  // k4 is computed as buffer_ + 4*slot_stride_, which is past the allocation
+  // (buffer_ only has 4*slot_stride_ elements total). This verifies the
+  // pointer would be past the last valid slot.
+  REQUIRE(k4 > k3); // Pointer math works, but access would be UB
+
+  // Verify MaxBatchSize correctly reports the limit
+  REQUIRE(cache.MaxBatchSize() == kSmallBatch);
+}
 #endif
 
 } // namespace inferflux

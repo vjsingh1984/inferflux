@@ -1,4 +1,5 @@
 #include "policy/policy_store.h"
+#include "runtime/string_utils.h"
 #include "server/auth/api_key_auth.h"
 
 #include <algorithm>
@@ -26,14 +27,7 @@ bool SizeToInt(std::size_t value, int *out) {
   return true;
 }
 
-std::string Trim(const std::string &input) {
-  auto start = input.find_first_not_of(" \t");
-  auto end = input.find_last_not_of(" \t\r\n");
-  if (start == std::string::npos || end == std::string::npos) {
-    return "";
-  }
-  return input.substr(start, end - start + 1);
-}
+using inferflux::Trim;
 std::string HexEncode(const unsigned char *data, std::size_t len) {
   static const char *hex = "0123456789abcdef";
   std::string out;
@@ -73,10 +67,7 @@ std::vector<unsigned char> HexDecode(const std::string &hex) {
 }
 
 bool ParseBoolValue(const std::string &value, bool *parsed) {
-  std::string lowered = value;
-  std::transform(
-      lowered.begin(), lowered.end(), lowered.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::string lowered = inferflux::ToLower(value);
   if (lowered == "true" || lowered == "1" || lowered == "yes") {
     *parsed = true;
     return true;

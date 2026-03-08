@@ -5,6 +5,7 @@
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
 #include "runtime/backends/cuda/native/quantized_weight_map_adapter.h"
 #include "runtime/backends/cuda/native/safetensors_parser.h"
+#include "runtime/string_utils.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 
@@ -33,27 +34,6 @@
 #include <nlohmann/json.hpp>
 
 namespace {
-
-inferflux::SafetensorsLoader::ModelConfig ModelInfoToModelConfig(
-    const inferflux::runtime::cuda::native::ModelInfo &info) {
-  inferflux::SafetensorsLoader::ModelConfig config;
-  config.hidden_size = info.hidden_size;
-  config.num_hidden_layers = info.num_hidden_layers;
-  config.num_attention_heads = info.num_attention_heads;
-  config.num_key_value_heads = info.num_key_value_heads;
-  config.head_dim = info.head_dim;
-  config.intermediate_size = info.intermediate_size;
-  config.vocab_size = info.vocab_size;
-  config.max_position_embeddings = info.max_position_embeddings;
-  config.rope_freq_base = info.rope_freq_base;
-  config.rope_freq_scale = info.rope_freq_scale;
-  config.rope_dim = info.rope_dim;
-  config.model_type = info.model_type;
-  config.activation = info.activation;
-  config.torch_dtype = info.torch_dtype;
-  config.rms_norm_eps = info.rms_norm_eps;
-  return config;
-}
 
 constexpr std::size_t kKiB = 1024ULL;
 constexpr std::size_t kMiB = kKiB * kKiB;
@@ -126,27 +106,16 @@ bool CheckedMulSize(std::size_t a, std::size_t b, std::size_t *out) {
   return true;
 }
 
-std::string ToLowerAscii(std::string value) {
-  std::transform(
-      value.begin(), value.end(), value.begin(),
-      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-  return value;
+// Use inferflux::ToLower from string_utils.h (included via header chain).
+// Local wrappers for backward compatibility with call sites.
+std::string ToLowerAscii(const std::string &value) {
+  return inferflux::ToLower(value);
 }
 
 bool ParseBoolSetting(const char *raw, bool fallback) {
-  if (!raw) {
+  if (!raw)
     return fallback;
-  }
-  const std::string lowered = ToLowerAscii(raw);
-  if (lowered == "1" || lowered == "true" || lowered == "yes" ||
-      lowered == "on") {
-    return true;
-  }
-  if (lowered == "0" || lowered == "false" || lowered == "no" ||
-      lowered == "off") {
-    return false;
-  }
-  return fallback;
+  return inferflux::ParseBool(raw);
 }
 
 std::string
@@ -193,6 +162,26 @@ ConvertModelInfo(const inferflux::runtime::cuda::native::ModelInfo &info) {
   cfg.torch_dtype = info.torch_dtype;
   cfg.rms_norm_eps = info.rms_norm_eps;
   return cfg;
+}
+
+void WarmQuantizedLaneCache(inferflux::QuantizedWeightMap *weight_map) {
+  if (!weight_map) {
+    return;
+  }
+
+  // Warm permanent-cache tensors up front so overlap lanes don't race
+  // first-touch dequantized cache creation in the shared GGUF loader.
+  (void)weight_map->EmbedTokens();
+  (void)weight_map->FinalNorm();
+  (void)weight_map->LmHead();
+  const int layers = weight_map->NumLayers();
+  for (int layer = 0; layer < layers; ++layer) {
+    (void)weight_map->LayerInputNorm(layer);
+    (void)weight_map->LayerPostAttnNorm(layer);
+    (void)weight_map->LayerQProjBias(layer);
+    (void)weight_map->LayerKProjBias(layer);
+    (void)weight_map->LayerVProjBias(layer);
+  }
 }
 
 } // namespace
@@ -840,6 +829,12 @@ void NativeKernelExecutor::ReleaseBatchScopedDequantizedCache() {
   if (quantized_weight_map_) {
     quantized_weight_map_->ClearCache();
   }
+  if (decode_lane_quantized_weight_map_) {
+    decode_lane_quantized_weight_map_->ClearCache();
+  }
+  if (prefill_lane_quantized_weight_map_) {
+    prefill_lane_quantized_weight_map_->ClearCache();
+  }
 #endif
   model_loader_->ClearDequantizedCache();
 }
@@ -853,6 +848,10 @@ void NativeKernelExecutor::DestroyLaneOverlapResources() {
   prefill_lane_sampler_.reset();
   decode_lane_gemm_.reset();
   prefill_lane_gemm_.reset();
+  decode_lane_quantized_weight_adapter_.reset();
+  prefill_lane_quantized_weight_adapter_.reset();
+  decode_lane_quantized_weight_map_.reset();
+  prefill_lane_quantized_weight_map_.reset();
   if (d_decode_logits_) {
     if (cudaFree(d_decode_logits_) != cudaSuccess) {
       log::Warn("native_kernel_executor", "cudaFree(d_decode_logits_) failed");
@@ -868,9 +867,19 @@ void NativeKernelExecutor::DestroyLaneOverlapResources() {
 }
 
 bool NativeKernelExecutor::CanRunLaneOverlap() const {
-  return lane_overlap_ready_ && decode_lane_forward_ && prefill_lane_forward_ &&
-         decode_lane_sampler_ && prefill_lane_sampler_ && decode_lane_gemm_ &&
-         prefill_lane_gemm_ && d_decode_logits_ && d_prefill_logits_;
+  if (!lane_overlap_ready_ || !decode_lane_forward_ || !prefill_lane_forward_ ||
+      !decode_lane_sampler_ || !prefill_lane_sampler_ || !decode_lane_gemm_ ||
+      !prefill_lane_gemm_ || !d_decode_logits_ || !d_prefill_logits_) {
+    return false;
+  }
+
+  if (model_loader_ && model_loader_->GetFormat() == "gguf") {
+    return decode_lane_quantized_weight_map_ &&
+           prefill_lane_quantized_weight_map_ &&
+           decode_lane_quantized_weight_adapter_ &&
+           prefill_lane_quantized_weight_adapter_;
+  }
+  return true;
 }
 
 NativeKernelExecutor::LaneExecutionResources
@@ -895,7 +904,13 @@ NativeKernelExecutor::GetLaneResources(bool decode_lane) {
         decode_lane ? decode_lane_sampler_.get() : prefill_lane_sampler_.get();
     lane_resources.gemm =
         decode_lane ? decode_lane_gemm_.get() : prefill_lane_gemm_.get();
-    lane_resources.quantized_weights = nullptr;
+    if (model_loader_ && model_loader_->GetFormat() == "gguf") {
+      lane_resources.quantized_weights =
+          decode_lane ? decode_lane_quantized_weight_map_.get()
+                      : prefill_lane_quantized_weight_map_.get();
+    } else {
+      lane_resources.quantized_weights = nullptr;
+    }
     lane_resources.logits = decode_lane ? d_decode_logits_ : d_prefill_logits_;
     lane_resources.stream = decode_lane ? decode_stream_ : prefill_stream_;
     return lane_resources;
@@ -913,14 +928,15 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
   if (!decode_stream_ || !prefill_stream_) {
     return false;
   }
-  // GGUF quantized path currently relies on shared dequant scratch/cache state.
-  if (model_loader_ && model_loader_->GetFormat() == "gguf") {
-    log::Info("native_kernel_executor",
-              "Lane-overlap replicas disabled for GGUF path; shared quantized "
-              "dequant scratch is not lane-safe yet");
+  const bool is_gguf_path =
+      (model_loader_ && model_loader_->GetFormat() == "gguf");
+  if (!kv_cache_) {
     return false;
   }
-  if (!weight_map_ || !kv_cache_) {
+  if (!is_gguf_path && !weight_map_) {
+    return false;
+  }
+  if (is_gguf_path && !model_loader_) {
     return false;
   }
 
@@ -934,7 +950,11 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
     return false;
   }
 
-  if (want_bf16) {
+  if (is_gguf_path) {
+    // GGUF path currently feeds FP16 into the forward path.
+    decode_lane_forward_ = CreateModelForward(config.model_type);
+    prefill_lane_forward_ = CreateModelForward(config.model_type);
+  } else if (want_bf16) {
     decode_lane_forward_ =
         CreateModelForwardTyped<__nv_bfloat16>(config.model_type);
     prefill_lane_forward_ =
@@ -949,16 +969,53 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
     DestroyLaneOverlapResources();
     return false;
   }
-  if (!decode_lane_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
-                                        decode_lane_gemm_.get(),
-                                        decode_stream_) ||
-      !prefill_lane_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
-                                         prefill_lane_gemm_.get(),
-                                         prefill_stream_)) {
-    log::Warn("native_kernel_executor",
-              "Failed to initialize lane-overlap forward replicas");
-    DestroyLaneOverlapResources();
-    return false;
+
+  if (is_gguf_path) {
+    decode_lane_quantized_weight_map_ = std::make_unique<QuantizedWeightMap>();
+    prefill_lane_quantized_weight_map_ = std::make_unique<QuantizedWeightMap>();
+    if (!decode_lane_quantized_weight_map_->Build(
+            model_loader_.get(), model_info_, decode_stream_) ||
+        !prefill_lane_quantized_weight_map_->Build(
+            model_loader_.get(), model_info_, prefill_stream_)) {
+      log::Warn("native_kernel_executor",
+                "Failed to build GGUF lane-local quantized maps");
+      DestroyLaneOverlapResources();
+      return false;
+    }
+
+    decode_lane_quantized_weight_adapter_ =
+        std::make_unique<QuantizedWeightMapAdapter>(
+            decode_lane_quantized_weight_map_.get());
+    prefill_lane_quantized_weight_adapter_ =
+        std::make_unique<QuantizedWeightMapAdapter>(
+            prefill_lane_quantized_weight_map_.get());
+    WarmQuantizedLaneCache(decode_lane_quantized_weight_map_.get());
+    WarmQuantizedLaneCache(prefill_lane_quantized_weight_map_.get());
+
+    const auto gguf_config = ConvertModelInfo(model_info_);
+    if (!decode_lane_forward_->Initialize(
+            gguf_config, *decode_lane_quantized_weight_adapter_,
+            kv_cache_.get(), decode_lane_gemm_.get(), decode_stream_) ||
+        !prefill_lane_forward_->Initialize(
+            gguf_config, *prefill_lane_quantized_weight_adapter_,
+            kv_cache_.get(), prefill_lane_gemm_.get(), prefill_stream_)) {
+      log::Warn("native_kernel_executor",
+                "Failed to initialize GGUF lane-overlap forward replicas");
+      DestroyLaneOverlapResources();
+      return false;
+    }
+  } else {
+    if (!decode_lane_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
+                                          decode_lane_gemm_.get(),
+                                          decode_stream_) ||
+        !prefill_lane_forward_->Initialize(
+            config, *weight_map_, kv_cache_.get(), prefill_lane_gemm_.get(),
+            prefill_stream_)) {
+      log::Warn("native_kernel_executor",
+                "Failed to initialize lane-overlap forward replicas");
+      DestroyLaneOverlapResources();
+      return false;
+    }
   }
 
   decode_lane_sampler_ = std::make_unique<GpuSampler>();
@@ -993,9 +1050,13 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
   }
 
   lane_overlap_ready_ = true;
-  log::Info("native_kernel_executor",
-            "Lane-overlap replicas initialized (decode/prefill forward + "
-            "sampler + logits)");
+  const std::string overlap_mode =
+      is_gguf_path ? " (GGUF lane-local quantized maps)" : "";
+  log::Info(
+      "native_kernel_executor",
+      "Lane-overlap replicas initialized (decode/prefill forward + sampler + "
+      "logits)" +
+          overlap_mode);
   return true;
 }
 
@@ -1072,8 +1133,35 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   }
 
   // 2. Allocate KV cache (independent precision policy)
+  // Defaults can be overridden via env vars to reduce GPU memory usage.
+  // Minimum max_batch is 16 (scheduler uses kMaxSequenceSlots=16 slot IDs).
   int max_batch = 32;
   int max_seq = 4096;
+  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_MAX_BATCH")) {
+    int val = std::atoi(env);
+    if (val > 0 && val <= 128) {
+      max_batch = val;
+      log::Info("native_kernel_executor",
+                "KV cache max_batch overridden to " + std::to_string(val));
+    }
+  }
+  // Scheduler allocates sequence slot IDs 0..15, so KV cache needs ≥16 slots.
+  constexpr int kMinKvBatch = 16;
+  if (max_batch < kMinKvBatch) {
+    log::Warn("native_kernel_executor",
+              "KV max_batch=" + std::to_string(max_batch) +
+                  " < scheduler slots (" + std::to_string(kMinKvBatch) +
+                  "), clamping to " + std::to_string(kMinKvBatch));
+    max_batch = kMinKvBatch;
+  }
+  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_MAX_SEQ")) {
+    int val = std::atoi(env);
+    if (val > 0 && val <= 131072) {
+      max_seq = val;
+      log::Info("native_kernel_executor",
+                "KV cache max_seq overridden to " + std::to_string(val));
+    }
+  }
   if (config.max_position_embeddings > 0 &&
       config.max_position_embeddings < max_seq) {
     max_seq = config.max_position_embeddings;
@@ -1182,7 +1270,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
                      config.model_type);
       return false;
     }
-    auto gguf_config = ModelInfoToModelConfig(model_info_);
+    auto gguf_config = ConvertModelInfo(model_info_);
     if (!model_forward_->Initialize(gguf_config, *quantized_weight_adapter_,
                                     kv_cache_.get(), gemm_.get(),
                                     compute_stream_)) {
@@ -2180,8 +2268,8 @@ bool NativeKernelExecutor::SupportsAsyncUnifiedBatch() const {
   // which supports true batching (BatchForward + SampleBatch). The async
   // path (ExecuteLaneBatch) processes inputs sequentially through Forward()
   // and serializes concurrent requests through shared_pipeline_mutex_,
-  // defeating batching. When lane-overlap resources are unavailable (GGUF
-  // path), the async path just adds mutex serialization overhead.
+  // defeating batching. When lane-overlap resources are unavailable, the async
+  // path just adds mutex serialization overhead.
   return false;
 }
 

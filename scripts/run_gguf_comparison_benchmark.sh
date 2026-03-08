@@ -131,7 +131,13 @@ start_server() {
 
     log "Starting $backend on port $port..."
 
+    # Right-size KV cache for native backend to reduce GPU memory overhead
+    local kv_batch=${INFERFLUX_NATIVE_KV_MAX_BATCH:-16}
+    local kv_seq=${INFERFLUX_NATIVE_KV_MAX_SEQ:-2048}
+
     INFERFLUX_PORT_OVERRIDE=$port INFERCTL_API_KEY=$API_KEY \
+        INFERFLUX_NATIVE_KV_MAX_BATCH=$kv_batch \
+        INFERFLUX_NATIVE_KV_MAX_SEQ=$kv_seq \
         "$BUILD_DIR/inferfluxd" --config "$config_file" \
         > "$log_file" 2>&1 &
     local pid=$!

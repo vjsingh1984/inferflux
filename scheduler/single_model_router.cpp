@@ -54,15 +54,24 @@ BuildModelCapabilities(const BackendCapabilities &base,
   BackendCapabilities caps = base;
   caps.supports_vision = backend && backend->SupportsVision();
 
-  // Native CUDA currently serves the unified decode/prefill path; legacy
-  // llama.cpp-only surfaces (logprobs/grammar embeddings/spec decode) are not
-  // available without delegation and must be gated at routing time.
-  if (provider == BackendProvider::kNative ||
-      std::dynamic_pointer_cast<NativeCudaBackend>(backend) != nullptr) {
-    caps.supports_logprobs = false;
-    caps.supports_structured_output = false;
-    caps.supports_embeddings = false;
-    caps.supports_speculative_decoding = false;
+  // Native capability contracts are explicit so fallback policy can be applied
+  // endpoint-by-endpoint instead of a blanket provider-level downgrade.
+  auto native_backend = std::dynamic_pointer_cast<NativeCudaBackend>(backend);
+  if (provider == BackendProvider::kNative || native_backend != nullptr) {
+    if (native_backend) {
+      caps.supports_logprobs = native_backend->SupportsLogprobsContract();
+      caps.supports_structured_output =
+          native_backend->SupportsStructuredOutputContract();
+      caps.supports_embeddings = native_backend->SupportsEmbeddingsContract();
+      caps.supports_speculative_decoding =
+          native_backend->SupportsSpeculativeDecodingContract();
+    } else {
+      // Conservative default for provider-only registrations in tests/mocks.
+      caps.supports_logprobs = false;
+      caps.supports_structured_output = false;
+      caps.supports_embeddings = false;
+      caps.supports_speculative_decoding = false;
+    }
     // Prefix copy + KV serialization are implemented natively.
     caps.supports_kv_prefix_transfer = true;
   }
@@ -332,6 +341,20 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
         continue;
       }
       if (!candidate_selection.backend->LoadModel(attempt.path, cfg)) {
+        if (candidate_selection.require_strict_native_execution &&
+            candidate_selection.provider == BackendProvider::kNative) {
+          auto native_backend = std::dynamic_pointer_cast<NativeCudaBackend>(
+              candidate_selection.backend);
+          if (native_backend && native_backend->IsFallbackExecutor()) {
+            failure_reason =
+                "backend_policy_violation: strict_native_request enabled; "
+                "native backend rejected fallback runtime";
+            if (!native_backend->FallbackReason().empty()) {
+              failure_reason += " (" + native_backend->FallbackReason() + ")";
+            }
+            continue;
+          }
+        }
         failure_reason = "backend candidate '" + candidate +
                          "' failed to load model from path '" + attempt.path +
                          "'";

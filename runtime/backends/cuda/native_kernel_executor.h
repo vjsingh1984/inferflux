@@ -304,6 +304,14 @@ private:
   std::unique_ptr<GpuSampler> prefill_lane_sampler_;
   std::unique_ptr<CublasGemm> decode_lane_gemm_;
   std::unique_ptr<CublasGemm> prefill_lane_gemm_;
+  // GGUF overlap lanes need independent quantized maps/adapters because
+  // QuantizedWeightMap uses mutable dequant scratch/cache state.
+  std::unique_ptr<QuantizedWeightMap> decode_lane_quantized_weight_map_;
+  std::unique_ptr<QuantizedWeightMap> prefill_lane_quantized_weight_map_;
+  std::unique_ptr<QuantizedWeightMapAdapter>
+      decode_lane_quantized_weight_adapter_;
+  std::unique_ptr<QuantizedWeightMapAdapter>
+      prefill_lane_quantized_weight_adapter_;
   float *d_decode_logits_{nullptr};
   float *d_prefill_logits_{nullptr};
 

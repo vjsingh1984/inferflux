@@ -12,6 +12,7 @@
 #include "runtime/prefix_cache/prefix_cache.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "runtime/speculative/speculative_decoder.h"
+#include "runtime/string_utils.h"
 #include "scheduler/model_registry.h"
 #include "scheduler/model_router.h"
 #include "scheduler/model_selection.h"
@@ -51,21 +52,9 @@ struct ModelConfig {
 };
 
 namespace {
-std::string Trim(const std::string &input) {
-  auto start = input.find_first_not_of(" \t");
-  auto end = input.find_last_not_of(" \t\r\n");
-  if (start == std::string::npos) {
-    return "";
-  }
-  return input.substr(start, end - start + 1);
-}
-
-std::string ToLower(std::string value) {
-  std::transform(
-      value.begin(), value.end(), value.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return value;
-}
+using inferflux::ParseBool;
+using inferflux::ToLower;
+using inferflux::Trim;
 
 std::size_t ParsePositiveSize(const std::string &text) {
   try {
@@ -76,11 +65,6 @@ std::size_t ParsePositiveSize(const std::string &text) {
   } catch (...) {
   }
   return 0;
-}
-
-bool ParseBool(const std::string &value) {
-  auto lowered = ToLower(value);
-  return lowered == "true" || lowered == "1" || lowered == "yes";
 }
 
 std::vector<ModelConfig> ParseModelsEnv(const std::string &raw) {

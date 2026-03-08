@@ -25,6 +25,7 @@ struct GpuProfile {
   float memory_bandwidth_gb_s{0}; // GB/s
   int sm_count{0};
   bool initialized{false};
+  bool has_dp4a{false}; // SM 6.1+ supports __dp4a int8x4 dot product
 
   // Base M threshold before scaling by bits-per-weight.
   // This reflects how much faster cuBLAS tensor cores are than our scalar
@@ -78,6 +79,8 @@ GpuProfile &GetGpuProfile() {
           static_cast<float>(prop.memoryClockRate) * 2.0f *
           static_cast<float>(prop.memoryBusWidth) / 8.0f / 1e6f;
       profile.sm_count = prop.multiProcessorCount;
+      profile.has_dp4a =
+          (prop.major > 6) || (prop.major == 6 && prop.minor >= 1);
       profile.initialized = true;
 
       log::Info(
@@ -87,7 +90,8 @@ GpuProfile &GetGpuProfile() {
               std::to_string(profile.sm_count) + " SMs, " +
               std::to_string(static_cast<int>(profile.memory_bandwidth_gb_s)) +
               " GB/s bandwidth, base_threshold=" +
-              std::to_string(profile.base_threshold()));
+              std::to_string(profile.base_threshold()) +
+              ", dp4a=" + (profile.has_dp4a ? "yes" : "no"));
     }
   });
   return profile;
@@ -148,18 +152,81 @@ template <typename BlockType,
 bool DispatchFused(const void *data, const half *activation, half *output,
                    int M, int N, int K, cudaStream_t stream) {
   auto *w = static_cast<const BlockType *>(data);
-  if (M == 1) {
-    int grid = (N + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
-    size_t smem = static_cast<size_t>(K) * sizeof(float);
-    GemvKernel<<<grid, kGemvThreadsPerBlock, smem, stream>>>(
-        w, activation, output, N, K);
-  } else {
-    int grid = (N + kTileN - 1) / kTileN;
-    GemmKernel<<<grid, kSmallBatchThreads, 0, stream>>>(w, activation, output,
-                                                        M, N, K);
-  }
+  // GEMV kernel with 2D grid: blockIdx.x covers output columns, blockIdx.y
+  // covers input rows. Each block loads one row of X into shared memory and
+  // computes output elements for that row. Single launch for all M rows.
+  int grid_x = (N + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
+  dim3 grid(grid_x, M);
+  size_t smem = static_cast<size_t>(K) * sizeof(float);
+  GemvKernel<<<grid, kGemvThreadsPerBlock, smem, stream>>>(w, activation,
+                                                           output, N, K);
   return true;
 }
+
+// dp4a variant: uses K bytes (int8 activations) + workspace for warp reductions
+template <typename BlockType,
+          void (*Dp4aKernel)(const BlockType *, const half *, half *, int, int)>
+bool DispatchFusedDp4a(const void *data, const half *activation, half *output,
+                       int M, int N, int K, cudaStream_t stream) {
+  auto *w = static_cast<const BlockType *>(data);
+  int grid_x = (N + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
+  dim3 grid(grid_x, M);
+  // smem: K bytes (int8 activations) + (kGemvWarpsPerBlock + 1) floats
+  size_t smem = static_cast<size_t>(K) +
+                (kGemvWarpsPerBlock + 1) * sizeof(float);
+  Dp4aKernel<<<grid, kGemvThreadsPerBlock, smem, stream>>>(w, activation,
+                                                           output, N, K);
+  return true;
+}
+
+// ============================================================================
+// Fused RmsNorm+GEMV dispatch
+// ============================================================================
+
+using RmsNormDispatchFn = bool (*)(const void *data, const half *residual,
+                                   const half *norm_weight, half *output,
+                                   int M, int N, int K, float eps,
+                                   cudaStream_t stream);
+
+template <typename BlockType,
+          void (*RmsNormGemvKernel)(const BlockType *, const half *,
+                                   const half *, half *, int, int, float)>
+bool DispatchRmsNormGemv(const void *data, const half *residual,
+                         const half *norm_weight, half *output, int M, int N,
+                         int K, float eps, cudaStream_t stream) {
+  auto *w = static_cast<const BlockType *>(data);
+  int grid_x = (N + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
+  dim3 grid(grid_x, M);
+  // smem: K floats (activations) + kGemvWarpsPerBlock floats (warp reduction)
+  size_t smem =
+      static_cast<size_t>(K) * sizeof(float) + kGemvWarpsPerBlock * sizeof(float);
+  RmsNormGemvKernel<<<grid, kGemvThreadsPerBlock, smem, stream>>>(
+      w, residual, norm_weight, output, N, K, eps);
+  return true;
+}
+
+// dp4a + RmsNorm variant: needs K*sizeof(float) during norm phase
+template <typename BlockType,
+          void (*RmsNormDp4aKernel)(const BlockType *, const half *,
+                                   const half *, half *, int, int, float)>
+bool DispatchRmsNormGemvDp4a(const void *data, const half *residual,
+                             const half *norm_weight, half *output, int M,
+                             int N, int K, float eps, cudaStream_t stream) {
+  auto *w = static_cast<const BlockType *>(data);
+  int grid_x = (N + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
+  dim3 grid(grid_x, M);
+  // smem: K floats (norm phase, reused as int8 in dp4a phase) + workspace
+  size_t smem = static_cast<size_t>(K) * sizeof(float) +
+                (kGemvWarpsPerBlock + 1) * sizeof(float);
+  RmsNormDp4aKernel<<<grid, kGemvThreadsPerBlock, smem, stream>>>(
+      w, residual, norm_weight, output, N, K, eps);
+  return true;
+}
+
+struct RmsNormDispatchEntry {
+  RmsNormDispatchFn fn;
+  const char *name;
+};
 
 struct DispatchEntry {
   FusedDispatchFn fn;
@@ -169,6 +236,7 @@ struct DispatchEntry {
 constexpr int kMaxTensorType = 16;
 
 const DispatchEntry &GetDispatchEntry(GGUF::TensorType qtype) {
+  static const bool dp4a = GetGpuProfile().has_dp4a;
   static const DispatchEntry table[kMaxTensorType] = {
       {nullptr, nullptr}, // 0: F32
       {nullptr, nullptr}, // 1: F16
@@ -178,25 +246,69 @@ const DispatchEntry &GetDispatchEntry(GGUF::TensorType qtype) {
       {nullptr, nullptr}, // 5: (unused)
       {nullptr, nullptr}, // 6: Q5_0
       {nullptr, nullptr}, // 7: Q5_1
-      {DispatchFused<block_q8_0, fused_dequant_gemv_q8_0,
-                     fused_dequant_gemm_q8_0>,
+      // Q8_0: use dp4a variant on SM 6.1+
+      {dp4a ? DispatchFusedDp4a<block_q8_0, fused_dequant_gemv_q8_0_dp4a>
+            : DispatchFused<block_q8_0, fused_dequant_gemv_q8_0,
+                            fused_dequant_gemm_q8_0>,
        "Q8_0"},           // 8
       {nullptr, nullptr}, // 9: Q8_1
       {nullptr, nullptr}, // 10: Q2_K
       {nullptr, nullptr}, // 11: Q3_K
+      // Q4_K: no dp4a (scales/mins prevent factoring)
       {DispatchFused<block_q4_k, fused_dequant_gemv_q4k,
                      fused_dequant_gemm_q4k>,
        "Q4_K"},           // 12
       {nullptr, nullptr}, // 13: Q5_K
+      // Q6_K: no dp4a
       {DispatchFused<block_q6_k, fused_dequant_gemv_q6k,
                      fused_dequant_gemm_q6k>,
        "Q6_K"}, // 14
-      {DispatchFused<block_q8_k, fused_dequant_gemv_q8k,
-                     fused_dequant_gemm_q8k>,
+      // Q8_K: use dp4a variant on SM 6.1+
+      {dp4a ? DispatchFusedDp4a<block_q8_k, fused_dequant_gemv_q8k_dp4a>
+            : DispatchFused<block_q8_k, fused_dequant_gemv_q8k,
+                            fused_dequant_gemm_q8k>,
        "Q8_K"}, // 15
   };
 
   static const DispatchEntry empty = {nullptr, nullptr};
+  auto idx = static_cast<uint32_t>(qtype);
+  if (idx >= kMaxTensorType)
+    return empty;
+  return table[idx];
+}
+
+const RmsNormDispatchEntry &GetRmsNormDispatchEntry(GGUF::TensorType qtype) {
+  static const bool dp4a = GetGpuProfile().has_dp4a;
+  static const RmsNormDispatchEntry table[kMaxTensorType] = {
+      {nullptr, nullptr}, // 0: F32
+      {nullptr, nullptr}, // 1: F16
+      {nullptr, nullptr}, // 2: Q4_0
+      {nullptr, nullptr}, // 3: Q4_1
+      {nullptr, nullptr}, // 4: (unused)
+      {nullptr, nullptr}, // 5: (unused)
+      {nullptr, nullptr}, // 6: Q5_0
+      {nullptr, nullptr}, // 7: Q5_1
+      // Q8_0: combined RmsNorm+dp4a on SM 6.1+, standard RmsNorm+GEMV otherwise
+      {dp4a ? DispatchRmsNormGemvDp4a<block_q8_0,
+                                      fused_rmsnorm_gemv_q8_0_dp4a>
+            : DispatchRmsNormGemv<block_q8_0, fused_rmsnorm_gemv_q8_0>,
+       "Q8_0"},           // 8
+      {nullptr, nullptr}, // 9: Q8_1
+      {nullptr, nullptr}, // 10: Q2_K
+      {nullptr, nullptr}, // 11: Q3_K
+      {DispatchRmsNormGemv<block_q4_k, fused_rmsnorm_gemv_q4k>,
+       "Q4_K"},           // 12
+      {nullptr, nullptr}, // 13: Q5_K
+      {DispatchRmsNormGemv<block_q6_k, fused_rmsnorm_gemv_q6k>,
+       "Q6_K"}, // 14
+      // Q8_K: combined RmsNorm+dp4a on SM 6.1+, standard RmsNorm+GEMV otherwise
+      {dp4a ? DispatchRmsNormGemvDp4a<block_q8_k,
+                                      fused_rmsnorm_gemv_q8k_dp4a>
+            : DispatchRmsNormGemv<block_q8_k, fused_rmsnorm_gemv_q8k>,
+       "Q8_K"}, // 15
+  };
+
+  static const RmsNormDispatchEntry empty = {nullptr, nullptr};
   auto idx = static_cast<uint32_t>(qtype);
   if (idx >= kMaxTensorType)
     return empty;
@@ -255,6 +367,47 @@ bool FusedQuantGemm::Gemv(const QuantizedWeightInfo &weight,
   }
 
   return entry.fn(weight.data, activation, output, M, N, K, stream);
+}
+
+bool FusedQuantGemm::RmsNormGemv(const QuantizedWeightInfo &weight,
+                                 const half *residual, const half *norm_weight,
+                                 half *output, int M, int N, int K,
+                                 float rms_norm_eps, cudaStream_t stream) {
+  if (!weight.data || weight.quant_type < 0)
+    return false;
+
+  // Respect the global disable flag
+  static const bool disabled = [] {
+    const char *env = std::getenv("INFERFLUX_DISABLE_FUSED_GEMV");
+    return env && (std::string(env) == "1" || std::string(env) == "true");
+  }();
+  if (disabled)
+    return false;
+
+  auto qtype = static_cast<GGUF::TensorType>(weight.quant_type);
+  const auto &entry = GetRmsNormDispatchEntry(qtype);
+
+  if (!entry.fn)
+    return false;
+
+  // Same adaptive threshold as regular GEMV
+  int threshold = GetAdaptiveThreshold(weight.quant_type);
+  if (M > threshold)
+    return false;
+
+  // Log once per quant type on first use
+  static bool logged[kMaxTensorType] = {};
+  auto idx = static_cast<uint32_t>(qtype);
+  if (idx < kMaxTensorType && !logged[idx] && entry.name) {
+    logged[idx] = true;
+    log::Info("fused_quant_gemm",
+              std::string("Using fused RmsNorm+GEMV kernel for ") + entry.name +
+                  " (M=" + std::to_string(M) + ", N=" + std::to_string(N) +
+                  ", K=" + std::to_string(K) + ")");
+  }
+
+  return entry.fn(weight.data, residual, norm_weight, output, M, N, K,
+                  rms_norm_eps, stream);
 }
 
 } // namespace inferflux

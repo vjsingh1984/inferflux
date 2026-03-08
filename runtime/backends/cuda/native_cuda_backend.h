@@ -2,7 +2,10 @@
 
 #include "runtime/backends/cpu/llama_backend.h"
 
+#include <atomic>
+#include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace inferflux {
@@ -67,6 +70,8 @@ public:
   ChatTemplateResult FormatChatMessages(
       const std::vector<std::pair<std::string, std::string>> &messages,
       bool add_assistant_prefix = true) override;
+  std::vector<float> EmbedForParity(const std::string &text);
+  int EmbedDimsForParity() const;
   int TokenCount(const std::string &text) const override;
   std::vector<int> TokenizeForCache(const std::string &prompt) const override;
   bool IsReady() const override;
@@ -75,17 +80,41 @@ public:
   bool IsFallbackExecutor() const { return fallback_mode_; }
   const std::string &FallbackReason() const { return fallback_reason_; }
 
+  // Endpoint capability contracts for native provider routing.
+  virtual bool SupportsLogprobsContract() const;
+  virtual bool SupportsStructuredOutputContract() const;
+  virtual bool SupportsEmbeddingsContract() const;
+  virtual bool SupportsSpeculativeDecodingContract() const;
+
   // Returns true when native CUDA kernels are compiled and CUDA runtime is
   // available.
   static bool NativeKernelsReady();
 
 private:
+  bool IsParityDelegateAvailable() const;
+  std::shared_ptr<LlamaCPUBackend> EnsureParityBackend() const;
   std::shared_ptr<LlamaCPUBackend> DelegateBackend() const;
+  bool UsesStructuredConstraintSampler() const;
+  SamplingParams SnapshotSamplingParams() const;
+  static int AcquireEphemeralSequenceId();
 
   std::unique_ptr<NativeCudaRuntime> runtime_;
+  std::filesystem::path loaded_model_path_;
+  LlamaBackendConfig loaded_config_{};
+  std::filesystem::path parity_load_path_;
+  bool parity_delegate_enabled_{true};
+  mutable bool parity_delegate_available_{false};
+  mutable bool parity_delegate_init_attempted_{false};
+  mutable std::shared_ptr<LlamaCPUBackend> parity_backend_;
   std::string runtime_kind_{"native_cuda"};
   bool fallback_mode_{true};
   std::string fallback_reason_;
+  mutable std::mutex parity_backend_mutex_;
+  mutable std::mutex sampling_mutex_;
+  SamplingParams active_sampling_{};
+  bool sampling_active_{false};
+  bool structured_constraint_sampler_active_{false};
+  static std::atomic<int> next_ephemeral_sequence_id_;
 };
 
 } // namespace inferflux

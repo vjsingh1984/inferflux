@@ -162,6 +162,29 @@ bool KvCacheGpuTyped<T>::HydrateSequence(int seq_id,
   return cudaStreamSynchronize(stream) == cudaSuccess;
 }
 
+template <typename T>
+void KvCacheGpuTyped<T>::GetBatchAppendPtrs(int layer, const int *seq_ids,
+                                            const int *n_past, int batch_size,
+                                            T **h_k_ptrs,
+                                            T **h_v_ptrs) const {
+  for (int b = 0; b < batch_size; ++b) {
+    h_k_ptrs[b] =
+        GetK(layer, seq_ids[b]) + static_cast<size_t>(n_past[b]) * kv_dim_;
+    h_v_ptrs[b] =
+        GetV(layer, seq_ids[b]) + static_cast<size_t>(n_past[b]) * kv_dim_;
+  }
+}
+
+template <typename T>
+void KvCacheGpuTyped<T>::GetBatchKVPtrs(int layer, const int *seq_ids,
+                                        int batch_size, const T **h_k_ptrs,
+                                        const T **h_v_ptrs) const {
+  for (int b = 0; b < batch_size; ++b) {
+    h_k_ptrs[b] = GetK(layer, seq_ids[b]);
+    h_v_ptrs[b] = GetV(layer, seq_ids[b]);
+  }
+}
+
 // Explicit template instantiations
 template class KvCacheGpuTyped<half>;
 template class KvCacheGpuTyped<__nv_bfloat16>;

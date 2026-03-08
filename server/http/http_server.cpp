@@ -3,6 +3,7 @@
 #include "model/model_format.h"
 #include "runtime/backends/backend_capabilities.h"
 #include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cuda/native_cuda_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "scheduler/model_selection.h"
 #include "server/logging/logger.h"
@@ -284,10 +285,11 @@ const ModelInfo *FindModelById(const std::vector<ModelInfo> &models,
 }
 
 BackendFeatureRequirements
-BuildGenerationRequirements(const CompletionRequestPayload &payload) {
-  return BuildGenerationFeatureRequirements(payload.stream, payload.logprobs,
-                                            payload.has_response_format,
-                                            payload.has_images);
+BuildGenerationRequirements(const CompletionRequestPayload &payload,
+                            bool speculative_enabled) {
+  return BuildGenerationFeatureRequirements(
+      payload.stream, payload.logprobs, payload.has_response_format,
+      payload.has_images, speculative_enabled && !payload.has_response_format);
 }
 
 bool IsDefaultModelAlias(const std::string &model) {
@@ -2318,8 +2320,15 @@ void HttpServer::HandleClient(ClientSession &session) {
     // Generate embeddings for each input.
     json data = json::array();
     int total_tokens = 0;
+    auto native_backend =
+        std::dynamic_pointer_cast<NativeCudaBackend>(embed_backend);
     for (std::size_t idx = 0; idx < inputs.size(); ++idx) {
-      auto emb = embed_backend->Embed(inputs[idx]);
+      std::vector<float> emb;
+      if (native_backend) {
+        emb = native_backend->EmbedForParity(inputs[idx]);
+      } else {
+        emb = embed_backend->Embed(inputs[idx]);
+      }
       if (emb.empty()) {
         SendAll(session, BuildResponse(BuildErrorBody(
                                            "model_does_not_support_embeddings"),
@@ -2514,7 +2523,9 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
       generation_options.require_ready_backend = false;
       auto selection = SelectModelForRequest(
-          router, parsed.model, BuildGenerationRequirements(parsed),
+          router, parsed.model,
+          BuildGenerationRequirements(
+              parsed, speculative_decoder_ && speculative_decoder_->Enabled()),
           generation_options);
       if (selection.status == ModelSelectionStatus::kNotFound &&
           !parsed.model.empty() && !IsDefaultModelAlias(parsed.model)) {

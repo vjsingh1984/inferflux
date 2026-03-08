@@ -38,6 +38,29 @@ public:
                    half *output, int M, int N, int K, cudaStream_t stream);
 
   /**
+   * Fused RmsNorm+GEMV: computes normalization inside the GEMV kernel's shared
+   * memory loading phase, eliminating standalone RmsNorm kernel launches and
+   * the intermediate d_norm_out_ buffer round-trip.
+   *
+   * @param weight  Raw quantized weight info (GPU pointer + quant type)
+   * @param residual  Raw residual activation [M, K] (half, device, not
+   * normalized)
+   * @param norm_weight  RmsNorm weight vector [K] (half, device)
+   * @param output  Output matrix [M, N] (half, device)
+   * @param M  Number of rows (1 = decode, M>1 = batched decode)
+   * @param N  Number of output columns
+   * @param K  Inner dimension
+   * @param rms_norm_eps  RmsNorm epsilon
+   * @param stream  CUDA stream
+   * @return true if fused kernel was launched, false to fall back to separate
+   *         RmsNorm + GEMV/cuBLAS
+   */
+  static bool RmsNormGemv(const QuantizedWeightInfo &weight,
+                          const half *residual, const half *norm_weight,
+                          half *output, int M, int N, int K, float rms_norm_eps,
+                          cudaStream_t stream);
+
+  /**
    * Get the adaptive M threshold for a given quant type.
    * Above this M, cuBLAS with tensor cores is expected to be faster.
    * Queries GPU properties once on first call (thread-safe).

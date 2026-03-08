@@ -68,5 +68,30 @@ cudaError_t EmbeddingLookup(const half *table, const int *token_ids,
 cudaError_t HalfToFloat(const half *input, float *output, int count,
                         cudaStream_t stream);
 
+// ============================================================================
+// Batched kernels for multi-sequence decode
+// ============================================================================
+
+/**
+ * BatchedRoPE: Apply RoPE to B sequences with different n_past values.
+ * q layout: [B, num_heads * head_dim], k layout: [B, num_kv_heads * head_dim]
+ * d_n_past: [B] per-sequence positions on device.
+ */
+template <typename T>
+cudaError_t BatchedRoPE(T *q, T *k, int batch_size, int num_heads,
+                        int num_kv_heads, int head_dim, const int *d_n_past,
+                        float freq_base, cudaStream_t stream,
+                        int rope_type = 0);
+
+/**
+ * BatchedKvAppend: Scatter-copy K/V for B sequences into KV cache.
+ * k_new/v_new layout: [B, kv_dim]
+ * d_k_dst/d_v_dst: [B] device pointers to each sequence's K/V row.
+ */
+template <typename T>
+cudaError_t BatchedKvAppend(const T *k_new, const T *v_new, T **d_k_dst,
+                            T **d_v_dst, int batch_size, int kv_dim,
+                            cudaStream_t stream);
+
 } // namespace cuda_kernel
 } // namespace inferflux

@@ -346,5 +346,132 @@ cudaError_t HalfToFloat(const half *input, float *output, int count,
   return HalfToFloat<half>(input, output, count, stream);
 }
 
+// ============================================================================
+// Batched RoPE: B sequences with different n_past values
+// q layout: [B, num_heads * head_dim], k layout: [B, num_kv_heads * head_dim]
+// ============================================================================
+
+template <typename T>
+__global__ void BatchedRoPEKernel(T *__restrict__ q, T *__restrict__ k,
+                                  int batch_size, int num_heads,
+                                  int num_kv_heads, int head_dim,
+                                  const int *__restrict__ d_n_past,
+                                  float freq_base, int rope_type) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int half_dim = head_dim / 2;
+  const int q_pairs_per_seq = num_heads * half_dim;
+  const int k_pairs_per_seq = num_kv_heads * half_dim;
+  const int pairs_per_seq = q_pairs_per_seq + k_pairs_per_seq;
+  const int total_pairs = batch_size * pairs_per_seq;
+
+  if (idx >= total_pairs)
+    return;
+
+  int b = idx / pairs_per_seq;
+  int local_idx = idx % pairs_per_seq;
+  bool is_q = (local_idx < q_pairs_per_seq);
+  int pair_in_tensor = is_q ? local_idx : (local_idx - q_pairs_per_seq);
+  int n_heads = is_q ? num_heads : num_kv_heads;
+
+  int pair_idx = pair_in_tensor % half_dim;
+  int head_idx = pair_in_tensor / half_dim;
+
+  int position = d_n_past[b]; // Each sequence has its own position
+  float freq =
+      1.0f / powf(freq_base, 2.0f * pair_idx / static_cast<float>(head_dim));
+  float angle = position * freq;
+  float cos_val = cosf(angle);
+  float sin_val = sinf(angle);
+
+  int base_offset = b * n_heads * head_dim + head_idx * head_dim;
+  T *tensor = is_q ? q : k;
+  // Adjust base for k: k has different stride per batch element
+  if (!is_q) {
+    base_offset = b * num_kv_heads * head_dim + head_idx * head_dim;
+  }
+
+  int i0, i1;
+  if (rope_type == 2) {
+    i0 = base_offset + pair_idx;
+    i1 = base_offset + pair_idx + half_dim;
+  } else {
+    i0 = base_offset + 2 * pair_idx;
+    i1 = base_offset + 2 * pair_idx + 1;
+  }
+
+  float v0 = DtypeTraits<T>::to_float(tensor[i0]);
+  float v1 = DtypeTraits<T>::to_float(tensor[i1]);
+
+  tensor[i0] = DtypeTraits<T>::from_float(v0 * cos_val - v1 * sin_val);
+  tensor[i1] = DtypeTraits<T>::from_float(v0 * sin_val + v1 * cos_val);
+}
+
+template <typename T>
+cudaError_t BatchedRoPE(T *q, T *k, int batch_size, int num_heads,
+                        int num_kv_heads, int head_dim, const int *d_n_past,
+                        float freq_base, cudaStream_t stream, int rope_type) {
+  int half_dim = head_dim / 2;
+  int pairs_per_seq = num_heads * half_dim + num_kv_heads * half_dim;
+  int total_pairs = batch_size * pairs_per_seq;
+  int threads = 256;
+  int blocks = (total_pairs + threads - 1) / threads;
+
+  BatchedRoPEKernel<T><<<blocks, threads, 0, stream>>>(
+      q, k, batch_size, num_heads, num_kv_heads, head_dim, d_n_past, freq_base,
+      rope_type);
+  return cudaGetLastError();
+}
+
+template cudaError_t BatchedRoPE<half>(half *, half *, int, int, int, int,
+                                       const int *, float, cudaStream_t, int);
+template cudaError_t
+BatchedRoPE<__nv_bfloat16>(__nv_bfloat16 *, __nv_bfloat16 *, int, int, int,
+                            int, const int *, float, cudaStream_t, int);
+
+// ============================================================================
+// Batched KV Append: scatter-copy K/V for B sequences
+// k_new/v_new layout: [B, kv_dim]
+// d_k_dst/d_v_dst: [B] device pointers to destination rows
+// ============================================================================
+
+template <typename T>
+__global__ void BatchedKvAppendKernel(const T *__restrict__ k_new,
+                                      const T *__restrict__ v_new,
+                                      T *const *__restrict__ d_k_dst,
+                                      T *const *__restrict__ d_v_dst,
+                                      int batch_size, int kv_dim) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch_size * kv_dim;
+  if (idx >= total)
+    return;
+
+  int b = idx / kv_dim;
+  int d = idx % kv_dim;
+
+  d_k_dst[b][d] = k_new[b * kv_dim + d];
+  d_v_dst[b][d] = v_new[b * kv_dim + d];
+}
+
+template <typename T>
+cudaError_t BatchedKvAppend(const T *k_new, const T *v_new, T **d_k_dst,
+                            T **d_v_dst, int batch_size, int kv_dim,
+                            cudaStream_t stream) {
+  int total = batch_size * kv_dim;
+  int threads = 256;
+  int blocks = (total + threads - 1) / threads;
+
+  BatchedKvAppendKernel<T>
+      <<<blocks, threads, 0, stream>>>(k_new, v_new, d_k_dst, d_v_dst,
+                                       batch_size, kv_dim);
+  return cudaGetLastError();
+}
+
+template cudaError_t BatchedKvAppend<half>(const half *, const half *, half **,
+                                           half **, int, int, cudaStream_t);
+template cudaError_t
+BatchedKvAppend<__nv_bfloat16>(const __nv_bfloat16 *, const __nv_bfloat16 *,
+                                __nv_bfloat16 **, __nv_bfloat16 **, int, int,
+                                cudaStream_t);
+
 } // namespace cuda_kernel
 } // namespace inferflux

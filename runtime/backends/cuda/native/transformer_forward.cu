@@ -129,6 +129,41 @@ bool TryFusedGemv<half>(const QuantizedWeightInfo &raw, const half *input,
   return ok;
 }
 
+// Fused RmsNorm+GEMV dispatch: computes normalization inside the GEMV kernel,
+// eliminating the standalone RmsNorm kernel launch and d_norm_out_ round-trip.
+// Only valid for half (FP16) type.
+template <typename T>
+bool TryFusedRmsNormGemv(const QuantizedWeightInfo &, const T *, const T *,
+                         T *, int, int, int, float, cudaStream_t,
+                         const char * = nullptr) {
+  return false; // BF16 and other types: no fused path
+}
+
+template <>
+bool TryFusedRmsNormGemv<half>(const QuantizedWeightInfo &raw,
+                               const half *residual, const half *norm_weight,
+                               half *output, int M, int N, int K, float eps,
+                               cudaStream_t stream, const char *proj_name) {
+  static const bool force_cublas =
+      std::getenv("INFERFLUX_FORCE_CUBLAS") != nullptr;
+  if (force_cublas)
+    return false;
+  bool ok = raw.data && FusedQuantGemm::RmsNormGemv(raw, residual, norm_weight,
+                                                    output, M, N, K, eps,
+                                                    stream);
+  if (proj_name) {
+    static std::unordered_map<const char *, bool> logged;
+    if (!logged.count(proj_name)) {
+      logged[proj_name] = true;
+      log::Info("llama_forward",
+                std::string(proj_name) +
+                    (ok ? ": using fused RmsNorm+GEMV"
+                        : ": using separate RmsNorm + GEMV/cuBLAS"));
+    }
+  }
+  return ok;
+}
+
 } // namespace
 
 template <typename T> LlamaForwardTyped<T>::~LlamaForwardTyped() {
@@ -175,6 +210,32 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   if (err != cudaSuccess)
     return false;
 
+  // Batch metadata buffers for batched decode
+  size_t bsz = static_cast<size_t>(max_batch_size_);
+  err = cudaMalloc(&d_batch_n_past_, bsz * sizeof(int));
+  if (err != cudaSuccess)
+    return false;
+  err = cudaMalloc(&d_batch_seq_ids_, bsz * sizeof(int));
+  if (err != cudaSuccess)
+    return false;
+  err = cudaMalloc(&d_batch_kv_lens_, bsz * sizeof(int));
+  if (err != cudaSuccess)
+    return false;
+
+  // Device pointer arrays for batched KV append and attention
+  err = cudaMalloc(&d_k_ptrs_, bsz * sizeof(T *));
+  if (err != cudaSuccess)
+    return false;
+  err = cudaMalloc(&d_v_ptrs_, bsz * sizeof(T *));
+  if (err != cudaSuccess)
+    return false;
+  err = cudaMalloc(&d_k_append_ptrs_, bsz * sizeof(T *));
+  if (err != cudaSuccess)
+    return false;
+  err = cudaMalloc(&d_v_append_ptrs_, bsz * sizeof(T *));
+  if (err != cudaSuccess)
+    return false;
+
   return true;
 }
 
@@ -202,6 +263,27 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
     cudaFree(d_token_ids_);
     d_token_ids_ = nullptr;
   }
+
+  auto free_int = [](int **ptr) {
+    if (*ptr) {
+      cudaFree(*ptr);
+      *ptr = nullptr;
+    }
+  };
+  free_int(&d_batch_n_past_);
+  free_int(&d_batch_seq_ids_);
+  free_int(&d_batch_kv_lens_);
+
+  auto free_void = [](void **ptr) {
+    if (*ptr) {
+      cudaFree(*ptr);
+      *ptr = nullptr;
+    }
+  };
+  free_void(&d_k_ptrs_);
+  free_void(&d_v_ptrs_);
+  free_void(&d_k_append_ptrs_);
+  free_void(&d_v_append_ptrs_);
 }
 
 template <typename T>
@@ -315,53 +397,101 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     const T *post_attn_norm =
         reinterpret_cast<const T *>(weights_->LayerPostAttnNorm(layer));
 
-    // 4a: RMSNorm
-    err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, seq_len,
-                                  hidden_size_, rms_norm_eps_, stream_);
-    if (err != cudaSuccess) {
-      log::Error("llama_forward",
-                 "RmsNorm failed at layer " + std::to_string(layer));
-      return false;
-    }
-
-    // 4b-d: Q/K/V projections + optional bias
+    // 4a-d: RMSNorm + Q/K/V projections + optional bias
+    // Try fused RmsNorm+GEMV first (eliminates standalone RmsNorm kernel).
+    // Each fused kernel independently normalizes d_residual_ — the norm
+    // re-computation is ~1% of GEMV cost and amortized across 8 warps.
     {
       NVTX_SCOPE("QKV_Projection");
+      bool norm_computed = false;
+
       auto q_raw = weights_->LayerQProjRaw(layer);
-      if (!TryFusedGemv<T>(q_raw, d_norm_out_, d_q_, seq_len,
-                           num_heads_ * head_dim_, hidden_size_, stream_,
-                           "q_proj")) {
-        const T *q_proj =
-            reinterpret_cast<const T *>(weights_->LayerQProj(layer));
-        if (!gemm_->GemmTyped<T>(seq_len, num_heads_ * head_dim_, hidden_size_,
-                                 d_norm_out_, q_proj, d_q_)) {
-          log::Error("llama_forward", "Q projection failed");
-          return false;
+      if (!TryFusedRmsNormGemv<T>(q_raw, d_residual_, input_norm, d_q_,
+                                  seq_len, num_heads_ * head_dim_,
+                                  hidden_size_, rms_norm_eps_, stream_,
+                                  "q_proj")) {
+        // Fallback: standalone RmsNorm + GEMV/cuBLAS
+        if (!norm_computed) {
+          err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_,
+                                        seq_len, hidden_size_, rms_norm_eps_,
+                                        stream_);
+          if (err != cudaSuccess) {
+            log::Error("llama_forward",
+                       "RmsNorm failed at layer " + std::to_string(layer));
+            return false;
+          }
+          norm_computed = true;
+        }
+        if (!TryFusedGemv<T>(q_raw, d_norm_out_, d_q_, seq_len,
+                             num_heads_ * head_dim_, hidden_size_, stream_,
+                             "q_proj")) {
+          const T *q_proj =
+              reinterpret_cast<const T *>(weights_->LayerQProj(layer));
+          if (!gemm_->GemmTyped<T>(seq_len, num_heads_ * head_dim_,
+                                   hidden_size_, d_norm_out_, q_proj, d_q_)) {
+            log::Error("llama_forward", "Q projection failed");
+            return false;
+          }
         }
       }
 
       auto k_raw = weights_->LayerKProjRaw(layer);
-      if (!TryFusedGemv<T>(k_raw, d_norm_out_, d_k_new_, seq_len,
-                           num_kv_heads_ * head_dim_, hidden_size_, stream_,
-                           "k_proj")) {
-        const T *k_proj =
-            reinterpret_cast<const T *>(weights_->LayerKProj(layer));
-        if (!gemm_->GemmTyped<T>(seq_len, num_kv_heads_ * head_dim_,
-                                 hidden_size_, d_norm_out_, k_proj, d_k_new_)) {
-          log::Error("llama_forward", "K projection failed");
-          return false;
+      if (!TryFusedRmsNormGemv<T>(k_raw, d_residual_, input_norm, d_k_new_,
+                                  seq_len, num_kv_heads_ * head_dim_,
+                                  hidden_size_, rms_norm_eps_, stream_,
+                                  "k_proj")) {
+        if (!norm_computed) {
+          err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_,
+                                        seq_len, hidden_size_, rms_norm_eps_,
+                                        stream_);
+          if (err != cudaSuccess) {
+            log::Error("llama_forward",
+                       "RmsNorm failed at layer " + std::to_string(layer));
+            return false;
+          }
+          norm_computed = true;
+        }
+        if (!TryFusedGemv<T>(k_raw, d_norm_out_, d_k_new_, seq_len,
+                             num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                             "k_proj")) {
+          const T *k_proj =
+              reinterpret_cast<const T *>(weights_->LayerKProj(layer));
+          if (!gemm_->GemmTyped<T>(seq_len, num_kv_heads_ * head_dim_,
+                                   hidden_size_, d_norm_out_, k_proj,
+                                   d_k_new_)) {
+            log::Error("llama_forward", "K projection failed");
+            return false;
+          }
         }
       }
+
       auto v_raw = weights_->LayerVProjRaw(layer);
-      if (!TryFusedGemv<T>(v_raw, d_norm_out_, d_v_new_, seq_len,
-                           num_kv_heads_ * head_dim_, hidden_size_, stream_,
-                           "v_proj")) {
-        const T *v_proj =
-            reinterpret_cast<const T *>(weights_->LayerVProj(layer));
-        if (!gemm_->GemmTyped<T>(seq_len, num_kv_heads_ * head_dim_,
-                                 hidden_size_, d_norm_out_, v_proj, d_v_new_)) {
-          log::Error("llama_forward", "V projection failed");
-          return false;
+      if (!TryFusedRmsNormGemv<T>(v_raw, d_residual_, input_norm, d_v_new_,
+                                  seq_len, num_kv_heads_ * head_dim_,
+                                  hidden_size_, rms_norm_eps_, stream_,
+                                  "v_proj")) {
+        if (!norm_computed) {
+          err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_,
+                                        seq_len, hidden_size_, rms_norm_eps_,
+                                        stream_);
+          if (err != cudaSuccess) {
+            log::Error("llama_forward",
+                       "RmsNorm failed at layer " + std::to_string(layer));
+            return false;
+          }
+          norm_computed = true;
+        }
+        if (!TryFusedGemv<T>(v_raw, d_norm_out_, d_v_new_, seq_len,
+                             num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                             "v_proj")) {
+          const T *v_proj =
+              reinterpret_cast<const T *>(weights_->LayerVProj(layer));
+          if (!gemm_->GemmTyped<T>(seq_len, num_kv_heads_ * head_dim_,
+                                   hidden_size_, d_norm_out_, v_proj,
+                                   d_v_new_)) {
+            log::Error("llama_forward", "V projection failed");
+            return false;
+          }
         }
       }
 
@@ -478,38 +608,63 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     // 4j-n: FFN block
     {
       NVTX_SCOPE("FFN");
-      // Post-attn RMSNorm
-      err = cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm, d_norm_out_,
-                                    seq_len, hidden_size_, rms_norm_eps_,
-                                    stream_);
-      if (err != cudaSuccess) {
-        log::Error("llama_forward", "Post-attn RmsNorm failed");
-        return false;
-      }
+      bool ffn_norm_computed = false;
 
-      // Gate and up projections
+      // Gate projection: try fused RmsNorm+GEMV (post-attn norm)
       auto gate_raw = weights_->LayerGateProjRaw(layer);
-      if (!TryFusedGemv<T>(gate_raw, d_norm_out_, d_ffn_gate_, seq_len,
-                           intermediate_size_, hidden_size_, stream_,
-                           "gate_proj")) {
-        const T *gate_proj =
-            reinterpret_cast<const T *>(weights_->LayerGateProj(layer));
-        if (!gemm_->GemmTyped<T>(seq_len, intermediate_size_, hidden_size_,
-                                 d_norm_out_, gate_proj, d_ffn_gate_)) {
-          log::Error("llama_forward", "Gate projection failed");
-          return false;
+      if (!TryFusedRmsNormGemv<T>(gate_raw, d_residual_, post_attn_norm,
+                                  d_ffn_gate_, seq_len, intermediate_size_,
+                                  hidden_size_, rms_norm_eps_, stream_,
+                                  "gate_proj")) {
+        if (!ffn_norm_computed) {
+          err = cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm,
+                                        d_norm_out_, seq_len, hidden_size_,
+                                        rms_norm_eps_, stream_);
+          if (err != cudaSuccess) {
+            log::Error("llama_forward", "Post-attn RmsNorm failed");
+            return false;
+          }
+          ffn_norm_computed = true;
+        }
+        if (!TryFusedGemv<T>(gate_raw, d_norm_out_, d_ffn_gate_, seq_len,
+                             intermediate_size_, hidden_size_, stream_,
+                             "gate_proj")) {
+          const T *gate_proj =
+              reinterpret_cast<const T *>(weights_->LayerGateProj(layer));
+          if (!gemm_->GemmTyped<T>(seq_len, intermediate_size_, hidden_size_,
+                                   d_norm_out_, gate_proj, d_ffn_gate_)) {
+            log::Error("llama_forward", "Gate projection failed");
+            return false;
+          }
         }
       }
+
+      // Up projection: try fused RmsNorm+GEMV (post-attn norm)
       auto up_raw = weights_->LayerUpProjRaw(layer);
-      if (!TryFusedGemv<T>(up_raw, d_norm_out_, d_ffn_up_, seq_len,
-                           intermediate_size_, hidden_size_, stream_,
-                           "up_proj")) {
-        const T *up_proj =
-            reinterpret_cast<const T *>(weights_->LayerUpProj(layer));
-        if (!gemm_->GemmTyped<T>(seq_len, intermediate_size_, hidden_size_,
-                                 d_norm_out_, up_proj, d_ffn_up_)) {
-          log::Error("llama_forward", "Up projection failed");
-          return false;
+      if (!TryFusedRmsNormGemv<T>(up_raw, d_residual_, post_attn_norm,
+                                  d_ffn_up_, seq_len, intermediate_size_,
+                                  hidden_size_, rms_norm_eps_, stream_,
+                                  "up_proj")) {
+        if (!ffn_norm_computed) {
+          err = cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm,
+                                        d_norm_out_, seq_len, hidden_size_,
+                                        rms_norm_eps_, stream_);
+          if (err != cudaSuccess) {
+            log::Error("llama_forward", "Post-attn RmsNorm failed");
+            return false;
+          }
+          ffn_norm_computed = true;
+        }
+        if (!TryFusedGemv<T>(up_raw, d_norm_out_, d_ffn_up_, seq_len,
+                             intermediate_size_, hidden_size_, stream_,
+                             "up_proj")) {
+          const T *up_proj =
+              reinterpret_cast<const T *>(weights_->LayerUpProj(layer));
+          if (!gemm_->GemmTyped<T>(seq_len, intermediate_size_, hidden_size_,
+                                   d_norm_out_, up_proj, d_ffn_up_)) {
+            log::Error("llama_forward", "Up projection failed");
+            return false;
+          }
         }
       }
 
@@ -521,7 +676,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         return false;
       }
 
-      // Down projection
+      // Down projection (input is activation, not normalized — no fusion)
       auto down_raw = weights_->LayerDownProjRaw(layer);
       if (!TryFusedGemv<T>(down_raw, d_ffn_gate_, d_ffn_down_, seq_len,
                            hidden_size_, intermediate_size_, stream_,
@@ -545,27 +700,32 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     }
   }
 
-  // Step 5: Final RMSNorm (last token only)
+  // Step 5: Final RMSNorm + LM head (last token only)
   {
     NVTX_SCOPE("LM_Head");
     T *last_hidden = d_residual_ + (seq_len - 1) * hidden_size_;
     const T *final_norm = reinterpret_cast<const T *>(weights_->FinalNorm());
-    err = cuda_kernel::RmsNorm<T>(last_hidden, final_norm, d_norm_out_, 1,
-                                  hidden_size_, rms_norm_eps_, stream_);
-    if (err != cudaSuccess) {
-      log::Error("llama_forward", "Final RmsNorm failed");
-      return false;
-    }
 
-    // Step 6: LM head projection -> logits [1, vocab_size] typed
+    // Try fused RmsNorm+GEMV for LM head
     auto lm_raw = weights_->LmHeadRaw();
-    if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, 1, vocab_size_,
-                         hidden_size_, stream_, "lm_head")) {
-      const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
-      if (!gemm_->GemmTyped<T>(1, vocab_size_, hidden_size_, d_norm_out_,
-                               lm_head, d_logits_typed_)) {
-        log::Error("llama_forward", "LM head projection failed");
+    if (!TryFusedRmsNormGemv<T>(lm_raw, last_hidden, final_norm,
+                                d_logits_typed_, 1, vocab_size_, hidden_size_,
+                                rms_norm_eps_, stream_, "lm_head")) {
+      // Fallback: standalone RmsNorm + GEMV/cuBLAS
+      err = cuda_kernel::RmsNorm<T>(last_hidden, final_norm, d_norm_out_, 1,
+                                    hidden_size_, rms_norm_eps_, stream_);
+      if (err != cudaSuccess) {
+        log::Error("llama_forward", "Final RmsNorm failed");
         return false;
+      }
+      if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, 1,
+                           vocab_size_, hidden_size_, stream_, "lm_head")) {
+        const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
+        if (!gemm_->GemmTyped<T>(1, vocab_size_, hidden_size_, d_norm_out_,
+                                 lm_head, d_logits_typed_)) {
+          log::Error("llama_forward", "LM head projection failed");
+          return false;
+        }
       }
     }
 
@@ -606,12 +766,25 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   int B = batch_size;
   cudaError_t err;
 
-  // Step 1: Upload all token IDs [B]
+  // Step 1: Upload all token IDs [B] and batch metadata
   err = cudaMemcpyAsync(d_token_ids_, token_ids.data(), B * sizeof(int),
                         cudaMemcpyHostToDevice, stream_);
   if (err != cudaSuccess) {
     log::Error("llama_forward", "BatchForward: token upload failed");
     return false;
+  }
+  // Upload n_past and sequence_ids for batched RoPE/KV/attention kernels
+  cudaMemcpyAsync(d_batch_n_past_, n_past.data(), B * sizeof(int),
+                  cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(d_batch_seq_ids_, sequence_ids.data(), B * sizeof(int),
+                  cudaMemcpyHostToDevice, stream_);
+  // kv_lens = n_past + 1 for each sequence (computed on host, uploaded once)
+  {
+    int h_kv_lens[64];
+    for (int b = 0; b < B; ++b)
+      h_kv_lens[b] = n_past[b] + 1;
+    cudaMemcpyAsync(d_batch_kv_lens_, h_kv_lens, B * sizeof(int),
+                    cudaMemcpyHostToDevice, stream_);
   }
 
   // Step 2: Batched embedding [B, hidden_size]
@@ -643,50 +816,86 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
     const T *post_attn_norm =
         reinterpret_cast<const T *>(weights_->LayerPostAttnNorm(layer));
 
-    // RMSNorm over B rows
-    err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, B,
-                                  hidden_size_, rms_norm_eps_, stream_);
-    if (err != cudaSuccess) {
-      log::Error("llama_forward", "BatchForward: RmsNorm failed");
-      return false;
-    }
-
-    // Batched Q/K/V projections (M=B)
+    // Batched Q/K/V projections (M=B) with fused RmsNorm
     {
       NVTX_SCOPE("QKV_Projection");
+      bool norm_computed = false;
+
       auto q_raw = weights_->LayerQProjRaw(layer);
-      if (!TryFusedGemv<T>(q_raw, d_norm_out_, d_q_, B, num_heads_ * head_dim_,
-                           hidden_size_, stream_, "q_proj")) {
-        const T *q_proj =
-            reinterpret_cast<const T *>(weights_->LayerQProj(layer));
-        if (!gemm_->GemmTyped<T>(B, num_heads_ * head_dim_, hidden_size_,
-                                 d_norm_out_, q_proj, d_q_)) {
-          log::Error("llama_forward", "BatchForward: Q projection failed");
-          return false;
+      if (!TryFusedRmsNormGemv<T>(q_raw, d_residual_, input_norm, d_q_, B,
+                                  num_heads_ * head_dim_, hidden_size_,
+                                  rms_norm_eps_, stream_, "q_proj")) {
+        if (!norm_computed) {
+          err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, B,
+                                        hidden_size_, rms_norm_eps_, stream_);
+          if (err != cudaSuccess) {
+            log::Error("llama_forward", "BatchForward: RmsNorm failed");
+            return false;
+          }
+          norm_computed = true;
+        }
+        if (!TryFusedGemv<T>(q_raw, d_norm_out_, d_q_, B,
+                             num_heads_ * head_dim_, hidden_size_, stream_,
+                             "q_proj")) {
+          const T *q_proj =
+              reinterpret_cast<const T *>(weights_->LayerQProj(layer));
+          if (!gemm_->GemmTyped<T>(B, num_heads_ * head_dim_, hidden_size_,
+                                   d_norm_out_, q_proj, d_q_)) {
+            log::Error("llama_forward", "BatchForward: Q projection failed");
+            return false;
+          }
         }
       }
+
       auto k_raw = weights_->LayerKProjRaw(layer);
-      if (!TryFusedGemv<T>(k_raw, d_norm_out_, d_k_new_, B,
-                           num_kv_heads_ * head_dim_, hidden_size_, stream_,
-                           "k_proj")) {
-        const T *k_proj =
-            reinterpret_cast<const T *>(weights_->LayerKProj(layer));
-        if (!gemm_->GemmTyped<T>(B, num_kv_heads_ * head_dim_, hidden_size_,
-                                 d_norm_out_, k_proj, d_k_new_)) {
-          log::Error("llama_forward", "BatchForward: K projection failed");
-          return false;
+      if (!TryFusedRmsNormGemv<T>(k_raw, d_residual_, input_norm, d_k_new_, B,
+                                  num_kv_heads_ * head_dim_, hidden_size_,
+                                  rms_norm_eps_, stream_, "k_proj")) {
+        if (!norm_computed) {
+          err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, B,
+                                        hidden_size_, rms_norm_eps_, stream_);
+          if (err != cudaSuccess) {
+            log::Error("llama_forward", "BatchForward: RmsNorm failed");
+            return false;
+          }
+          norm_computed = true;
+        }
+        if (!TryFusedGemv<T>(k_raw, d_norm_out_, d_k_new_, B,
+                             num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                             "k_proj")) {
+          const T *k_proj =
+              reinterpret_cast<const T *>(weights_->LayerKProj(layer));
+          if (!gemm_->GemmTyped<T>(B, num_kv_heads_ * head_dim_, hidden_size_,
+                                   d_norm_out_, k_proj, d_k_new_)) {
+            log::Error("llama_forward", "BatchForward: K projection failed");
+            return false;
+          }
         }
       }
+
       auto v_raw = weights_->LayerVProjRaw(layer);
-      if (!TryFusedGemv<T>(v_raw, d_norm_out_, d_v_new_, B,
-                           num_kv_heads_ * head_dim_, hidden_size_, stream_,
-                           "v_proj")) {
-        const T *v_proj =
-            reinterpret_cast<const T *>(weights_->LayerVProj(layer));
-        if (!gemm_->GemmTyped<T>(B, num_kv_heads_ * head_dim_, hidden_size_,
-                                 d_norm_out_, v_proj, d_v_new_)) {
-          log::Error("llama_forward", "BatchForward: V projection failed");
-          return false;
+      if (!TryFusedRmsNormGemv<T>(v_raw, d_residual_, input_norm, d_v_new_, B,
+                                  num_kv_heads_ * head_dim_, hidden_size_,
+                                  rms_norm_eps_, stream_, "v_proj")) {
+        if (!norm_computed) {
+          err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, B,
+                                        hidden_size_, rms_norm_eps_, stream_);
+          if (err != cudaSuccess) {
+            log::Error("llama_forward", "BatchForward: RmsNorm failed");
+            return false;
+          }
+          norm_computed = true;
+        }
+        if (!TryFusedGemv<T>(v_raw, d_norm_out_, d_v_new_, B,
+                             num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                             "v_proj")) {
+          const T *v_proj =
+              reinterpret_cast<const T *>(weights_->LayerVProj(layer));
+          if (!gemm_->GemmTyped<T>(B, num_kv_heads_ * head_dim_, hidden_size_,
+                                   d_norm_out_, v_proj, d_v_new_)) {
+            log::Error("llama_forward", "BatchForward: V projection failed");
+            return false;
+          }
         }
       }
 
@@ -711,49 +920,58 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       }
     }
 
-    // Per-sequence: RoPE, KV cache append, attention (different n_past values)
+    // Batched RoPE, KV append, and FlashDecode for all B sequences
     auto *typed_cache = static_cast<KvCacheGpuTyped<T> *>(
         static_cast<IKvCacheGpu *>(kv_cache_));
 
-    for (int b = 0; b < B; ++b) {
-      T *q_b = d_q_ + b * num_heads_ * head_dim_;
-      T *k_b = d_k_new_ + b * num_kv_heads_ * head_dim_;
-      T *v_b = d_v_new_ + b * num_kv_heads_ * head_dim_;
-      T *attn_b = d_attn_out_ + b * num_heads_ * head_dim_;
+    // Batched RoPE: single kernel for all B sequences
+    {
+      NVTX_SCOPE("RoPE");
+      err = cuda_kernel::BatchedRoPE<T>(d_q_, d_k_new_, B, num_heads_,
+                                        num_kv_heads_, head_dim_,
+                                        d_batch_n_past_, rope_freq_base_,
+                                        stream_, rope_type_);
+      if (err != cudaSuccess)
+        return false;
+    }
 
-      // RoPE per sequence (different n_past)
-      {
-        NVTX_SCOPE("RoPE");
-        err = cuda_kernel::RoPE<T>(q_b, k_b, 1, num_heads_, num_kv_heads_,
-                                   head_dim_, n_past[b], rope_freq_base_,
-                                   stream_, rope_type_);
-        if (err != cudaSuccess)
-          return false;
-      }
+    // Batched KV cache append: compute dest pointers on host, upload, scatter
+    {
+      NVTX_SCOPE("KV_Append");
+      T *h_k_ptrs[64], *h_v_ptrs[64]; // Stack arrays, B <= max_batch_size_
+      typed_cache->GetBatchAppendPtrs(layer, sequence_ids.data(), n_past.data(),
+                                      B, h_k_ptrs, h_v_ptrs);
+      cudaMemcpyAsync(d_k_append_ptrs_, h_k_ptrs, B * sizeof(T *),
+                       cudaMemcpyHostToDevice, stream_);
+      cudaMemcpyAsync(d_v_append_ptrs_, h_v_ptrs, B * sizeof(T *),
+                       cudaMemcpyHostToDevice, stream_);
+      int kv_dim = num_kv_heads_ * head_dim_;
+      err = cuda_kernel::BatchedKvAppend<T>(
+          d_k_new_, d_v_new_, static_cast<T **>(d_k_append_ptrs_),
+          static_cast<T **>(d_v_append_ptrs_), B, kv_dim, stream_);
+      if (err != cudaSuccess)
+        return false;
+    }
 
-      // KV cache append
-      {
-        NVTX_SCOPE("KV_Append");
-        err = typed_cache->Append(layer, sequence_ids[b], n_past[b], 1, k_b,
-                                  v_b, stream_);
-        if (err != cudaSuccess)
-          return false;
-      }
+    // Batched FlashDecode: single kernel for all B queries
+    {
+      NVTX_SCOPE("FlashAttention2");
+      const T *h_k_ptrs[64], *h_v_ptrs[64];
+      typed_cache->GetBatchKVPtrs(layer, sequence_ids.data(), B,
+                                  h_k_ptrs, h_v_ptrs);
+      cudaMemcpyAsync(d_k_ptrs_, h_k_ptrs, B * sizeof(T *),
+                       cudaMemcpyHostToDevice, stream_);
+      cudaMemcpyAsync(d_v_ptrs_, h_v_ptrs, B * sizeof(T *),
+                       cudaMemcpyHostToDevice, stream_);
 
-      // FlashAttention-2 (query_len=1, memory-bound, fast)
-      {
-        NVTX_SCOPE("FlashAttention2");
-        int kv_len = n_past[b] + 1;
-        T *k_cache = typed_cache->GetK(layer, sequence_ids[b]);
-        T *v_cache = typed_cache->GetV(layer, sequence_ids[b]);
-        float attn_scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
-
-        err = cuda_kernel::FlashAttention2Typed<T>(
-            q_b, k_cache, v_cache, attn_b, 1, 1, kv_len, num_heads_,
-            num_kv_heads_, head_dim_, attn_scale, true, stream_);
-        if (err != cudaSuccess)
-          return false;
-      }
+      float attn_scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
+      err = cuda_kernel::FlashDecodeMultiSeq<T>(
+          d_q_, static_cast<const T *const *>(d_k_ptrs_),
+          static_cast<const T *const *>(d_v_ptrs_), d_attn_out_,
+          d_batch_kv_lens_, B, num_heads_, num_kv_heads_, head_dim_,
+          attn_scale, stream_);
+      if (err != cudaSuccess)
+        return false;
     }
 
     // Batched O projection (M=B)
@@ -781,30 +999,54 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
     // FFN block
     {
       NVTX_SCOPE("FFN");
-      err = cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm, d_norm_out_, B,
-                                    hidden_size_, rms_norm_eps_, stream_);
-      if (err != cudaSuccess)
-        return false;
+      bool ffn_norm_computed = false;
 
       auto gate_raw = weights_->LayerGateProjRaw(layer);
-      if (!TryFusedGemv<T>(gate_raw, d_norm_out_, d_ffn_gate_, B,
-                           intermediate_size_, hidden_size_, stream_,
-                           "gate_proj")) {
-        const T *gate_proj =
-            reinterpret_cast<const T *>(weights_->LayerGateProj(layer));
-        if (!gemm_->GemmTyped<T>(B, intermediate_size_, hidden_size_,
-                                 d_norm_out_, gate_proj, d_ffn_gate_))
-          return false;
+      if (!TryFusedRmsNormGemv<T>(gate_raw, d_residual_, post_attn_norm,
+                                  d_ffn_gate_, B, intermediate_size_,
+                                  hidden_size_, rms_norm_eps_, stream_,
+                                  "gate_proj")) {
+        if (!ffn_norm_computed) {
+          err = cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm,
+                                        d_norm_out_, B, hidden_size_,
+                                        rms_norm_eps_, stream_);
+          if (err != cudaSuccess)
+            return false;
+          ffn_norm_computed = true;
+        }
+        if (!TryFusedGemv<T>(gate_raw, d_norm_out_, d_ffn_gate_, B,
+                             intermediate_size_, hidden_size_, stream_,
+                             "gate_proj")) {
+          const T *gate_proj =
+              reinterpret_cast<const T *>(weights_->LayerGateProj(layer));
+          if (!gemm_->GemmTyped<T>(B, intermediate_size_, hidden_size_,
+                                   d_norm_out_, gate_proj, d_ffn_gate_))
+            return false;
+        }
       }
+
       auto up_raw = weights_->LayerUpProjRaw(layer);
-      if (!TryFusedGemv<T>(up_raw, d_norm_out_, d_ffn_up_, B,
-                           intermediate_size_, hidden_size_, stream_,
-                           "up_proj")) {
-        const T *up_proj =
-            reinterpret_cast<const T *>(weights_->LayerUpProj(layer));
-        if (!gemm_->GemmTyped<T>(B, intermediate_size_, hidden_size_,
-                                 d_norm_out_, up_proj, d_ffn_up_))
-          return false;
+      if (!TryFusedRmsNormGemv<T>(up_raw, d_residual_, post_attn_norm,
+                                  d_ffn_up_, B, intermediate_size_,
+                                  hidden_size_, rms_norm_eps_, stream_,
+                                  "up_proj")) {
+        if (!ffn_norm_computed) {
+          err = cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm,
+                                        d_norm_out_, B, hidden_size_,
+                                        rms_norm_eps_, stream_);
+          if (err != cudaSuccess)
+            return false;
+          ffn_norm_computed = true;
+        }
+        if (!TryFusedGemv<T>(up_raw, d_norm_out_, d_ffn_up_, B,
+                             intermediate_size_, hidden_size_, stream_,
+                             "up_proj")) {
+          const T *up_proj =
+              reinterpret_cast<const T *>(weights_->LayerUpProj(layer));
+          if (!gemm_->GemmTyped<T>(B, intermediate_size_, hidden_size_,
+                                   d_norm_out_, up_proj, d_ffn_up_))
+            return false;
+        }
       }
 
       err = cuda_kernel::SiluMul<T>(d_ffn_gate_, d_ffn_up_, d_ffn_gate_,
@@ -832,22 +1074,25 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   // Step 5: Final RMSNorm + LM head for each sequence
   {
     NVTX_SCOPE("LM_Head");
-    // Each sequence's last token is at row b (since seq_len=1 per sequence)
     const T *final_norm = reinterpret_cast<const T *>(weights_->FinalNorm());
-    err = cuda_kernel::RmsNorm<T>(d_residual_, final_norm, d_norm_out_, B,
-                                  hidden_size_, rms_norm_eps_, stream_);
-    if (err != cudaSuccess)
-      return false;
 
-    // Batched LM head: [B, hidden_size] x [vocab_size, hidden_size]^T -> [B,
-    // vocab_size]
+    // Try fused RmsNorm+GEMV for batched LM head
     auto lm_raw = weights_->LmHeadRaw();
-    if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, B, vocab_size_,
-                         hidden_size_, stream_, "lm_head")) {
-      const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
-      if (!gemm_->GemmTyped<T>(B, vocab_size_, hidden_size_, d_norm_out_,
-                               lm_head, d_logits_typed_))
+    if (!TryFusedRmsNormGemv<T>(lm_raw, d_residual_, final_norm,
+                                d_logits_typed_, B, vocab_size_, hidden_size_,
+                                rms_norm_eps_, stream_, "lm_head")) {
+      // Fallback: standalone RmsNorm + GEMV/cuBLAS
+      err = cuda_kernel::RmsNorm<T>(d_residual_, final_norm, d_norm_out_, B,
+                                    hidden_size_, rms_norm_eps_, stream_);
+      if (err != cudaSuccess)
         return false;
+      if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, B, vocab_size_,
+                           hidden_size_, stream_, "lm_head")) {
+        const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
+        if (!gemm_->GemmTyped<T>(B, vocab_size_, hidden_size_, d_norm_out_,
+                                 lm_head, d_logits_typed_))
+          return false;
+      }
     }
 
     // Convert [B * vocab_size] typed -> float

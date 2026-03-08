@@ -51,6 +51,21 @@ public:
   cudaError_t Append(int layer, int seq_id, int start_pos, int seq_len,
                      const T *k_new, const T *v_new, cudaStream_t stream);
 
+  /**
+   * Compute K/V destination pointers for batched append.
+   * Fills h_k_ptrs and h_v_ptrs with pointers to the start of each
+   * sequence's KV row at the given layer and position.
+   */
+  void GetBatchAppendPtrs(int layer, const int *seq_ids, const int *n_past,
+                          int batch_size, T **h_k_ptrs, T **h_v_ptrs) const;
+
+  /**
+   * Compute K/V cache base pointers for batched FlashDecode.
+   * Returns pointers to each sequence's K and V cache for the given layer.
+   */
+  void GetBatchKVPtrs(int layer, const int *seq_ids, int batch_size,
+                      const T **h_k_ptrs, const T **h_v_ptrs) const;
+
   void ClearSequence(int seq_id) override;
   void ClearSequenceAsync(int seq_id, cudaStream_t stream) override;
   bool CopySequencePrefix(int src_seq, int dst_seq, int n_tokens,

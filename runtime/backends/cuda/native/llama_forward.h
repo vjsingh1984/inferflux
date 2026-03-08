@@ -71,6 +71,17 @@ private:
   int *d_token_ids_{nullptr};
   T *d_logits_typed_{nullptr};
 
+  // Batch metadata buffers (pre-allocated for max_batch_size)
+  int *d_batch_n_past_{nullptr};
+  int *d_batch_seq_ids_{nullptr};
+  int *d_batch_kv_lens_{nullptr};
+
+  // Device pointer arrays for batched KV/attention (max_batch_size each)
+  void *d_k_ptrs_{nullptr};        // T** on device
+  void *d_v_ptrs_{nullptr};        // T** on device
+  void *d_k_append_ptrs_{nullptr}; // T** on device
+  void *d_v_append_ptrs_{nullptr}; // T** on device
+
   bool AllocateScratch();
 };
 
