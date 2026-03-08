@@ -17,7 +17,7 @@ TEST_CASE("KvCacheGpu: interface compiles", "[gpu_kv_cache]") {
   REQUIRE(cache.MaxSeqLen() == 0);
   REQUIRE(cache.MaxBatchSize() == 0);
 #else
-  REQUIRE(true);  // Placeholder
+  REQUIRE(true); // Placeholder
 #endif
 }
 
@@ -37,25 +37,25 @@ TEST_CASE("KvCacheGpu: Allocate and access", "[gpu_kv_cache][cuda]") {
   int max_seq = 128;
   int max_batch = 4;
 
-  REQUIRE(cache.Allocate(num_layers, num_kv_heads, head_dim, max_seq,
-                         max_batch));
+  REQUIRE(
+      cache.Allocate(num_layers, num_kv_heads, head_dim, max_seq, max_batch));
   REQUIRE(cache.GetMemoryUsage() > 0);
   REQUIRE(cache.MaxSeqLen() == max_seq);
   REQUIRE(cache.MaxBatchSize() == max_batch);
 
   // Verify K/V pointers are non-null and distinct
-  half* k0 = cache.GetK(0, 0);
-  half* v0 = cache.GetV(0, 0);
+  half *k0 = cache.GetK(0, 0);
+  half *v0 = cache.GetV(0, 0);
   REQUIRE(k0 != nullptr);
   REQUIRE(v0 != nullptr);
   REQUIRE(k0 != v0);
 
   // Different layers should have different pointers
-  half* k1 = cache.GetK(1, 0);
+  half *k1 = cache.GetK(1, 0);
   REQUIRE(k1 != k0);
 
   // Different batch slots should have different pointers
-  half* k0_b1 = cache.GetK(0, 1);
+  half *k0_b1 = cache.GetK(0, 1);
   REQUIRE(k0_b1 != k0);
 
   // Clear should not crash
@@ -63,4 +63,4 @@ TEST_CASE("KvCacheGpu: Allocate and access", "[gpu_kv_cache][cuda]") {
 }
 #endif
 
-}  // namespace inferflux
+} // namespace inferflux

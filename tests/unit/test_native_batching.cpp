@@ -17,11 +17,10 @@ TEST_CASE("Native metrics record forward passes", "[native_batch]") {
 
   auto output = registry.RenderPrometheus();
   REQUIRE(output.find("inferflux_native_forward_passes_total{phase=\"decode\"} "
-                       "1") != std::string::npos);
-  REQUIRE(
-      output.find(
-          "inferflux_native_forward_passes_total{phase=\"prefill\"} 1") !=
-      std::string::npos);
+                      "1") != std::string::npos);
+  REQUIRE(output.find(
+              "inferflux_native_forward_passes_total{phase=\"prefill\"} 1") !=
+          std::string::npos);
   REQUIRE(output.find("inferflux_native_forward_batch_tokens_total 132") !=
           std::string::npos);
 }
@@ -58,7 +57,7 @@ TEST_CASE("Native forward pass histogram buckets", "[native_batch]") {
   auto output = registry.RenderPrometheus();
   // Should be in the 10ms bucket
   REQUIRE(output.find("inferflux_native_forward_duration_ms_bucket{le=\"10\"} "
-                       "1") != std::string::npos);
+                      "1") != std::string::npos);
   // And in +Inf
   REQUIRE(output.find(
               "inferflux_native_forward_duration_ms_bucket{le=\"+Inf\"} 1") !=

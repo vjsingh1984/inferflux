@@ -1,6 +1,5 @@
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
 
-#include "runtime/backends/cuda/native/cuda_kernels.cuh"
 #include "server/logging/logger.h"
 #include <cstring>
 #include <cuda_bf16.h>
@@ -56,18 +55,10 @@ bool KvCacheGpuTyped<T>::Allocate(int num_layers, int num_kv_heads,
 }
 
 template <typename T> T *KvCacheGpuTyped<T>::GetK(int layer, int seq_id) const {
-  if (layer < 0 || layer >= num_layers_ || seq_id < 0 ||
-      seq_id >= max_batch_size_) {
-    return nullptr;
-  }
   return buffer_ + seq_id * slot_stride_ + layer * layer_stride_;
 }
 
 template <typename T> T *KvCacheGpuTyped<T>::GetV(int layer, int seq_id) const {
-  if (layer < 0 || layer >= num_layers_ || seq_id < 0 ||
-      seq_id >= max_batch_size_) {
-    return nullptr;
-  }
   return buffer_ + seq_id * slot_stride_ + layer * layer_stride_ + kv_stride_;
 }
 
@@ -75,12 +66,6 @@ template <typename T>
 cudaError_t KvCacheGpuTyped<T>::Append(int layer, int seq_id, int start_pos,
                                        int seq_len, const T *k_new,
                                        const T *v_new, cudaStream_t stream) {
-  if (layer < 0 || layer >= num_layers_ || seq_id < 0 ||
-      seq_id >= max_batch_size_ || start_pos < 0 ||
-      start_pos + seq_len > max_seq_len_) {
-    return cudaErrorInvalidValue;
-  }
-
   size_t copy_bytes = static_cast<size_t>(seq_len) * kv_dim_ * sizeof(T);
 
   T *k_dst = GetK(layer, seq_id) + static_cast<size_t>(start_pos) * kv_dim_;
@@ -96,35 +81,11 @@ cudaError_t KvCacheGpuTyped<T>::Append(int layer, int seq_id, int start_pos,
   return err;
 }
 
-template <typename T>
-void KvCacheGpuTyped<T>::ClearSequence(int seq_id, cudaStream_t stream) {
-  if (!buffer_ || seq_id < 0 || seq_id >= max_batch_size_)
+template <typename T> void KvCacheGpuTyped<T>::ClearSequence(int seq_id) {
+  if (!buffer_ || seq_id >= max_batch_size_)
     return;
   size_t bytes = slot_stride_ * sizeof(T);
-  if (stream) {
-    // Async clear on the specified stream — avoids race with non-blocking
-    // compute streams (cudaMemset on NULL stream does NOT synchronize with
-    // cudaStreamNonBlocking streams).
-    cudaMemsetAsync(buffer_ + seq_id * slot_stride_, 0, bytes, stream);
-  } else {
-    // Synchronous fallback: device-sync ensures the clear completes before
-    // any subsequent kernel launch on any stream.
-    cudaDeviceSynchronize();
-    cudaMemset(buffer_ + seq_id * slot_stride_, 0, bytes);
-  }
-}
-
-template <typename T>
-cudaError_t KvCacheGpuTyped<T>::BatchAppend(int layer, const int *d_seq_ids,
-                                            const int *d_n_past, int batch_size,
-                                            const T *k_new, const T *v_new,
-                                            cudaStream_t stream) {
-  if (layer < 0 || layer >= num_layers_ || batch_size <= 0)
-    return cudaErrorInvalidValue;
-
-  return cuda_kernel::BatchKvAppend<T>(
-      k_new, v_new, buffer_, d_seq_ids, d_n_past, batch_size, kv_dim_,
-      slot_stride_, layer_stride_, kv_stride_, layer, stream);
+  cudaMemset(buffer_ + seq_id * slot_stride_, 0, bytes);
 }
 
 // Explicit template instantiations

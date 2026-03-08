@@ -6,7 +6,6 @@
 #include "runtime/backends/cuda/native/cublas_gemm.h"
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/model_forward_factory.h"
-#include "runtime/backends/cuda/native/native_tokenizer.h"
 #include "runtime/backends/cuda/native/quantized_weight_map_adapter.h"
 #include "runtime/backends/cuda/native/weight_map.h"
 #endif
@@ -56,24 +55,6 @@ TEST_CASE("ModelForwardFactory: supported model types", "[native_forward]") {
   REQUIRE(CreateModelForward("") == nullptr);
 #else
   REQUIRE(true); // Placeholder when native kernels not compiled
-#endif
-}
-
-// ============================================================================
-// NativeTokenizer Tests
-// ============================================================================
-
-TEST_CASE("NativeTokenizer: Load returns false for missing file",
-          "[native_forward]") {
-#ifdef INFERFLUX_NATIVE_KERNELS_READY
-  NativeTokenizer tok;
-  REQUIRE_FALSE(tok.Load("/nonexistent/path"));
-  REQUIRE(tok.VocabSize() == 0);
-  REQUIRE(tok.EosTokenId() == -1);
-  REQUIRE(tok.BosTokenId() == -1);
-  REQUIRE(tok.IdToString(0).empty());
-#else
-  REQUIRE(true);
 #endif
 }
 

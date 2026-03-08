@@ -3,12 +3,14 @@
 #include "runtime/backends/cuda/native/cuda_kernels.cuh"
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/llama_forward.h"
+#include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
 
 #include "server/logging/logger.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -20,6 +22,75 @@ namespace inferflux {
 
 namespace {
 
+// Debug: dump top-K logits to stderr when INFERFLUX_DEBUG_LOGITS=1
+void DebugDumpLogits(const float *d_logits, int vocab_size,
+                     const std::vector<int> &token_ids, int n_past,
+                     cudaStream_t stream) {
+  static const bool enabled = std::getenv("INFERFLUX_DEBUG_LOGITS") != nullptr;
+  if (!enabled)
+    return;
+  constexpr int TOP_N = 10;
+  std::vector<float> h_logits(vocab_size);
+  cudaMemcpyAsync(h_logits.data(), d_logits, vocab_size * sizeof(float),
+                  cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+
+  // Find top-N by value
+  std::vector<std::pair<float, int>> scored(vocab_size);
+  for (int i = 0; i < vocab_size; ++i)
+    scored[i] = {h_logits[i], i};
+  std::partial_sort(scored.begin(), scored.begin() + TOP_N, scored.end(),
+                    [](auto &a, auto &b) { return a.first > b.first; });
+
+  fprintf(stderr, "[DEBUG_LOGITS] tokens=[");
+  for (size_t i = 0; i < token_ids.size(); ++i)
+    fprintf(stderr, "%s%d", i ? "," : "", token_ids[i]);
+  fprintf(stderr, "] n_past=%d top-%d:", n_past, TOP_N);
+  for (int i = 0; i < TOP_N; ++i)
+    fprintf(stderr, " [%d]=%.4f", scored[i].second, scored[i].first);
+
+  // Also check for NaN/Inf
+  int nan_count = 0, inf_count = 0, zero_count = 0;
+  for (int i = 0; i < vocab_size; ++i) {
+    if (std::isnan(h_logits[i]))
+      nan_count++;
+    if (std::isinf(h_logits[i]))
+      inf_count++;
+    if (h_logits[i] == 0.0f)
+      zero_count++;
+  }
+  fprintf(stderr, " (nan=%d inf=%d zero=%d/%d)\n", nan_count, inf_count,
+          zero_count, vocab_size);
+}
+
+// Debug: dump hidden state stats
+void DebugDumpHidden(const char *label, const void *d_data, int count,
+                     cudaStream_t stream) {
+  static const bool enabled = std::getenv("INFERFLUX_DEBUG_LOGITS") != nullptr;
+  if (!enabled)
+    return;
+  // Read as half, convert to float
+  std::vector<half> h_data(count);
+  cudaMemcpyAsync(h_data.data(), d_data, count * sizeof(half),
+                  cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+
+  float min_v = 1e30f, max_v = -1e30f, sum = 0.0f;
+  int nan_count = 0;
+  for (int i = 0; i < count; ++i) {
+    float v = __half2float(h_data[i]);
+    if (std::isnan(v)) {
+      nan_count++;
+      continue;
+    }
+    min_v = std::min(min_v, v);
+    max_v = std::max(max_v, v);
+    sum += v;
+  }
+  fprintf(stderr, "[DEBUG_HIDDEN] %s: count=%d min=%.6f max=%.6f mean=%.6f nan=%d\n",
+          label, count, min_v, max_v, sum / count, nan_count);
+}
+
 // One-shot per-projection path logger. Logs which GEMM path (fused vs cuBLAS)
 // is taken for each projection name on first invocation only.
 void LogGemmPath(const char *proj_name, bool fused) {
@@ -28,9 +99,10 @@ void LogGemmPath(const char *proj_name, bool fused) {
   if (logged.count(proj_name))
     return;
   logged[proj_name] = true;
-  log::Info("llama_forward", std::string(proj_name) +
-                                 (fused ? ": using fused dequant-GEMV"
-                                        : ": using cuBLAS (dequantized FP16)"));
+  log::Info("llama_forward",
+            std::string(proj_name) +
+                (fused ? ": using fused dequant-GEMV"
+                       : ": using cuBLAS (dequantized FP16)"));
 }
 
 // Fused dequant-GEMV dispatch: only valid for half (FP16) type.
@@ -43,8 +115,13 @@ bool TryFusedGemv(const QuantizedWeightInfo &, const T *, T *, int, int, int,
 
 template <>
 bool TryFusedGemv<half>(const QuantizedWeightInfo &raw, const half *input,
-                        half *output, int M, int N, int K, cudaStream_t stream,
-                        const char *proj_name) {
+                        half *output, int M, int N, int K,
+                        cudaStream_t stream, const char *proj_name) {
+  // If INFERFLUX_FORCE_CUBLAS=1, skip fused kernels entirely
+  static const bool force_cublas =
+      std::getenv("INFERFLUX_FORCE_CUBLAS") != nullptr;
+  if (force_cublas)
+    return false;
   bool ok =
       raw.data && FusedQuantGemm::Gemv(raw, input, output, M, N, K, stream);
   if (proj_name)
@@ -90,7 +167,6 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   if (!alloc(&d_ffn_down_, rows * hidden_size_))
     return false;
   // Logits buffer sized for batched decode: [max_batch_size, vocab_size]
-  // Only needed for single-sequence Forward(); BatchForward uses FP32-out GEMM
   if (!alloc(&d_logits_typed_,
              static_cast<size_t>(max_batch_size_) * vocab_size_))
     return false;
@@ -98,27 +174,6 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   cudaError_t err = cudaMalloc(&d_token_ids_, rows * sizeof(int));
   if (err != cudaSuccess)
     return false;
-
-  // Batched KV append + FlashDecode scratch buffers
-  size_t B = static_cast<size_t>(max_batch_size_);
-  err = cudaMalloc(&d_batch_seq_ids_, B * sizeof(int));
-  if (err != cudaSuccess)
-    return false;
-  err = cudaMalloc(&d_batch_n_past_, B * sizeof(int));
-  if (err != cudaSuccess)
-    return false;
-  err = cudaMalloc(&d_k_ptrs_, B * sizeof(const T *));
-  if (err != cudaSuccess)
-    return false;
-  err = cudaMalloc(&d_v_ptrs_, B * sizeof(const T *));
-  if (err != cudaSuccess)
-    return false;
-  err = cudaMalloc(&d_kv_lens_, B * sizeof(int));
-  if (err != cudaSuccess)
-    return false;
-  h_k_ptrs_.resize(B);
-  h_v_ptrs_.resize(B);
-  h_kv_lens_.resize(B);
 
   return true;
 }
@@ -147,26 +202,6 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
     cudaFree(d_token_ids_);
     d_token_ids_ = nullptr;
   }
-  if (d_batch_seq_ids_) {
-    cudaFree(d_batch_seq_ids_);
-    d_batch_seq_ids_ = nullptr;
-  }
-  if (d_batch_n_past_) {
-    cudaFree(d_batch_n_past_);
-    d_batch_n_past_ = nullptr;
-  }
-  if (d_k_ptrs_) {
-    cudaFree(d_k_ptrs_);
-    d_k_ptrs_ = nullptr;
-  }
-  if (d_v_ptrs_) {
-    cudaFree(d_v_ptrs_);
-    d_v_ptrs_ = nullptr;
-  }
-  if (d_kv_lens_) {
-    cudaFree(d_kv_lens_);
-    d_kv_lens_ = nullptr;
-  }
 }
 
 template <typename T>
@@ -182,14 +217,11 @@ bool LlamaForwardTyped<T>::Initialize(
   vocab_size_ = config.vocab_size;
   max_seq_len_ = config.max_position_embeddings;
   rope_freq_base_ = config.rope_freq_base;
-  rope_freq_scale_ = config.rope_freq_scale;
   rms_norm_eps_ = config.rms_norm_eps;
-  rope_type_ = config.rope_type;
+  rope_type_ = static_cast<int>(
+      runtime::cuda::native::InferRopeType(config.model_type));
 
   if (max_seq_len_ > 4096) {
-    log::Warn("llama_forward", "Clamping max_seq_len from " +
-                                   std::to_string(max_seq_len_) +
-                                   " to 4096 (scratch buffer limit)");
     max_seq_len_ = 4096;
   }
 
@@ -218,7 +250,8 @@ bool LlamaForwardTyped<T>::Initialize(
                 ", head_dim=" + std::to_string(head_dim_) +
                 ", vocab=" + std::to_string(vocab_size_) +
                 ", max_seq=" + std::to_string(max_seq_len_) +
-                ", rope=" + (rope_type_ == 2 ? "neox" : "norm"));
+                ", rope_type=" + (rope_type_ == 2 ? "neox" : "norm") +
+                ", model=" + config.model_type);
   return true;
 }
 
@@ -236,16 +269,6 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                     std::to_string(max_seq_len_));
     return false;
   }
-  if (n_past < 0) {
-    log::Error("llama_forward",
-               "n_past is negative: " + std::to_string(n_past));
-    return false;
-  }
-  if (sequence_id < 0) {
-    log::Error("llama_forward",
-               "sequence_id is negative: " + std::to_string(sequence_id));
-    return false;
-  }
 
   int kv_len = n_past + seq_len;
   cudaError_t err;
@@ -259,11 +282,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
   }
 
   // Step 2: Embedding lookup
+  // WeightMap is always WeightMapTyped<half> currently, but the embed_tokens
+  // pointer points to the same GPU data regardless of type. We cast it.
   const T *embed = reinterpret_cast<const T *>(weights_->EmbedTokens());
-  if (!embed) {
-    log::Error("llama_forward", "EmbedTokens returned null");
-    return false;
-  }
   {
     NVTX_SCOPE("Embedding");
     err = cuda_kernel::EmbeddingLookup<T>(embed, d_token_ids_, d_hidden_,
@@ -273,6 +294,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     log::Error("llama_forward", "EmbeddingLookup failed");
     return false;
   }
+
+  DebugDumpHidden("after_embedding", d_hidden_, seq_len * hidden_size_, stream_);
 
   // Step 3: Copy to residual stream
   err = cudaMemcpyAsync(d_residual_, d_hidden_,
@@ -286,15 +309,11 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
   // Step 4: Transformer layers
   for (int layer = 0; layer < num_layers_; layer++) {
     NVTX_SCOPE("Layer");
+    // Norm weights are small (F32/F16), always fetch eagerly
     const T *input_norm =
         reinterpret_cast<const T *>(weights_->LayerInputNorm(layer));
     const T *post_attn_norm =
         reinterpret_cast<const T *>(weights_->LayerPostAttnNorm(layer));
-    if (!input_norm || !post_attn_norm) {
-      log::Error("llama_forward",
-                 "Null norm weights at layer " + std::to_string(layer));
-      return false;
-    }
 
     // 4a: RMSNorm
     err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, seq_len,
@@ -379,12 +398,19 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       }
     }
 
+    if (layer == 0) {
+      DebugDumpHidden("layer0_after_q_proj", d_q_,
+                      seq_len * num_heads_ * head_dim_, stream_);
+      DebugDumpHidden("layer0_after_k_proj", d_k_new_,
+                      seq_len * num_kv_heads_ * head_dim_, stream_);
+    }
+
     // 4e: RoPE in-place
     {
       NVTX_SCOPE("RoPE");
-      err = cuda_kernel::RoPE<T>(
-          d_q_, d_k_new_, seq_len, num_heads_, num_kv_heads_, head_dim_, n_past,
-          rope_freq_base_, stream_, rope_type_, rope_freq_scale_);
+      err = cuda_kernel::RoPE<T>(d_q_, d_k_new_, seq_len, num_heads_,
+                                 num_kv_heads_, head_dim_, n_past,
+                                 rope_freq_base_, stream_, rope_type_);
       if (err != cudaSuccess) {
         log::Error("llama_forward", "RoPE failed");
         return false;
@@ -411,12 +437,6 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           static_cast<IKvCacheGpu *>(kv_cache_));
       T *k_cache = typed_cache->GetK(layer, sequence_id);
       T *v_cache = typed_cache->GetV(layer, sequence_id);
-      if (!k_cache || !v_cache) {
-        log::Error("llama_forward", "Null KV cache for seq " +
-                                        std::to_string(sequence_id) +
-                                        " layer " + std::to_string(layer));
-        return false;
-      }
 
       float attn_scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
 
@@ -530,10 +550,6 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     NVTX_SCOPE("LM_Head");
     T *last_hidden = d_residual_ + (seq_len - 1) * hidden_size_;
     const T *final_norm = reinterpret_cast<const T *>(weights_->FinalNorm());
-    if (!final_norm) {
-      log::Error("llama_forward", "FinalNorm returned null");
-      return false;
-    }
     err = cuda_kernel::RmsNorm<T>(last_hidden, final_norm, d_norm_out_, 1,
                                   hidden_size_, rms_norm_eps_, stream_);
     if (err != cudaSuccess) {
@@ -546,10 +562,6 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, 1, vocab_size_,
                          hidden_size_, stream_, "lm_head")) {
       const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
-      if (!lm_head) {
-        log::Error("llama_forward", "LmHead returned null");
-        return false;
-      }
       if (!gemm_->GemmTyped<T>(1, vocab_size_, hidden_size_, d_norm_out_,
                                lm_head, d_logits_typed_)) {
         log::Error("llama_forward", "LM head projection failed");
@@ -564,6 +576,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       log::Error("llama_forward", "HalfToFloat failed");
       return false;
     }
+
+    DebugDumpLogits(d_logits, vocab_size_, token_ids, n_past, stream_);
   }
 
   return true;
@@ -587,16 +601,6 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
     return Forward(single, n_past[0], sequence_ids[0], d_logits);
   }
 
-  // Validate all inputs
-  for (int b = 0; b < batch_size; ++b) {
-    if (n_past[b] < 0 || sequence_ids[b] < 0) {
-      log::Error("llama_forward", "BatchForward: invalid n_past or sequence_id "
-                                  "at index " +
-                                      std::to_string(b));
-      return false;
-    }
-  }
-
   // Each decode request has exactly 1 token.
   // Batch GEMMs (M=batch_size), but attention and KV cache are per-sequence.
   int B = batch_size;
@@ -614,10 +618,6 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   {
     NVTX_SCOPE("Embedding");
     const T *embed = reinterpret_cast<const T *>(weights_->EmbedTokens());
-    if (!embed) {
-      log::Error("llama_forward", "BatchForward: EmbedTokens returned null");
-      return false;
-    }
     err = cuda_kernel::EmbeddingLookup<T>(embed, d_token_ids_, d_hidden_, B,
                                           hidden_size_, stream_);
     if (err != cudaSuccess) {
@@ -642,11 +642,6 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
         reinterpret_cast<const T *>(weights_->LayerInputNorm(layer));
     const T *post_attn_norm =
         reinterpret_cast<const T *>(weights_->LayerPostAttnNorm(layer));
-    if (!input_norm || !post_attn_norm) {
-      log::Error("llama_forward", "BatchForward: null norm weights at layer " +
-                                      std::to_string(layer));
-      return false;
-    }
 
     // RMSNorm over B rows
     err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, B,
@@ -703,97 +698,62 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       const T *v_bias =
           reinterpret_cast<const T *>(weights_->LayerVProjBias(layer));
       if (q_bias) {
-        err = cuda_kernel::BiasAdd<T>(d_q_, q_bias, B, num_heads_ * head_dim_,
-                                      stream_);
-        if (err != cudaSuccess)
-          return false;
+        cuda_kernel::BiasAdd<T>(d_q_, q_bias, B, num_heads_ * head_dim_,
+                                stream_);
       }
       if (k_bias) {
-        err = cuda_kernel::BiasAdd<T>(d_k_new_, k_bias, B,
-                                      num_kv_heads_ * head_dim_, stream_);
-        if (err != cudaSuccess)
-          return false;
+        cuda_kernel::BiasAdd<T>(d_k_new_, k_bias, B, num_kv_heads_ * head_dim_,
+                                stream_);
       }
       if (v_bias) {
-        err = cuda_kernel::BiasAdd<T>(d_v_new_, v_bias, B,
-                                      num_kv_heads_ * head_dim_, stream_);
-        if (err != cudaSuccess)
-          return false;
+        cuda_kernel::BiasAdd<T>(d_v_new_, v_bias, B, num_kv_heads_ * head_dim_,
+                                stream_);
       }
     }
 
-    // Batched RoPE: single kernel launch for all B sequences.
-    // Upload n_past to device (reuse d_token_ids_ — embedding lookup is done).
-    {
-      NVTX_SCOPE("RoPE");
-      err = cudaMemcpyAsync(d_token_ids_, n_past.data(), B * sizeof(int),
-                            cudaMemcpyHostToDevice, stream_);
-      if (err != cudaSuccess)
-        return false;
-      err = cuda_kernel::BatchRoPE<T>(
-          d_q_, d_k_new_, B, num_heads_, num_kv_heads_, head_dim_, d_token_ids_,
-          rope_freq_base_, stream_, rope_type_, rope_freq_scale_);
-      if (err != cudaSuccess)
-        return false;
-    }
-
-    // Batched KV cache append (single kernel for all B sequences)
+    // Per-sequence: RoPE, KV cache append, attention (different n_past values)
     auto *typed_cache = static_cast<KvCacheGpuTyped<T> *>(
         static_cast<IKvCacheGpu *>(kv_cache_));
-    float attn_scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
 
-    {
-      NVTX_SCOPE("KV_Append");
-      // Upload sequence_ids and n_past to device (done once per layer on first
-      // layer, but n_past is the same across layers so the uploads are
-      // redundant after layer 0 — the cost is negligible: 2 small H2D copies)
-      if (layer == 0) {
-        err = cudaMemcpyAsync(d_batch_seq_ids_, sequence_ids.data(),
-                              B * sizeof(int), cudaMemcpyHostToDevice, stream_);
-        if (err != cudaSuccess)
-          return false;
-        err = cudaMemcpyAsync(d_batch_n_past_, n_past.data(), B * sizeof(int),
-                              cudaMemcpyHostToDevice, stream_);
+    for (int b = 0; b < B; ++b) {
+      T *q_b = d_q_ + b * num_heads_ * head_dim_;
+      T *k_b = d_k_new_ + b * num_kv_heads_ * head_dim_;
+      T *v_b = d_v_new_ + b * num_kv_heads_ * head_dim_;
+      T *attn_b = d_attn_out_ + b * num_heads_ * head_dim_;
+
+      // RoPE per sequence (different n_past)
+      {
+        NVTX_SCOPE("RoPE");
+        err = cuda_kernel::RoPE<T>(q_b, k_b, 1, num_heads_, num_kv_heads_,
+                                   head_dim_, n_past[b], rope_freq_base_,
+                                   stream_, rope_type_);
         if (err != cudaSuccess)
           return false;
       }
-      err = typed_cache->BatchAppend(layer, d_batch_seq_ids_, d_batch_n_past_,
-                                     B, d_k_new_, d_v_new_, stream_);
-      if (err != cudaSuccess)
-        return false;
-    }
 
-    // Batched FlashDecode (single kernel for all B sequences)
-    {
-      NVTX_SCOPE("FlashAttention2");
-      for (int b = 0; b < B; ++b) {
-        h_k_ptrs_[b] = typed_cache->GetK(layer, sequence_ids[b]);
-        h_v_ptrs_[b] = typed_cache->GetV(layer, sequence_ids[b]);
-        h_kv_lens_[b] = n_past[b] + 1;
-        if (!h_k_ptrs_[b] || !h_v_ptrs_[b]) {
-          log::Error("llama_forward", "BatchForward: null KV cache for seq " +
-                                          std::to_string(sequence_ids[b]));
+      // KV cache append
+      {
+        NVTX_SCOPE("KV_Append");
+        err = typed_cache->Append(layer, sequence_ids[b], n_past[b], 1, k_b,
+                                  v_b, stream_);
+        if (err != cudaSuccess)
           return false;
-        }
       }
-      err = cudaMemcpyAsync(d_k_ptrs_, h_k_ptrs_.data(), B * sizeof(const T *),
-                            cudaMemcpyHostToDevice, stream_);
-      if (err != cudaSuccess)
-        return false;
-      err = cudaMemcpyAsync(d_v_ptrs_, h_v_ptrs_.data(), B * sizeof(const T *),
-                            cudaMemcpyHostToDevice, stream_);
-      if (err != cudaSuccess)
-        return false;
-      err = cudaMemcpyAsync(d_kv_lens_, h_kv_lens_.data(), B * sizeof(int),
-                            cudaMemcpyHostToDevice, stream_);
-      if (err != cudaSuccess)
-        return false;
 
-      err = cuda_kernel::FlashDecodeTyped<T>(
-          d_q_, d_attn_out_, d_k_ptrs_, d_v_ptrs_, d_kv_lens_, B, num_heads_,
-          num_kv_heads_, head_dim_, attn_scale, stream_);
-      if (err != cudaSuccess)
-        return false;
+      // FlashAttention-2 (query_len=1, memory-bound, fast)
+      {
+        NVTX_SCOPE("FlashAttention2");
+        int kv_len = n_past[b] + 1;
+        T *k_cache = typed_cache->GetK(layer, sequence_ids[b]);
+        T *v_cache = typed_cache->GetV(layer, sequence_ids[b]);
+        float attn_scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
+
+        err = cuda_kernel::FlashAttention2Typed<T>(
+            q_b, k_cache, v_cache, attn_b, 1, 1, kv_len, num_heads_,
+            num_kv_heads_, head_dim_, attn_scale, true, stream_);
+        if (err != cudaSuccess)
+          return false;
+      }
     }
 
     // Batched O projection (M=B)
@@ -869,28 +829,31 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       return false;
   }
 
-  // Step 5: Final RMSNorm + LM head with FP32 output (fused conversion)
+  // Step 5: Final RMSNorm + LM head for each sequence
   {
     NVTX_SCOPE("LM_Head");
+    // Each sequence's last token is at row b (since seq_len=1 per sequence)
     const T *final_norm = reinterpret_cast<const T *>(weights_->FinalNorm());
-    if (!final_norm) {
-      log::Error("llama_forward", "BatchForward: FinalNorm returned null");
-      return false;
-    }
     err = cuda_kernel::RmsNorm<T>(d_residual_, final_norm, d_norm_out_, B,
                                   hidden_size_, rms_norm_eps_, stream_);
     if (err != cudaSuccess)
       return false;
 
-    // Batched LM head: [B, hidden] x [vocab, hidden]^T -> [B, vocab] (FP32)
-    // Use cuBLAS FP32-out path to avoid separate HalfToFloat kernel
-    const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
-    if (!lm_head) {
-      log::Error("llama_forward", "BatchForward: LmHead returned null");
-      return false;
+    // Batched LM head: [B, hidden_size] x [vocab_size, hidden_size]^T -> [B,
+    // vocab_size]
+    auto lm_raw = weights_->LmHeadRaw();
+    if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, B, vocab_size_,
+                         hidden_size_, stream_, "lm_head")) {
+      const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
+      if (!gemm_->GemmTyped<T>(B, vocab_size_, hidden_size_, d_norm_out_,
+                               lm_head, d_logits_typed_))
+        return false;
     }
-    if (!gemm_->GemmTypedFP32Out<T>(B, vocab_size_, hidden_size_, d_norm_out_,
-                                    lm_head, d_logits))
+
+    // Convert [B * vocab_size] typed -> float
+    err = cuda_kernel::HalfToFloat<T>(d_logits_typed_, d_logits,
+                                      B * vocab_size_, stream_);
+    if (err != cudaSuccess)
       return false;
   }
 

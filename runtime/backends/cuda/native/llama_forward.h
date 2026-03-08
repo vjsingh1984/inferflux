@@ -48,9 +48,8 @@ private:
   int max_seq_len_{0};
   int max_batch_size_{32};
   float rope_freq_base_{10000.0f};
-  float rope_freq_scale_{1.0f};
   float rms_norm_eps_{1e-5f};
-  int rope_type_{0}; // 0=NORM (consecutive), 2=NEOX (split-half)
+  int rope_type_{0}; // 0 = kNorm (consecutive), 2 = kNeox (split-half)
 
   // External references (not owned)
   const WeightMap *weights_{nullptr};
@@ -71,16 +70,6 @@ private:
   T *d_ffn_down_{nullptr};
   int *d_token_ids_{nullptr};
   T *d_logits_typed_{nullptr};
-
-  // Batched KV append + FlashDecode scratch buffers
-  int *d_batch_seq_ids_{nullptr};
-  int *d_batch_n_past_{nullptr};
-  const T **d_k_ptrs_{nullptr};
-  const T **d_v_ptrs_{nullptr};
-  int *d_kv_lens_{nullptr};
-  std::vector<const T *> h_k_ptrs_;
-  std::vector<const T *> h_v_ptrs_;
-  std::vector<int> h_kv_lens_;
 
   bool AllocateScratch();
 };
