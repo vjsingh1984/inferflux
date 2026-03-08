@@ -733,7 +733,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--host", default="127.0.0.1")
   parser.add_argument("--port", type=int, default=18081)
   parser.add_argument("--api-key", default="dev-key-123")
-  parser.add_argument("--endpoint", default="/v1/completions",
+  parser.add_argument("--endpoint", default="/v1/chat/completions",
                       choices=["/v1/completions", "/v1/chat/completions"])
   parser.add_argument("--model", default="")
   parser.add_argument("--prompt", default="Explain why throughput guardrails matter.")

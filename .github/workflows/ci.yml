@@ -455,7 +455,7 @@ jobs:
             --config config/server.cuda.yaml \
             --host 127.0.0.1 \
             --port 18081 \
-            --endpoint /v1/completions \
+            --endpoint /v1/chat/completions \
             --model tinyllama \
             --backend cuda \
             --concurrency "${INFERFLUX_TP_CONCURRENCY}" \

@@ -2138,9 +2138,10 @@ int main(int argc, char **argv) {
         std::cerr << "--prompt is required" << std::endl;
         return 1;
       }
-      auto payload =
-          BuildCompletionPayload(prompt, model, max_tokens, stream_mode);
-      std::string url = BuildUrl(host, port, "/v1/completions");
+      // Use /v1/chat/completions (the legacy /v1/completions is deprecated).
+      std::vector<ChatMessage> msgs{{"user", prompt}};
+      auto payload = BuildChatPayload(msgs, model, max_tokens, stream_mode);
+      std::string url = BuildUrl(host, port, "/v1/chat/completions");
       if (stream_mode) {
         auto conn = client.SendRaw("POST", url, payload.dump(), headers);
         ReceiveStream(client, conn, nullptr);

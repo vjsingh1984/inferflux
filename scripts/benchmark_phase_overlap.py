@@ -66,14 +66,14 @@ class PhaseOverlapBenchmark:
 
         payload = {
             "model": "test-model",
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "stream": False
         }
 
         try:
             response = requests.post(
-                f"{self.base_url}/v1/completions",
+                f"{self.base_url}/v1/chat/completions",
                 headers=self.headers,
                 json=payload,
                 timeout=timeout

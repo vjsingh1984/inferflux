@@ -331,12 +331,13 @@ async function sendCompletion() {
   const model = modelSelect.value;
   localStorage.setItem("inferflux_model", model);
   persistPrompt();
-  const res = await fetch("/v1/completions", {
+  const res = await fetch("/v1/chat/completions", {
     method: "POST",
     headers: headers(),
-    body: JSON.stringify({ prompt, model, max_tokens: 128 }),
+    body: JSON.stringify({ messages: [{role: "user", content: prompt}], model, max_tokens: 128 }),
   });
-  const text = await res.text();
+  const data = await res.json();
+  const text = data.choices?.[0]?.message?.content ?? JSON.stringify(data);
   document.getElementById("output").textContent = text;
   appendHistory("completion", prompt, text);
 }

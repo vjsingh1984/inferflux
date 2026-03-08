@@ -105,17 +105,17 @@ echo ""
 echo "Test 2: Simple Completion"
 echo "-------------------------"
 
-RESPONSE=$(curl -s -X POST http://localhost:8080/v1/completions \
+RESPONSE=$(curl -s -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer dev-key-123" \
   -d '{
     "model": "test-model",
-    "prompt": "Hello, ",
+    "messages": [{"role": "user", "content": "Hello, "}],
     "max_tokens": 10
   }')
 
-if echo "$RESPONSE" | grep -q "text"; then
-    GENERATED_TEXT=$(echo "$RESPONSE" | grep -o '"text":"[^"]*"' | head -1 | cut -d'"' -f4)
+if echo "$RESPONSE" | grep -q "content"; then
+    GENERATED_TEXT=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
     if [ -n "$GENERATED_TEXT" ]; then
         echo -e "${GREEN}✓ Completion works: \"${GENERATED_TEXT}\"${NC}"
     else

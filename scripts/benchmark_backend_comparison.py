@@ -225,7 +225,7 @@ def send_completion(host: str, port: int, prompt: str,
                     max_tokens: int, model: str) -> RequestResult:
     payload = {
         "model": model,
-        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": False,
@@ -233,7 +233,7 @@ def send_completion(host: str, port: int, prompt: str,
     start = time.perf_counter()
     try:
         conn = http.client.HTTPConnection(host, port, timeout=120)
-        conn.request("POST", "/v1/completions",
+        conn.request("POST", "/v1/chat/completions",
                      body=json.dumps(payload),
                      headers={"Content-Type": "application/json",
                               "Authorization": f"Bearer {API_KEY}"})
@@ -255,7 +255,8 @@ def send_completion(host: str, port: int, prompt: str,
         data = json.loads(body)
         text = ""
         if "choices" in data and data["choices"]:
-            text = data["choices"][0].get("text", "")
+            choice = data["choices"][0]
+            text = choice.get("message", {}).get("content", "") or choice.get("text", "")
         tokens = int(data.get("usage", {}).get("completion_tokens", 0))
     except Exception:
         text = body

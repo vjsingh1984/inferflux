@@ -49,10 +49,10 @@ done
 
 # Warmup request
 echo "Sending warmup request..."
-curl -s -X POST http://127.0.0.1:8080/v1/completions \
+curl -s -X POST http://127.0.0.1:8080/v1/chat/completions \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer dev-key-123" \
-    -d '{"prompt": "Warmup", "max_tokens": 10}' > /dev/null
+    -d '{"messages": [{"role": "user", "content": "Warmup"}], "max_tokens": 10}' > /dev/null
 
 # Start profiling
 echo ""

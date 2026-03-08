@@ -183,10 +183,10 @@ send_request() {
     local start_ns=$(date +%s%N)
 
     local response
-    response=$(curl -sf -X POST "http://127.0.0.1:$port/v1/completions" \
+    response=$(curl -sf -X POST "http://127.0.0.1:$port/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $API_KEY" \
-        -d "{\"model\":\"bench-model\",\"prompt\":$(printf '%s' "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
+        -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":$(printf '%s' "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}],\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
         --max-time 120 2>/dev/null) || {
         echo "ERROR" > "$output_file"
         return 1
@@ -199,7 +199,7 @@ send_request() {
     text=$(echo "$response" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-text = d.get('choices', [{}])[0].get('text', '')
+text = d.get('choices', [{}])[0].get('message', {}).get('content', '')
 tokens = d.get('usage', {}).get('completion_tokens', 0)
 print(json.dumps({'text': text.strip(), 'tokens': tokens, 'latency_ms': $latency_ms}))
 " 2>/dev/null) || {

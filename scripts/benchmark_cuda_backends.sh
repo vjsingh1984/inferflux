@@ -29,10 +29,10 @@ run_benchmark() {
 
     # Launch all requests in background
     for i in $(seq 1 $num_requests); do
-        curl -s -X POST "$SERVER_URL/v1/completions" \
+        curl -s -X POST "$SERVER_URL/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $API_KEY" \
-            -d "{\"model\":\"$MODEL\",\"prompt\":\"$PROMPT\",\"max_tokens\":$MAX_TOKENS}" &
+            -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}],\"max_tokens\":$MAX_TOKENS}" &
     done
 
     # Wait for all to complete

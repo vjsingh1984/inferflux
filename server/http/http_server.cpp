@@ -2553,6 +2553,20 @@ void HttpServer::HandleClient(ClientSession &session) {
 
     bool chat_mode =
         (path == "/v1/chat/completions") || !parsed.messages.empty();
+
+    // /v1/completions is deprecated per OpenAI API (Jan 2024).
+    // Log once and add Deprecation header to response.
+    const bool is_legacy_completions =
+        (path == "/v1/completions" && !chat_mode);
+    if (is_legacy_completions) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        inferflux::log::Warn(
+            "server",
+            "/v1/completions is deprecated; use /v1/chat/completions instead");
+      }
+    }
     std::string guard_reason;
     if (guardrail_ && guardrail_->Enabled() &&
         !guardrail_->Check(req.prompt, &guard_reason)) {
@@ -2699,6 +2713,12 @@ void HttpServer::HandleClient(ClientSession &session) {
     if (request_ctx.valid()) {
       trace_response_header =
           "traceparent: " + request_ctx.ToTraceparent() + "\r\n";
+    }
+    if (is_legacy_completions) {
+      trace_response_header +=
+          "Deprecation: true\r\n"
+          "Sunset: 2025-06-01\r\n"
+          "Link: </v1/chat/completions>; rel=\"successor-version\"\r\n";
     }
 
     std::string stream_id;
