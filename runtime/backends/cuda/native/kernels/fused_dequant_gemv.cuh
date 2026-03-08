@@ -114,6 +114,9 @@ ApplyNormInPlaceMaxAbs(float *__restrict__ sx,
 
 // Grid: (ceil(N / kGemvWarpsPerBlock), M)
 // Each block at (bx, row) loads x[row] into smem and computes output[row][cols].
+//
+// Inner loop: reads each qs byte once (both nibbles), vectorizes qs loads as
+// int32 (4 bytes = 8 elements), and pre-extracts scale/min per sub-block pair.
 __global__ void fused_dequant_gemv_q4k(const block_q4_k *__restrict__ weight,
                                        const half *__restrict__ x,
                                        half *__restrict__ output, int N,
@@ -142,13 +145,35 @@ __global__ void fused_dequant_gemv_q4k(const block_q4_k *__restrict__ weight,
   for (int blk = 0; blk < num_blocks; ++blk) {
     const block_q4_k &b = wrow[blk];
 
-    float d = __half2float(*reinterpret_cast<const half *>(&b.d));
-    float dmin = __half2float(*reinterpret_cast<const half *>(&b.dmin));
+    const float d = __half2float(*reinterpret_cast<const half *>(&b.d));
+    const float dmin = __half2float(*reinterpret_cast<const half *>(&b.dmin));
 
-    for (int sb = 0; sb < 8; ++sb) {
-      int elem_idx = blk * QK_K + sb * 32 + lane;
-      float w_val = dequant_q4k_element(b, d, dmin, sb, lane);
-      acc += w_val * sx[elem_idx];
+    // Process sub-blocks in pairs (0&1, 2&3, 4&5, 6&7).
+    // Each pair shares the same qs byte: qs[pair*32+lane] holds both nibbles.
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+      const int sb_lo = pair * 2;
+      const int sb_hi = pair * 2 + 1;
+
+      // Extract scales and mins for both sub-blocks (once per pair)
+      unsigned char sc_lo, m_lo, sc_hi, m_hi;
+      get_scale_min_k4(sb_lo, b.scales, &sc_lo, &m_lo);
+      get_scale_min_k4(sb_hi, b.scales, &sc_hi, &m_hi);
+
+      // Pre-compute per-sub-block scale factors
+      const float d_sc_lo = d * static_cast<float>(sc_lo);
+      const float dm_m_lo = dmin * static_cast<float>(m_lo);
+      const float d_sc_hi = d * static_cast<float>(sc_hi);
+      const float dm_m_hi = dmin * static_cast<float>(m_hi);
+
+      // Read qs byte once — low nibble is sb_lo, high nibble is sb_hi
+      const unsigned char qbyte = b.qs[pair * 32 + lane];
+      const float q_lo = static_cast<float>(qbyte & 0x0F);
+      const float q_hi = static_cast<float>(qbyte >> 4);
+
+      const int base = blk * QK_K + pair * 64;
+      acc += (d_sc_lo * q_lo - dm_m_lo) * sx[base + lane];
+      acc += (d_sc_hi * q_hi - dm_m_hi) * sx[base + 32 + lane];
     }
   }
 
@@ -195,13 +220,52 @@ __global__ void fused_dequant_gemv_q6k(const block_q6_k *__restrict__ weight,
 
     float d = __half2float(*reinterpret_cast<const half *>(&b.d));
 
-    for (int step = 0; step < 8; ++step) {
-      int g = step / 4;
-      int sub = step % 4;
-      int elem_idx = blk * QK_K + g * 128 + sub * 32 + lane;
+    // Process in group pairs: subs 0&2 share ql byte (low/high nibble),
+    // subs 1&3 share another ql byte. Read each byte once.
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+      // Pair subs 0 & 2 (same ql byte at g*64+lane)
+      {
+        const int ql_idx = g * 64 + lane;
+        const unsigned char ql_byte = b.ql[ql_idx];
+        const int qh_idx = g * 32 + lane;
+        const unsigned char qh_byte = b.qh[qh_idx];
 
-      float w_val = dequant_q6k_element(b, d, g, sub, lane);
-      acc += w_val * sx[elem_idx];
+        const int ql0 = ql_byte & 0x0F;
+        const int qh0 = (qh_byte >> 0) & 0x03;
+        const int q0 = (ql0 | (qh0 << 4)) - 32;
+        const int sc0 = g * 8 + 0 * 2 + lane / 16;
+        acc += d * static_cast<float>(b.scales[sc0]) * static_cast<float>(q0) *
+               sx[blk * QK_K + g * 128 + lane];
+
+        const int ql2 = ql_byte >> 4;
+        const int qh2 = (qh_byte >> 4) & 0x03;
+        const int q2 = (ql2 | (qh2 << 4)) - 32;
+        const int sc2 = g * 8 + 2 * 2 + lane / 16;
+        acc += d * static_cast<float>(b.scales[sc2]) * static_cast<float>(q2) *
+               sx[blk * QK_K + g * 128 + 64 + lane];
+      }
+      // Pair subs 1 & 3 (same ql byte at g*64+32+lane)
+      {
+        const int ql_idx = g * 64 + 32 + lane;
+        const unsigned char ql_byte = b.ql[ql_idx];
+        const int qh_idx = g * 32 + lane;
+        const unsigned char qh_byte = b.qh[qh_idx];
+
+        const int ql1 = ql_byte & 0x0F;
+        const int qh1 = (qh_byte >> 2) & 0x03;
+        const int q1 = (ql1 | (qh1 << 4)) - 32;
+        const int sc1 = g * 8 + 1 * 2 + lane / 16;
+        acc += d * static_cast<float>(b.scales[sc1]) * static_cast<float>(q1) *
+               sx[blk * QK_K + g * 128 + 32 + lane];
+
+        const int ql3 = ql_byte >> 4;
+        const int qh3 = (qh_byte >> 6) & 0x03;
+        const int q3 = (ql3 | (qh3 << 4)) - 32;
+        const int sc3 = g * 8 + 3 * 2 + lane / 16;
+        acc += d * static_cast<float>(b.scales[sc3]) * static_cast<float>(q3) *
+               sx[blk * QK_K + g * 128 + 96 + lane];
+      }
     }
   }
 
@@ -380,12 +444,30 @@ fused_rmsnorm_gemv_q4k(const block_q4_k *__restrict__ weight,
   float acc = 0.0f;
   for (int blk = 0; blk < num_blocks; ++blk) {
     const block_q4_k &b = wrow[blk];
-    float d = __half2float(*reinterpret_cast<const half *>(&b.d));
-    float dmin = __half2float(*reinterpret_cast<const half *>(&b.dmin));
-    for (int sb = 0; sb < 8; ++sb) {
-      int elem_idx = blk * QK_K + sb * 32 + lane;
-      float w_val = dequant_q4k_element(b, d, dmin, sb, lane);
-      acc += w_val * sx[elem_idx];
+    const float d = __half2float(*reinterpret_cast<const half *>(&b.d));
+    const float dmin = __half2float(*reinterpret_cast<const half *>(&b.dmin));
+
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+      const int sb_lo = pair * 2;
+      const int sb_hi = pair * 2 + 1;
+
+      unsigned char sc_lo, m_lo, sc_hi, m_hi;
+      get_scale_min_k4(sb_lo, b.scales, &sc_lo, &m_lo);
+      get_scale_min_k4(sb_hi, b.scales, &sc_hi, &m_hi);
+
+      const float d_sc_lo = d * static_cast<float>(sc_lo);
+      const float dm_m_lo = dmin * static_cast<float>(m_lo);
+      const float d_sc_hi = d * static_cast<float>(sc_hi);
+      const float dm_m_hi = dmin * static_cast<float>(m_hi);
+
+      const unsigned char qbyte = b.qs[pair * 32 + lane];
+      const float q_lo = static_cast<float>(qbyte & 0x0F);
+      const float q_hi = static_cast<float>(qbyte >> 4);
+
+      const int base = blk * QK_K + pair * 64;
+      acc += (d_sc_lo * q_lo - dm_m_lo) * sx[base + lane];
+      acc += (d_sc_hi * q_hi - dm_m_hi) * sx[base + 32 + lane];
     }
   }
 
@@ -447,13 +529,50 @@ fused_rmsnorm_gemv_q6k(const block_q6_k *__restrict__ weight,
   float acc = 0.0f;
   for (int blk = 0; blk < num_blocks; ++blk) {
     const block_q6_k &b = wrow[blk];
-    float d = __half2float(*reinterpret_cast<const half *>(&b.d));
-    for (int step = 0; step < 8; ++step) {
-      int g = step / 4;
-      int sub = step % 4;
-      int elem_idx = blk * QK_K + g * 128 + sub * 32 + lane;
-      float w_val = dequant_q6k_element(b, d, g, sub, lane);
-      acc += w_val * sx[elem_idx];
+    const float d = __half2float(*reinterpret_cast<const half *>(&b.d));
+
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+      {
+        const int ql_idx = g * 64 + lane;
+        const unsigned char ql_byte = b.ql[ql_idx];
+        const int qh_idx = g * 32 + lane;
+        const unsigned char qh_byte = b.qh[qh_idx];
+
+        const int ql0 = ql_byte & 0x0F;
+        const int qh0 = (qh_byte >> 0) & 0x03;
+        const int q0 = (ql0 | (qh0 << 4)) - 32;
+        const int sc0 = g * 8 + 0 * 2 + lane / 16;
+        acc += d * static_cast<float>(b.scales[sc0]) * static_cast<float>(q0) *
+               sx[blk * QK_K + g * 128 + lane];
+
+        const int ql2 = ql_byte >> 4;
+        const int qh2 = (qh_byte >> 4) & 0x03;
+        const int q2 = (ql2 | (qh2 << 4)) - 32;
+        const int sc2 = g * 8 + 2 * 2 + lane / 16;
+        acc += d * static_cast<float>(b.scales[sc2]) * static_cast<float>(q2) *
+               sx[blk * QK_K + g * 128 + 64 + lane];
+      }
+      {
+        const int ql_idx = g * 64 + 32 + lane;
+        const unsigned char ql_byte = b.ql[ql_idx];
+        const int qh_idx = g * 32 + lane;
+        const unsigned char qh_byte = b.qh[qh_idx];
+
+        const int ql1 = ql_byte & 0x0F;
+        const int qh1 = (qh_byte >> 2) & 0x03;
+        const int q1 = (ql1 | (qh1 << 4)) - 32;
+        const int sc1 = g * 8 + 1 * 2 + lane / 16;
+        acc += d * static_cast<float>(b.scales[sc1]) * static_cast<float>(q1) *
+               sx[blk * QK_K + g * 128 + 32 + lane];
+
+        const int ql3 = ql_byte >> 4;
+        const int qh3 = (qh_byte >> 6) & 0x03;
+        const int q3 = (ql3 | (qh3 << 4)) - 32;
+        const int sc3 = g * 8 + 3 * 2 + lane / 16;
+        acc += d * static_cast<float>(b.scales[sc3]) * static_cast<float>(q3) *
+               sx[blk * QK_K + g * 128 + 96 + lane];
+      }
     }
   }
 
