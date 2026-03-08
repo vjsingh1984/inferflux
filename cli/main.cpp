@@ -212,8 +212,7 @@ struct BackendExposureView {
 BackendExposureView ParseBackendExposure(const json &model) {
   BackendExposureView out;
   out.exposed_backend = model.value("backend", "");
-  out.requested_backend =
-      model.value("requested_backend", out.exposed_backend);
+  out.requested_backend = model.value("requested_backend", out.exposed_backend);
   out.provider = model.value("backend_provider", "unknown");
   out.fallback = model.value("backend_fallback", false);
   out.fallback_reason = model.value("backend_fallback_reason", "");
@@ -227,7 +226,8 @@ BackendExposureView ParseBackendExposure(const json &model) {
         exposure.value("requested_backend", out.requested_backend);
     out.provider = exposure.value("provider", out.provider);
     out.fallback = exposure.value("fallback", out.fallback);
-    out.fallback_reason = exposure.value("fallback_reason", out.fallback_reason);
+    out.fallback_reason =
+        exposure.value("fallback_reason", out.fallback_reason);
   }
 
   if (out.requested_backend.empty()) {
@@ -261,8 +261,8 @@ void PrintModelsTable(const json &payload) {
   std::cout << std::left << std::setw(kIdW) << "ID" << std::setw(kExposedW)
             << "EXPOSED-BE" << std::setw(kRequestedW) << "REQ-BE"
             << std::setw(kProviderW) << "PROVIDER" << std::setw(kFallbackW)
-            << "FALLBACK" << std::setw(kReadyW) << "READY"
-            << std::setw(kOwnerW) << "OWNED-BY" << "CREATED\n";
+            << "FALLBACK" << std::setw(kReadyW) << "READY" << std::setw(kOwnerW)
+            << "OWNED-BY" << "CREATED\n";
   std::cout << std::string(kIdW + kExposedW + kRequestedW + kProviderW +
                                kFallbackW + kReadyW + kOwnerW + 12,
                            '-')
@@ -317,9 +317,8 @@ void PrintAdminModelsTable(const json &payload) {
             << "ID" << std::setw(kBackendW) << "EXPOSED-BE"
             << std::setw(kRequestedW) << "REQ-BE" << std::setw(kProviderW)
             << "PROVIDER" << std::setw(kFallbackW) << "FALLBACK"
-            << std::setw(kFormatW) << "FORMAT" << std::setw(kReadyW)
-            << "READY" << std::setw(kSourceW) << "SOURCE-PATH"
-            << "EFFECTIVE-LOAD-PATH\n";
+            << std::setw(kFormatW) << "FORMAT" << std::setw(kReadyW) << "READY"
+            << std::setw(kSourceW) << "SOURCE-PATH" << "EFFECTIVE-LOAD-PATH\n";
   std::cout << std::string(kDefaultW + kIdW + kBackendW + kFormatW + kReadyW +
                                kRequestedW + kProviderW + kFallbackW +
                                kSourceW + kEffectiveW,
@@ -1697,8 +1696,7 @@ int main(int argc, char **argv) {
         };
 
         json scheduler_metrics{
-            {"queue_depth",
-             metric_or_null("inferflux_scheduler_queue_depth")},
+            {"queue_depth", metric_or_null("inferflux_scheduler_queue_depth")},
             {"prefill_queue_depth",
              metric_or_null("inferflux_prefill_queue_depth")},
             {"decode_queue_depth",

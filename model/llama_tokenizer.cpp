@@ -181,9 +181,9 @@ ITokenizer::ChatResult LlamaTokenizer::ApplyChatTemplate(
 
   result.prompt = std::string(buf.data(), static_cast<size_t>(n));
   result.valid = true;
-  log::Info("llama_tokenizer",
-            "ApplyChatTemplate result (" + std::to_string(n) +
-                " chars): [" + result.prompt + "]");
+  log::Info("llama_tokenizer", "ApplyChatTemplate result (" +
+                                   std::to_string(n) + " chars): [" +
+                                   result.prompt + "]");
   return result;
 }
 
