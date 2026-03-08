@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <vector>
@@ -15,6 +16,12 @@ class IKvCacheGpu {
 public:
   virtual ~IKvCacheGpu() = default;
   virtual void ClearSequence(int seq_id) = 0;
+  virtual bool CopySequencePrefix(int src_seq, int dst_seq, int n_tokens,
+                                  cudaStream_t stream) = 0;
+  virtual bool SerializeSequence(int seq_id,
+                                 std::vector<uint8_t> *out) const = 0;
+  virtual bool HydrateSequence(int seq_id, const std::vector<uint8_t> &blob,
+                               cudaStream_t stream) = 0;
   virtual size_t GetMemoryUsage() const = 0;
   virtual int MaxSeqLen() const = 0;
   virtual int MaxBatchSize() const = 0;
@@ -44,6 +51,11 @@ public:
                      const T *k_new, const T *v_new, cudaStream_t stream);
 
   void ClearSequence(int seq_id) override;
+  bool CopySequencePrefix(int src_seq, int dst_seq, int n_tokens,
+                          cudaStream_t stream) override;
+  bool SerializeSequence(int seq_id, std::vector<uint8_t> *out) const override;
+  bool HydrateSequence(int seq_id, const std::vector<uint8_t> &blob,
+                       cudaStream_t stream) override;
 
   size_t GetMemoryUsage() const override { return total_bytes_; }
   int MaxSeqLen() const override { return max_seq_len_; }

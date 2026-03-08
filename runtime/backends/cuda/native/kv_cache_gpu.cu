@@ -1,6 +1,7 @@
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
 
 #include "server/logging/logger.h"
+#include <algorithm>
 #include <cstring>
 #include <cuda_bf16.h>
 
@@ -86,6 +87,71 @@ template <typename T> void KvCacheGpuTyped<T>::ClearSequence(int seq_id) {
     return;
   size_t bytes = slot_stride_ * sizeof(T);
   cudaMemset(buffer_ + seq_id * slot_stride_, 0, bytes);
+}
+
+template <typename T>
+bool KvCacheGpuTyped<T>::CopySequencePrefix(int src_seq, int dst_seq,
+                                            int n_tokens,
+                                            cudaStream_t stream) {
+  if (!buffer_ || src_seq < 0 || dst_seq < 0 || src_seq >= max_batch_size_ ||
+      dst_seq >= max_batch_size_) {
+    return false;
+  }
+  if (n_tokens <= 0 || src_seq == dst_seq) {
+    return true;
+  }
+  const int copy_tokens = std::min(n_tokens, max_seq_len_);
+  const size_t copy_bytes =
+      static_cast<size_t>(copy_tokens) * kv_dim_ * sizeof(T);
+  for (int layer = 0; layer < num_layers_; ++layer) {
+    T *k_src = GetK(layer, src_seq);
+    T *k_dst = GetK(layer, dst_seq);
+    cudaError_t err = cudaMemcpyAsync(k_dst, k_src, copy_bytes,
+                                      cudaMemcpyDeviceToDevice, stream);
+    if (err != cudaSuccess) {
+      return false;
+    }
+    T *v_src = GetV(layer, src_seq);
+    T *v_dst = GetV(layer, dst_seq);
+    err = cudaMemcpyAsync(v_dst, v_src, copy_bytes, cudaMemcpyDeviceToDevice,
+                          stream);
+    if (err != cudaSuccess) {
+      return false;
+    }
+  }
+  return cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
+template <typename T>
+bool KvCacheGpuTyped<T>::SerializeSequence(int seq_id,
+                                           std::vector<uint8_t> *out) const {
+  if (!out || !buffer_ || seq_id < 0 || seq_id >= max_batch_size_) {
+    return false;
+  }
+  const size_t bytes = slot_stride_ * sizeof(T);
+  out->resize(bytes);
+  const T *src = buffer_ + static_cast<size_t>(seq_id) * slot_stride_;
+  return cudaMemcpy(out->data(), src, bytes, cudaMemcpyDeviceToHost) ==
+         cudaSuccess;
+}
+
+template <typename T>
+bool KvCacheGpuTyped<T>::HydrateSequence(int seq_id,
+                                         const std::vector<uint8_t> &blob,
+                                         cudaStream_t stream) {
+  if (!buffer_ || seq_id < 0 || seq_id >= max_batch_size_) {
+    return false;
+  }
+  const size_t bytes = slot_stride_ * sizeof(T);
+  if (blob.size() != bytes) {
+    return false;
+  }
+  T *dst = buffer_ + static_cast<size_t>(seq_id) * slot_stride_;
+  if (cudaMemcpyAsync(dst, blob.data(), bytes, cudaMemcpyHostToDevice,
+                      stream) != cudaSuccess) {
+    return false;
+  }
+  return cudaStreamSynchronize(stream) == cudaSuccess;
 }
 
 // Explicit template instantiations

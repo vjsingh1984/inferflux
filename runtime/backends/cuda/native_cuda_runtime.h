@@ -84,6 +84,18 @@ public:
     }
   }
 
+  virtual std::vector<uint8_t> NativeSerializeSequence(int sequence_id) const {
+    auto backend = BackendHandle();
+    return backend ? backend->SerializeSequence(sequence_id)
+                   : std::vector<uint8_t>{};
+  }
+
+  virtual bool NativeHydrateSequence(int dest_sequence_id,
+                                     const std::vector<uint8_t> &blob) {
+    auto backend = BackendHandle();
+    return backend ? backend->HydrateSequence(dest_sequence_id, blob) : false;
+  }
+
   struct NativeChatResult {
     std::string prompt;
     bool valid{false};
