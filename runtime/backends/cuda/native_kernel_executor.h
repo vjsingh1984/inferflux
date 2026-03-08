@@ -326,6 +326,11 @@ private:
   cudaEvent_t sampling_start_{nullptr};
   cudaEvent_t sampling_stop_{nullptr};
 
+  // Timing sample rate: 0 = disabled, N>0 = record every Nth batch.
+  // Controlled by INFERFLUX_NATIVE_TIMING_SAMPLE_RATE env var.
+  int timing_sample_rate_{1};
+  int timing_batch_counter_{0};
+
   struct NativePerfAccumulator {
     std::atomic<double> prefill_ms{0.0};
     std::atomic<double> decode_ms{0.0};

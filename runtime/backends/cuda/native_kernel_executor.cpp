@@ -1258,16 +1258,31 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     }
   }
 
-  // 9. Create cudaEvent pairs for forward/sampling timing
-  if (!CheckCudaStatus(cudaEventCreate(&forward_start_),
-                       "cudaEventCreate(forward_start_)") ||
-      !CheckCudaStatus(cudaEventCreate(&forward_stop_),
-                       "cudaEventCreate(forward_stop_)") ||
-      !CheckCudaStatus(cudaEventCreate(&sampling_start_),
-                       "cudaEventCreate(sampling_start_)") ||
-      !CheckCudaStatus(cudaEventCreate(&sampling_stop_),
-                       "cudaEventCreate(sampling_stop_)")) {
-    return false;
+  // 9. Read timing sample-rate from environment.
+  //    0 or negative → disable event recording entirely (max throughput).
+  //    N > 0         → record events every Nth batch (default 1 = always).
+  {
+    const char *env = std::getenv("INFERFLUX_NATIVE_TIMING_SAMPLE_RATE");
+    if (env) {
+      timing_sample_rate_ = std::atoi(env);
+      log::Info("native_kernel_executor",
+                "Timing sample rate: " + std::to_string(timing_sample_rate_) +
+                    (timing_sample_rate_ <= 0 ? " (disabled)" : ""));
+    }
+  }
+
+  // Create cudaEvent pairs for forward/sampling timing
+  if (timing_sample_rate_ > 0) {
+    if (!CheckCudaStatus(cudaEventCreate(&forward_start_),
+                         "cudaEventCreate(forward_start_)") ||
+        !CheckCudaStatus(cudaEventCreate(&forward_stop_),
+                         "cudaEventCreate(forward_stop_)") ||
+        !CheckCudaStatus(cudaEventCreate(&sampling_start_),
+                         "cudaEventCreate(sampling_start_)") ||
+        !CheckCudaStatus(cudaEventCreate(&sampling_stop_),
+                         "cudaEventCreate(sampling_stop_)")) {
+      return false;
+    }
   }
 
   // 10. Create lane-specific streams for async overlap
@@ -1945,19 +1960,24 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
   const int decode_batch_capacity =
       kv_cache_ ? std::max(1, kv_cache_->MaxBatchSize()) : 32;
   if (!decode_group.empty()) {
+    // Pre-allocate batch vectors once at maximum capacity to avoid per-batch
+    // heap allocations in the hot loop.
+    const int max_B = static_cast<int>(std::min(
+        decode_group.size(), static_cast<size_t>(decode_batch_capacity)));
+    std::vector<int> batch_tokens(max_B);
+    std::vector<int> batch_n_past(max_B);
+    std::vector<int> batch_seq_ids(max_B);
+    std::vector<float> batch_temps(max_B);
+    std::vector<int> batch_top_ks(max_B);
+    std::vector<float> batch_top_ps(max_B);
+    std::vector<int> sampled_tokens;
+
     for (size_t offset = 0; offset < decode_group.size();
          offset += static_cast<size_t>(decode_batch_capacity)) {
       NVTX_SCOPE("BatchedDecode");
       const int B = static_cast<int>(
           std::min(decode_group.size() - offset,
                    static_cast<size_t>(decode_batch_capacity)));
-
-      std::vector<int> batch_tokens(B);
-      std::vector<int> batch_n_past(B);
-      std::vector<int> batch_seq_ids(B);
-      std::vector<float> batch_temps(B);
-      std::vector<int> batch_top_ks(B);
-      std::vector<float> batch_top_ps(B);
 
       for (int b = 0; b < B; ++b) {
         const auto &entry = decode_group[offset + static_cast<size_t>(b)];
@@ -1969,25 +1989,21 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         batch_top_ps[b] = entry.top_p;
       }
 
-      if (!CheckCudaStatus(cudaEventRecord(forward_start_, compute_stream_),
-                           "cudaEventRecord(forward_start_,decode_batch)")) {
-        for (int b = 0; b < B; ++b) {
-          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
-          outputs[entry.input_idx].ok = false;
-          outputs[entry.input_idx].token = -1;
-        }
-        return outputs;
+      // Record forward timing based on sample rate.
+      // rate=0: never record (pure throughput). rate=N: every Nth batch.
+      bool record_timing = false;
+      if (timing_sample_rate_ > 0) {
+        ++timing_batch_counter_;
+        record_timing = (timing_batch_counter_ % timing_sample_rate_ == 0);
       }
+      if (record_timing) {
+        cudaEventRecord(forward_start_, compute_stream_);
+      }
+
       bool fwd_ok = model_forward_->BatchForward(batch_tokens, batch_n_past,
                                                  batch_seq_ids, d_logits_, B);
-      if (!CheckCudaStatus(cudaEventRecord(forward_stop_, compute_stream_),
-                           "cudaEventRecord(forward_stop_,decode_batch)")) {
-        for (int b = 0; b < B; ++b) {
-          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
-          outputs[entry.input_idx].ok = false;
-          outputs[entry.input_idx].token = -1;
-        }
-        return outputs;
+      if (record_timing) {
+        cudaEventRecord(forward_stop_, compute_stream_);
       }
 
       if (!fwd_ok) {
@@ -2000,44 +2016,23 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         continue;
       }
 
-      if (!CheckCudaStatus(cudaEventRecord(sampling_start_, compute_stream_),
-                           "cudaEventRecord(sampling_start_,decode_batch)")) {
-        for (int b = 0; b < B; ++b) {
-          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
-          outputs[entry.input_idx].ok = false;
-          outputs[entry.input_idx].token = -1;
-        }
-        return outputs;
-      }
-      std::vector<int> sampled_tokens;
       sampler_->SampleBatch(d_logits_, B, batch_temps, batch_top_ks,
                             batch_top_ps, &sampled_tokens);
-      if (!CheckCudaStatus(cudaEventRecord(sampling_stop_, compute_stream_),
-                           "cudaEventRecord(sampling_stop_,decode_batch)")) {
-        for (int b = 0; b < B; ++b) {
-          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
-          outputs[entry.input_idx].ok = false;
-          outputs[entry.input_idx].token = -1;
-        }
-        return outputs;
-      }
 
-      // SampleBatch already synchronized the stream, so forward events are
-      // guaranteed complete.  Compute elapsed times without an extra sync.
-      float fwd_ms = 0.0f;
-      if (CheckCudaStatus(
-              cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
-              "cudaEventElapsedTime(forward,decode_batch)")) {
-        GlobalMetrics().RecordNativeForwardPass(/*is_decode=*/true, B, fwd_ms);
-        perf_accum_.decode_ms.store(
-            perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
-            std::memory_order_relaxed);
-      }
-      float samp_ms = 0.0f;
-      if (CheckCudaStatus(
-              cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_),
-              "cudaEventElapsedTime(sampling,decode_batch)")) {
-        GlobalMetrics().RecordNativeSampling(B, samp_ms);
+      // SampleBatch already synchronized the stream.
+      if (record_timing) {
+        float fwd_ms = 0.0f;
+        if (CheckCudaStatus(
+                cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
+                "cudaEventElapsedTime(forward,decode_batch)")) {
+          // Scale metrics by total decode count (first batch is representative)
+          int total_decode = static_cast<int>(decode_group.size());
+          GlobalMetrics().RecordNativeForwardPass(/*is_decode=*/true,
+                                                  total_decode, fwd_ms);
+          perf_accum_.decode_ms.store(
+              perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
+              std::memory_order_relaxed);
+        }
       }
 
       for (int b = 0; b < B; ++b) {
@@ -2069,32 +2064,31 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
 
     if (!input.request_logits) {
       NVTX_SCOPE("ForwardPass");
-      if (!CheckCudaStatus(
-              cudaEventRecord(forward_start_, compute_stream_),
-              "cudaEventRecord(forward_start_,prefill_no_logits)")) {
-        continue;
+      bool record_prefill_timing = (timing_sample_rate_ > 0);
+      if (record_prefill_timing) {
+        cudaEventRecord(forward_start_, compute_stream_);
       }
       if (!model_forward_->Forward(input.tokens, input.n_past,
                                    input.sequence_id, d_logits_)) {
         log::Error("native_kernel_executor", "Forward pass failed");
       }
-      if (!CheckCudaStatus(
-              cudaEventRecord(forward_stop_, compute_stream_),
-              "cudaEventRecord(forward_stop_,prefill_no_logits)")) {
-        continue;
+      if (record_prefill_timing) {
+        cudaEventRecord(forward_stop_, compute_stream_);
+        cudaEventSynchronize(forward_stop_);
+        float fwd_ms = 0.0f;
+        if (CheckCudaStatus(
+                cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
+                "cudaEventElapsedTime(forward,prefill_no_logits)")) {
+          GlobalMetrics().RecordNativeForwardPass(is_decode, batch_tokens,
+                                                  fwd_ms);
+          perf_accum_.prefill_ms.store(
+              perf_accum_.prefill_ms.load(std::memory_order_relaxed) + fwd_ms,
+              std::memory_order_relaxed);
+        }
+      } else {
+        // No timing — just sync stream to ensure forward completes
+        cudaStreamSynchronize(compute_stream_);
       }
-      // Need sync here because prefill-no-logits has no subsequent sampling
-      cudaEventSynchronize(forward_stop_);
-      float fwd_ms = 0.0f;
-      if (!CheckCudaStatus(
-              cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
-              "cudaEventElapsedTime(forward,prefill_no_logits)")) {
-        continue;
-      }
-      GlobalMetrics().RecordNativeForwardPass(is_decode, batch_tokens, fwd_ms);
-      perf_accum_.prefill_ms.store(
-          perf_accum_.prefill_ms.load(std::memory_order_relaxed) + fwd_ms,
-          std::memory_order_relaxed);
       perf_accum_.prompt_tokens.fetch_add(batch_tokens,
                                           std::memory_order_relaxed);
       output.ok = true;
@@ -2104,63 +2098,62 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
     // Forward pass
     {
       NVTX_SCOPE("ForwardPass");
-      if (!CheckCudaStatus(cudaEventRecord(forward_start_, compute_stream_),
-                           "cudaEventRecord(forward_start_,prefill_logits)")) {
-        continue;
+      bool record_prefill_timing = (timing_sample_rate_ > 0);
+      if (record_prefill_timing) {
+        cudaEventRecord(forward_start_, compute_stream_);
       }
       if (!model_forward_->Forward(input.tokens, input.n_past,
                                    input.sequence_id, d_logits_)) {
         log::Error("native_kernel_executor", "Forward pass failed");
         continue;
       }
-      if (!CheckCudaStatus(cudaEventRecord(forward_stop_, compute_stream_),
-                           "cudaEventRecord(forward_stop_,prefill_logits)")) {
-        continue;
+      if (record_prefill_timing) {
+        cudaEventRecord(forward_stop_, compute_stream_);
       }
-      // Don't sync forward event here — sampling will sync the stream
     }
 
     // Sample
     {
       NVTX_SCOPE("Sampling");
-      if (!CheckCudaStatus(cudaEventRecord(sampling_start_, compute_stream_),
-                           "cudaEventRecord(sampling_start_,prefill_logits)")) {
-        continue;
+      bool record_prefill_timing = (timing_sample_rate_ > 0);
+      if (record_prefill_timing) {
+        cudaEventRecord(sampling_start_, compute_stream_);
       }
       int token_id = sampler_->Sample(
           d_logits_, input.sampling.temperature, input.sampling.top_k,
           input.sampling.top_p, input.sampling.seed);
       // Sample() already synchronizes the stream before returning
-      if (!CheckCudaStatus(cudaEventRecord(sampling_stop_, compute_stream_),
-                           "cudaEventRecord(sampling_stop_,prefill_logits)")) {
-        continue;
+      if (record_prefill_timing) {
+        cudaEventRecord(sampling_stop_, compute_stream_);
       }
 
       // Deferred timing: compute elapsed from already-completed events
-      float fwd_ms = 0.0f;
-      if (CheckCudaStatus(
-              cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
-              "cudaEventElapsedTime(forward,prefill_logits)")) {
-        GlobalMetrics().RecordNativeForwardPass(is_decode, batch_tokens,
-                                                fwd_ms);
-        if (is_decode) {
-          perf_accum_.decode_ms.store(
-              perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
-              std::memory_order_relaxed);
-        } else {
-          perf_accum_.prefill_ms.store(
-              perf_accum_.prefill_ms.load(std::memory_order_relaxed) + fwd_ms,
-              std::memory_order_relaxed);
-          perf_accum_.prompt_tokens.fetch_add(batch_tokens,
-                                              std::memory_order_relaxed);
+      if (record_prefill_timing) {
+        float fwd_ms = 0.0f;
+        if (CheckCudaStatus(
+                cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
+                "cudaEventElapsedTime(forward,prefill_logits)")) {
+          GlobalMetrics().RecordNativeForwardPass(is_decode, batch_tokens,
+                                                  fwd_ms);
+          if (is_decode) {
+            perf_accum_.decode_ms.store(
+                perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
+                std::memory_order_relaxed);
+          } else {
+            perf_accum_.prefill_ms.store(
+                perf_accum_.prefill_ms.load(std::memory_order_relaxed) + fwd_ms,
+                std::memory_order_relaxed);
+            perf_accum_.prompt_tokens.fetch_add(batch_tokens,
+                                                std::memory_order_relaxed);
+          }
         }
-      }
-      float samp_ms = 0.0f;
-      if (CheckCudaStatus(
-              cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_),
-              "cudaEventElapsedTime(sampling,prefill_logits)")) {
-        GlobalMetrics().RecordNativeSampling(1, samp_ms);
-      }
+        float samp_ms = 0.0f;
+        if (CheckCudaStatus(
+                cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_),
+                "cudaEventElapsedTime(sampling,prefill_logits)")) {
+          GlobalMetrics().RecordNativeSampling(1, samp_ms);
+        }
+      } // end if (record_prefill_timing)
 
       if (tokenizer_ && token_id == tokenizer_->EosTokenId()) {
         output.token = -1;
@@ -2183,11 +2176,13 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
 }
 
 bool NativeKernelExecutor::SupportsAsyncUnifiedBatch() const {
-#ifdef INFERFLUX_NATIVE_KERNELS_READY
-  return model_forward_ != nullptr;
-#else
+  // Disable async dispatch to use the synchronous ExecuteUnifiedBatch path
+  // which supports true batching (BatchForward + SampleBatch). The async
+  // path (ExecuteLaneBatch) processes inputs sequentially through Forward()
+  // and serializes concurrent requests through shared_pipeline_mutex_,
+  // defeating batching. When lane-overlap resources are unavailable (GGUF
+  // path), the async path just adds mutex serialization overhead.
   return false;
-#endif
 }
 
 UnifiedBatchHandle NativeKernelExecutor::SubmitUnifiedBatchAsync(
