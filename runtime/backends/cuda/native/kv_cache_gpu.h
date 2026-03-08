@@ -16,6 +16,7 @@ class IKvCacheGpu {
 public:
   virtual ~IKvCacheGpu() = default;
   virtual void ClearSequence(int seq_id) = 0;
+  virtual void ClearSequenceAsync(int seq_id, cudaStream_t stream) = 0;
   virtual bool CopySequencePrefix(int src_seq, int dst_seq, int n_tokens,
                                   cudaStream_t stream) = 0;
   virtual bool SerializeSequence(int seq_id,
@@ -51,6 +52,7 @@ public:
                      const T *k_new, const T *v_new, cudaStream_t stream);
 
   void ClearSequence(int seq_id) override;
+  void ClearSequenceAsync(int seq_id, cudaStream_t stream) override;
   bool CopySequencePrefix(int src_seq, int dst_seq, int n_tokens,
                           cudaStream_t stream) override;
   bool SerializeSequence(int seq_id, std::vector<uint8_t> *out) const override;

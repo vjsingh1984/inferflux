@@ -595,9 +595,32 @@ main() {
         exit 1
     fi
 
+    # Auto-build if binary is missing or stale (older than any source file).
+    local needs_build=false
     if [ ! -f "$BUILD_DIR/inferfluxd" ]; then
-        log_err "inferfluxd not found at $BUILD_DIR/inferfluxd"
-        echo "Build with CUDA: cmake -S . -B build-cuda -DENABLE_CUDA=ON && cmake --build build-cuda -j"
+        needs_build=true
+    else
+        # Check if any source file is newer than the binary.
+        local newest_src
+        newest_src=$(find runtime server scheduler model cli net io policy \
+            -name '*.cpp' -o -name '*.h' -o -name '*.cu' -o -name '*.cuh' 2>/dev/null \
+            | xargs stat --format='%Y' 2>/dev/null | sort -rn | head -1)
+        local bin_mtime
+        bin_mtime=$(stat --format='%Y' "$BUILD_DIR/inferfluxd" 2>/dev/null || echo 0)
+        if [ -n "$newest_src" ] && [ "$newest_src" -gt "$bin_mtime" ]; then
+            needs_build=true
+        fi
+    fi
+    if $needs_build; then
+        log "Building $BUILD_DIR/inferfluxd (CUDA enabled)..."
+        cmake -S . -B "$BUILD_DIR" -DENABLE_CUDA=ON >/dev/null 2>&1 || {
+            log_err "cmake configure failed"; exit 1; }
+        cmake --build "$BUILD_DIR" -j"$(nproc)" 2>&1 | tail -5 || {
+            log_err "cmake build failed"; exit 1; }
+        log "Build complete: $BUILD_DIR/inferfluxd"
+    fi
+    if [ ! -f "$BUILD_DIR/inferfluxd" ]; then
+        log_err "inferfluxd not found at $BUILD_DIR/inferfluxd after build attempt"
         exit 1
     fi
 

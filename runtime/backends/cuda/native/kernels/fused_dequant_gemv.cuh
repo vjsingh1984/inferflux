@@ -10,26 +10,37 @@ namespace runtime {
 namespace cuda {
 namespace native {
 
-// Number of warps per thread block for GEMV kernels
+// Number of warps per thread block for GEMV kernels.
+// x vector is cooperatively loaded into shared memory by all threads in the
+// block, then each warp computes one output element reading x from smem.
 constexpr int kGemvWarpsPerBlock = 8;
 constexpr int kGemvThreadsPerBlock = kGemvWarpsPerBlock * 32;
 
 //==============================================================================
-// Q4_K Fused Dequant-GEMV
+// Q4_K Fused Dequant-GEMV (shared-memory x cache)
 //==============================================================================
 
-// Each warp computes one output element using shared dequant_q4k_element().
 __global__ void fused_dequant_gemv_q4k(const block_q4_k *__restrict__ weight,
                                        const half *__restrict__ x,
                                        half *__restrict__ output, int N,
                                        int K) {
-  int out_idx = blockIdx.x * kGemvWarpsPerBlock + (threadIdx.x >> 5);
+  extern __shared__ float sx[];
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x * kGemvWarpsPerBlock + warp_id;
+
+  // Cooperatively load x into shared memory (all threads participate)
+  for (int i = tid; i < K; i += kGemvThreadsPerBlock) {
+    sx[i] = __half2float(x[i]);
+  }
+  __syncthreads();
+
   if (out_idx >= N)
     return;
 
-  int lane = threadIdx.x & 31;
-  int num_blocks = K / QK_K;
-
+  const int num_blocks = K / QK_K;
   const block_q4_k *row = weight + out_idx * num_blocks;
 
   float acc = 0.0f;
@@ -43,8 +54,7 @@ __global__ void fused_dequant_gemv_q4k(const block_q4_k *__restrict__ weight,
     for (int sb = 0; sb < 8; ++sb) {
       int elem_idx = blk * QK_K + sb * 32 + lane;
       float w_val = dequant_q4k_element(b, d, dmin, sb, lane);
-      float x_val = __half2float(x[elem_idx]);
-      acc += w_val * x_val;
+      acc += w_val * sx[elem_idx];
     }
   }
 
@@ -59,21 +69,29 @@ __global__ void fused_dequant_gemv_q4k(const block_q4_k *__restrict__ weight,
 }
 
 //==============================================================================
-// Q6_K Fused Dequant-GEMV
+// Q6_K Fused Dequant-GEMV (shared-memory x cache)
 //==============================================================================
 
-// Each warp computes one output element using shared dequant_q6k_element().
 __global__ void fused_dequant_gemv_q6k(const block_q6_k *__restrict__ weight,
                                        const half *__restrict__ x,
                                        half *__restrict__ output, int N,
                                        int K) {
-  int out_idx = blockIdx.x * kGemvWarpsPerBlock + (threadIdx.x >> 5);
+  extern __shared__ float sx[];
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x * kGemvWarpsPerBlock + warp_id;
+
+  for (int i = tid; i < K; i += kGemvThreadsPerBlock) {
+    sx[i] = __half2float(x[i]);
+  }
+  __syncthreads();
+
   if (out_idx >= N)
     return;
 
-  int lane = threadIdx.x & 31;
-  int num_blocks = K / QK_K;
-
+  const int num_blocks = K / QK_K;
   const block_q6_k *row = weight + out_idx * num_blocks;
 
   float acc = 0.0f;
@@ -89,8 +107,7 @@ __global__ void fused_dequant_gemv_q6k(const block_q6_k *__restrict__ weight,
       int elem_idx = blk * QK_K + g * 128 + sub * 32 + lane;
 
       float w_val = dequant_q6k_element(b, d, g, sub, lane);
-      float x_val = __half2float(x[elem_idx]);
-      acc += w_val * x_val;
+      acc += w_val * sx[elem_idx];
     }
   }
 
@@ -105,21 +122,29 @@ __global__ void fused_dequant_gemv_q6k(const block_q6_k *__restrict__ weight,
 }
 
 //==============================================================================
-// Q8_0 Fused Dequant-GEMV
+// Q8_0 Fused Dequant-GEMV (shared-memory x cache)
 //==============================================================================
 
-// Each warp computes one output element using shared dequant_q8_0_element().
 __global__ void fused_dequant_gemv_q8_0(const block_q8_0 *__restrict__ weight,
                                         const half *__restrict__ x,
                                         half *__restrict__ output, int N,
                                         int K) {
-  int out_idx = blockIdx.x * kGemvWarpsPerBlock + (threadIdx.x >> 5);
+  extern __shared__ float sx[];
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x * kGemvWarpsPerBlock + warp_id;
+
+  for (int i = tid; i < K; i += kGemvThreadsPerBlock) {
+    sx[i] = __half2float(x[i]);
+  }
+  __syncthreads();
+
   if (out_idx >= N)
     return;
 
-  int lane = threadIdx.x & 31;
-  int num_blocks = K / QK8_0;
-
+  const int num_blocks = K / QK8_0;
   const block_q8_0 *row = weight + out_idx * num_blocks;
 
   float acc = 0.0f;
@@ -130,8 +155,7 @@ __global__ void fused_dequant_gemv_q8_0(const block_q8_0 *__restrict__ weight,
 
     int elem_idx = blk * QK8_0 + lane;
     float w_val = dequant_q8_0_element(b, d, lane);
-    float x_val = __half2float(x[elem_idx]);
-    acc += w_val * x_val;
+    acc += w_val * sx[elem_idx];
   }
 
   // Warp reduction
@@ -145,21 +169,29 @@ __global__ void fused_dequant_gemv_q8_0(const block_q8_0 *__restrict__ weight,
 }
 
 //==============================================================================
-// Q8_K Fused Dequant-GEMV
+// Q8_K Fused Dequant-GEMV (shared-memory x cache)
 //==============================================================================
 
-// Each warp computes one output element using shared dequant_q8k_element().
 __global__ void fused_dequant_gemv_q8k(const block_q8_k *__restrict__ weight,
                                        const half *__restrict__ x,
                                        half *__restrict__ output, int N,
                                        int K) {
-  int out_idx = blockIdx.x * kGemvWarpsPerBlock + (threadIdx.x >> 5);
+  extern __shared__ float sx[];
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x * kGemvWarpsPerBlock + warp_id;
+
+  for (int i = tid; i < K; i += kGemvThreadsPerBlock) {
+    sx[i] = __half2float(x[i]);
+  }
+  __syncthreads();
+
   if (out_idx >= N)
     return;
 
-  int lane = threadIdx.x & 31;
-  int num_blocks = K / QK_K;
-
+  const int num_blocks = K / QK_K;
   const block_q8_k *row = weight + out_idx * num_blocks;
 
   float acc = 0.0f;
@@ -173,8 +205,7 @@ __global__ void fused_dequant_gemv_q8k(const block_q8_k *__restrict__ weight,
       int elem = step * 32 + lane;
       int elem_idx = blk * QK_K + elem;
       float w_val = dequant_q8k_element(b, d, elem);
-      float x_val = __half2float(x[elem_idx]);
-      acc += w_val * x_val;
+      acc += w_val * sx[elem_idx];
     }
   }
 

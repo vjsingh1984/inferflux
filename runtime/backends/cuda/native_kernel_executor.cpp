@@ -2022,8 +2022,9 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         return outputs;
       }
 
+      // SampleBatch already synchronized the stream, so forward events are
+      // guaranteed complete.  Compute elapsed times without an extra sync.
       float fwd_ms = 0.0f;
-      cudaEventSynchronize(forward_stop_);
       if (CheckCudaStatus(
               cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
               "cudaEventElapsedTime(forward,decode_batch)")) {
@@ -2362,7 +2363,7 @@ bool NativeKernelExecutor::NativeIsReady() const { return model_loaded_; }
 void NativeKernelExecutor::NativeFreeSequence(int sequence_id) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (kv_cache_) {
-    kv_cache_->ClearSequence(sequence_id);
+    kv_cache_->ClearSequenceAsync(sequence_id, compute_stream_);
   }
 #endif
 }

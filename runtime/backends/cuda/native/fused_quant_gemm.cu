@@ -150,8 +150,9 @@ bool DispatchFused(const void *data, const half *activation, half *output,
   auto *w = static_cast<const BlockType *>(data);
   if (M == 1) {
     int grid = (N + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
-    GemvKernel<<<grid, kGemvThreadsPerBlock, 0, stream>>>(w, activation, output,
-                                                          N, K);
+    size_t smem = static_cast<size_t>(K) * sizeof(float);
+    GemvKernel<<<grid, kGemvThreadsPerBlock, smem, stream>>>(
+        w, activation, output, N, K);
   } else {
     int grid = (N + kTileN - 1) / kTileN;
     GemmKernel<<<grid, kSmallBatchThreads, 0, stream>>>(w, activation, output,
