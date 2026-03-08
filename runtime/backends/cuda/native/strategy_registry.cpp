@@ -250,11 +250,7 @@ void QuantizedRuntimeStrategyRegistry::RegisterDefaults() {
       "matmul.fused.dequant_tile_gemm.v1",
       MatmulExecutionMode::kFusedDequantTileGemm,
       std::vector<GGUF::TensorType>{
-          GGUF::TensorType::Q4_0, GGUF::TensorType::Q4_1,
-          GGUF::TensorType::Q5_0, GGUF::TensorType::Q5_1,
-          GGUF::TensorType::Q8_0, GGUF::TensorType::Q8_1,
-          GGUF::TensorType::Q2_K, GGUF::TensorType::Q3_K,
-          GGUF::TensorType::Q4_K, GGUF::TensorType::Q5_K,
+          GGUF::TensorType::Q8_0, GGUF::TensorType::Q4_K,
           GGUF::TensorType::Q6_K, GGUF::TensorType::Q8_K},
       8));
 

@@ -832,8 +832,6 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       ++decode_requests;
     }
   }
-  GlobalMetrics().RecordSchedulerIteration(prefill_requests, decode_requests,
-                                           selection.total_tokens);
 
   GlobalMetrics().SetDecodeQueueDepth(
       static_cast<int>(selection.pending.size()));
@@ -1155,6 +1153,16 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       }
     }
   }
+
+  std::size_t metrics_decode_requests = decode_requests;
+  if (!use_decode_workers_) {
+    // In unified (single-worker) mode staged decode requests are executed in
+    // the same ProcessBatch iteration, so count them toward mixed-phase
+    // accounting.
+    metrics_decode_requests = decode_ready.size();
+  }
+  GlobalMetrics().RecordSchedulerIteration(
+      prefill_requests, metrics_decode_requests, selection.total_tokens);
 
   if (use_decode_workers_) {
     GlobalMetrics().SetDecodeQueueDepth(
@@ -1556,9 +1564,9 @@ void Scheduler::EvictionWorkerLoop() {
   // teardown doesn't block waiting on sleep_for.
   std::unique_lock<std::mutex> wait_lock(eviction_mutex_);
   while (eviction_running_) {
-    const bool stop_requested = eviction_cv_.wait_for(
-        wait_lock, std::chrono::seconds(30),
-        [this] { return !eviction_running_.load(); });
+    const bool stop_requested =
+        eviction_cv_.wait_for(wait_lock, std::chrono::seconds(30),
+                              [this] { return !eviction_running_.load(); });
     if (stop_requested || !eviction_running_) {
       break;
     }

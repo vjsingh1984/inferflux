@@ -188,6 +188,12 @@ void NativeCudaBackend::FreeSequence(int sequence_id) {
 }
 
 std::vector<uint8_t> NativeCudaBackend::SerializeSequence(int sequence_id) {
+  if (runtime_) {
+    auto blob = runtime_->NativeSerializeSequence(sequence_id);
+    if (!blob.empty()) {
+      return blob;
+    }
+  }
   auto backend = DelegateBackend();
   if (!backend) {
     return {};
@@ -197,6 +203,9 @@ std::vector<uint8_t> NativeCudaBackend::SerializeSequence(int sequence_id) {
 
 bool NativeCudaBackend::HydrateSequence(int dest_sequence_id,
                                         const std::vector<uint8_t> &blob) {
+  if (runtime_ && runtime_->NativeHydrateSequence(dest_sequence_id, blob)) {
+    return true;
+  }
   auto backend = DelegateBackend();
   if (!backend) {
     return false;

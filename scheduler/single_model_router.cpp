@@ -47,6 +47,29 @@ bool BackendSupportsModelFormat(const BackendFactoryResult &selection,
   return false;
 }
 
+BackendCapabilities
+BuildModelCapabilities(const BackendCapabilities &base,
+                       BackendProvider provider,
+                       const std::shared_ptr<LlamaCPUBackend> &backend) {
+  BackendCapabilities caps = base;
+  caps.supports_vision = backend && backend->SupportsVision();
+
+  // Native CUDA currently serves the unified decode/prefill path; legacy
+  // llama.cpp-only surfaces (logprobs/grammar embeddings/spec decode) are not
+  // available without delegation and must be gated at routing time.
+  if (provider == BackendProvider::kNative ||
+      std::dynamic_pointer_cast<NativeCudaBackend>(backend) != nullptr) {
+    caps.supports_logprobs = false;
+    caps.supports_structured_output = false;
+    caps.supports_embeddings = false;
+    caps.supports_speculative_decoding = false;
+    // Prefix copy + KV serialization are implemented natively.
+    caps.supports_kv_prefix_transfer = true;
+  }
+
+  return caps;
+}
+
 void AppendUniqueHint(std::vector<std::string> *candidates,
                       const std::string &hint) {
   if (!candidates) {
@@ -168,9 +191,12 @@ bool SingleModelRouter::RegisterModel(
   entry.info.backend_fallback = info.backend_fallback;
   entry.info.backend_fallback_reason = info.backend_fallback_reason;
   auto register_target = ParseLlamaBackendTarget(entry.info.backend);
-  entry.info.capabilities =
-      DescribeLlamaBackendTarget(register_target).capabilities;
-  entry.info.capabilities.supports_vision = backend->SupportsVision();
+  const BackendProvider register_provider =
+      entry.info.backend_provider == "native" ? BackendProvider::kNative
+                                              : BackendProvider::kLlamaCpp;
+  entry.info.capabilities = BuildModelCapabilities(
+      DescribeLlamaBackendTarget(register_target).capabilities,
+      register_provider, backend);
   entry.info.supports_structured_output =
       entry.info.capabilities.supports_structured_output;
   entry.info.is_moe = backend->IsMoE();
@@ -379,8 +405,8 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
     info.backend_fallback_reason = selected_native_executor_fallback_reason;
   }
   info.ready = selection.backend->IsReady();
-  info.capabilities = selection.capabilities;
-  info.capabilities.supports_vision = selection.backend->SupportsVision();
+  info.capabilities = BuildModelCapabilities(
+      selection.capabilities, selection.provider, selection.backend);
   info.supports_structured_output =
       info.capabilities.supports_structured_output;
   info.is_moe = selection.backend->IsMoE();

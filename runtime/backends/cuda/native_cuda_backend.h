@@ -22,6 +22,10 @@ public:
   bool LoadModel(const std::filesystem::path &model_path,
                  const LlamaBackendConfig &config = {}) override;
 
+#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
+  std::string Name() const override { return "native_cuda"; }
+#endif
+
   std::vector<UnifiedBatchOutput>
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override;
 

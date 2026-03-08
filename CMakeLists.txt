@@ -471,6 +471,7 @@ add_executable(inferflux_tests
   tests/unit/test_unified_batching.cpp
   tests/unit/test_model_registry.cpp
   tests/unit/test_model_selection.cpp
+  tests/unit/test_single_model_router.cpp
   tests/unit/test_stop_sequences.cpp
   tests/unit/test_parallel_context.cpp
   tests/unit/test_ep_dispatch.cpp

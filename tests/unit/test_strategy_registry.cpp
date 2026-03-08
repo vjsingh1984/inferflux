@@ -80,6 +80,19 @@ TEST_CASE("Strategy registry falls back to compatibility matmul on pre-SM80",
   CHECK(selection.matmul->Id() == "matmul.compat.dequantize_then_gemm");
 }
 
+TEST_CASE(
+    "Strategy registry keeps unsupported fused types on compatibility path",
+    "[quantization]") {
+  auto &registry = QuantizedRuntimeStrategyRegistry::Instance();
+  registry.RegisterDefaults();
+
+  const auto selection =
+      registry.Select(gguf::TensorType::Q4_0, KvPrecision::kFp16, 8, 9);
+
+  REQUIRE(selection.matmul != nullptr);
+  CHECK(selection.matmul->Id() == "matmul.compat.dequantize_then_gemm");
+}
+
 TEST_CASE("BF16 attention strategy requires SM80+", "[quantization]") {
   auto &registry = QuantizedRuntimeStrategyRegistry::Instance();
   registry.RegisterDefaults();
