@@ -1,7 +1,5 @@
 #include "runtime/backends/cuda/native_kernel_executor.h"
-#include "model/hf_tokenizer.h"
-#include "model/llama_tokenizer.h"
-#include "model/tokenizer.h"
+#include "model/tokenizer_factory.h"
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
@@ -49,7 +47,6 @@ inferflux::SafetensorsLoader::ModelConfig ModelInfoToModelConfig(
   config.rope_freq_base = info.rope_freq_base;
   config.rope_freq_scale = info.rope_freq_scale;
   config.rope_dim = info.rope_dim;
-  config.rope_type = static_cast<int>(info.rope_type);
   config.model_type = info.model_type;
   config.activation = info.activation;
   config.torch_dtype = info.torch_dtype;
@@ -434,14 +431,6 @@ bool SafetensorsLoader::ParseConfig(const std::string &config_path) {
     if (config.contains("rope_theta")) {
       config_.rope_freq_base = config["rope_theta"];
     }
-    if (config.contains("rope_scaling") && config["rope_scaling"].is_object()) {
-      const auto &rs = config["rope_scaling"];
-      if (rs.contains("factor") && rs["factor"].is_number_float()) {
-        float f = rs["factor"].get<float>();
-        if (f > 0.0f)
-          config_.rope_freq_scale = 1.0f / f;
-      }
-    }
 
     // Model type
     if (config.contains("model_type")) {
@@ -798,17 +787,17 @@ bool NativeKernelExecutor::ConfigureDequantizedCachePolicy(
     const std::string &raw_policy) {
   std::string policy = ToLowerAscii(raw_policy);
   if (policy.empty()) {
-    policy = "batch";
+    policy = "model";
   }
 
   runtime::cuda::native::DequantizedCachePolicy parsed =
-      runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime;
+      runtime::cuda::native::DequantizedCachePolicy::kModelLifetime;
   if (!runtime::cuda::native::ParseDequantizedCachePolicy(policy, &parsed)) {
     log::Warn("native_kernel_executor", "Invalid dequantized cache policy '" +
                                             policy +
-                                            "'; falling back to batch");
-    parsed = runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime;
-    policy = "batch";
+                                            "'; falling back to model");
+    parsed = runtime::cuda::native::DequantizedCachePolicy::kModelLifetime;
+    policy = "model";
   }
   dequantized_cache_policy_ = parsed;
   dequantized_cache_policy_hint_ = policy;
@@ -1095,32 +1084,19 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     return false;
   }
 
-  // 6. Load tokenizer via strategy pattern (LlamaTokenizer by default)
+  // 6. Load tokenizer via factory (LlamaTokenizer for GGUF, HFTokenizer for
+  // safetensors/hf, with automatic fallback).
   {
-    const std::string model_path_str = loaded_model_path_.string();
-    auto llama_tok = std::make_unique<LlamaTokenizer>();
-    if (llama_tok->Load(model_path_str)) {
-      tokenizer_ = std::move(llama_tok);
-      log::Info("native_kernel_executor",
-                "Using LlamaTokenizer (llama.cpp) for model: " +
-                    model_path_str);
-    } else {
-      // Fallback: HFTokenizer (adapter over MlxTokenizer) for safetensors
-      auto hf_tok = std::make_unique<HFTokenizer>();
-      const std::string tok_path =
-          model_loader_ ? model_path_str : loader_->GetModelPath();
-      if (hf_tok->Load(tok_path)) {
-        tokenizer_ = std::move(hf_tok);
-        log::Info("native_kernel_executor",
-                  "Using HFTokenizer (tokenizer.json BPE) for model: " +
-                      tok_path);
-      } else {
-        log::Error(
-            "native_kernel_executor",
-            "Failed to initialize tokenizer for model path: " + tok_path +
-                " (no GGUF vocab and no tokenizer.json found)");
-        return false;
-      }
+    const std::string tokenizer_path =
+        model_loader_ ? loaded_model_path_.string() : loader_->GetModelPath();
+    const std::string model_format =
+        model_loader_ ? model_loader_->GetFormat() : "safetensors";
+    tokenizer_ = CreateTokenizer(tokenizer_path, model_format);
+    if (!tokenizer_) {
+      log::Error("native_kernel_executor",
+                 "Failed to initialize tokenizer for model path: " +
+                     tokenizer_path);
+      return false;
     }
   }
 
@@ -1157,9 +1133,6 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
           "cudaStreamCreateWithFlags(prefill_stream_)")) {
     return false;
   }
-
-  // 11. Create per-stream cuBLAS handles to avoid SetStream serialization
-  gemm_->InitializeMultiStream({decode_stream_, prefill_stream_});
 
   log::Info("native_kernel_executor",
             "Native inference pipeline initialized successfully");
@@ -1444,43 +1417,12 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
                                                batch_seq_ids, d_logits_, B);
 
     if (fwd_ok) {
-      // Apply per-sequence logit bias and repetition penalty
-      for (int b = 0; b < B; ++b) {
-        float *logits_b = d_logits_ + b * model_forward_->VocabSize();
-        const auto &input = inputs[decode_group[b].input_idx];
-
-        if (!input.sampling.logit_bias.empty()) {
-          std::vector<int> bias_ids;
-          std::vector<float> bias_vals;
-          bias_ids.reserve(input.sampling.logit_bias.size());
-          bias_vals.reserve(input.sampling.logit_bias.size());
-          for (const auto &[tok, val] : input.sampling.logit_bias) {
-            bias_ids.push_back(tok);
-            bias_vals.push_back(val);
-          }
-          sampler_->ApplyLogitBias(logits_b, bias_ids, bias_vals);
-        }
-
-        if (input.sampling.repetition_penalty != 1.0f) {
-          int seq_id = decode_group[b].sequence_id;
-          auto &history = sequence_token_history_[seq_id];
-          int window = input.sampling.penalty_last_n;
-          if (window > 0 && !history.empty()) {
-            int start = std::max(0, static_cast<int>(history.size()) - window);
-            std::vector<int> window_hist(history.begin() + start,
-                                         history.end());
-            sampler_->ApplyRepetitionPenalty(logits_b, window_hist,
-                                             input.sampling.repetition_penalty);
-          }
-        }
-      }
-
       // Batched sampling on decode stream (non-blocking)
       std::vector<int> sampled_tokens;
       sampler_->SampleBatch(d_logits_, B, batch_temps, batch_top_ks,
                             batch_top_ps, &sampled_tokens);
 
-      // Fill outputs and track token history
+      // Fill outputs
       for (int b = 0; b < B; ++b) {
         const auto &de = decode_group[b];
         auto &output = outputs[de.input_idx];
@@ -1489,7 +1431,6 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
             tokenizer_ ? tokenizer_->TokenToString(sampled_tokens[b]) : "";
         output.ok = true;
         perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
-        sequence_token_history_[de.sequence_id].push_back(sampled_tokens[b]);
       }
     } else {
       for (const auto &de : decode_group) {
@@ -1690,29 +1631,13 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
     bool fwd_ok = model_forward_->BatchForward(batch_tokens, batch_n_past,
                                                batch_seq_ids, d_logits_, B);
     if (!CheckCudaStatus(cudaEventRecord(forward_stop_, compute_stream_),
-                         "cudaEventRecord(forward_stop_,decode_batch)") ||
-        !CheckCudaStatus(cudaEventSynchronize(forward_stop_),
-                         "cudaEventSynchronize(forward_stop_,decode_batch)")) {
+                         "cudaEventRecord(forward_stop_,decode_batch)")) {
       for (const auto &de : decode_group) {
         outputs[de.input_idx].ok = false;
         outputs[de.input_idx].token = -1;
       }
       return outputs;
     }
-    float fwd_ms = 0.0f;
-    if (!CheckCudaStatus(
-            cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
-            "cudaEventElapsedTime(forward,decode_batch)")) {
-      for (const auto &de : decode_group) {
-        outputs[de.input_idx].ok = false;
-        outputs[de.input_idx].token = -1;
-      }
-      return outputs;
-    }
-    GlobalMetrics().RecordNativeForwardPass(/*is_decode=*/true, B, fwd_ms);
-    perf_accum_.decode_ms.store(
-        perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
-        std::memory_order_relaxed);
 
     if (!fwd_ok) {
       log::Error("native_kernel_executor", "BatchForward failed");
@@ -1730,66 +1655,38 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         }
         return outputs;
       }
-      // Apply per-sequence logit bias and repetition penalty
-      for (int b = 0; b < B; ++b) {
-        float *logits_b = d_logits_ + b * model_forward_->VocabSize();
-        const auto &input = inputs[decode_group[b].input_idx];
-
-        // Logit bias
-        if (!input.sampling.logit_bias.empty()) {
-          std::vector<int> bias_ids;
-          std::vector<float> bias_vals;
-          bias_ids.reserve(input.sampling.logit_bias.size());
-          bias_vals.reserve(input.sampling.logit_bias.size());
-          for (const auto &[tok, val] : input.sampling.logit_bias) {
-            bias_ids.push_back(tok);
-            bias_vals.push_back(val);
-          }
-          sampler_->ApplyLogitBias(logits_b, bias_ids, bias_vals);
-        }
-
-        // Repetition penalty
-        if (input.sampling.repetition_penalty != 1.0f) {
-          int seq_id = decode_group[b].sequence_id;
-          auto &history = sequence_token_history_[seq_id];
-          int window = input.sampling.penalty_last_n;
-          if (window > 0 && !history.empty()) {
-            int start = std::max(0, static_cast<int>(history.size()) - window);
-            std::vector<int> window_hist(history.begin() + start,
-                                         history.end());
-            sampler_->ApplyRepetitionPenalty(logits_b, window_hist,
-                                             input.sampling.repetition_penalty);
-          }
-        }
-      }
-
       std::vector<int> sampled_tokens;
       sampler_->SampleBatch(d_logits_, B, batch_temps, batch_top_ks,
                             batch_top_ps, &sampled_tokens);
+      // SampleBatch already synchronizes the stream before returning results
       if (!CheckCudaStatus(cudaEventRecord(sampling_stop_, compute_stream_),
-                           "cudaEventRecord(sampling_stop_,decode_batch)") ||
-          !CheckCudaStatus(
-              cudaEventSynchronize(sampling_stop_),
-              "cudaEventSynchronize(sampling_stop_,decode_batch)")) {
+                           "cudaEventRecord(sampling_stop_,decode_batch)")) {
         for (const auto &de : decode_group) {
           outputs[de.input_idx].ok = false;
           outputs[de.input_idx].token = -1;
         }
         return outputs;
+      }
+
+      // Compute timing from events (deferred — events already recorded)
+      float fwd_ms = 0.0f;
+      cudaEventSynchronize(forward_stop_);
+      if (CheckCudaStatus(
+              cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
+              "cudaEventElapsedTime(forward,decode_batch)")) {
+        GlobalMetrics().RecordNativeForwardPass(/*is_decode=*/true, B, fwd_ms);
+        perf_accum_.decode_ms.store(
+            perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
+            std::memory_order_relaxed);
       }
       float samp_ms = 0.0f;
-      if (!CheckCudaStatus(
+      if (CheckCudaStatus(
               cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_),
               "cudaEventElapsedTime(sampling,decode_batch)")) {
-        for (const auto &de : decode_group) {
-          outputs[de.input_idx].ok = false;
-          outputs[de.input_idx].token = -1;
-        }
-        return outputs;
+        GlobalMetrics().RecordNativeSampling(B, samp_ms);
       }
-      GlobalMetrics().RecordNativeSampling(B, samp_ms);
 
-      // Fill outputs and track token history
+      // Fill outputs
       for (int b = 0; b < B; ++b) {
         int idx = decode_group[b].input_idx;
         int token_id = sampled_tokens[b];
@@ -1801,8 +1698,6 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
           outputs[idx].piece =
               tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
           perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
-          sequence_token_history_[decode_group[b].sequence_id].push_back(
-              token_id);
         }
         outputs[idx].ok = true;
       }
@@ -1832,12 +1727,11 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       }
       if (!CheckCudaStatus(
               cudaEventRecord(forward_stop_, compute_stream_),
-              "cudaEventRecord(forward_stop_,prefill_no_logits)") ||
-          !CheckCudaStatus(
-              cudaEventSynchronize(forward_stop_),
-              "cudaEventSynchronize(forward_stop_,prefill_no_logits)")) {
+              "cudaEventRecord(forward_stop_,prefill_no_logits)")) {
         continue;
       }
+      // Need sync here because prefill-no-logits has no subsequent sampling
+      cudaEventSynchronize(forward_stop_);
       float fwd_ms = 0.0f;
       if (!CheckCudaStatus(
               cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
@@ -1867,30 +1761,10 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         continue;
       }
       if (!CheckCudaStatus(cudaEventRecord(forward_stop_, compute_stream_),
-                           "cudaEventRecord(forward_stop_,prefill_logits)") ||
-          !CheckCudaStatus(
-              cudaEventSynchronize(forward_stop_),
-              "cudaEventSynchronize(forward_stop_,prefill_logits)")) {
+                           "cudaEventRecord(forward_stop_,prefill_logits)")) {
         continue;
       }
-      float fwd_ms = 0.0f;
-      if (!CheckCudaStatus(
-              cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
-              "cudaEventElapsedTime(forward,prefill_logits)")) {
-        continue;
-      }
-      GlobalMetrics().RecordNativeForwardPass(is_decode, batch_tokens, fwd_ms);
-      if (is_decode) {
-        perf_accum_.decode_ms.store(
-            perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
-            std::memory_order_relaxed);
-      } else {
-        perf_accum_.prefill_ms.store(
-            perf_accum_.prefill_ms.load(std::memory_order_relaxed) + fwd_ms,
-            std::memory_order_relaxed);
-        perf_accum_.prompt_tokens.fetch_add(batch_tokens,
-                                            std::memory_order_relaxed);
-      }
+      // Don't sync forward event here — sampling will sync the stream
     }
 
     // Sample
@@ -1903,20 +1777,37 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       int token_id = sampler_->Sample(
           d_logits_, input.sampling.temperature, input.sampling.top_k,
           input.sampling.top_p, input.sampling.seed);
+      // Sample() already synchronizes the stream before returning
       if (!CheckCudaStatus(cudaEventRecord(sampling_stop_, compute_stream_),
-                           "cudaEventRecord(sampling_stop_,prefill_logits)") ||
-          !CheckCudaStatus(
-              cudaEventSynchronize(sampling_stop_),
-              "cudaEventSynchronize(sampling_stop_,prefill_logits)")) {
+                           "cudaEventRecord(sampling_stop_,prefill_logits)")) {
         continue;
+      }
+
+      // Deferred timing: compute elapsed from already-completed events
+      float fwd_ms = 0.0f;
+      if (CheckCudaStatus(
+              cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
+              "cudaEventElapsedTime(forward,prefill_logits)")) {
+        GlobalMetrics().RecordNativeForwardPass(is_decode, batch_tokens,
+                                                fwd_ms);
+        if (is_decode) {
+          perf_accum_.decode_ms.store(
+              perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
+              std::memory_order_relaxed);
+        } else {
+          perf_accum_.prefill_ms.store(
+              perf_accum_.prefill_ms.load(std::memory_order_relaxed) + fwd_ms,
+              std::memory_order_relaxed);
+          perf_accum_.prompt_tokens.fetch_add(batch_tokens,
+                                              std::memory_order_relaxed);
+        }
       }
       float samp_ms = 0.0f;
-      if (!CheckCudaStatus(
+      if (CheckCudaStatus(
               cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_),
               "cudaEventElapsedTime(sampling,prefill_logits)")) {
-        continue;
+        GlobalMetrics().RecordNativeSampling(1, samp_ms);
       }
-      GlobalMetrics().RecordNativeSampling(1, samp_ms);
 
       if (tokenizer_ && token_id == tokenizer_->EosTokenId()) {
         output.token = -1;
@@ -2102,32 +1993,16 @@ NativeCudaRuntime::NativePerfSnapshot NativeKernelExecutor::NativeTakePerf() {
 std::vector<int>
 NativeKernelExecutor::NativeTokenize(const std::string &prompt) const {
   if (tokenizer_) {
-    return tokenizer_->Tokenize(prompt, true);
+    return tokenizer_->Tokenize(prompt);
   }
   return {};
 }
 
 int NativeKernelExecutor::NativeTokenCount(const std::string &text) const {
   if (tokenizer_) {
-    return tokenizer_->TokenCount(text);
+    return static_cast<int>(tokenizer_->Tokenize(text).size());
   }
   return 0;
-}
-
-NativeCudaRuntime::NativeChatResult NativeKernelExecutor::NativeFormatChat(
-    const std::vector<std::pair<std::string, std::string>> &messages,
-    bool add_assistant_prefix) const {
-  NativeChatResult result;
-  if (tokenizer_) {
-    auto chat = tokenizer_->ApplyChatTemplate(messages, add_assistant_prefix);
-    result.prompt = std::move(chat.prompt);
-    result.valid = chat.valid;
-  }
-  return result;
-}
-
-const ITokenizer *NativeKernelExecutor::NativeGetTokenizer() const {
-  return tokenizer_.get();
 }
 
 bool NativeKernelExecutor::NativeIsReady() const { return model_loaded_; }
@@ -2135,20 +2010,32 @@ bool NativeKernelExecutor::NativeIsReady() const { return model_loaded_; }
 void NativeKernelExecutor::NativeFreeSequence(int sequence_id) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (kv_cache_) {
-    // Pass compute_stream_ to avoid race condition: cudaMemset on the NULL
-    // stream does NOT synchronize with cudaStreamNonBlocking streams.
-    // Using cudaMemsetAsync on compute_stream_ ensures the clear is ordered
-    // before subsequent forward pass kernels on the same stream.
-    kv_cache_->ClearSequence(sequence_id, compute_stream_);
+    kv_cache_->ClearSequence(sequence_id);
   }
 #endif
-  sequence_token_history_.erase(sequence_id);
 }
 
 void NativeKernelExecutor::NativeCopySequencePrefix(int /*src_seq*/,
                                                     int /*dst_seq*/,
                                                     int /*n_tokens*/) {
   // No-op stub — full implementation needs KV cache copy support
+}
+
+NativeCudaRuntime::NativeChatResult NativeKernelExecutor::NativeFormatChat(
+    const std::vector<std::pair<std::string, std::string>> &messages,
+    bool add_assistant_prefix) const {
+  NativeChatResult result;
+  if (!tokenizer_) {
+    return result;
+  }
+  auto chat = tokenizer_->ApplyChatTemplate(messages, add_assistant_prefix);
+  result.prompt = std::move(chat.prompt);
+  result.valid = chat.valid;
+  return result;
+}
+
+const ITokenizer *NativeKernelExecutor::NativeGetTokenizer() const {
+  return tokenizer_.get();
 }
 
 } // namespace inferflux

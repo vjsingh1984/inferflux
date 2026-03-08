@@ -1,11 +1,18 @@
 #include "runtime/backends/cuda/native/quantized_weight_map.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
+#include "runtime/backends/cuda/native/quantization_handler.h"
 #include "server/logging/logger.h"
 
 namespace inferflux {
 
 QuantizedWeightMap::~QuantizedWeightMap() {
-  // Note: GPU memory is managed by IModelLoader, we don't own it
+  // Note: per-tensor GPU memory is managed by IModelLoader, we don't own it
+#ifdef INFERFLUX_HAS_CUDA
+  if (scratch_buffer_) {
+    cudaFree(scratch_buffer_);
+    scratch_buffer_ = nullptr;
+  }
+#endif
 }
 
 bool QuantizedWeightMap::Build(IModelLoader *loader, const ModelInfo &config,
@@ -75,6 +82,47 @@ bool QuantizedWeightMap::Build(IModelLoader *loader, const ModelInfo &config,
     lm_head_accessor = embed_tokens_accessor;
   }
 
+#ifdef INFERFLUX_HAS_CUDA
+  // Allocate scratch buffer sized for the largest quantized projection weight
+  if (is_quantized_) {
+    size_t max_elements = 0;
+    for (int layer = 0; layer < num_layers_; ++layer) {
+      auto &lw = layers_[layer];
+      for (auto &acc :
+           {lw.q_proj_accessor, lw.k_proj_accessor, lw.v_proj_accessor,
+            lw.o_proj_accessor, lw.gate_proj_accessor, lw.up_proj_accessor,
+            lw.down_proj_accessor}) {
+        if (acc && acc->IsQuantized()) {
+          auto dims = acc->GetDimensions();
+          max_elements = std::max(max_elements, dims.first * dims.second);
+        }
+      }
+    }
+    // Also check LM head (may be quantized)
+    if (lm_head_accessor && lm_head_accessor->IsQuantized()) {
+      auto dims = lm_head_accessor->GetDimensions();
+      max_elements = std::max(max_elements, dims.first * dims.second);
+    }
+    if (max_elements > 0) {
+      auto err = cudaMalloc(reinterpret_cast<void **>(&scratch_buffer_),
+                            max_elements * sizeof(half));
+      if (err != cudaSuccess) {
+        log::Error(
+            "quantized_weight_map",
+            "Failed to allocate scratch buffer (" +
+                std::to_string(max_elements * sizeof(half) / 1024 / 1024) +
+                " MiB)");
+        return false;
+      }
+      scratch_buffer_elements_ = max_elements;
+      log::Info("quantized_weight_map",
+                "Scratch buffer: " +
+                    std::to_string(max_elements * sizeof(half) / 1024 / 1024) +
+                    " MiB (replaces per-tensor dequantized cache)");
+    }
+  }
+#endif
+
   log::Info("quantized_weight_map", "Weight map built successfully");
   return true;
 }
@@ -122,38 +170,77 @@ const half *QuantizedWeightMap::GetDequantizedWeights(
   return cache_ptr;
 }
 
-// --- Per-layer accessors ---
-
-const half *QuantizedWeightMap::LayerQProj(int layer) const {
-  if (layer < 0 || layer >= num_layers_) {
+const half *QuantizedWeightMap::DequantizeToScratch(
+    std::shared_ptr<IWeightAccessor> accessor) const {
+  if (!accessor) {
     return nullptr;
   }
-  return GetDequantizedWeights(layers_[layer].q_proj_accessor,
-                               layers_[layer].q_proj);
+
+  // Non-quantized weights have permanent GPU pointers — return directly
+  if (!accessor->IsQuantized()) {
+    return accessor->GetDequantizedGpuWeights(stream_);
+  }
+
+  // Quantized: dequantize into shared scratch buffer
+  if (!scratch_buffer_) {
+    // Fallback to per-tensor caching if scratch not allocated
+    return accessor->GetDequantizedGpuWeights(stream_);
+  }
+
+  auto dims = accessor->GetDimensions();
+  size_t num_elements = dims.first * dims.second;
+  if (num_elements > scratch_buffer_elements_) {
+    log::Warn("quantized_weight_map",
+              "Tensor too large for scratch buffer, falling back to cache");
+    return accessor->GetDequantizedGpuWeights(stream_);
+  }
+
+  // Get the quantization handler and dequantize directly into scratch
+  void *raw_gpu = accessor->GetGpuWeights(stream_);
+  if (!raw_gpu) {
+    return nullptr;
+  }
+
+  auto type_str = accessor->GetDataType();
+  auto handler =
+      runtime::cuda::native::QuantizationHandlerRegistry::Instance().Create(
+          type_str);
+  if (!handler) {
+    log::Warn("quantized_weight_map",
+              "No handler for " + type_str + ", falling back to cache");
+    return accessor->GetDequantizedGpuWeights(stream_);
+  }
+
+  handler->DequantizeGpuToGpu(raw_gpu, scratch_buffer_, num_elements, stream_);
+  return scratch_buffer_;
+}
+
+// --- Per-layer accessors ---
+// Projection weights use scratch buffer (no per-tensor caching).
+// Norms/embeddings use permanent cache (small, accessed repeatedly).
+
+const half *QuantizedWeightMap::LayerQProj(int layer) const {
+  if (layer < 0 || layer >= num_layers_)
+    return nullptr;
+  return DequantizeToScratch(layers_[layer].q_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerKProj(int layer) const {
-  if (layer < 0 || layer >= num_layers_) {
+  if (layer < 0 || layer >= num_layers_)
     return nullptr;
-  }
-  return GetDequantizedWeights(layers_[layer].k_proj_accessor,
-                               layers_[layer].k_proj);
+  return DequantizeToScratch(layers_[layer].k_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerVProj(int layer) const {
-  if (layer < 0 || layer >= num_layers_) {
+  if (layer < 0 || layer >= num_layers_)
     return nullptr;
-  }
-  return GetDequantizedWeights(layers_[layer].v_proj_accessor,
-                               layers_[layer].v_proj);
+  return DequantizeToScratch(layers_[layer].v_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerOProj(int layer) const {
-  if (layer < 0 || layer >= num_layers_) {
+  if (layer < 0 || layer >= num_layers_)
     return nullptr;
-  }
-  return GetDequantizedWeights(layers_[layer].o_proj_accessor,
-                               layers_[layer].o_proj);
+  return DequantizeToScratch(layers_[layer].o_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerInputNorm(int layer) const {
@@ -173,27 +260,21 @@ const half *QuantizedWeightMap::LayerPostAttnNorm(int layer) const {
 }
 
 const half *QuantizedWeightMap::LayerGateProj(int layer) const {
-  if (layer < 0 || layer >= num_layers_) {
+  if (layer < 0 || layer >= num_layers_)
     return nullptr;
-  }
-  return GetDequantizedWeights(layers_[layer].gate_proj_accessor,
-                               layers_[layer].gate_proj);
+  return DequantizeToScratch(layers_[layer].gate_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerUpProj(int layer) const {
-  if (layer < 0 || layer >= num_layers_) {
+  if (layer < 0 || layer >= num_layers_)
     return nullptr;
-  }
-  return GetDequantizedWeights(layers_[layer].up_proj_accessor,
-                               layers_[layer].up_proj);
+  return DequantizeToScratch(layers_[layer].up_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerDownProj(int layer) const {
-  if (layer < 0 || layer >= num_layers_) {
+  if (layer < 0 || layer >= num_layers_)
     return nullptr;
-  }
-  return GetDequantizedWeights(layers_[layer].down_proj_accessor,
-                               layers_[layer].down_proj);
+  return DequantizeToScratch(layers_[layer].down_proj_accessor);
 }
 
 // --- Bias accessors ---
@@ -233,6 +314,7 @@ const half *QuantizedWeightMap::FinalNorm() const {
 }
 
 const half *QuantizedWeightMap::LmHead() const {
+  // LM head is accessed every forward pass — keep permanent cache
   return GetDequantizedWeights(lm_head_accessor, lm_head_);
 }
 
@@ -315,17 +397,11 @@ QuantizedWeightMap::GetWeightAccessor(const std::string &name) {
 void QuantizedWeightMap::ClearCache() {
   log::Info("quantized_weight_map", "Clearing dequantized weight cache");
 
-  // Clear layer caches
+  // Projection weights use scratch buffer — nothing to clear for them.
+  // Only clear permanently-cached non-projection weights.
   for (auto &lw : layers_) {
-    lw.q_proj = nullptr;
-    lw.k_proj = nullptr;
-    lw.v_proj = nullptr;
-    lw.o_proj = nullptr;
     lw.input_norm = nullptr;
     lw.post_attn_norm = nullptr;
-    lw.gate_proj = nullptr;
-    lw.up_proj = nullptr;
-    lw.down_proj = nullptr;
     lw.q_proj_bias = nullptr;
     lw.k_proj_bias = nullptr;
     lw.v_proj_bias = nullptr;

@@ -191,9 +191,13 @@ private:
     std::shared_ptr<IWeightAccessor> v_proj_bias_accessor;
   };
 
-  // Helper to get dequantized weights (lazy evaluation)
+  // Helper to get dequantized weights (lazy evaluation, permanent cache)
   const half *GetDequantizedWeights(std::shared_ptr<IWeightAccessor> accessor,
                                     const half *&cache_ptr) const;
+
+  // Dequantize into shared scratch buffer (no per-tensor caching)
+  const half *
+  DequantizeToScratch(std::shared_ptr<IWeightAccessor> accessor) const;
 
   IModelLoader *loader_{nullptr};
   cudaStream_t stream_{nullptr};
@@ -205,6 +209,10 @@ private:
   mutable const half *embed_tokens_{nullptr};
   mutable const half *final_norm_{nullptr};
   mutable const half *lm_head_{nullptr};
+
+  // Scratch buffer for on-demand projection dequantization
+  mutable half *scratch_buffer_{nullptr};
+  size_t scratch_buffer_elements_{0};
 
   // Global weight accessors
   std::shared_ptr<IWeightAccessor> embed_tokens_accessor;

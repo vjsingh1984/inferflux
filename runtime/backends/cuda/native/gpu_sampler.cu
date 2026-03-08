@@ -1,8 +1,8 @@
-#include "runtime/backends/cuda/native/cuda_kernels.cuh"
 #include "runtime/backends/cuda/native/gpu_sampler.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
 
 #include "server/logging/logger.h"
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
@@ -179,6 +179,47 @@ __global__ void TopPMaskKernel(float *__restrict__ probs, int vocab_size,
   }
 }
 
+// Batched argmax: one block per sequence, parallel reduction within each block
+__global__ void BatchedArgmaxKernel(const float *__restrict__ logits,
+                                    int *__restrict__ results, int vocab_size,
+                                    int batch_size) {
+  int seq = blockIdx.x;
+  if (seq >= batch_size)
+    return;
+  extern __shared__ char smem_raw[];
+  float *s_vals = reinterpret_cast<float *>(smem_raw);
+  int *s_idxs = reinterpret_cast<int *>(s_vals + blockDim.x);
+  int tid = threadIdx.x;
+
+  const float *row = logits + seq * vocab_size;
+
+  float best_val = -FLT_MAX;
+  int best_idx = 0;
+  for (int i = tid; i < vocab_size; i += blockDim.x) {
+    if (row[i] > best_val) {
+      best_val = row[i];
+      best_idx = i;
+    }
+  }
+  s_vals[tid] = best_val;
+  s_idxs[tid] = best_idx;
+  __syncthreads();
+
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (s_vals[tid + s] > s_vals[tid]) {
+        s_vals[tid] = s_vals[tid + s];
+        s_idxs[tid] = s_idxs[tid + s];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    results[seq] = s_idxs[0];
+  }
+}
+
 // Multinomial sample: walk CDF until uniform < cumsum
 __global__ void MultinomialSampleKernel(const float *__restrict__ probs,
                                         const float *__restrict__ uniform,
@@ -226,16 +267,10 @@ GpuSampler::~GpuSampler() {
     cudaFree(d_max_val_);
   if (d_max_idx_)
     cudaFree(d_max_idx_);
+  if (d_result_batch_)
+    cudaFree(d_result_batch_);
   if (d_uniform_)
     cudaFree(d_uniform_);
-  if (d_batch_results_)
-    cudaFree(d_batch_results_);
-  if (d_bias_token_ids_)
-    cudaFree(d_bias_token_ids_);
-  if (d_bias_values_)
-    cudaFree(d_bias_values_);
-  if (d_penalty_history_)
-    cudaFree(d_penalty_history_);
   if (rng_initialized_)
     curandDestroyGenerator(rng_);
 }
@@ -261,6 +296,9 @@ bool GpuSampler::Initialize(int vocab_size, cudaStream_t stream) {
   if (err != cudaSuccess)
     return false;
   err = cudaMalloc(&d_uniform_, sizeof(float));
+  if (err != cudaSuccess)
+    return false;
+  err = cudaMalloc(&d_result_batch_, kMaxBatchSize * sizeof(int));
   if (err != cudaSuccess)
     return false;
 
@@ -308,21 +346,15 @@ int GpuSampler::StochasticSample(const float *d_logits, float temperature,
         d_probs_, vocab_size_, temperature);
   }
 
-  // Step 3: Softmax
+  // Step 3: Softmax (no host sync — sum is always positive for valid logits)
   int smem = threads * sizeof(float);
   SoftmaxMaxKernel<<<1, threads, smem, stream_>>>(d_probs_, d_max_val_,
                                                   vocab_size_);
   SoftmaxExpSumKernel<<<1, threads, smem, stream_>>>(
       d_probs_, d_temp_, d_max_val_, d_max_val_, vocab_size_);
-  // d_max_val_ reused as sum_val
-  float h_sum;
-  cudaMemcpyAsync(&h_sum, d_max_val_, sizeof(float), cudaMemcpyDeviceToHost,
-                  stream_);
-  cudaStreamSynchronize(stream_);
-  if (h_sum > 0.0f) {
-    SoftmaxNormKernel<<<blocks, threads, 0, stream_>>>(d_temp_, d_max_val_,
-                                                       vocab_size_);
-  }
+  // d_max_val_ reused as sum_val — SoftmaxNormKernel reads it on device
+  SoftmaxNormKernel<<<blocks, threads, 0, stream_>>>(d_temp_, d_max_val_,
+                                                     vocab_size_);
 
   // Copy normalized probs back
   cudaMemcpyAsync(d_probs_, d_temp_, vocab_size_ * sizeof(float),
@@ -366,6 +398,26 @@ int GpuSampler::Sample(const float *d_logits, float temperature, int top_k,
   return StochasticSample(d_logits, temperature, top_k, top_p);
 }
 
+void GpuSampler::GreedyArgmaxBatch(const float *d_logits, int batch_size,
+                                   std::vector<int> *out_tokens) {
+  NVTX_SCOPE("Sampler_BatchedArgmax");
+  int B = std::min(batch_size, kMaxBatchSize);
+  int threads = 256;
+  int smem = threads * (sizeof(float) + sizeof(int));
+
+  BatchedArgmaxKernel<<<B, threads, smem, stream_>>>(d_logits, d_result_batch_,
+                                                     vocab_size_, B);
+
+  cudaMemcpyAsync(h_result_batch_, d_result_batch_, B * sizeof(int),
+                  cudaMemcpyDeviceToHost, stream_);
+  cudaStreamSynchronize(stream_);
+
+  out_tokens->resize(B);
+  for (int i = 0; i < B; ++i) {
+    (*out_tokens)[i] = h_result_batch_[i];
+  }
+}
+
 void GpuSampler::SampleBatch(const float *d_logits, int batch_size,
                              const std::vector<float> &temperatures,
                              const std::vector<int> &top_ks,
@@ -374,98 +426,19 @@ void GpuSampler::SampleBatch(const float *d_logits, int batch_size,
   NVTX_SCOPE("SampleBatch");
   out_tokens->resize(batch_size);
 
-  // Fast path: if ALL sequences are greedy, launch B argmax kernels without
-  // intermediate syncs, then do a single bulk D2H copy + sync.
-  bool all_greedy = true;
-  for (int i = 0; i < batch_size; ++i) {
-    if (temperatures[i] > 0.0f) {
-      all_greedy = false;
-      break;
-    }
-  }
-
-  if (all_greedy && batch_size > 1) {
-    // Allocate batch result buffer on first use
-    if (!d_batch_results_) {
-      cudaMalloc(&d_batch_results_, batch_size * sizeof(int));
-      h_batch_results_.resize(batch_size);
-    } else if (static_cast<int>(h_batch_results_.size()) < batch_size) {
-      cudaFree(d_batch_results_);
-      cudaMalloc(&d_batch_results_, batch_size * sizeof(int));
-      h_batch_results_.resize(batch_size);
-    }
-
-    int threads = 256;
-    int smem = threads * (sizeof(float) + sizeof(int));
-    for (int i = 0; i < batch_size; ++i) {
-      const float *logits_i = d_logits + i * vocab_size_;
-      ArgmaxKernel<<<1, threads, smem, stream_>>>(
-          logits_i, d_batch_results_ + i, vocab_size_);
-    }
-    // Single bulk D2H + sync (instead of B syncs)
-    cudaMemcpyAsync(h_batch_results_.data(), d_batch_results_,
-                    batch_size * sizeof(int), cudaMemcpyDeviceToHost, stream_);
-    cudaStreamSynchronize(stream_);
-    for (int i = 0; i < batch_size; ++i) {
-      (*out_tokens)[i] = h_batch_results_[i];
-    }
+  // Fast path: if ALL sequences are greedy, use batched kernel (1 sync total)
+  bool all_greedy = std::all_of(temperatures.begin(), temperatures.end(),
+                                [](float t) { return t <= 0.0f; });
+  if (all_greedy) {
+    GreedyArgmaxBatch(d_logits, batch_size, out_tokens);
     return;
   }
 
-  // Mixed or stochastic: fall back to per-sequence sampling
+  // Fallback: per-sequence sampling (stochastic needs per-seq state)
   for (int i = 0; i < batch_size; ++i) {
     const float *logits_i = d_logits + i * vocab_size_;
     (*out_tokens)[i] = Sample(logits_i, temperatures[i], top_ks[i], top_ps[i]);
   }
-}
-
-void GpuSampler::ApplyLogitBias(float *d_logits,
-                                const std::vector<int> &token_ids,
-                                const std::vector<float> &biases) {
-  if (token_ids.empty())
-    return;
-  int n = static_cast<int>(token_ids.size());
-
-  // Grow scratch buffers if needed
-  if (n > bias_scratch_size_) {
-    if (d_bias_token_ids_)
-      cudaFree(d_bias_token_ids_);
-    if (d_bias_values_)
-      cudaFree(d_bias_values_);
-    cudaMalloc(&d_bias_token_ids_, n * sizeof(int));
-    cudaMalloc(&d_bias_values_, n * sizeof(float));
-    bias_scratch_size_ = n;
-  }
-
-  cudaMemcpyAsync(d_bias_token_ids_, token_ids.data(), n * sizeof(int),
-                  cudaMemcpyHostToDevice, stream_);
-  cudaMemcpyAsync(d_bias_values_, biases.data(), n * sizeof(float),
-                  cudaMemcpyHostToDevice, stream_);
-
-  cuda_kernel::LogitBias(d_logits, d_bias_token_ids_, d_bias_values_, n,
-                         stream_);
-}
-
-void GpuSampler::ApplyRepetitionPenalty(float *d_logits,
-                                        const std::vector<int> &history,
-                                        float penalty) {
-  if (history.empty() || penalty == 1.0f)
-    return;
-  int n = static_cast<int>(history.size());
-
-  // Grow scratch buffer if needed
-  if (n > penalty_scratch_size_) {
-    if (d_penalty_history_)
-      cudaFree(d_penalty_history_);
-    cudaMalloc(&d_penalty_history_, n * sizeof(int));
-    penalty_scratch_size_ = n;
-  }
-
-  cudaMemcpyAsync(d_penalty_history_, history.data(), n * sizeof(int),
-                  cudaMemcpyHostToDevice, stream_);
-
-  cuda_kernel::RepetitionPenalty(d_logits, d_penalty_history_, n, penalty,
-                                 stream_);
 }
 
 } // namespace inferflux

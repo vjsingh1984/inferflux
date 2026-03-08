@@ -38,7 +38,7 @@ TEST_CASE("GpuSampler: Greedy argmax", "[gpu_sampler][cuda]") {
   std::vector<float> h_logits(vocab_size, 0.0f);
   h_logits[42] = 10.0f;
 
-  float* d_logits;
+  float *d_logits;
   cudaMalloc(&d_logits, vocab_size * sizeof(float));
   cudaMemcpy(d_logits, h_logits.data(), vocab_size * sizeof(float),
              cudaMemcpyHostToDevice);
@@ -46,6 +46,51 @@ TEST_CASE("GpuSampler: Greedy argmax", "[gpu_sampler][cuda]") {
   // Greedy (temperature=0) should return 42
   int token = sampler.Sample(d_logits, 0.0f, 0, 1.0f);
   REQUIRE(token == 42);
+
+  cudaFree(d_logits);
+  cudaStreamDestroy(stream);
+}
+
+TEST_CASE("GpuSampler: Batched greedy argmax", "[gpu_sampler][cuda]") {
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count == 0) {
+    SKIP("No CUDA device available");
+  }
+
+  int vocab_size = 100;
+  int batch_size = 4;
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+
+  GpuSampler sampler;
+  REQUIRE(sampler.Initialize(vocab_size, stream));
+
+  // Create batched logits with known maxima at different positions
+  std::vector<float> h_logits(batch_size * vocab_size, 0.0f);
+  h_logits[0 * vocab_size + 10] = 10.0f; // seq 0 -> token 10
+  h_logits[1 * vocab_size + 42] = 10.0f; // seq 1 -> token 42
+  h_logits[2 * vocab_size + 0] = 10.0f;  // seq 2 -> token 0
+  h_logits[3 * vocab_size + 99] = 10.0f; // seq 3 -> token 99
+
+  float *d_logits;
+  cudaMalloc(&d_logits, batch_size * vocab_size * sizeof(float));
+  cudaMemcpy(d_logits, h_logits.data(), batch_size * vocab_size * sizeof(float),
+             cudaMemcpyHostToDevice);
+
+  // All greedy temperatures -> should use batched kernel
+  std::vector<float> temps(batch_size, 0.0f);
+  std::vector<int> top_ks(batch_size, 0);
+  std::vector<float> top_ps(batch_size, 1.0f);
+  std::vector<int> out_tokens;
+
+  sampler.SampleBatch(d_logits, batch_size, temps, top_ks, top_ps, &out_tokens);
+
+  REQUIRE(out_tokens.size() == 4);
+  REQUIRE(out_tokens[0] == 10);
+  REQUIRE(out_tokens[1] == 42);
+  REQUIRE(out_tokens[2] == 0);
+  REQUIRE(out_tokens[3] == 99);
 
   cudaFree(d_logits);
   cudaStreamDestroy(stream);
@@ -69,7 +114,7 @@ TEST_CASE("GpuSampler: Stochastic sample returns valid token",
   // Uniform logits
   std::vector<float> h_logits(vocab_size, 1.0f);
 
-  float* d_logits;
+  float *d_logits;
   cudaMalloc(&d_logits, vocab_size * sizeof(float));
   cudaMemcpy(d_logits, h_logits.data(), vocab_size * sizeof(float),
              cudaMemcpyHostToDevice);
@@ -84,4 +129,4 @@ TEST_CASE("GpuSampler: Stochastic sample returns valid token",
 }
 #endif
 
-}  // namespace inferflux
+} // namespace inferflux

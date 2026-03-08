@@ -55,30 +55,17 @@ public:
                    const std::vector<float> &top_ps,
                    std::vector<int> *out_tokens);
 
-  /**
-   * Apply logit bias to a sequence's logits on GPU.
-   *
-   * @param d_logits    [vocab_size] FP32 logits on device (modified in-place)
-   * @param token_ids   Token IDs to bias
-   * @param biases      Bias values corresponding to token_ids
-   */
-  void ApplyLogitBias(float *d_logits, const std::vector<int> &token_ids,
-                      const std::vector<float> &biases);
-
-  /**
-   * Apply repetition penalty to a sequence's logits on GPU.
-   *
-   * @param d_logits    [vocab_size] FP32 logits on device (modified in-place)
-   * @param history     Token IDs in the generation history
-   * @param penalty     Multiplicative penalty (1.0 = disabled)
-   */
-  void ApplyRepetitionPenalty(float *d_logits, const std::vector<int> &history,
-                              float penalty);
-
 private:
   int GreedyArgmax(const float *d_logits);
   int StochasticSample(const float *d_logits, float temperature, int top_k,
                        float top_p);
+
+  /**
+   * Batched greedy argmax: one kernel launch + one sync for B sequences.
+   * Reduces B cudaStreamSynchronize calls to 1.
+   */
+  void GreedyArgmaxBatch(const float *d_logits, int batch_size,
+                         std::vector<int> *out_tokens);
 
   cudaStream_t stream_{nullptr};
   int vocab_size_{0};
@@ -94,21 +81,15 @@ private:
   float *d_max_val_{nullptr}; // [1] max value
   int *d_max_idx_{nullptr};   // [1] max index
 
+  // Batch buffers (allocated once, sized for max batch)
+  static constexpr int kMaxBatchSize = 64;
+  int *d_result_batch_{nullptr};        // [kMaxBatchSize] on device
+  int h_result_batch_[kMaxBatchSize]{}; // host buffer
+
   // cuRAND
   curandGenerator_t rng_{nullptr};
   float *d_uniform_{nullptr}; // [1] random uniform
   bool rng_initialized_{false};
-
-  // Batched argmax results (lazily allocated)
-  int *d_batch_results_{nullptr};
-  std::vector<int> h_batch_results_;
-
-  // Logit bias / repetition penalty scratch (lazily allocated)
-  int *d_bias_token_ids_{nullptr};
-  float *d_bias_values_{nullptr};
-  int *d_penalty_history_{nullptr};
-  int bias_scratch_size_{0};
-  int penalty_scratch_size_{0};
 };
 
 } // namespace inferflux
