@@ -1,93 +1,60 @@
-# Native GGUF Quantized Runtime (Foundational Design)
+# Native GGUF Quantized Runtime Architecture
 
-Status: active design + foundational scaffolding merged
+**Snapshot date:** March 9, 2026  
+**Status:** active foundation, partial hot-path maturity
 
-## 1) Why this architecture
-
-```mermaid
-flowchart LR
-    A[Current pain]
-    A --> A1[Full dequantized caches inflate VRAM]
-    A --> A2[Weight precision tied to KV choices]
-    A --> A3[No explicit strategy contract by GGUF type + SM]
-
-    B[Target]
-    B --> B1[Quantized weights remain immutable + shared]
-    B --> B2[Paged KV has separate lifecycle]
-    B --> B3[Strategy registry selects runtime policy deterministically]
-
-    A --> B
-```
-
-## 2) Core runtime split
+## 1) Core Architecture
 
 ```mermaid
 flowchart TD
-    W[Model Weights]
-    W --> W1[GGUF quantized tensors on GPU]
-    W --> W2[Immutable, shared across requests]
-
-    K[KV Cache]
-    K --> K1[Paged allocation]
-    K --> K2[Prefix reuse + ref-counted blocks]
-    K --> K3[Eviction/offload lifecycle]
-
-    S[Session Layer]
-    S --> S1[API remains stateless by default]
-    S --> S2[Optional sticky session handle maps to sequence slot]
-
-    W --- K
-    K --- S
+    A[GGUF tensor metadata] --> B[Strategy registry]
+    B --> C[Weight layout strategy]
+    B --> D[Matmul strategy]
+    B --> E[Attention strategy]
+    C --> F[Native CUDA executor]
+    D --> F
+    E --> F
+    G[KV policy] --> F
 ```
 
-## 3) Strategy contracts (implemented foundation)
+## 2) Runtime Contract
 
-- `IWeightLayoutStrategy`: tensor layout policy per GGUF tensor type (`Q4_K`, `Q6_K`, `Q8_0`, `F16`, ...).
-- `IMatmulStrategy`: compute policy (`fused dequantize-tile+GEMM` vs compatibility path).
-- `IAttentionStrategy`: paged-KV attention policy keyed by KV precision + GPU SM capability.
-- `QuantizedRuntimeStrategyRegistry`: deterministic selection by `(tensor_type, kv_precision, sm_major/minor)`.
+| Plane | Contract |
+|---|---|
+| Weights | Stay in GGUF-native precision/layout as the source of truth |
+| Dequant policy | `none`, `batch`, or `model`; native quantized default is memory-first `none` |
+| KV cache | Separate lifecycle from weights; precision is fixed at model-load scope |
+| Strategy selection | Deterministic by tensor type, KV precision, and GPU capability |
+| API model | Stateless by default; optional session lease sits above the runtime |
 
-```mermaid
-sequenceDiagram
-    participant Loader as GGUF Loader
-    participant Registry as Strategy Registry
-    participant Runtime as Native Runtime
+## 3) Current Code Reality
 
-    Loader->>Registry: select(tensor_type, kv_precision, sm)
-    Registry-->>Runtime: weight_layout + matmul + attention strategies
-    Runtime->>Runtime: enforce/trace selected policy at startup
-```
-
-## 4) Precision policy contract
-
-| Plane | Policy | Current implementation |
+| Area | Implemented now | Still missing |
 |---|---|---|
-| Weights | From GGUF tensor metadata | Enabled |
-| KV cache | `auto|fp16|bf16|int8|fp8` | `auto/fp16/bf16` active; `int8/fp8` declared + guarded fallback |
-| Dequantized temp cache | `batch|model` | `batch` default (memory-efficient), `model` opt-in |
+| Loader selection | Loader is detected from artifact structure/metadata | None at the contract level |
+| Strategy layer | Weight-layout, matmul, and attention strategy selection scaffolding exists | End-to-end execution is not yet fully strategy-driven on every hot path |
+| Memory policy | `dequant_cache_policy=none` is the native default; `lm_head` scratch/caching behavior is policy-aware | Wider fused coverage so `none` remains the fast path instead of a conservative path |
+| KV policy | KV precision is load-scoped; planner can auto-tune max sequence against a VRAM budget | Lower-precision KV defaults still need proof before promotion |
+| Supported GGUF families | `F16`, `Q4_K`, `Q6_K`, `Q8_0`, `Q8_K` foundations are present in parsing/strategy/handler coverage | Sustained quantized heavy-batch performance proof |
 
-Decision: KV precision is fixed at model-load (server lifecycle), not per request.
+## 4) Design Rules
 
-Rationale:
-- avoids mixed-page ABI fragmentation,
-- avoids per-request kernel graph churn,
-- keeps scheduler admission deterministic.
+1. Do not pre-dequantize whole models by default.
+2. Keep weight precision and KV precision decoupled.
+3. Treat batching quality as the throughput lever; async is not the design target here.
+4. Use GGUF metadata, not filenames, as the source of truth for behavior.
 
-## 5) Stateless API + sessions
+## 5) Next Gates
 
-Default request model remains stateless.
+| Priority | Gate |
+|---|---|
+| P0 | Complete fused native hot paths for common quantized decode/prefill envelopes |
+| P0 | Keep memory-first dequant as the default while improving throughput |
+| P1 | Add graph capture/reuse for repeatable native envelopes |
+| P1 | Promote lower-precision KV only after quality and allocator ABI are proven |
 
-Session-capable behavior is layered above it:
-- request without session handle => ephemeral sequence slot,
-- request with session handle => stable slot mapping + TTL/eviction policy,
-- KV pages remain shared infra, while ownership/refcount controls lifecycle.
+## 6) Related Docs
 
-This keeps OpenAI-compatible APIs simple while enabling stateful optimization paths.
-
-## 6) Rollout phases
-
-1. Foundation (this change): strategy contracts + registry + KV precision policy decoupling.
-2. Runtime enforcement: strict gate to reject unsupported quantized paths when fused kernels required.
-3. Kernel progression: replace compatibility matmul path with fused dequantize-tile GEMM by GGUF type.
-4. Session layer: optional sticky-session contract with TTL + observability.
-5. KV quantization: add INT8/FP8 KV as opt-in once quality/perf gates pass.
+- [NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN](NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN.md)
+- [../GGUF_NATIVE_KERNEL_IMPLEMENTATION](../GGUF_NATIVE_KERNEL_IMPLEMENTATION.md)
+- [../MODERNIZATION_AUDIT](../MODERNIZATION_AUDIT.md)
