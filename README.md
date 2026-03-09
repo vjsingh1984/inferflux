@@ -86,6 +86,7 @@ Start here: [Docs Index](docs/INDEX.md)
 | Fast local setup | [Quickstart](docs/Quickstart.md) |
 | API and auth contracts | [API Surface](docs/API_SURFACE.md) |
 | Runtime and subsystem design | [Architecture](docs/Architecture.md) |
+| Vision and modernization | [Vision](docs/VISION.md), [Modernization Audit](docs/MODERNIZATION_AUDIT.md) |
 | Production operations | [Admin Guide](docs/AdminGuide.md) |
 | Config knobs | [Config Reference](docs/CONFIG_REFERENCE.md) |
 | Contributor workflow | [Developer Guide](docs/DeveloperGuide.md) |
@@ -107,6 +108,8 @@ Start here: [Docs Index](docs/INDEX.md)
 ## Current Positioning
 
 Competitive and roadmap status lives in:
+- [Vision](docs/VISION.md)
+- [Modernization Audit](docs/MODERNIZATION_AUDIT.md)
 - [Tech Debt and Competitive Roadmap](docs/TechDebt_and_Competitive_Roadmap.md)
 - [Roadmap](docs/Roadmap.md)
 - [PRD](docs/PRD.md)

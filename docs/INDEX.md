@@ -17,7 +17,8 @@ graph TD
     C --> C1[Architecture]
     C --> C2[Config Reference]
     C --> C3[Developer Guide]
-    C --> C4[PRD + Roadmap + TechDebt]
+    C --> C4[Vision + PRD + Roadmap + TechDebt]
+    C --> C5[Modernization Audit]
 
     D --> D1[User Guide]
     D --> D2[Troubleshooting]
@@ -39,13 +40,15 @@ graph TD
 
 | Domain | Doc |
 |---|---|
+| Vision and product direction | [VISION](VISION.md), [PRD](PRD.md) |
 | Runtime architecture | [Architecture](Architecture.md) |
 | API surface | [API_SURFACE](API_SURFACE.md) |
 | Configuration | [CONFIG_REFERENCE](CONFIG_REFERENCE.md) |
 | Monitoring and tuning | [MONITORING](MONITORING.md) |
 | Developer workflow + CI contracts | [DeveloperGuide](DeveloperGuide.md) |
-| Product requirements | [PRD](PRD.md) |
 | Grades and execution plan | [Roadmap](Roadmap.md), [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |
+| Modernization migration guide | [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) |
+| Competitive positioning | [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md) |
 | GGUF runtime contract | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md) |
 | FP16 status | [FP16_STATUS](FP16_STATUS.md) |
 
