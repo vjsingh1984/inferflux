@@ -215,7 +215,7 @@ private:
 
   // Scratch buffer for on-demand projection dequantization
   mutable half *scratch_buffer_{nullptr};
-  size_t scratch_buffer_elements_{0};
+  mutable size_t scratch_buffer_elements_{0};
 
   // Global weight accessors
   std::shared_ptr<IWeightAccessor> embed_tokens_accessor;

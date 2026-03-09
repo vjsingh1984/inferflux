@@ -166,6 +166,9 @@ struct InferenceRequest {
   // Shared cancellation flag toggled when the HTTP connection closes.
   std::shared_ptr<std::atomic<bool>> cancellation_flag;
   std::vector<int> block_table; // Logical-to-physical KV block mappings.
+  // Distributed prefill/decode handoff retry counter. Incremented when
+  // kv_transport->Enqueue rejects a packet; reset on successful enqueue.
+  int disagg_enqueue_retries{0};
 
   // Swapping state (§P1c).
   bool is_swapped{false};

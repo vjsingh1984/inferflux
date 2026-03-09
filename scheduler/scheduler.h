@@ -34,6 +34,9 @@ struct DisaggregatedConfig {
   int prefill_pool_size{0}; // 0 = unified
   int decode_pool_size{0};  // 0 = unified
   std::shared_ptr<disaggregated::IKVTransport> kv_transport;
+  // Maximum number of kv_transport enqueue rejections tolerated before failing
+  // the request with a deterministic distributed-overload error.
+  int kv_enqueue_max_retries{3};
 };
 
 // Scheduler: handles request queuing, batch selection, and fairness.

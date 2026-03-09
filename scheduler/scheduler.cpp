@@ -1131,16 +1131,53 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         enqueued = true;
       }
       if (enqueued) {
+        inf.disagg_enqueue_retries = 0;
         staged_decode.push_back(pending);
         continue;
       } else {
+        inf.disagg_enqueue_retries += 1;
+        const bool retries_exhausted =
+            inf.disagg_enqueue_retries > disagg_config_.kv_enqueue_max_retries;
+        GlobalMetrics().RecordDisaggKVEnqueueRejected(retries_exhausted);
+
         // Channel rejected the packet (full).  Undo any phased state so the
         // request retries cleanly and does not hold a stale slot or stale
         // n_past.
+        if (retries_exhausted) {
+          if (inf.session_lease_acquired && session_handle_manager_) {
+            FinalizeSessionLease(pending.get(), false);
+          } else {
+            if (inf.sequence_id >= 0) {
+              if (pending->resolved_backend) {
+                pending->resolved_backend->FreeSequence(inf.sequence_id);
+              }
+              FreeSeqSlot(inf.sequence_id);
+              inf.sequence_id = -1;
+              inf.n_past = -1;
+            }
+            if (cache_ && !inf.block_table.empty()) {
+              cache_->ReleaseBlocksRef(inf.block_table);
+              inf.block_table.clear();
+            }
+          }
+          InferenceResult error;
+          error.no_backend = true;
+          error.completion = "distributed_overloaded: kv transport enqueue "
+                             "retries exhausted";
+          pending->promise.set_value(std::move(error));
+          continue;
+        }
         if (inf.sequence_id >= 0) {
+          if (pending->resolved_backend) {
+            pending->resolved_backend->FreeSequence(inf.sequence_id);
+          }
           FreeSeqSlot(inf.sequence_id);
           inf.sequence_id = -1;
           inf.n_past = -1;
+        }
+        if (cache_ && !inf.block_table.empty()) {
+          cache_->ReleaseBlocksRef(inf.block_table);
+          inf.block_table.clear();
         }
         inf.phase = RequestPhase::kPending;
         std::lock_guard<std::mutex> lock(queue_mutex_);

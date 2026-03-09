@@ -21,7 +21,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # Configuration (override via env)
-MODEL_PATH="${MODEL_PATH:-models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf}"
+MODEL_PATH="${MODEL_PATH:-models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf}"
 BUILD_DIR="${BUILD_DIR:-./build-cuda}"
 OUTPUT_DIR="${OUTPUT_DIR:-./gguf_benchmark_results}"
 NUM_REQUESTS="${NUM_REQUESTS:-10}"
@@ -97,7 +97,7 @@ runtime:
       enabled: true
   backend_exposure:
     prefer_native: $([ "$backend" = "cuda_native" ] && echo "true" || echo "false")
-    allow_llama_cpp_fallback: true
+    allow_llama_cpp_fallback: $([ "$backend" = "cuda_native" ] && echo "false" || echo "true")
   scheduler:
     max_batch_size: 32
     max_batch_tokens: 16384
@@ -462,7 +462,7 @@ print_report() {
     printf "  %-20s %8s %10s %10s %10s %10s %12s %12s\n" \
         "--------------------" "--------" "----------" "----------" "----------" "----------" "------------" "------------"
 
-    for backend in cuda_llama_cpp cuda_native; do
+    for backend in cuda_native cuda_llama_cpp; do
         local stats_file="$OUTPUT_DIR/stats_${backend}.json"
         if [ ! -f "$stats_file" ]; then
             printf "  %-20s %8s\n" "$backend" "SKIPPED"
@@ -642,7 +642,7 @@ main() {
     log "GPU: $(gpu_name), $(gpu_mem_total_mb) MB"
 
     # Benchmark each backend
-    for backend in cuda_llama_cpp cuda_native; do
+    for backend in cuda_native cuda_llama_cpp; do
         local port=$PORT_LLAMA
         [ "$backend" = "cuda_native" ] && port=$PORT_NATIVE
 

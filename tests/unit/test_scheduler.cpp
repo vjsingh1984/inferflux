@@ -236,6 +236,29 @@ private:
   std::atomic<int> free_sequence_calls_{0};
 };
 
+class RejectingKVTransport final : public disaggregated::IKVTransport {
+public:
+  bool Enqueue(disaggregated::KVPacket packet) override {
+    (void)packet;
+    enqueue_calls_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+  std::optional<disaggregated::KVPacket> TryDequeue() override {
+    return std::nullopt;
+  }
+
+  std::size_t Size() const override { return 0; }
+  std::size_t Capacity() const override { return 0; }
+
+  int EnqueueCalls() const {
+    return enqueue_calls_.load(std::memory_order_relaxed);
+  }
+
+private:
+  std::atomic<int> enqueue_calls_{0};
+};
+
 } // namespace
 
 TEST_CASE("Scheduler stub response with no backend", "[scheduler]") {
@@ -460,6 +483,43 @@ TEST_CASE("Scheduler session handles preserve sequence until lease release",
 
   // Scheduler teardown drains session handles and frees retained sequence
   // state.
+  REQUIRE(backend->FreeSequenceCalls() >= 1);
+}
+
+TEST_CASE("Scheduler fails fast when distributed enqueue retries are exhausted",
+          "[scheduler][distributed]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      16, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<SessionLeaseStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "dist-retry-model";
+  info.path = "/tmp/dist-retry.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  auto rejecting_transport = std::make_shared<RejectingKVTransport>();
+  DisaggregatedConfig disagg_config;
+  disagg_config.decode_pool_size = 1;
+  disagg_config.kv_transport = rejecting_transport;
+  disagg_config.kv_enqueue_max_retries = 1;
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, disagg_config);
+
+  InferenceRequest req;
+  req.model = info.id;
+  req.prompt = "distributed retry test";
+  req.max_tokens = 4;
+
+  auto resp = scheduler.Generate(std::move(req)).get();
+  REQUIRE(resp.no_backend);
+  REQUIRE(resp.completion.find("distributed_overloaded") != std::string::npos);
+  REQUIRE(rejecting_transport->EnqueueCalls() >= 2);
   REQUIRE(backend->FreeSequenceCalls() >= 1);
 }
 

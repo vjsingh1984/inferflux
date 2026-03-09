@@ -157,6 +157,20 @@ TEST_CASE("MetricsRegistry records scheduler iteration composition",
                       "backend=\"cpu\"} 28") != std::string::npos);
 }
 
+TEST_CASE("MetricsRegistry records distributed KV enqueue rejection counters",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordDisaggKVEnqueueRejected(false);
+  registry.RecordDisaggKVEnqueueRejected(false);
+  registry.RecordDisaggKVEnqueueRejected(true);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_disagg_kv_enqueue_rejections_total{"
+                      "backend=\"cpu\"} 3") != std::string::npos);
+  REQUIRE(output.find("inferflux_disagg_kv_enqueue_exhausted_total{"
+                      "backend=\"cpu\"} 1") != std::string::npos);
+}
+
 TEST_CASE("MetricsRegistry records per-model token counters", "[metrics]") {
   inferflux::MetricsRegistry registry;
   registry.RecordModelRoute("llama3-8b", "cuda", true);

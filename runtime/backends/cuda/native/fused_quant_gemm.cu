@@ -254,9 +254,10 @@ const DispatchEntry &GetDispatchEntry(GGUF::TensorType qtype) {
       {nullptr, nullptr}, // 9: Q8_1
       {nullptr, nullptr}, // 10: Q2_K
       {nullptr, nullptr}, // 11: Q3_K
-      // Q4_K: no dp4a (scales/mins prevent factoring)
-      {DispatchFused<block_q4_k, fused_dequant_gemv_q4k,
-                     fused_dequant_gemm_q4k>,
+      // Q4_K: dp4a uses vec_dot_q4_K_q8_1 approach (nibble extraction + sums)
+      {dp4a ? DispatchFusedDp4a<block_q4_k, fused_dequant_gemv_q4k_dp4a>
+            : DispatchFused<block_q4_k, fused_dequant_gemv_q4k,
+                            fused_dequant_gemm_q4k>,
        "Q4_K"},           // 12
       {nullptr, nullptr}, // 13: Q5_K
       // Q6_K: no dp4a
@@ -296,7 +297,8 @@ const RmsNormDispatchEntry &GetRmsNormDispatchEntry(GGUF::TensorType qtype) {
       {nullptr, nullptr}, // 9: Q8_1
       {nullptr, nullptr}, // 10: Q2_K
       {nullptr, nullptr}, // 11: Q3_K
-      {DispatchRmsNormGemv<block_q4_k, fused_rmsnorm_gemv_q4k>,
+      {dp4a ? DispatchRmsNormGemvDp4a<block_q4_k, fused_rmsnorm_gemv_q4k_dp4a>
+            : DispatchRmsNormGemv<block_q4_k, fused_rmsnorm_gemv_q4k>,
        "Q4_K"},           // 12
       {nullptr, nullptr}, // 13: Q5_K
       {DispatchRmsNormGemv<block_q6_k, fused_rmsnorm_gemv_q6k>,

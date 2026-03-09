@@ -111,6 +111,7 @@ public:
   // KVPacket::enqueue_time to when a decode worker dequeues it from KVChannel /
   // ShmKVTransport.
   void RecordKVTransfer(double transfer_ms);
+  void RecordDisaggKVEnqueueRejected(bool retries_exhausted);
 
   // GGML-native perf counters (from llama_perf_context). Exposes ground-truth
   // kernel timings that subprocess wrappers cannot surface.
@@ -232,6 +233,8 @@ private:
   LatencyHistogram decode_latency_;  // OBS-2: decode phase
   LatencyHistogram
       kv_transfer_latency_; // §2.5 item 12: prefill→decode KV hand-off
+  std::atomic<uint64_t> disagg_kv_enqueue_rejections_{0};
+  std::atomic<uint64_t> disagg_kv_enqueue_exhausted_{0};
   LatencyHistogram llama_prefill_latency_; // GGML-native prompt eval latency
   LatencyHistogram llama_decode_latency_;  // GGML-native token gen latency
   std::atomic<uint64_t> llama_prompt_tokens_{0};

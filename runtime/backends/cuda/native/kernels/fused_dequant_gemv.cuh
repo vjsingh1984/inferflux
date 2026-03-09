@@ -716,6 +716,141 @@ fused_rmsnorm_gemv_q8k(const block_q8_k *__restrict__ weight,
 }
 
 //==============================================================================
+// Q4_K dp4a GEMV (SM 6.1+)
+//
+// Matches llama.cpp's vec_dot_q4_K_q8_1 approach:
+// - Activations quantized to int8 with global scale
+// - Q4 nibbles packed as int32, dot product via __dp4a
+// - Activation sums for dmin*m correction via dp4a(0x01010101, x, 0)
+//
+// Work distribution: 32 lanes, each handles 4 qs bytes (8 elements) per
+// super-block. pair = lane >> 3, offs = (lane & 7) * 4.
+//==============================================================================
+
+__global__ void
+fused_dequant_gemv_q4k_dp4a(const block_q4_k *__restrict__ weight,
+                             const half *__restrict__ x,
+                             half *__restrict__ output, int N, int K) {
+  extern __shared__ char smem_raw[];
+  signed char *sx_int8 = reinterpret_cast<signed char *>(smem_raw);
+  float *warp_data = reinterpret_cast<float *>(smem_raw + K);
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x * kGemvWarpsPerBlock + warp_id;
+  const int row = blockIdx.y;
+
+  const half *x_row = x + row * K;
+
+  // Phase 1: Find per-row max|x| (vectorized half2 loads)
+  float local_max = 0.0f;
+  {
+    const int K2 = K / 2;
+    for (int i = tid; i < K2; i += kGemvThreadsPerBlock) {
+      __half2 h2 = reinterpret_cast<const __half2 *>(x_row)[i];
+      float2 f2 = __half22float2(h2);
+      local_max = fmaxf(local_max, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+    }
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_max =
+        fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));
+  }
+  if (lane == 0)
+    warp_data[warp_id] = local_max;
+  __syncthreads();
+
+  float max_val;
+  if (tid == 0) {
+    max_val = 0.0f;
+    for (int w = 0; w < kGemvWarpsPerBlock; ++w)
+      max_val = fmaxf(max_val, warp_data[w]);
+    warp_data[kGemvWarpsPerBlock] = max_val;
+  }
+  __syncthreads();
+  max_val = warp_data[kGemvWarpsPerBlock];
+  float inv_scale = (max_val > 0.0f) ? 127.0f / max_val : 0.0f;
+  float activation_scale = max_val / 127.0f;
+
+  // Phase 2: Quantize x to int8 (vectorized half2 loads)
+  {
+    const int K2 = K / 2;
+    for (int i = tid; i < K2; i += kGemvThreadsPerBlock) {
+      __half2 h2 = reinterpret_cast<const __half2 *>(x_row)[i];
+      float2 f2 = __half22float2(h2);
+      sx_int8[2 * i] =
+          static_cast<signed char>(__float2int_rn(f2.x * inv_scale));
+      sx_int8[2 * i + 1] =
+          static_cast<signed char>(__float2int_rn(f2.y * inv_scale));
+    }
+  }
+  __syncthreads();
+
+  if (out_idx >= N)
+    return;
+
+  // Phase 3: dp4a dot product over Q4_K super-blocks (256 elements each)
+  const int num_blocks = K / QK_K;
+  const block_q4_k *wrow = weight + out_idx * num_blocks;
+
+  // Each lane handles one pair of sub-blocks (4 qs bytes = 8 elements)
+  const int pair = lane >> 3;      // 0..3
+  const int offs = (lane & 7) * 4; // 0, 4, 8, ..., 28
+
+  float acc = 0.0f;
+
+  for (int blk = 0; blk < num_blocks; ++blk) {
+    const block_q4_k &b = wrow[blk];
+
+    const float d = __half2float(*reinterpret_cast<const half *>(&b.d));
+    const float dmin = __half2float(*reinterpret_cast<const half *>(&b.dmin));
+
+    // Extract scales and mins for both sub-blocks in this pair
+    unsigned char sc_lo, m_lo, sc_hi, m_hi;
+    get_scale_min_k4(pair * 2, b.scales, &sc_lo, &m_lo);
+    get_scale_min_k4(pair * 2 + 1, b.scales, &sc_hi, &m_hi);
+
+    const float d_sc_lo = d * static_cast<float>(sc_lo);
+    const float dm_m_lo = dmin * static_cast<float>(m_lo);
+    const float d_sc_hi = d * static_cast<float>(sc_hi);
+    const float dm_m_hi = dmin * static_cast<float>(m_hi);
+
+    // Read 4 qs bytes as int32 → extract low and high nibbles
+    int qs4 = *reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]);
+    int q_lo4 = qs4 & 0x0F0F0F0F;
+    int q_hi4 = (qs4 >> 4) & 0x0F0F0F0F;
+
+    // Read 4 activation int8 values for each sub-block
+    const int base = blk * QK_K + pair * 64;
+    int x_lo4 = *reinterpret_cast<const int *>(&sx_int8[base + offs]);
+    int x_hi4 = *reinterpret_cast<const int *>(&sx_int8[base + 32 + offs]);
+
+    // dp4a: weighted dot product (q4 × activation)
+    int dot_lo = Dp4aS8(q_lo4, x_lo4, 0);
+    int dot_hi = Dp4aS8(q_hi4, x_hi4, 0);
+
+    // dp4a: activation sums for dmin*m correction
+    int sum_lo = Dp4aS8(0x01010101, x_lo4, 0);
+    int sum_hi = Dp4aS8(0x01010101, x_hi4, 0);
+
+    acc += activation_scale *
+           (d_sc_lo * static_cast<float>(dot_lo) -
+            dm_m_lo * static_cast<float>(sum_lo) +
+            d_sc_hi * static_cast<float>(dot_hi) -
+            dm_m_hi * static_cast<float>(sum_hi));
+  }
+
+  // Warp reduction
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+  }
+  if (lane == 0) {
+    output[row * N + out_idx] = __float2half(acc);
+  }
+}
+
+//==============================================================================
 // __dp4a Int8 GEMV Kernels for Q8_0/Q8_K (SM 6.1+)
 //
 // Uses hardware int8x4 dot product (__dp4a) for Q8_0/Q8_K where weights are
@@ -981,13 +1116,17 @@ fused_rmsnorm_gemv_q8_0_dp4a(const block_q8_0 *__restrict__ weight,
   float inv_scale = (max_val > 0.0f) ? 127.0f / max_val : 0.0f;
   float activation_scale = max_val / 127.0f;
 
-  // Phase 3: Quantize normalized activations to int8 (reuse smem as int8)
-  __syncthreads();
+  // Phase 3: Quantize FP32→int8 in chunks to avoid cross-warp smem race
+  // (FP32 and int8 alias the same memory; writing int8[X] corrupts FP32[X/4])
   signed char *sx_int8 = reinterpret_cast<signed char *>(smem_raw);
-  for (int i = tid; i < K; i += kGemvThreadsPerBlock) {
-    sx_int8[i] = static_cast<signed char>(__float2int_rn(sx_fp32[i] * inv_scale));
+  for (int base = 0; base < K; base += kGemvThreadsPerBlock) {
+    int idx = base + tid;
+    float val = (idx < K) ? sx_fp32[idx] * inv_scale : 0.0f;
+    __syncthreads();
+    if (idx < K)
+      sx_int8[idx] = static_cast<signed char>(__float2int_rn(val));
+    __syncthreads();
   }
-  __syncthreads();
 
   if (out_idx >= N)
     return;
@@ -1076,12 +1215,16 @@ fused_rmsnorm_gemv_q8k_dp4a(const block_q8_k *__restrict__ weight,
   float inv_scale = (max_val > 0.0f) ? 127.0f / max_val : 0.0f;
   float activation_scale = max_val / 127.0f;
 
-  __syncthreads();
+  // Quantize FP32→int8 in chunks to avoid cross-warp smem race
   signed char *sx_int8 = reinterpret_cast<signed char *>(smem_raw);
-  for (int i = tid; i < K; i += kGemvThreadsPerBlock) {
-    sx_int8[i] = static_cast<signed char>(__float2int_rn(sx_fp32[i] * inv_scale));
+  for (int base = 0; base < K; base += kGemvThreadsPerBlock) {
+    int idx = base + tid;
+    float val = (idx < K) ? sx_fp32[idx] * inv_scale : 0.0f;
+    __syncthreads();
+    if (idx < K)
+      sx_int8[idx] = static_cast<signed char>(__float2int_rn(val));
+    __syncthreads();
   }
-  __syncthreads();
 
   if (out_idx >= N)
     return;
@@ -1100,6 +1243,137 @@ fused_rmsnorm_gemv_q8k_dp4a(const block_q8_k *__restrict__ weight,
       int_acc = Dp4aS8(w4, x4, int_acc);
     }
     acc += d * static_cast<float>(int_acc) * activation_scale;
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+  }
+  if (lane == 0) {
+    output[row * N + out_idx] = __float2half(acc);
+  }
+}
+
+//==============================================================================
+// Q4_K Fused RmsNorm+GEMV+dp4a (SM 6.1+)
+//
+// Combined norm+quantize+dp4a path for Q4_K: no intermediate buffers,
+// hardware int8 dot products with Q4 nibble extraction.
+//==============================================================================
+
+__global__ void
+fused_rmsnorm_gemv_q4k_dp4a(const block_q4_k *__restrict__ weight,
+                             const half *__restrict__ residual,
+                             const half *__restrict__ norm_weight,
+                             half *__restrict__ output, int N, int K,
+                             float eps) {
+  extern __shared__ char smem_raw[];
+  float *sx_fp32 = reinterpret_cast<float *>(smem_raw);
+  float *warp_data = sx_fp32 + K;
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x * kGemvWarpsPerBlock + warp_id;
+  const int row = blockIdx.y;
+
+  // Phase 1: Load residual → FP32, compute sum-of-squares
+  const half *res_row = residual + row * K;
+  float local_sum_sq = LoadHalfToSmemSumSq(res_row, sx_fp32, K, tid);
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_sum_sq += __shfl_down_sync(0xFFFFFFFF, local_sum_sq, offset);
+  }
+  if (lane == 0)
+    warp_data[warp_id] = local_sum_sq;
+  __syncthreads();
+
+  float rms;
+  if (tid == 0) {
+    float total = 0.0f;
+    for (int w = 0; w < kGemvWarpsPerBlock; ++w)
+      total += warp_data[w];
+    warp_data[0] = rsqrtf(total / static_cast<float>(K) + eps);
+  }
+  __syncthreads();
+  rms = warp_data[0];
+
+  // Phase 2: Apply norm+weight, find max|normalized|
+  float local_max = ApplyNormInPlaceMaxAbs(sx_fp32, norm_weight, rms, K, tid);
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_max =
+        fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));
+  }
+  if (lane == 0)
+    warp_data[warp_id] = local_max;
+  __syncthreads();
+
+  float max_val;
+  if (tid == 0) {
+    max_val = 0.0f;
+    for (int w = 0; w < kGemvWarpsPerBlock; ++w)
+      max_val = fmaxf(max_val, warp_data[w]);
+    warp_data[0] = max_val;
+  }
+  __syncthreads();
+  max_val = warp_data[0];
+  float inv_scale = (max_val > 0.0f) ? 127.0f / max_val : 0.0f;
+  float activation_scale = max_val / 127.0f;
+
+  // Phase 3: Quantize FP32→int8 in chunks to avoid cross-warp smem race
+  signed char *sx_int8 = reinterpret_cast<signed char *>(smem_raw);
+  for (int base = 0; base < K; base += kGemvThreadsPerBlock) {
+    int idx = base + tid;
+    float val = (idx < K) ? sx_fp32[idx] * inv_scale : 0.0f;
+    __syncthreads();
+    if (idx < K)
+      sx_int8[idx] = static_cast<signed char>(__float2int_rn(val));
+    __syncthreads();
+  }
+
+  if (out_idx >= N)
+    return;
+
+  // Phase 4: dp4a dot product over Q4_K super-blocks
+  const int num_blocks = K / QK_K;
+  const block_q4_k *wrow = weight + out_idx * num_blocks;
+
+  const int pair = lane >> 3;
+  const int offs = (lane & 7) * 4;
+
+  float acc = 0.0f;
+
+  for (int blk = 0; blk < num_blocks; ++blk) {
+    const block_q4_k &b = wrow[blk];
+
+    const float d = __half2float(*reinterpret_cast<const half *>(&b.d));
+    const float dmin = __half2float(*reinterpret_cast<const half *>(&b.dmin));
+
+    unsigned char sc_lo, m_lo, sc_hi, m_hi;
+    get_scale_min_k4(pair * 2, b.scales, &sc_lo, &m_lo);
+    get_scale_min_k4(pair * 2 + 1, b.scales, &sc_hi, &m_hi);
+
+    const float d_sc_lo = d * static_cast<float>(sc_lo);
+    const float dm_m_lo = dmin * static_cast<float>(m_lo);
+    const float d_sc_hi = d * static_cast<float>(sc_hi);
+    const float dm_m_hi = dmin * static_cast<float>(m_hi);
+
+    int qs4 = *reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]);
+    int q_lo4 = qs4 & 0x0F0F0F0F;
+    int q_hi4 = (qs4 >> 4) & 0x0F0F0F0F;
+
+    const int base = blk * QK_K + pair * 64;
+    int x_lo4 = *reinterpret_cast<const int *>(&sx_int8[base + offs]);
+    int x_hi4 = *reinterpret_cast<const int *>(&sx_int8[base + 32 + offs]);
+
+    int dot_lo = Dp4aS8(q_lo4, x_lo4, 0);
+    int dot_hi = Dp4aS8(q_hi4, x_hi4, 0);
+    int sum_lo = Dp4aS8(0x01010101, x_lo4, 0);
+    int sum_hi = Dp4aS8(0x01010101, x_hi4, 0);
+
+    acc += activation_scale *
+           (d_sc_lo * static_cast<float>(dot_lo) -
+            dm_m_lo * static_cast<float>(sum_lo) +
+            d_sc_hi * static_cast<float>(dot_hi) -
+            dm_m_hi * static_cast<float>(sum_hi));
   }
 
   for (int offset = 16; offset > 0; offset >>= 1) {

@@ -352,6 +352,13 @@ void MetricsRegistry::RecordKVTransfer(double transfer_ms) {
   kv_transfer_latency_.Record(transfer_ms);
 }
 
+void MetricsRegistry::RecordDisaggKVEnqueueRejected(bool retries_exhausted) {
+  disagg_kv_enqueue_rejections_.fetch_add(1, std::memory_order_relaxed);
+  if (retries_exhausted) {
+    disagg_kv_enqueue_exhausted_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 void MetricsRegistry::RecordLlamaPerf(double prefill_ms, double decode_ms,
                                       int32_t prompt_tokens,
                                       int32_t generated_tokens) {
@@ -667,6 +674,19 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_scheduler_batch_token_budget_skips_total{backend=\""
       << backend << "\"} " << scheduler_batch_token_budget_skips_.load()
       << "\n";
+
+  out << "# HELP inferflux_disagg_kv_enqueue_rejections_total "
+         "Prefill-to-decode "
+         "KV transport enqueue rejections\n";
+  out << "# TYPE inferflux_disagg_kv_enqueue_rejections_total counter\n";
+  out << "inferflux_disagg_kv_enqueue_rejections_total{backend=\"" << backend
+      << "\"} " << disagg_kv_enqueue_rejections_.load() << "\n";
+
+  out << "# HELP inferflux_disagg_kv_enqueue_exhausted_total Requests that "
+         "failed after distributed KV enqueue retries were exhausted\n";
+  out << "# TYPE inferflux_disagg_kv_enqueue_exhausted_total counter\n";
+  out << "inferflux_disagg_kv_enqueue_exhausted_total{backend=\"" << backend
+      << "\"} " << disagg_kv_enqueue_exhausted_.load() << "\n";
 
   out << "# HELP inferflux_fairness_preemptions_total Scheduler swaps "
          "triggered by fairness\n";

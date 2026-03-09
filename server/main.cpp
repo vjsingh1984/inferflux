@@ -224,6 +224,7 @@ int main(int argc, char **argv) {
       0; // 0 = decode on WorkerLoop thread (no separate pool)
   std::size_t kv_channel_capacity = 64;
   std::string kv_transport_type = "channel"; // "channel" | "shm"
+  int kv_enqueue_max_retries = 3;
   inferflux::Scheduler::Config scheduler_config;
   std::vector<ModelConfig> configured_models;
   std::string default_model_override;
@@ -470,6 +471,9 @@ int main(int argc, char **argv) {
           if (disagg["kv_channel_capacity"])
             kv_channel_capacity =
                 disagg["kv_channel_capacity"].as<std::size_t>();
+          if (disagg["kv_enqueue_max_retries"])
+            kv_enqueue_max_retries =
+                std::max(0, disagg["kv_enqueue_max_retries"].as<int>());
         }
         if (config["runtime"]["scheduler"]) {
           const auto &scheduler_node = config["runtime"]["scheduler"];
@@ -876,6 +880,16 @@ int main(int argc, char **argv) {
   if (const char *env_kv_transport = std::getenv("INFERFLUX_KV_TRANSPORT")) {
     kv_transport_type = env_kv_transport; // "channel" or "shm"
   }
+  if (const char *env_kv_enqueue_retries =
+          std::getenv("INFERFLUX_KV_ENQUEUE_MAX_RETRIES")) {
+    try {
+      int retries = std::stoi(env_kv_enqueue_retries);
+      if (retries >= 0) {
+        kv_enqueue_max_retries = retries;
+      }
+    } catch (...) {
+    }
+  }
   if (const char *env_models = std::getenv("INFERFLUX_MODELS")) {
     auto parsed = ParseModelsEnv(env_models);
     if (!parsed.empty()) {
@@ -948,6 +962,22 @@ int main(int argc, char **argv) {
           std::string(backend_allow_llama_cpp_fallback ? "true" : "false") +
           ", strict_native_request=" +
           std::string(backend_strict_native_request ? "true" : "false"));
+  // TODO(perf): When allow_llama_cpp_fallback=true with prefer_native=true,
+  // the parity delegate may load a second copy of model weights via llama.cpp
+  // for features the native backend doesn't support (logprobs, structured
+  // output). This doubles GPU memory for model weights. Disable fallback via
+  // allow_llama_cpp_fallback=false or
+  // INFERFLUX_NATIVE_DISABLE_PARITY_DELEGATE=1 to avoid this. Long-term fix:
+  // make the parity delegate truly lazy and share the GGUF weight data with the
+  // native backend.
+  if (backend_prefer_native && backend_allow_llama_cpp_fallback) {
+    inferflux::log::Warn(
+        "server",
+        "allow_llama_cpp_fallback=true with prefer_native=true: parity "
+        "delegate may load duplicate model weights. Set "
+        "allow_llama_cpp_fallback=false or "
+        "INFERFLUX_NATIVE_DISABLE_PARITY_DELEGATE=1 to reduce GPU memory.");
+  }
   inferflux::log::Info(
       "server",
       "Capability routing policy: allow_default_fallback=" +
@@ -1337,6 +1367,7 @@ int main(int argc, char **argv) {
   disagg_config.prefill_pool_size = std::max(0, prefill_pool_size);
   disagg_config.decode_pool_size = std::max(0, decode_pool_size);
   disagg_config.kv_transport = kv_transport;
+  disagg_config.kv_enqueue_max_retries = std::max(0, kv_enqueue_max_retries);
   inferflux::Scheduler scheduler(tokenizer, device, cache, router,
                                  speculative_decoder, prefix_cache,
                                  fairness_config, disagg_config,
@@ -1370,7 +1401,8 @@ int main(int argc, char **argv) {
             << disagg_config.prefill_pool_size << "/"
             << disagg_config.decode_pool_size
             << " kv_transport=" << kv_transport_type
-            << " capacity=" << kv_channel_capacity
+            << " capacity=" << kv_channel_capacity << " kv_enqueue_max_retries="
+            << disagg_config.kv_enqueue_max_retries
             << " max_batch_size=" << scheduler_config.max_batch_size
             << " max_batch_tokens=" << scheduler_config.max_batch_tokens
             << std::endl;

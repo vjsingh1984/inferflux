@@ -312,9 +312,12 @@ bool LlamaForwardTyped<T>::Initialize(
   gemm_ = gemm;
   stream_ = stream;
 
-  // Get max batch size from KV cache
+  // Match scratch buffer sizing to KV cache limits (not model max)
   if (kv_cache) {
     max_batch_size_ = kv_cache->MaxBatchSize();
+    if (kv_cache->MaxSeqLen() > 0 && kv_cache->MaxSeqLen() < max_seq_len_) {
+      max_seq_len_ = kv_cache->MaxSeqLen();
+    }
   }
 
   if (!AllocateScratch()) {

@@ -83,7 +83,9 @@ bool QuantizedWeightMap::Build(IModelLoader *loader, const ModelInfo &config,
   }
 
 #ifdef INFERFLUX_HAS_CUDA
-  // Allocate scratch buffer sized for the largest quantized projection weight
+  // Compute scratch buffer size for cuBLAS fallback dequantization.
+  // Allocation is deferred to first use — decode-only workloads (fused GEMV)
+  // never need it, saving up to hundreds of MB for large-vocab models.
   if (is_quantized_) {
     size_t max_elements = 0;
     for (int layer = 0; layer < num_layers_; ++layer) {
@@ -98,27 +100,16 @@ bool QuantizedWeightMap::Build(IModelLoader *loader, const ModelInfo &config,
         }
       }
     }
-    // Also check LM head (may be quantized)
     if (lm_head_accessor && lm_head_accessor->IsQuantized()) {
       auto dims = lm_head_accessor->GetDimensions();
       max_elements = std::max(max_elements, dims.first * dims.second);
     }
+    scratch_buffer_elements_ = max_elements; // Size known, allocation deferred
     if (max_elements > 0) {
-      auto err = cudaMalloc(reinterpret_cast<void **>(&scratch_buffer_),
-                            max_elements * sizeof(half));
-      if (err != cudaSuccess) {
-        log::Error(
-            "quantized_weight_map",
-            "Failed to allocate scratch buffer (" +
-                std::to_string(max_elements * sizeof(half) / 1024 / 1024) +
-                " MiB)");
-        return false;
-      }
-      scratch_buffer_elements_ = max_elements;
       log::Info("quantized_weight_map",
                 "Scratch buffer: " +
                     std::to_string(max_elements * sizeof(half) / 1024 / 1024) +
-                    " MiB (replaces per-tensor dequantized cache)");
+                    " MiB (deferred allocation, used only for cuBLAS fallback)");
     }
   }
 #endif
@@ -181,18 +172,30 @@ const half *QuantizedWeightMap::DequantizeToScratch(
     return accessor->GetDequantizedGpuWeights(stream_);
   }
 
-  // Quantized: dequantize into shared scratch buffer
-  if (!scratch_buffer_) {
-    // Fallback to per-tensor caching if scratch not allocated
-    return accessor->GetDequantizedGpuWeights(stream_);
-  }
-
+  // Quantized: dequantize into shared scratch buffer (lazy allocation)
   auto dims = accessor->GetDimensions();
   size_t num_elements = dims.first * dims.second;
-  if (num_elements > scratch_buffer_elements_) {
+  if (num_elements > scratch_buffer_elements_ || scratch_buffer_elements_ == 0) {
     log::Warn("quantized_weight_map",
               "Tensor too large for scratch buffer, falling back to cache");
     return accessor->GetDequantizedGpuWeights(stream_);
+  }
+
+  // Lazy allocate on first use (decode-only workloads skip this entirely)
+  if (!scratch_buffer_) {
+    auto err = cudaMalloc(reinterpret_cast<void **>(&scratch_buffer_),
+                          scratch_buffer_elements_ * sizeof(half));
+    if (err != cudaSuccess) {
+      log::Warn("quantized_weight_map",
+                "Failed to allocate scratch buffer, falling back to cache");
+      scratch_buffer_elements_ = 0;
+      return accessor->GetDequantizedGpuWeights(stream_);
+    }
+    log::Info("quantized_weight_map",
+              "Scratch buffer allocated: " +
+                  std::to_string(scratch_buffer_elements_ * sizeof(half) /
+                                 1024 / 1024) +
+                  " MiB (cuBLAS fallback triggered)");
   }
 
   // Get the quantization handler and dequantize directly into scratch
