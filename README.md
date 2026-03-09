@@ -1,6 +1,6 @@
 # InferFlux
 
-> Open-source inference server with OpenAI-compatible HTTP APIs, multi-backend runtime, and operator-grade controls.
+> Open-source inference server with OpenAI-compatible HTTP APIs, multi-backend runtime, explicit backend identity, and operator-grade controls.
 
 ```mermaid
 graph LR
@@ -26,6 +26,23 @@ graph LR
 | API surface | `/v1/completions`, `/v1/chat/completions`, `/v1/models`, `/v1/models/{id}`, `/v1/embeddings`, `/v1/admin/*` |
 | Runtime options | CPU + optional CUDA/ROCm/MPS/Vulkan/MLX (build-time toggles) |
 | Ops endpoints | `/livez`, `/readyz`, `/healthz`, `/metrics`, optional `/ui` |
+
+## Current Reality
+
+| State | Reading |
+|---|---|
+| Strong today | API/admin/CLI contracts, backend/provider identity, policy-visible fallback, and operator observability |
+| Foundation now | Native memory-first GGUF policy, KV auto-tune, optional session leases, distributed transport-health semantics |
+| Still open | Quantized native throughput, graph maturity, distributed ownership cleanup, required GPU/provider CI lane |
+
+## Modern Runtime Stance
+
+| Principle | Current reading |
+|---|---|
+| Throughput | Sync-first batching is the performance path |
+| Async | Useful for admission/collection only if it preserves batch quality |
+| Quantized GGUF | Should stay quantized and memory-first, not silently devolve into persistent full dequant |
+| Distributed runtime | Readiness/admin/admission can react to degraded transport, but ownership maturity is still open |
 
 ## 3-Minute Bring-Up
 

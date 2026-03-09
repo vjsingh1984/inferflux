@@ -23,6 +23,7 @@ flowchart LR
 | CUDA overlap | `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_overlap_events_total` |
 | Native path activity | `inferflux_native_forward_passes_total{phase=...}` |
 | Native KV planning | `inferflux_native_kv_active_sequences`, `inferflux_native_kv_max_sequences`, `inferflux_native_kv_autotune_events_total`, `inferflux_native_kv_requested_max_seq`, `inferflux_native_kv_planned_max_seq`, `inferflux_native_kv_budget_bytes` |
+| Distributed KV health | `inferflux_disagg_kv_tickets_total{stage=...}`, `inferflux_disagg_kv_timeout_streak`, `inferflux_disagg_kv_timeout_debt` |
 | Cache reuse | `inferflux_prefix_hits_total`, `inferflux_prefix_partial_hits_total`, `inferflux_prefix_matched_tokens_total`, `inferflux_kv_prefix_reuse_total` |
 
 ## 2) Fast Checks
@@ -53,7 +54,8 @@ Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 | Native execution | `inferflux_native_forward_passes_total{phase=...}` | Zero deltas mean native forward is not active |
 | Overlap activity | `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_overlap_events_total` | Non-zero deltas confirm mixed-workload lane activity |
 | Native KV sizing | `inferflux_native_kv_requested_max_seq`, `inferflux_native_kv_planned_max_seq`, `inferflux_native_kv_budget_bytes` | Planned values below requested show KV auto-tune is protecting VRAM |
-| Readiness on decode nodes | `/readyz` | Decode nodes are ready only when weights are loaded and all configured workers are alive |
+| Readiness on decode/disagg nodes | `/readyz` | Ready requires weights loaded, full decode-worker health, and timeout streak/debt below threshold |
+| Fail-closed admission | generation `503` with `error=distributed_kv_transport_degraded` | optional protection when degraded transport should stop new generation work immediately |
 
 ## 5) Throughput Gate Contract
 
@@ -107,6 +109,7 @@ nsys profile -t cuda,nvtx -o /tmp/inferflux_profile \
 | Symptom | First checks | Typical action |
 |---|---|---|
 | High latency, low throughput | queue depth + batch metrics + provider identity | fix routing/batch settings before profiling kernels |
+| Distributed route instability | distributed KV ticket counters + timeout streak/debt | inspect transport pressure before widening worker pools |
 | Native CUDA expected but missing | `/v1/models` exposure fields + native counters | inspect strict/fallback policy and model format path |
 | VRAM pressure | native KV planning metrics + dequant policy | tighten budget or keep memory-first dequant policy |
 | Cache not helping | prefix/kv reuse counters | validate warmup patterns and prefix-affinity policy |

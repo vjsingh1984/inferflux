@@ -18,7 +18,7 @@ flowchart TD
     G --> J[Sampling / Structured Output]
     D --> K[Metrics + Traces]
     B --> L[Admin API]
-    L --> M[Model + Routing + Cache Control]
+    L --> M[Model + Routing + Cache + Pools Control]
 ```
 
 ## 2) Request Lifecycle Contract
@@ -33,6 +33,7 @@ sequenceDiagram
 
     C->>H: POST /v1/chat/completions
     H->>H: Auth + scope check
+    H->>H: Optional fail-closed admission check
     H->>S: Enqueue InferenceRequest
     S->>R: Resolve(model_id, capabilities, policy)
     R-->>S: backend handle + exposure metadata
@@ -47,18 +48,18 @@ sequenceDiagram
 
 | Layer | Contract | Key files |
 |---|---|---|
-| HTTP + Auth | OpenAI-compatible endpoints with scope enforcement | `server/http/http_server.cpp`, `server/auth/*` |
+| HTTP + Auth | OpenAI-compatible endpoints with scope enforcement and optional fail-closed generation admission | `server/http/http_server.cpp`, `server/auth/*` |
 | Scheduler | Fair, phase-aware batch construction and execution | `scheduler/scheduler.cpp`, `runtime/execution/batch_executor.cpp` |
 | Model routing | Capability and policy-driven backend resolution | `scheduler/model_router.h`, `scheduler/single_model_router.cpp` |
 | Backend runtime | Prefill/decode execution with per-sequence state | `runtime/backends/*` |
-| Policy/admin | Guardrails, rate-limit, API keys, routing, model lifecycle | `policy/*`, `/v1/admin/*` handlers |
-| Observability | Prometheus metrics + traces for queueing/runtime health | `server/metrics/*`, `server/observability/*` |
+| Policy/admin | Guardrails, rate-limit, API keys, routing, models, cache, pools | `policy/*`, `/v1/admin/*` handlers |
+| Observability | Prometheus metrics + traces for queueing/runtime and distributed transport health | `server/metrics/*`, `server/observability/*` |
 
 ## 4) Scheduler and Runtime Execution Model
 
 | Concern | Current contract |
 |---|---|
-| Request admission | Asynchronous at the scheduler boundary |
+| Request admission | HTTP-layer async admission into scheduler queues; optional fail-closed policy on degraded distributed transport |
 | Throughput core | Sync-first batched execution inside the runtime |
 | Phase model | Prefill and decode remain explicit |
 | Mixed workloads | Prefill/decode overlap exists for native CUDA in the sync path |
@@ -100,18 +101,17 @@ flowchart LR
 
 | Axis | `native_cuda` provider | `cuda_llama_cpp` provider |
 |---|---|---|
-| Primary value | Throughput/control core owned by InferFlux | Stable compatibility baseline and deterministic fallback |
+| Primary value | Throughput/control path owned by InferFlux | Stable compatibility baseline and deterministic fallback |
 | Runtime core | `NativeCudaRuntime` + native loaders + native metrics | llama.cpp runtime behind InferFlux control plane |
 | Strong today | Native safetensors path, GGUF loader detection, memory-first dequant policy, KV auto-tune metrics, explicit provider identity | Mature GGUF behavior, lower operational risk, broad compatibility |
-| Current limits | Async unified batch intentionally off; quantized GGUF throughput and native-first parity are still maturing | Lower headroom for first-party kernel/runtime innovation |
+| Current limits | Async unified batch intentionally off; quantized GGUF throughput and native-owned parity are still maturing | Lower headroom for first-party kernel/runtime innovation |
 | Operational role | Preferred when native is ready and policy allows | Compatibility/safety net when policy permits fallback |
-
-Keeping both backends is intentional: one maximizes headroom, the other limits operational risk.
 
 ## 6.2) Memory and State Lifecycle Contract
 
 | Area | Current contract |
 |---|---|
+| Model format detection | Loader is selected from artifact structure and GGUF metadata rather than filename guesses |
 | Model weights | Loaded once per model instance; treated as shared runtime state |
 | Dequantized projections | Policy-scoped as `none`, `batch`, or `model`; native quantized path defaults to memory-first `none` |
 | KV cache | Separate lifecycle from weights; precision is fixed at model-load scope |
@@ -125,9 +125,10 @@ Keeping both backends is intentional: one maximizes headroom, the other limits o
 |---|---|
 | Topology foundation | `ParallelContext` and split prefill/decode roles exist |
 | KV transport | In-process channel path plus SHM-backed transport exist |
-| Readiness semantics | Decode nodes require a loaded model and all configured decode workers alive |
-| Failure contracts | Deterministic overload/error paths exist for some queue/transport failures |
-| Missing for maturity | Ticket/ack/commit transport lifecycle, sequence ownership cleanup, session leases in decode-worker mode, CI fault matrix |
+| Ticket lifecycle | Enqueue, acknowledge, commit, and timeout states are tracked and exported |
+| Health semantics | Decode nodes gate on loaded model, live workers, transport timeout streak/debt, and admin pools visibility |
+| Admission semantics | Optional fail-closed generation admission can stop new work when distributed transport is degraded |
+| Missing for maturity | Sequence ownership cleanup, decode-worker session reuse, multi-process proof, and CI fault matrix |
 
 ## 8) Admin Control Plane Contract
 
@@ -139,6 +140,7 @@ Keeping both backends is intentional: one maximizes headroom, the other limits o
 | Model operations | `/v1/admin/models`, `/v1/admin/models/default` |
 | Routing policy | `/v1/admin/routing` |
 | Cache operations | `/v1/admin/cache`, `/v1/admin/cache/warm` |
+| Pool/runtime health | `/v1/admin/pools` |
 
 See [API Surface](API_SURFACE.md) for the full method matrix.
 
@@ -146,10 +148,11 @@ See [API Surface](API_SURFACE.md) for the full method matrix.
 
 1. No request enters backend execution before auth/scope checks pass.
 2. Scheduler enforces batch/token limits before dispatch.
-3. Capability mismatches are rejected during routing, not discovered late in HTTP streaming.
+3. Capability mismatches are rejected during routing, not discovered late in streaming.
 4. Backend/provider identity remains machine-visible across API and CLI surfaces.
 5. Native throughput optimization must not rely on per-step async fragmentation.
 6. Decode-node readiness requires both loaded weights and all configured workers alive.
+7. Distributed transport degradation can surface in `/readyz`, `/v1/admin/pools`, and optionally generation admission.
 
 ## 10) Extension Points
 

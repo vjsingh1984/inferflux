@@ -2,66 +2,64 @@
 
 **Snapshot date:** March 9, 2026  
 **Current overall grade:** B-  
-**Target overall grade:** B (2026), B+ (2027)
+**Target overall grade:** B (after native/runtime maturity), B+ (after required GPU and distributed gates)
 
 ```mermaid
 flowchart LR
-    A[Now: strong control-plane contracts] --> B[Next: native throughput + memory maturity]
-    B --> C[Then: distributed runtime credibility]
-    C --> D[Finally: release-grade GPU enforcement]
+    A[Now: strong control-plane and identity contracts] --> B[Next: native quantized throughput and graph maturity]
+    B --> C[Then: distributed ownership and failure maturity]
+    C --> D[Finally: required GPU/provider release gates]
 ```
 
 ## 1) Grade Scorecard
 
 | Dimension | Current | Evidence in code today | Blocker to next grade |
 |---|---|---|---|
-| Throughput | C+ | Native provider path is real, native forward metrics exist, and sync mixed prefill/decode overlap is active | Quantized GGUF native path is not yet consistently competitive on heavy-batch edge workloads |
-| Continuous batching | C | Prefix-affinity scoring and mixed-step knobs exist; sync batch execution preserves real batching | Native async unified-batch contract is intentionally disabled and graph capture is not yet productionized |
-| Capability identity | A- | Backend/provider/fallback identity is explicit across API/CLI/admin flows | Some native parity still depends on delegate-backed behavior |
-| Resource efficiency | B- | Memory-first dequant policy, KV auto-tune planning, prefix reuse, and optional session leases are in place | Quantized GGUF hot paths still rely on compatibility/fallback paths too often |
-| CI/TDD enforcement | B+ | Focused contract suites and docs gates are visible in CI | GPU behavior lane is not yet universally merge-blocking |
-| Distributed runtime | C- | Split-role scheduling, SHM transport, and decode readiness semantics exist | Transport lifecycle, ownership cleanup, and failure-path coverage are incomplete |
+| Throughput | C+ | Native provider path is real, native forward metrics exist, and sync overlap is active | Quantized GGUF native hot paths are not yet consistently competitive under heavy-batch edge workloads |
+| Continuous batching | C | Sync-first batch execution preserves real batching; prefix-affinity and mixed-step knobs exist | Graph capture/reuse and broader native hot-path residency are still incomplete |
+| Capability identity | A- | Provider/fallback identity is explicit across API, CLI, admin, and metrics | Some critical behavior still depends on compatibility/delegate paths |
+| Resource efficiency | B- | Memory-first dequant policy, KV planner, load-scoped KV precision, prefix reuse, and session-lease foundations are real | Quantized native execution still leaves too much performance on the table |
+| CI/TDD enforcement | B+ | Focused contract suites, docs gate, and explicit CLI/admin tests exist | Required GPU/provider lane is still missing |
+| Distributed runtime | C | Split-role scheduling, SHM transport, ticket lifecycle, timeout debt, admin pools, and optional fail-closed admission are landed | Sequence ownership cleanup, decode-worker session reuse, and fault-path CI remain open |
 
 ## 2) Evidence Ledger
 
 | Evidence type | Current reading | Grade impact |
 |---|---|---|
-| Provider identity contract | `native` vs `llama_cpp` provider semantics are explicit and exposed | Keeps control-plane grades high and automation reliable |
-| Native readiness gate | Native can auto-enable when kernels are compiled and CUDA is available | Makes `backend=cuda` native-first without manual executor forcing |
-| Endpoint parity contract | Core endpoints are routed with explicit capability/policy semantics | Prevents blanket fallback behavior for completion/chat/embeddings |
-| Memory economy foundation | Native quantized path defaults to `dequant_cache_policy=none`; KV planner + native KV metrics are wired | Improves edge-device viability, but not yet enough to move throughput grades alone |
-| Session handle foundation | Optional TTL-based `session_id` reuse exists in unified scheduler mode | Enables future sticky reuse without changing baseline API semantics |
-| Distributed foundation | Decode readiness checks loaded weights plus all decode workers | Good operational direction, but not yet full distributed runtime maturity |
+| Provider identity contract | `requested_backend`, `exposed_backend`, `provider`, `fallback`, `fallback_reason` are explicit and tested | Keeps control-plane and automation grades high |
+| Native memory-economy foundation | `dequant_cache_policy=none`, KV planner, and native KV metrics are wired | Makes edge-memory work credible, but not enough to move throughput grades alone |
+| Sync-first batching stance | Native keeps `SupportsAsyncUnifiedBatch()==false` and uses sync batched execution for throughput | Correct architectural stance; async is not being mistaken for performance |
+| Session handle foundation | Optional TTL-based `session_id` reuse exists in unified mode | Enables future sticky reuse without breaking stateless default behavior |
+| Distributed transport contract | Ticket lifecycle, timeout streak/debt, readiness impact, admin pools visibility, and optional fail-closed admission are in code | Raises distributed runtime above scaffold-only status, but not yet to operations-grade maturity |
 
 ## 3) Grade-Movement Rule
 
-Grades move only when both conditions are true:
+Grades move only when both are true:
 
-1. The relevant contract/gate is present in CI or integration tests.
+1. A contract or behavior gate exists in CI/integration tests.
 2. Representative runtime evidence supports the claim on the affected path.
 
-Single benchmark wins or partial scaffolding do not move the grade.
+Single benchmarks, partial scaffolding, or broad aspirations do not move grades.
 
 ## 4) Priority Order
 
 | Priority | Foundation | Done when |
 |---|---|---|
-| P0 | Native quantized throughput core | Quantized GGUF runs stay on fast native hot paths without falling back to memory-expensive compatibility behavior |
-| P0 | GPU memory economy | Immutable quantized weights + paged KV + planner policy show stable edge-device gains |
-| P1 | Native-first parity independence | Core endpoint behavior does not depend on llama.cpp delegates for critical features |
-| P1 | Graph capture + repeatable overlap | Common decode/prefill envelopes reuse graph buckets and expose hit/fallback metrics |
-| P1 | Mandatory GPU CI lane | Release cannot pass without native-provider behavioral gates |
-| P1 | Distributed ticket + ownership contracts | KV handoff, worker health, and eviction cleanup are deterministic and tested |
-| P2 | Session leases in decode-worker mode | Stateful reuse can coexist safely with split-role deployments |
+| P0 | Quantized native throughput core | Common GGUF hot paths stay native, memory-first, and performance-credible |
+| P0 | Graph capture and repeatable overlap | Stable decode/prefill envelopes reuse graph buckets with hit/fallback metrics |
+| P1 | Distributed ownership maturity | Sequence ownership, cleanup, and transport failure paths are deterministic and tested |
+| P1 | Native-first parity independence | Completion/chat/embeddings critical behavior does not silently depend on delegate fallback |
+| P1 | Mandatory GPU behavior lane | Release cannot pass without native/provider/runtime behavioral gates |
+| P2 | Decode-worker session reuse | Session reuse remains safe in split-role deployments |
 
 ## 5) Quarter Targets
 
 | Quarter | Exit criteria |
 |---|---|
-| Q2 2026 | Canonical docs, identity contracts, and memory-economy foundations stay aligned with code |
-| Q3 2026 | Native quantized GGUF and graph/overlap work show sustained heavy-batch gains |
-| Q4 2026 | Distributed runtime moves from scaffold to fault-tested foundation |
-| 2027 | Release-grade GPU CI and broader scale/runtime maturity |
+| Q2 2026 | Canonical docs, identity contracts, transport-health semantics, and memory foundations stay aligned with code |
+| Q3 2026 | Native quantized GGUF plus graph/overlap work show sustained representative gains |
+| Q4 2026 | Distributed runtime moves from ticketed foundation to ownership-safe, fault-tested foundation |
+| 2027 | Required GPU/provider CI and broader runtime maturity support higher grades |
 
 ## 6) Canonical References
 

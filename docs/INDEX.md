@@ -86,3 +86,7 @@ Use these two docs for current scoring and grade movement rationale:
 
 - [Roadmap](Roadmap.md)
 - [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md)
+
+Use this doc for old-practice -> modern-practice migration guidance:
+
+- [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md)

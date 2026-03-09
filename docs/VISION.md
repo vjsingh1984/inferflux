@@ -4,49 +4,69 @@
 
 ```mermaid
 flowchart LR
-    A[OpenAI-compatible contract] --> B[Policy + routing control plane]
+    A[OpenAI-compatible APIs] --> B[Operator-grade control plane]
     B --> C[Portable runtime across CPU/CUDA/ROCm/MPS/MLX]
-    C --> D[Native performance core]
-    D --> E[Distributed-grade reliability]
+    C --> D[Native memory-efficient execution]
+    D --> E[Deterministic distributed contracts]
 ```
 
-## 1) Vision Contract
+## 1) Product Contract
 
-| Pillar | What it means in practice |
+| Pillar | Concrete meaning |
 |---|---|
-| API compatibility | Core user/admin surfaces stay OpenAI-style and scriptable |
-| Operator control plane | Auth, policy, routing, metrics, and admin APIs are part of the product, not bolt-ons |
-| Dual CUDA strategy | `native_cuda` is the performance/control path; `cuda_llama_cpp` is the compatibility/fallback path |
-| Memory economy | Shared model weights, separate KV lifecycle, prefix reuse, and explicit memory policy knobs |
-| Stateless by default | Baseline API remains stateless; optional `session_id` leases sit above the core contract |
-| Scale path | Single-node reliability first, then deterministic distributed runtime contracts |
+| API compatibility | Core request/admin surfaces remain OpenAI-style and scriptable |
+| Operator control plane | Auth, policy, routing, audit, metrics, and admin APIs are part of the product, not sidecars |
+| Dual CUDA strategy | `native_cuda` is the headroom path; `cuda_llama_cpp` is the compatibility/safety path |
+| Memory economy | Shared weights, separate KV lifecycle, prefix reuse, and explicit memory policy knobs |
+| Stateless default | Baseline API stays stateless; `session_id` reuse is optional and bounded |
+| Honest scale path | Single-node rigor first, distributed claims only when lifecycle and failure contracts exist |
 
 ## 2) Current Reality
 
 | State | Code-aligned reading |
 |---|---|
-| Strong today | API/admin/CLI contracts, machine-visible backend identity, strict routing policy, prefix/KV reuse, and broad operator controls |
-| Foundation present | Native loader detection, memory-first quantized GGUF policy, KV auto-tune planning/metrics, optional session handles, split prefill/decode node roles |
-| Still open | Native async parity, sustained quantized GGUF throughput, native-first feature independence, ticketed distributed KV handoff, mandatory GPU release lane |
+| Strong today | API/admin/CLI contracts, backend/provider identity, policy-visible fallback, prefix/KV reuse, admin pools visibility, and operator observability |
+| Foundation now | Native loader detection, memory-first GGUF dequant policy, KV auto-tune planning/metrics, optional session leases, distributed ticket lifecycle, timeout debt, and optional fail-closed generation admission |
+| Still not leadership | Quantized native GGUF throughput, graph-captured decode/prefill envelopes, native-owned endpoint independence everywhere, deterministic distributed ownership cleanup, mandatory GPU release lane |
 
-## 3) Modernization Stance
+## 3) Modern Serving Posture
+
+| Modern practice | InferFlux reading today | What still has to close |
+|---|---|---|
+| Sync batching over naive async fragmentation | Adopted | Only re-enable native async if it preserves the same batched execution core |
+| Quantized serving as first-class runtime path | Adopted foundation | Finish fused GGUF hot paths so memory-first mode is also the fast path |
+| Paged KV plus budget-aware planning | Adopted foundation | Mature allocator/ownership behavior under concurrency |
+| PD disaggregation with transport health | Adopted foundation | Close sequence ownership, cleanup, and multi-process fault matrix |
+| Explicit provider/fallback identity | Adopted | Keep every API/CLI/admin surface aligned as backends evolve |
+| Contract gates before grade moves | Adopted stance | Add required GPU/provider lanes before claiming release-grade runtime maturity |
+
+## 4) Old Practices to Retire
 
 | Retire | Replace with |
 |---|---|
-| Blanket fallback behavior | Capability + policy-driven routing with explicit fallback metadata |
-| "Async means faster" | Sync batched execution core with async admission only where it preserves batch quality |
-| Persistent dequant caches by default | Load-scoped memory policy with `none` as the native quantized default |
-| Fixed KV reservation | Budget-aware KV sizing and exported planning metrics |
-| Benchmark-only claims | Contract gates plus representative perf evidence |
+| Hidden compatibility fallback | Explicit backend/provider/fallback metadata and policy decisions |
+| “Async means faster” | Measure batch quality, hot-path residency, and end-to-end throughput |
+| Persistent dequant buffers by default | Policy-scoped dequant with memory-first `none` as the native GGUF default |
+| Fixed KV reservations | Budgeted KV planning with exported decisions |
+| Passive readiness only | Readiness plus optional fail-closed admission where degraded transport should stop new generation work |
+| Benchmark-only product claims | Contract tests plus representative runtime evidence |
 
-## 4) Canonical Source Map
+## 5) Grade Stance
+
+| Area | Reading |
+|---|---|
+| Overall | `B-` |
+| Why not lower | Control-plane, identity, observability, and memory-policy foundations are real and tested |
+| Why not higher | Native throughput and distributed ownership semantics are not yet best-in-class or release-enforced |
+
+## 6) Canonical Source Map
 
 | Need | Source of truth |
 |---|---|
-| Product contract | [PRD](PRD.md) |
-| Runtime architecture | [Architecture](Architecture.md) |
-| Current grades and milestones | [Roadmap](Roadmap.md) |
-| Debt and competitive lens | [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |
-| Modernization migration guide | [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) |
+| Runtime contract | [Architecture](Architecture.md) |
+| Grade and next moves | [Roadmap](Roadmap.md) |
+| Debt and migration order | [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |
+| Modernization table | [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) |
+| Product envelope | [PRD](PRD.md) |
 
-Archived long-form narratives remain under [ARCHIVE_INDEX](ARCHIVE_INDEX.md).
+Archived long-form narratives stay under [ARCHIVE_INDEX](ARCHIVE_INDEX.md).

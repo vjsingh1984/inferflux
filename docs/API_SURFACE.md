@@ -49,6 +49,7 @@ graph TD
 | `/v1/admin/routing` | `GET`, `PUT` | `admin` | Capability fallback policy |
 | `/v1/admin/cache` | `GET` | `admin` | Prefix/KV cache status |
 | `/v1/admin/cache/warm` | `POST` | `admin` | Seed cache entry |
+| `/v1/admin/pools` | `GET` | `admin` | Pool readiness plus scheduler and distributed KV transport state |
 
 ## 3) Ops Endpoints
 
@@ -74,7 +75,7 @@ graph TD
 | `inferctl admin cache --status` | `GET /v1/admin/cache` |
 | `inferctl admin cache --warm` | `POST /v1/admin/cache/warm` |
 | `inferctl admin routing --get/--set` | `GET`/`PUT /v1/admin/routing` |
-| `inferctl admin pools --get` | `/readyz` + `/metrics` aggregation in CLI |
+| `inferctl admin pools --get` | `GET /v1/admin/pools` (CLI falls back to `/readyz` + `/metrics` for older servers) |
 
 ## 5) Compatibility Notes
 
@@ -83,6 +84,20 @@ graph TD
 - `/v1/models` and `/v1/models/{id}` are distinct from admin model lifecycle endpoints.
 - `session_id` is an optional InferFlux extension for `/v1/completions` and `/v1/chat/completions`;
   it is ignored unless `runtime.scheduler.session_handles.enabled=true` and does not change default stateless behavior.
+
+`GET /v1/admin/pools` returns three top-level objects for automation symmetry:
+
+| Field | Meaning |
+|---|---|
+| `pool_health` | readiness contract (`ready`, `reason`, role, decode-pool state, distributed timeout streak/debt) |
+| `scheduler` | queue-depth and batch-cap metrics |
+| `distributed_kv` | enqueue rejection counts and ticket lifecycle totals |
+
+When `INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED=true`, generation endpoints fail closed with:
+
+| Endpoint class | Status | Body |
+|---|---|---|
+| `/v1/completions`, `/v1/chat/completions` | `503` | `{"error":"distributed_kv_transport_degraded"}` |
 
 ## 6) Model Identity Contract
 

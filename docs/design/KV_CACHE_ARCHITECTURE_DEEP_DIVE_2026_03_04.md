@@ -1,7 +1,7 @@
 # KV Cache and Slot Lifecycle
 
 **Snapshot date:** March 9, 2026  
-**Status:** partial implementation, still blocked on ownership cleanup
+**Status:** partial implementation; transport-health contracts landed, ownership cleanup still open
 
 ## 1) Layer Split
 
@@ -32,6 +32,7 @@ flowchart LR
 | Session reuse | TTL session lease layer stores `{model_id, sequence_id, prompt_tokens, block_table}` | Decode-worker mode support |
 | Memory pressure hooks | Slot manager exposes memory-pressure checks and graceful degradation helpers | Strong policy integration and broader test coverage |
 | Prefix reuse | Ref-counted block reuse and prefix hit metrics exist | Prefix-aware admission is still foundational, not fully cost-driven |
+| Distributed transport | Ticket lifecycle, timeout debt, readiness/admin surfaces, and optional fail-closed admission exist | Backend-owned cleanup and multi-process ownership proof |
 
 ## 3) What This Design Retires
 
@@ -54,8 +55,8 @@ flowchart LR
 ## 5) Next Gates
 
 1. Close backend sequence ownership cleanup in eviction paths.
-2. Add ticketed distributed KV handoff before claiming cluster-grade reuse semantics.
-3. Promote richer eviction policy only after ownership correctness is closed.
+2. Close backend-owned cleanup before claiming cluster-grade reuse semantics.
+3. Promote richer eviction policy only after ownership correctness and multi-process fault paths are closed.
 
 ## 6) Related Docs
 

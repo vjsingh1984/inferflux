@@ -230,6 +230,11 @@ Session handle contract:
 | `runtime.cuda.phase_overlap.enabled` | `true` for mixed workloads | prefill/decode overlap |
 | `runtime.cuda.phase_overlap.min_prefill_tokens` | `256` | overlap trigger threshold |
 
+Native CUDA KV sizing defaults:
+- startup defaults are `max_batch=16` and `max_seq=4096` (before clamps/overrides).
+- `max_batch` is clamped to scheduler slot floor (`>=16`).
+- `max_seq` can auto-tune downward for memory-constrained GPUs unless explicitly overridden.
+
 ### HTTP Server
 
 | Key | Default pattern | Tuning intent |
@@ -293,7 +298,15 @@ Scope contract:
 | `INFERFLUX_NATIVE_CUDA_STRICT` | fail model load if native CUDA runtime reports fallback |
 | `INFERFLUX_DISABLE_NATIVE_CUDA` | force native CUDA runtime readiness to false |
 | `INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY` | `runtime.cuda.dequantized_cache_policy` |
+| `INFERFLUX_NATIVE_KV_MAX_BATCH` | native CUDA KV cache `max_batch` hard override |
+| `INFERFLUX_NATIVE_KV_MAX_SEQ` | native CUDA KV cache `max_seq` hard override (disables seq auto-tune) |
+| `INFERFLUX_NATIVE_KV_AUTO_TUNE` | enable/disable native CUDA KV seq auto-tuning (`true` default) |
+| `INFERFLUX_NATIVE_KV_BUDGET_MB` | explicit KV budget in MiB for auto-tuning |
+| `INFERFLUX_NATIVE_KV_FREE_MEM_RATIO` | fraction of free VRAM used as KV budget when explicit budget is unset (`0.30` default) |
 | `INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL` | `runtime.cuda.quantized_runtime.require_fused_matmul` |
+| `INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED` | reject generation admission with `503` when distributed KV transport is degraded (`false` default) |
+| `INFERFLUX_READYZ_DISAGG_TIMEOUT_DEBT_THRESHOLD` | distributed KV timeout debt threshold that forces `/readyz` to `503` (`6` default when streak threshold is enabled, `0` disables) |
+| `INFERFLUX_READYZ_DISAGG_TIMEOUT_STREAK_THRESHOLD` | consecutive distributed KV ticket timeouts that force `/readyz` to `503` (`3`, `0` disables) |
 | `INFERFLUX_BACKEND_PRIORITY` | runtime backend priority chain |
 | `INFERFLUX_BACKEND_PREFER_NATIVE` | `runtime.backend_exposure.prefer_native` |
 | `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` | `runtime.backend_exposure.allow_llama_cpp_fallback` |
@@ -329,6 +342,7 @@ The startup advisor evaluates config quality at boot and emits recommendations f
 |---|---|
 | model load failure | model `path`, `format`, `backend` compatibility |
 | `422 backend_policy_violation` | strict native request policy + backend readiness |
+| `/readyz` says `distributed kv transport degraded` | inspect `inferflux_disagg_kv_timeout_streak`, `inferflux_disagg_kv_timeout_debt`, distributed KV ticket counters, and whether `INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED` is enabled |
 | low throughput | batch settings, KV pages, CUDA/FA2 enablement |
 | auth failures | API key scopes and bearer header |
 | no metrics | `server.enable_metrics` and `/metrics` reachability |

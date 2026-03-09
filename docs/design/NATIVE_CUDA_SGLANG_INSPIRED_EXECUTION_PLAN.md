@@ -36,7 +36,7 @@ flowchart LR
 | Native overlap | Sync-path mixed prefill/decode overlap is active | Graph capture and repeatable bucket reuse are still open |
 | Native async interface | Async submit/collect scaffolding exists | `SupportsAsyncUnifiedBatch()==false`; native throughput should not depend on per-step async dispatch |
 | Session reuse | TTL-based session handle layer in unified scheduler mode | Decode-worker mode ownership-safe session reuse |
-| Distributed foundation | Split roles, decode-worker readiness, SHM transport, overload failure path | Ticket/ack/commit transport lifecycle and ownership cleanup |
+| Distributed foundation | Split roles, decode-worker readiness, SHM transport, ticket lifecycle, timeout debt, admin pools visibility, and optional fail-closed admission | Sequence ownership cleanup and broader multi-process fault proof |
 
 ## 4) Foundations Already Landed
 
@@ -46,7 +46,8 @@ flowchart LR
 | Native GGUF memory path | Memory-first dequant policy and `lm_head` scratch/caching fixes |
 | KV lifecycle | Native KV planner, budget-based sequence tuning, and exported planning metrics |
 | Session layer | Optional `session_id` lease contract with TTL in unified mode |
-| Decode readiness | Decode-only nodes report ready only when weights are loaded and all workers are alive |
+| Decode readiness | Decode-only nodes report ready only when weights are loaded, workers are alive, and distributed transport health is below configured debt/streak thresholds |
+| Distributed transport health | Ticket lifecycle counters, timeout debt, admin pools contract, and optional fail-closed generation admission |
 
 ## 5) Open Phases
 
@@ -63,9 +64,9 @@ flowchart LR
 
 | Priority | Item | Done when |
 |---|---|---|
-| P1 | Ticketed KV transport | Handoff has explicit enqueue, ack, commit, timeout states |
 | P1 | Sequence ownership registry | Eviction and cleanup can free backend-owned state deterministically |
 | P1 | Session leases with decode workers | Session reuse remains safe in split-role deployments |
+| P1 | Multi-process failure matrix | Worker loss, queue pressure, and transport degradation are explicitly tested |
 
 ### Phase 3: CI and rollout safety
 
@@ -94,4 +95,4 @@ flowchart LR
 
 1. Finish first-class native quantized hot paths so memory-first policy stays enabled by default.
 2. Add graph capture buckets and graph-hit observability.
-3. Implement ticketed distributed KV transport and sequence ownership cleanup.
+3. Close sequence ownership cleanup and multi-process failure coverage on top of the existing ticketed transport foundation.
