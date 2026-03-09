@@ -498,6 +498,7 @@ add_executable(inferflux_tests
   tests/unit/test_quantized_weight_map.cpp
   tests/unit/test_strategy_registry.cpp
   tests/integration/test_gguf_quantization.cpp
+  tests/integration/test_http_generation_admission.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -533,6 +534,10 @@ add_test(NAME FlashAttnTests COMMAND inferflux_tests "[flash_attn]")
 set_tests_properties(FlashAttnTests PROPERTIES LABELS flash_attn)
 add_test(NAME ShmTransportTests COMMAND inferflux_tests "[shm_transport]")
 set_tests_properties(ShmTransportTests PROPERTIES LABELS shm_transport)
+add_test(NAME HttpGenerationAdmissionIntegrationTests
+         COMMAND inferflux_tests "[http_server][integration][admission]")
+set_tests_properties(HttpGenerationAdmissionIntegrationTests PROPERTIES
+  LABELS "http_server;integration;admission")
 add_test(NAME ChatTemplateTests COMMAND inferflux_tests "[chat_template]")
 set_tests_properties(ChatTemplateTests PROPERTIES LABELS chat_template)
 add_test(NAME SamplingTests COMMAND inferflux_tests "[sampling]")
