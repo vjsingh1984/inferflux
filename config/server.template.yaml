@@ -50,7 +50,7 @@ runtime:
 
     # Native CUDA KV cache precision (independent from weight precision)
     kv_cache_dtype: auto            # auto, fp16, bf16, int8, fp8
-    dequantized_cache_policy: batch # batch (default, lower VRAM) | model (higher reuse, higher VRAM)
+    dequantized_cache_policy: none  # none (default, memory-first) | batch (batch-boundary cleanup) | model (higher reuse, higher VRAM)
     quantized_runtime:
       require_fused_matmul: false   # true = fail startup unless fused quantized matmul strategy is selected
 
@@ -83,6 +83,10 @@ runtime:
     max_batch_tokens: 8192          # Max tokens per batch (affects memory)
     min_batch_size: 1               # Minimum batch size before flushing
     batch_accumulation_ms: 5        # Wait time to accumulate larger batches
+    policy: priority_age            # queue policy: priority_age | lpm_priority | throughput_balanced
+    continuous_decode_steps: 0      # 0 = disabled; >0 enforces decode bursts before requeue
+    chunked_prefill_tokens: 512     # Max tokens per prefill chunk in mixed execution
+    mixed_prefill_budget_ratio: 1.0 # Fraction (0.0-1.0) of backend token budget reserved for prefill
     session_handles:
       enabled: false                # Optional stateful layer; OpenAI flow stays stateless by default
       ttl_ms: 300000                # Session TTL in milliseconds
@@ -216,7 +220,7 @@ registry:
 # INFERFLUX_MODELS                  - Multi-model config string
 # INFERFLUX_NATIVE_CUDA_STRICT      - fail if native runtime reports fallback
 # INFERFLUX_NATIVE_KV_DTYPE         - KV precision policy override (auto/fp16/bf16/int8/fp8)
-# INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY - GGUF dequant cache lifecycle (batch/model)
+# INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY - GGUF dequant cache lifecycle (none/batch/model)
 # INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL - fail startup unless fused quantized matmul is selected
 # INFERFLUX_BACKEND_PRIORITY        - Override backend selection (Rule 8)
 # INFERFLUX_DISABLE_STARTUP_ADVISOR - Disable recommendation logging

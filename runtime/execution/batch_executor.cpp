@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -75,15 +76,56 @@ bool WaitForUnifiedBatchAsync(
   return backend->TryCollectUnifiedBatchAsync(handle, outputs);
 }
 
+BatchExecutor::UnifiedBatchTuning
+NormalizeUnifiedBatchTuning(BatchExecutor::UnifiedBatchTuning raw) {
+  raw.continuous_decode_steps = std::max(0, raw.continuous_decode_steps);
+  raw.chunked_prefill_tokens = std::max(1, raw.chunked_prefill_tokens);
+  if (!std::isfinite(raw.mixed_prefill_budget_ratio)) {
+    raw.mixed_prefill_budget_ratio = 1.0;
+  }
+  raw.mixed_prefill_budget_ratio =
+      std::clamp(raw.mixed_prefill_budget_ratio, 0.0, 1.0);
+  return raw;
+}
+
+int ComputePrefillChunkCap(int backend_step_token_cap, int active_decode_reqs,
+                           int active_prefill_reqs,
+                           const BatchExecutor::UnifiedBatchTuning &tuning) {
+  const int bounded_chunk_limit = std::max(
+      1, std::min(tuning.chunked_prefill_tokens, backend_step_token_cap));
+  const int scaled_prefill_budget = std::max(
+      1,
+      static_cast<int>(std::floor(static_cast<double>(backend_step_token_cap) *
+                                  tuning.mixed_prefill_budget_ratio)));
+  const int prefill_token_budget =
+      std::max(1, std::min(bounded_chunk_limit, scaled_prefill_budget) -
+                      active_decode_reqs);
+  if (active_prefill_reqs <= 0) {
+    return bounded_chunk_limit;
+  }
+  return std::max(1, std::min(bounded_chunk_limit,
+                              prefill_token_budget / active_prefill_reqs));
+}
+
 } // namespace
 
 BatchExecutor::BatchExecutor(
     SimpleTokenizer *tokenizer, std::shared_ptr<CPUDeviceContext> device,
     std::shared_ptr<PagedKVCache> cache, std::shared_ptr<ModelRouter> router,
     std::shared_ptr<SpeculativeDecoder> speculative_decoder)
+    : BatchExecutor(tokenizer, std::move(device), std::move(cache),
+                    std::move(router), std::move(speculative_decoder),
+                    UnifiedBatchTuning{}) {}
+
+BatchExecutor::BatchExecutor(
+    SimpleTokenizer *tokenizer, std::shared_ptr<CPUDeviceContext> device,
+    std::shared_ptr<PagedKVCache> cache, std::shared_ptr<ModelRouter> router,
+    std::shared_ptr<SpeculativeDecoder> speculative_decoder,
+    UnifiedBatchTuning tuning)
     : tokenizer_(tokenizer), device_(std::move(device)),
       cache_(std::move(cache)), router_(std::move(router)),
-      speculative_decoder_(std::move(speculative_decoder)) {}
+      speculative_decoder_(std::move(speculative_decoder)),
+      tuning_(NormalizeUnifiedBatchTuning(tuning)) {}
 
 std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
     const RequestBatch &batch,
@@ -205,6 +247,13 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   }
   if (slice_limit > 0) {
     decode_limit = std::min(decode_limit, slice_limit);
+  }
+  if (tuning_.continuous_decode_steps > 0) {
+    decode_limit = std::min(decode_limit, tuning_.continuous_decode_steps);
+    if (slice_limit <= 0) {
+      // Reuse fairness-yield semantics for bounded decode bursts.
+      slice_limit = tuning_.continuous_decode_steps;
+    }
   }
   if (decode_limit <= 0) {
     decode_limit = 1;
@@ -464,6 +513,7 @@ BatchExecutor::ExecuteBatchDecodePhased(
   std::vector<ReqState> states(n);
 
   auto decode_start = std::chrono::steady_clock::now();
+  std::size_t decode_step_loops = 0;
 
   for (std::size_t i = 0; i < n; ++i) {
     auto *req = eligible[i];
@@ -484,10 +534,14 @@ BatchExecutor::ExecuteBatchDecodePhased(
     if (slice > 0) {
       limit = std::min(limit, slice);
     }
+    if (tuning_.continuous_decode_steps > 0) {
+      limit = std::min(limit, tuning_.continuous_decode_steps);
+    }
     if (limit <= 0)
       limit = 1;
     states[i].decode_limit = limit;
-    states[i].slice_active = (slice > 0);
+    states[i].slice_active =
+        (slice > 0) || (tuning_.continuous_decode_steps > 0);
 
     // Emit the first token (pre-sampled by Prefill while its logits were
     // fresh).
@@ -542,6 +596,7 @@ BatchExecutor::ExecuteBatchDecodePhased(
 
     if (active_idx.empty())
       break;
+    ++decode_step_loops;
 
     auto step = backend->BatchDecodeStep(batch_inputs);
     if (step.empty())
@@ -628,6 +683,7 @@ BatchExecutor::ExecuteBatchDecodePhased(
   }
 
   GlobalMetrics().RecordDecodeDuration(decode_ms);
+  GlobalMetrics().RecordDecodeStepLoops("decode_phased", decode_step_loops);
   return outcomes;
 }
 
@@ -649,6 +705,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
   std::vector<ReqState> states(n);
 
   auto exec_start = std::chrono::steady_clock::now();
+  std::size_t decode_step_loops = 0;
 
   for (std::size_t i = 0; i < n; ++i) {
     auto *req = eligible[i];
@@ -668,10 +725,14 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     if (slice > 0) {
       limit = std::min(limit, slice);
     }
+    if (tuning_.continuous_decode_steps > 0) {
+      limit = std::min(limit, tuning_.continuous_decode_steps);
+    }
     if (limit <= 0)
       limit = 1;
     states[i].decode_limit = limit;
-    states[i].slice_active = (slice > 0);
+    states[i].slice_active =
+        (slice > 0) || (tuning_.continuous_decode_steps > 0);
 
     // If n_past is 0 and bpe_prompt_tokens is not empty, this is a fresh
     // prefill. (Note: In the current scheduler, Prefill() is called BEFORE
@@ -714,7 +775,6 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     }
   }
 
-  const int kMaxPrefillChunkSize = 512; // §P1d
   int loop_count = 0;
 
   while (true) {
@@ -746,16 +806,9 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
 
     const int backend_step_token_cap =
         std::max(1, backend->UnifiedBatchTokenCapacity());
-    const int prefill_token_budget =
-        std::max(1, backend_step_token_cap - active_decode_reqs);
-    int prefill_chunk_cap = kMaxPrefillChunkSize;
-    if (active_prefill_reqs > 0) {
-      // Keep each mixed-step submission under backend unified-batch capacity
-      // while allowing chunked prefill to remain in flight across steps.
-      prefill_chunk_cap =
-          std::max(1, std::min(kMaxPrefillChunkSize,
-                               prefill_token_budget / active_prefill_reqs));
-    }
+    const int prefill_chunk_cap =
+        ComputePrefillChunkCap(backend_step_token_cap, active_decode_reqs,
+                               active_prefill_reqs, tuning_);
 
     for (std::size_t i = 0; i < n; ++i) {
       if (!states[i].active)
@@ -771,6 +824,11 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
         int remaining = static_cast<int>(req->bpe_prompt_tokens.size()) -
                         req->prefill_offset;
         int chunk_size = std::min(remaining, prefill_chunk_cap);
+        if (remaining > chunk_size) {
+          GlobalMetrics().RecordPrefillChunkTruncation(
+              "unified_phased",
+              static_cast<std::size_t>(remaining - chunk_size));
+        }
         if (chunk_size <= 0) {
           states[i].in_prefill = false; // Safety
           continue;
@@ -801,6 +859,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
 
     if (active_idx.empty())
       break;
+    ++decode_step_loops;
 
     std::vector<LlamaCPUBackend::UnifiedBatchOutput> step;
     bool step_ok = true;
@@ -1002,6 +1061,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     req->first_token_time = std::chrono::steady_clock::now();
   }
 
+  GlobalMetrics().RecordDecodeStepLoops("unified_phased", decode_step_loops);
   return outcomes;
 }
 
@@ -1026,7 +1086,6 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
   if (!backend || batch.empty())
     return;
 
-  const int kMaxPrefillChunkSize = 512;
   int active_prefill_reqs = 0;
   int active_decode_reqs = 0;
   for (auto *req : batch.requests) {
@@ -1045,14 +1104,8 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
   }
   const int backend_step_token_cap =
       std::max(1, backend->UnifiedBatchTokenCapacity());
-  const int prefill_token_budget =
-      std::max(1, backend_step_token_cap - active_decode_reqs);
-  int prefill_chunk_cap = kMaxPrefillChunkSize;
-  if (active_prefill_reqs > 0) {
-    prefill_chunk_cap =
-        std::max(1, std::min(kMaxPrefillChunkSize,
-                             prefill_token_budget / active_prefill_reqs));
-  }
+  const int prefill_chunk_cap = ComputePrefillChunkCap(
+      backend_step_token_cap, active_decode_reqs, active_prefill_reqs, tuning_);
 
   std::vector<LlamaCPUBackend::UnifiedBatchInput> batch_inputs;
   std::vector<InferenceRequest *> active_reqs;
@@ -1073,6 +1126,10 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
       int remaining =
           static_cast<int>(req->bpe_prompt_tokens.size()) - req->prefill_offset;
       int chunk_size = std::min(remaining, prefill_chunk_cap);
+      if (remaining > chunk_size) {
+        GlobalMetrics().RecordPrefillChunkTruncation(
+            "unified_step", static_cast<std::size_t>(remaining - chunk_size));
+      }
       if (chunk_size <= 0) {
         req->exec_in_prefill = false;
         continue;
@@ -1101,6 +1158,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
   if (active_reqs.empty()) {
     return;
   }
+  GlobalMetrics().RecordDecodeStepLoops("unified_step", 1);
 
   std::vector<LlamaCPUBackend::UnifiedBatchOutput> step_outputs;
   if (backend->SupportsAsyncUnifiedBatch()) {

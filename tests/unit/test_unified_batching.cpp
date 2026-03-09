@@ -247,6 +247,123 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     REQUIRE(req_b.phase == RequestPhase::kFinished);
   }
 
+  SECTION("Executor tuning caps prefill chunk size") {
+    auto bounded_backend = std::make_shared<MockUnifiedBackend>();
+    bounded_backend->token_capacity = 128;
+
+    BatchExecutor::UnifiedBatchTuning tuning;
+    tuning.chunked_prefill_tokens = 16;
+    auto tuned_executor = std::make_unique<BatchExecutor>(
+        &tokenizer, device, cache, router, nullptr, tuning);
+
+    InferenceRequest req;
+    req.model = "mock";
+    req.phase = RequestPhase::kPrefill;
+    req.n_past = 0;
+    req.sequence_id = 41;
+    req.bpe_prompt_tokens.assign(40, 1);
+    req.max_tokens = 1;
+    req.remaining_decode_tokens = 1;
+    req.block_table = {41};
+
+    RequestBatch batch;
+    batch.requests = {&req};
+
+    auto results = tuned_executor->ExecuteBatch(batch, {bounded_backend});
+
+    REQUIRE(results.size() == 1);
+    REQUIRE(bounded_backend->calls.size() >= 3);
+    REQUIRE(bounded_backend->calls[0].inputs[0].tokens.size() == 16);
+    REQUIRE(bounded_backend->calls[1].inputs[0].tokens.size() == 16);
+    REQUIRE(bounded_backend->calls[2].inputs[0].tokens.size() == 8);
+  }
+
+  SECTION("Executor tuning applies mixed prefill budget ratio") {
+    auto bounded_backend = std::make_shared<MockUnifiedBackend>();
+    bounded_backend->token_capacity = 10;
+
+    BatchExecutor::UnifiedBatchTuning tuning;
+    tuning.chunked_prefill_tokens = 16;
+    tuning.mixed_prefill_budget_ratio = 0.5;
+    auto tuned_executor = std::make_unique<BatchExecutor>(
+        &tokenizer, device, cache, router, nullptr, tuning);
+
+    InferenceRequest req_prefill_a;
+    req_prefill_a.model = "mock";
+    req_prefill_a.phase = RequestPhase::kPrefill;
+    req_prefill_a.n_past = 0;
+    req_prefill_a.sequence_id = 51;
+    req_prefill_a.bpe_prompt_tokens.assign(10, 1);
+    req_prefill_a.max_tokens = 1;
+    req_prefill_a.remaining_decode_tokens = 1;
+    req_prefill_a.block_table = {51};
+
+    InferenceRequest req_prefill_b;
+    req_prefill_b.model = "mock";
+    req_prefill_b.phase = RequestPhase::kPrefill;
+    req_prefill_b.n_past = 0;
+    req_prefill_b.sequence_id = 52;
+    req_prefill_b.bpe_prompt_tokens.assign(10, 2);
+    req_prefill_b.max_tokens = 1;
+    req_prefill_b.remaining_decode_tokens = 1;
+    req_prefill_b.block_table = {52};
+
+    InferenceRequest req_decode;
+    req_decode.model = "mock";
+    req_decode.phase = RequestPhase::kDecode;
+    req_decode.n_past = 7;
+    req_decode.first_token = 42;
+    req_decode.first_piece = "x";
+    req_decode.max_tokens = 2;
+    req_decode.remaining_decode_tokens = 2;
+    req_decode.sequence_id = 53;
+    req_decode.block_table = {53};
+
+    RequestBatch batch;
+    batch.requests = {&req_prefill_a, &req_prefill_b, &req_decode};
+
+    auto results = tuned_executor->ExecuteBatch(
+        batch, {bounded_backend, bounded_backend, bounded_backend});
+
+    REQUIRE(results.size() == 3);
+    REQUIRE_FALSE(bounded_backend->calls.empty());
+    REQUIRE(bounded_backend->calls.front().inputs.size() == 3);
+    REQUIRE(bounded_backend->calls.front().inputs[0].tokens.size() == 2);
+    REQUIRE(bounded_backend->calls.front().inputs[1].tokens.size() == 2);
+    REQUIRE(bounded_backend->calls.front().inputs[2].tokens.size() == 1);
+  }
+
+  SECTION("Executor tuning enforces continuous decode-step slices") {
+    auto bounded_backend = std::make_shared<MockUnifiedBackend>();
+
+    BatchExecutor::UnifiedBatchTuning tuning;
+    tuning.continuous_decode_steps = 2;
+    auto tuned_executor = std::make_unique<BatchExecutor>(
+        &tokenizer, device, cache, router, nullptr, tuning);
+
+    InferenceRequest req;
+    req.model = "mock";
+    req.phase = RequestPhase::kPrefill;
+    req.n_past = 0;
+    req.sequence_id = 61;
+    req.bpe_prompt_tokens = {1, 2, 3, 4};
+    req.max_tokens = 5;
+    req.remaining_decode_tokens = 5;
+    req.block_table = {61};
+
+    RequestBatch batch;
+    batch.requests = {&req};
+
+    auto results = tuned_executor->ExecuteBatch(batch, {bounded_backend});
+
+    REQUIRE(results.size() == 1);
+    REQUIRE(req.fairness_yielded);
+    REQUIRE(req.phase == RequestPhase::kPending);
+    REQUIRE(req.total_completion_tokens == 2);
+    REQUIRE(req.remaining_decode_tokens == 3);
+    REQUIRE(results[0].completion_tokens == 2);
+  }
+
   SECTION("Deferred prefill resumes from non-zero prefill_offset") {
     auto async_backend = std::make_shared<MockAsyncUnifiedBackend>();
 

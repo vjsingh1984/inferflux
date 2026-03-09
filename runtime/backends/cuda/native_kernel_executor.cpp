@@ -29,6 +29,7 @@
 #include <set>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 #include <nlohmann/json.hpp>
@@ -658,23 +659,7 @@ NativeKernelExecutor::NativeKernelExecutor() = default;
 
 NativeKernelExecutor::~NativeKernelExecutor() {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-  // Drain async work before tearing down shared CUDA resources.
-  std::unordered_map<UnifiedBatchHandle, AsyncBatchState> pending_async;
-  {
-    std::lock_guard<std::mutex> lock(async_batches_mutex_);
-    pending_async.swap(async_batches_);
-  }
-  for (auto &entry : pending_async) {
-    auto &state = entry.second;
-    if (state.future.valid()) {
-      try {
-        (void)state.future.get();
-      } catch (...) {
-        // Best-effort shutdown path.
-      }
-    }
-  }
-
+  StopLaneDispatcher();
   DestroyLaneOverlapResources();
   model_forward_.reset();
   sampler_.reset();
@@ -741,6 +726,46 @@ bool CheckBF16Support() {
   return prop.major >= 8;
 }
 
+bool WaitForLaneHandle(
+    UnifiedBatchLaneDispatcher *dispatcher, UnifiedBatchHandle handle,
+    std::vector<LlamaCPUBackend::UnifiedBatchOutput> *outputs,
+    bool *decode_lane, std::string *error, double *elapsed_ms = nullptr,
+    bool *timed_out = nullptr,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+  if (!dispatcher || handle == 0) {
+    if (timed_out) {
+      *timed_out = false;
+    }
+    return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto status =
+        dispatcher->TryCollect(handle, outputs, decode_lane, error, elapsed_ms);
+    if (status == UnifiedBatchLaneDispatcher::CollectStatus::kSuccess) {
+      if (timed_out) {
+        *timed_out = false;
+      }
+      return true;
+    }
+    if (status == UnifiedBatchLaneDispatcher::CollectStatus::kFailed ||
+        status == UnifiedBatchLaneDispatcher::CollectStatus::kMissing) {
+      if (timed_out) {
+        *timed_out = false;
+      }
+      return false;
+    }
+    std::this_thread::yield();
+  }
+  auto status =
+      dispatcher->TryCollect(handle, outputs, decode_lane, error, elapsed_ms);
+  if (timed_out) {
+    *timed_out =
+        (status == UnifiedBatchLaneDispatcher::CollectStatus::kPending);
+  }
+  return status == UnifiedBatchLaneDispatcher::CollectStatus::kSuccess;
+}
+
 } // namespace
 
 bool NativeKernelExecutor::InitializeCUDA() {
@@ -780,17 +805,17 @@ bool NativeKernelExecutor::ConfigureDequantizedCachePolicy(
     const std::string &raw_policy) {
   std::string policy = ToLowerAscii(raw_policy);
   if (policy.empty()) {
-    policy = "model";
+    policy = "none";
   }
 
   runtime::cuda::native::DequantizedCachePolicy parsed =
-      runtime::cuda::native::DequantizedCachePolicy::kModelLifetime;
+      runtime::cuda::native::DequantizedCachePolicy::kNone;
   if (!runtime::cuda::native::ParseDequantizedCachePolicy(policy, &parsed)) {
     log::Warn("native_kernel_executor", "Invalid dequantized cache policy '" +
                                             policy +
-                                            "'; falling back to model");
-    parsed = runtime::cuda::native::DequantizedCachePolicy::kModelLifetime;
-    policy = "model";
+                                            "'; falling back to none");
+    parsed = runtime::cuda::native::DequantizedCachePolicy::kNone;
+    policy = "none";
   }
   dequantized_cache_policy_ = parsed;
   dequantized_cache_policy_hint_ = policy;
@@ -802,8 +827,8 @@ bool NativeKernelExecutor::ConfigureDequantizedCachePolicy(
 }
 
 void NativeKernelExecutor::ReleaseBatchScopedDequantizedCache() {
-  if (dequantized_cache_policy_ !=
-      runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime) {
+  if (dequantized_cache_policy_ ==
+      runtime::cuda::native::DequantizedCachePolicy::kModelLifetime) {
     return;
   }
   if (!model_loader_ || model_loader_->GetFormat() != "gguf") {
@@ -982,6 +1007,13 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
       DestroyLaneOverlapResources();
       return false;
     }
+    const bool allow_fused_quantized_matmul =
+        quantized_matmul_mode_ ==
+        runtime::cuda::native::MatmulExecutionMode::kFusedDequantTileGemm;
+    decode_lane_quantized_weight_map_->SetAllowFusedQuantizedMatmul(
+        allow_fused_quantized_matmul);
+    prefill_lane_quantized_weight_map_->SetAllowFusedQuantizedMatmul(
+        allow_fused_quantized_matmul);
 
     decode_lane_quantized_weight_adapter_ =
         std::make_unique<QuantizedWeightMapAdapter>(
@@ -1209,7 +1241,9 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
       const auto selection =
           registry.Select(tensor_type, kv_precision_, sm_major, sm_minor);
       if (selection.weight_layout && selection.matmul && selection.attention) {
-        const auto mode = selection.matmul->Mode();
+        quantized_matmul_mode_ = selection.matmul->Mode();
+        quantized_matmul_strategy_id_ = selection.matmul->Id();
+        const auto mode = quantized_matmul_mode_;
         log::Info("native_kernel_executor",
                   "Selected GGUF strategies: layout=" +
                       selection.weight_layout->Id() + ", matmul=" +
@@ -1251,6 +1285,15 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     }
   }
 
+  const bool allow_fused_quantized_matmul =
+      quantized_matmul_mode_ ==
+      runtime::cuda::native::MatmulExecutionMode::kFusedDequantTileGemm;
+  log::Info("native_kernel_executor",
+            "Quantized matmul execution mode: " +
+                MatmulModeToString(quantized_matmul_mode_) + ", strategy_id=" +
+                quantized_matmul_strategy_id_ + ", allow_fused=" +
+                std::string(allow_fused_quantized_matmul ? "true" : "false"));
+
   // 3. Create weights + forward implementation
   if (model_loader_) {
     quantized_weight_map_ = std::make_unique<QuantizedWeightMap>();
@@ -1260,6 +1303,8 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
                  "Failed to build quantized weight map");
       return false;
     }
+    quantized_weight_map_->SetAllowFusedQuantizedMatmul(
+        allow_fused_quantized_matmul);
     quantized_weight_adapter_ = std::make_unique<QuantizedWeightMapAdapter>(
         quantized_weight_map_.get());
     // GGUF always dequantizes to FP16, so use LlamaForwardTyped<half>
@@ -1407,6 +1452,9 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   log::Info("native_kernel_executor",
             "Loading native CUDA model from: " + model_path.string());
   loaded_model_path_ = model_path;
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  StopLaneDispatcher();
+#endif
   loader_.reset();
   model_loader_.reset();
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
@@ -1421,6 +1469,9 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   dequantized_cache_policy_hint_ = config.native_dequantized_cache_policy;
   require_fused_quantized_matmul_ =
       config.native_require_fused_quantized_matmul;
+  quantized_matmul_mode_ =
+      runtime::cuda::native::MatmulExecutionMode::kFusedDequantTileGemm;
+  quantized_matmul_strategy_id_ = "matmul.fused.dequant_tile_gemm.v1";
   if (const char *env_require_fused =
           std::getenv("INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL")) {
     require_fused_quantized_matmul_ =
@@ -1837,6 +1888,33 @@ NativeKernelExecutor::ExecuteLaneBatchForAsync(
   return result;
 }
 
+bool NativeKernelExecutor::EnsureLaneDispatcherStarted() {
+  std::lock_guard<std::mutex> lock(lane_dispatcher_mutex_);
+  if (lane_dispatcher_.IsRunning()) {
+    return true;
+  }
+  const bool started = lane_dispatcher_.Start(
+      [this](const std::vector<UnifiedBatchInput> &captured_inputs,
+             bool decode_lane) -> UnifiedBatchLaneDispatcher::ExecutionResult {
+        UnifiedBatchLaneDispatcher::ExecutionResult dispatch_result;
+        auto lane_result =
+            ExecuteLaneBatchForAsync(captured_inputs, decode_lane);
+        dispatch_result.success = true;
+        dispatch_result.outputs = std::move(lane_result.outputs);
+        dispatch_result.elapsed_ms = lane_result.elapsed_ms;
+        return dispatch_result;
+      });
+  if (started) {
+    GlobalMetrics().RecordCudaLaneWorkerRestart();
+  }
+  return started;
+}
+
+void NativeKernelExecutor::StopLaneDispatcher() {
+  std::lock_guard<std::mutex> lock(lane_dispatcher_mutex_);
+  lane_dispatcher_.Stop();
+}
+
 std::vector<LlamaCPUBackend::UnifiedBatchOutput>
 NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
     const std::vector<UnifiedBatchInput> &inputs) {
@@ -1890,49 +1968,100 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
     prefill_inputs.push_back(inputs[idx]);
   }
 
+  if (!EnsureLaneDispatcherStarted()) {
+    log::Warn("native_kernel_executor",
+              "Lane dispatcher unavailable; falling back to single-lane "
+              "execution");
+    return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
+  }
+
+  const UnifiedBatchHandle decode_handle =
+      lane_dispatcher_.Submit(decode_inputs, /*decode_lane=*/true);
+  if (decode_handle == 0) {
+    GlobalMetrics().RecordCudaLaneEnqueueReject(/*decode_lane=*/true);
+    GlobalMetrics().SetCudaLaneQueueDepth(
+        /*decode_lane=*/true,
+        static_cast<int>(lane_dispatcher_.PendingCount(/*decode_lane=*/true)));
+    log::Warn("native_kernel_executor",
+              "Decode lane submission rejected; falling back to single-lane "
+              "execution");
+    return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
+  }
   GlobalMetrics().RecordCudaLaneSubmission(/*decode_lane=*/true);
+  GlobalMetrics().SetCudaLaneQueueDepth(
+      /*decode_lane=*/true,
+      static_cast<int>(lane_dispatcher_.PendingCount(/*decode_lane=*/true)));
+
+  const UnifiedBatchHandle prefill_handle =
+      lane_dispatcher_.Submit(prefill_inputs, /*decode_lane=*/false);
+  if (prefill_handle == 0) {
+    GlobalMetrics().RecordCudaLaneEnqueueReject(/*decode_lane=*/false);
+    GlobalMetrics().SetCudaLaneQueueDepth(
+        /*decode_lane=*/false,
+        static_cast<int>(lane_dispatcher_.PendingCount(/*decode_lane=*/false)));
+    std::vector<UnifiedBatchOutput> drained_decode_outputs;
+    bool drained_decode_lane = true;
+    std::string drained_error;
+    double drained_elapsed_ms = 0.0;
+    bool drained_timed_out = false;
+    (void)WaitForLaneHandle(&lane_dispatcher_, decode_handle,
+                            &drained_decode_outputs, &drained_decode_lane,
+                            &drained_error, &drained_elapsed_ms,
+                            &drained_timed_out);
+    GlobalMetrics().RecordCudaLaneCompletion(/*decode_lane=*/true);
+    GlobalMetrics().SetCudaLaneQueueDepth(
+        /*decode_lane=*/true,
+        static_cast<int>(lane_dispatcher_.PendingCount(/*decode_lane=*/true)));
+    log::Warn("native_kernel_executor",
+              "Prefill lane submission rejected; falling back to single-lane "
+              "execution");
+    return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
+  }
   GlobalMetrics().RecordCudaLaneSubmission(/*decode_lane=*/false);
-  auto decode_future = std::async(std::launch::async, [this, decode_inputs]() {
-    return ExecuteLaneBatchForAsync(decode_inputs, /*decode_lane=*/true);
-  });
-  auto prefill_future =
-      std::async(std::launch::async, [this, prefill_inputs]() {
-        return ExecuteLaneBatchForAsync(prefill_inputs, /*decode_lane=*/false);
-      });
+  GlobalMetrics().SetCudaLaneQueueDepth(
+      /*decode_lane=*/false,
+      static_cast<int>(lane_dispatcher_.PendingCount(/*decode_lane=*/false)));
 
-  LaneExecutionResult decode_result;
-  LaneExecutionResult prefill_result;
-  bool decode_ok = true;
-  bool prefill_ok = true;
-  try {
-    decode_result = decode_future.get();
-  } catch (const std::exception &e) {
-    decode_ok = false;
-    log::Error("native_kernel_executor",
-               "Decode lane overlap execution failed: " +
-                   std::string(e.what()));
-  } catch (...) {
-    decode_ok = false;
-    log::Error("native_kernel_executor",
-               "Decode lane overlap execution failed with unknown error");
-  }
-  GlobalMetrics().RecordCudaLaneCompletion(/*decode_lane=*/true);
-
-  try {
-    prefill_result = prefill_future.get();
-  } catch (const std::exception &e) {
-    prefill_ok = false;
-    log::Error("native_kernel_executor",
-               "Prefill lane overlap execution failed: " +
-                   std::string(e.what()));
-  } catch (...) {
-    prefill_ok = false;
-    log::Error("native_kernel_executor",
-               "Prefill lane overlap execution failed with unknown error");
-  }
-  GlobalMetrics().RecordCudaLaneCompletion(/*decode_lane=*/false);
+  std::vector<UnifiedBatchOutput> decode_outputs;
+  std::vector<UnifiedBatchOutput> prefill_outputs;
+  bool decode_lane = true;
+  bool prefill_lane = false;
+  std::string decode_error;
+  std::string prefill_error;
+  double decode_elapsed_ms = 0.0;
+  double prefill_elapsed_ms = 0.0;
+  bool decode_timed_out = false;
+  bool prefill_timed_out = false;
+  const bool decode_ok = WaitForLaneHandle(
+      &lane_dispatcher_, decode_handle, &decode_outputs, &decode_lane,
+      &decode_error, &decode_elapsed_ms, &decode_timed_out);
+  GlobalMetrics().RecordCudaLaneCompletion(decode_lane);
+  GlobalMetrics().SetCudaLaneQueueDepth(
+      decode_lane, static_cast<int>(lane_dispatcher_.PendingCount(
+                       /*decode_lane=*/decode_lane)));
+  const bool prefill_ok = WaitForLaneHandle(
+      &lane_dispatcher_, prefill_handle, &prefill_outputs, &prefill_lane,
+      &prefill_error, &prefill_elapsed_ms, &prefill_timed_out);
+  GlobalMetrics().RecordCudaLaneCompletion(prefill_lane);
+  GlobalMetrics().SetCudaLaneQueueDepth(
+      prefill_lane, static_cast<int>(lane_dispatcher_.PendingCount(
+                        /*decode_lane=*/prefill_lane)));
 
   if (!decode_ok || !prefill_ok) {
+    if (!decode_ok) {
+      if (decode_timed_out) {
+        GlobalMetrics().RecordCudaLaneCollectTimeout(decode_lane);
+      }
+      log::Error("native_kernel_executor",
+                 "Decode lane overlap execution failed: " + decode_error);
+    }
+    if (!prefill_ok) {
+      if (prefill_timed_out) {
+        GlobalMetrics().RecordCudaLaneCollectTimeout(prefill_lane);
+      }
+      log::Error("native_kernel_executor",
+                 "Prefill lane overlap execution failed: " + prefill_error);
+    }
     return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
   }
 
@@ -1941,19 +2070,18 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
     output.token = -1;
     output.piece.clear();
   }
-  for (size_t i = 0;
-       i < decode_indices.size() && i < decode_result.outputs.size(); ++i) {
-    outputs[decode_indices[i]] = std::move(decode_result.outputs[i]);
+  for (size_t i = 0; i < decode_indices.size() && i < decode_outputs.size();
+       ++i) {
+    outputs[decode_indices[i]] = std::move(decode_outputs[i]);
   }
-  for (size_t i = 0;
-       i < prefill_indices.size() && i < prefill_result.outputs.size(); ++i) {
-    outputs[prefill_indices[i]] = std::move(prefill_result.outputs[i]);
+  for (size_t i = 0; i < prefill_indices.size() && i < prefill_outputs.size();
+       ++i) {
+    outputs[prefill_indices[i]] = std::move(prefill_outputs[i]);
   }
 
-  const double total_sequential_ms =
-      decode_result.elapsed_ms + prefill_result.elapsed_ms;
+  const double total_sequential_ms = decode_elapsed_ms + prefill_elapsed_ms;
   const double actual_concurrent_ms =
-      std::max(decode_result.elapsed_ms, prefill_result.elapsed_ms);
+      std::max(decode_elapsed_ms, prefill_elapsed_ms);
   const double overlap_ms = total_sequential_ms - actual_concurrent_ms;
   if (overlap_ms > 0.0) {
     GlobalMetrics().RecordCudaLaneOverlap(overlap_ms);
@@ -2264,19 +2392,26 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
 }
 
 bool NativeKernelExecutor::SupportsAsyncUnifiedBatch() const {
-  // Disable async dispatch to use the synchronous ExecuteUnifiedBatch path
-  // which supports true batching (BatchForward + SampleBatch). The async
-  // path (ExecuteLaneBatch) processes inputs sequentially through Forward()
-  // and serializes concurrent requests through shared_pipeline_mutex_,
-  // defeating batching. When lane-overlap resources are unavailable, the async
-  // path just adds mutex serialization overhead.
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!model_loaded_ || !model_forward_) {
+    return false;
+  }
+  if (!overlap_enabled_) {
+    return false;
+  }
+  return CanRunLaneOverlap();
+#else
   return false;
+#endif
 }
 
 UnifiedBatchHandle NativeKernelExecutor::SubmitUnifiedBatchAsync(
     const std::vector<UnifiedBatchInput> &inputs, UnifiedBatchLane lane) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!model_forward_ || inputs.empty()) {
+    return 0;
+  }
+  if (!EnsureLaneDispatcherStarted()) {
     return 0;
   }
 
@@ -2288,22 +2423,17 @@ UnifiedBatchHandle NativeKernelExecutor::SubmitUnifiedBatchAsync(
                      return in.tokens.size() == 1 && in.request_logits;
                    }));
 
-  auto future = std::async(
-      std::launch::async,
-      [this, captured_inputs = inputs, is_decode]() -> LaneExecutionResult {
-        return ExecuteLaneBatchForAsync(captured_inputs, is_decode);
-      });
-
-  const UnifiedBatchHandle handle = next_handle_.fetch_add(1);
-  {
-    std::lock_guard<std::mutex> lock(async_batches_mutex_);
-    AsyncBatchState state;
-    state.future = std::move(future);
-    state.is_decode = is_decode;
-    async_batches_.emplace(handle, std::move(state));
+  const UnifiedBatchHandle handle = lane_dispatcher_.Submit(inputs, is_decode);
+  if (handle == 0) {
+    GlobalMetrics().RecordCudaLaneEnqueueReject(is_decode);
+    GlobalMetrics().SetCudaLaneQueueDepth(
+        is_decode, static_cast<int>(lane_dispatcher_.PendingCount(is_decode)));
+    return 0;
   }
 
   GlobalMetrics().RecordCudaLaneSubmission(is_decode);
+  GlobalMetrics().SetCudaLaneQueueDepth(
+      is_decode, static_cast<int>(lane_dispatcher_.PendingCount(is_decode)));
   return handle;
 #else
   (void)inputs;
@@ -2315,45 +2445,27 @@ UnifiedBatchHandle NativeKernelExecutor::SubmitUnifiedBatchAsync(
 bool NativeKernelExecutor::TryCollectUnifiedBatchAsync(
     UnifiedBatchHandle handle, std::vector<UnifiedBatchOutput> *outputs) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-  AsyncBatchState state;
-  {
-    std::lock_guard<std::mutex> lock(async_batches_mutex_);
-    auto it = async_batches_.find(handle);
-    if (it == async_batches_.end()) {
-      return false;
-    }
-    if (!it->second.future.valid()) {
-      async_batches_.erase(it);
-      return false;
-    }
-    const auto wait_status =
-        it->second.future.wait_for(std::chrono::milliseconds(0));
-    if (wait_status != std::future_status::ready) {
-      return false;
-    }
-    state = std::move(it->second);
-    async_batches_.erase(it);
-  }
-
-  LaneExecutionResult completed;
-  try {
-    completed = state.future.get();
-  } catch (const std::exception &e) {
-    log::Error("native_kernel_executor",
-               "Async lane execution failed: " + std::string(e.what()));
-    GlobalMetrics().RecordCudaLaneCompletion(state.is_decode);
+  if (handle == 0) {
     return false;
-  } catch (...) {
-    log::Error("native_kernel_executor",
-               "Async lane execution failed with unknown error");
-    GlobalMetrics().RecordCudaLaneCompletion(state.is_decode);
+  }
+  bool decode_lane = false;
+  std::string error;
+  auto status =
+      lane_dispatcher_.TryCollect(handle, outputs, &decode_lane, &error);
+  if (status == UnifiedBatchLaneDispatcher::CollectStatus::kPending ||
+      status == UnifiedBatchLaneDispatcher::CollectStatus::kMissing) {
     return false;
   }
 
-  if (outputs) {
-    *outputs = std::move(completed.outputs);
+  GlobalMetrics().RecordCudaLaneCompletion(decode_lane);
+  GlobalMetrics().SetCudaLaneQueueDepth(
+      decode_lane,
+      static_cast<int>(lane_dispatcher_.PendingCount(decode_lane)));
+  if (status == UnifiedBatchLaneDispatcher::CollectStatus::kFailed) {
+    log::Error("native_kernel_executor",
+               "Async lane execution failed: " + error);
+    return false;
   }
-  GlobalMetrics().RecordCudaLaneCompletion(state.is_decode);
   return true;
 #else
   (void)handle;

@@ -82,6 +82,18 @@ private:
   void *d_k_append_ptrs_{nullptr}; // T** on device
   void *d_v_append_ptrs_{nullptr}; // T** on device
 
+  // Bulk KV pointer arrays for all layers (eliminates per-layer H2D copies)
+  void *d_all_k_append_ptrs_{nullptr}; // T** [num_layers * max_batch_size]
+  void *d_all_v_append_ptrs_{nullptr};
+  void *d_all_k_read_ptrs_{nullptr}; // const T** [num_layers * max_batch_size]
+  void *d_all_v_read_ptrs_{nullptr};
+
+  // CUDA graph state for batched decode
+  cudaGraph_t decode_graph_{nullptr};
+  cudaGraphExec_t decode_graph_exec_{nullptr};
+  int graph_batch_size_{0};
+  bool graph_enabled_{true};
+
   bool AllocateScratch();
 };
 

@@ -39,7 +39,11 @@ public:
   void RecordSchedulerIteration(std::size_t prefill_requests,
                                 std::size_t decode_requests,
                                 std::size_t token_count);
+  void RecordSchedulerPolicyIteration(const std::string &policy,
+                                      std::size_t prefill_requests,
+                                      std::size_t decode_requests);
   void RecordBatchTokenBudgetSkip();
+  void RecordPrefixAffinityProbe(bool hit, int matched_tokens);
   void RecordPrefixLookup(bool hit);
   void RecordPrefixMatchedTokens(int tokens);
   void RecordPartialPrefixHit();
@@ -140,6 +144,12 @@ public:
   void RecordCudaLaneExecutionStop(bool decode_lane);
   void RecordCudaLaneOverlap(double duration_ms);
   void SetCudaLaneQueueDepth(bool decode_lane, int depth);
+  void RecordCudaLaneEnqueueReject(bool decode_lane);
+  void RecordCudaLaneCollectTimeout(bool decode_lane);
+  void RecordCudaLaneWorkerRestart();
+  void RecordDecodeStepLoops(const std::string &mode, std::size_t loops);
+  void RecordPrefillChunkTruncation(const std::string &mode,
+                                    std::size_t truncated_tokens);
   void SetCudaAttentionKernel(const std::string &kernel);
   void RecordCudaAttentionKernelFallback(const std::string &requested_kernel,
                                          const std::string &selected_kernel,
@@ -188,6 +198,9 @@ private:
   std::atomic<uint64_t> scheduler_iteration_requests_total_{0};
   std::atomic<uint64_t> scheduler_iteration_tokens_total_{0};
   std::atomic<uint64_t> scheduler_batch_token_budget_skips_{0};
+  std::atomic<uint64_t> scheduler_prefix_affinity_probes_{0};
+  std::atomic<uint64_t> scheduler_prefix_affinity_hits_{0};
+  std::atomic<uint64_t> scheduler_prefix_affinity_matched_tokens_{0};
   std::atomic<uint64_t> prefix_hits_{0};
   std::atomic<uint64_t> prefix_misses_{0};
   std::atomic<uint64_t> prefix_matched_tokens_{0};
@@ -251,12 +264,25 @@ private:
   std::atomic<uint64_t> cuda_prefill_lane_submissions_{0};
   std::atomic<uint64_t> cuda_decode_lane_completions_{0};
   std::atomic<uint64_t> cuda_prefill_lane_completions_{0};
+  mutable std::mutex scheduler_policy_metrics_mutex_;
+  std::unordered_map<std::string, uint64_t> scheduler_policy_iterations_;
+  mutable std::mutex scheduler_step_metrics_mutex_;
+  std::unordered_map<std::string, uint64_t> scheduler_decode_step_loops_;
+  std::unordered_map<std::string, uint64_t>
+      scheduler_prefill_chunk_truncations_;
+  std::unordered_map<std::string, uint64_t>
+      scheduler_prefill_chunk_truncated_tokens_;
   std::atomic<uint64_t> cuda_lane_overlap_events_{0};
   std::atomic<uint64_t> cuda_lane_overlap_duration_us_{0};
   std::atomic<int> cuda_decode_lane_inflight_{0};
   std::atomic<int> cuda_prefill_lane_inflight_{0};
   std::atomic<int> cuda_decode_lane_queue_depth_{0};
   std::atomic<int> cuda_prefill_lane_queue_depth_{0};
+  std::atomic<uint64_t> cuda_decode_lane_enqueue_rejects_{0};
+  std::atomic<uint64_t> cuda_prefill_lane_enqueue_rejects_{0};
+  std::atomic<uint64_t> cuda_decode_lane_collect_timeouts_{0};
+  std::atomic<uint64_t> cuda_prefill_lane_collect_timeouts_{0};
+  std::atomic<uint64_t> cuda_lane_worker_restarts_{0};
   mutable std::mutex cuda_attention_kernel_mutex_;
   std::string cuda_attention_kernel_{"standard"};
   mutable std::mutex cuda_overlap_timing_mutex_;

@@ -199,7 +199,7 @@ int main(int argc, char **argv) {
   int cuda_flash_attention_tile = 128;
   std::string cuda_attention_kernel = "auto";
   std::string native_kv_cache_dtype = "auto";
-  std::string native_dequantized_cache_policy = "model";
+  std::string native_dequantized_cache_policy = "none";
   bool native_require_fused_quantized_matmul = false;
   bool cuda_phase_overlap_scaffold = false;
   int cuda_phase_overlap_min_prefill_tokens = 256;
@@ -492,6 +492,34 @@ int main(int argc, char **argv) {
           if (scheduler_node["batch_accumulation_ms"]) {
             scheduler_config.batch_accumulation_ms =
                 std::max(0, scheduler_node["batch_accumulation_ms"].as<int>());
+          }
+          if (scheduler_node["continuous_decode_steps"]) {
+            scheduler_config.continuous_decode_steps = std::max(
+                0, scheduler_node["continuous_decode_steps"].as<int>());
+          }
+          if (scheduler_node["chunked_prefill_tokens"]) {
+            scheduler_config.chunked_prefill_tokens =
+                std::max(1, scheduler_node["chunked_prefill_tokens"].as<int>());
+          }
+          if (scheduler_node["mixed_prefill_budget_ratio"]) {
+            scheduler_config.mixed_prefill_budget_ratio = std::clamp(
+                scheduler_node["mixed_prefill_budget_ratio"].as<double>(), 0.0,
+                1.0);
+          }
+          if (scheduler_node["policy"]) {
+            const std::string policy_raw =
+                scheduler_node["policy"].as<std::string>();
+            if (inferflux::IsSchedulerBatchPolicyValue(policy_raw)) {
+              scheduler_config.batch_policy =
+                  inferflux::ParseSchedulerBatchPolicy(
+                      policy_raw, scheduler_config.batch_policy);
+            } else {
+              inferflux::log::Warn("server",
+                                   "Invalid runtime.scheduler.policy '" +
+                                       policy_raw + "'; keeping " +
+                                       inferflux::SchedulerBatchPolicyToString(
+                                           scheduler_config.batch_policy));
+            }
           }
           if (scheduler_node["session_handles"]) {
             const auto &session_node = scheduler_node["session_handles"];
@@ -853,6 +881,44 @@ int main(int argc, char **argv) {
       scheduler_config.batch_accumulation_ms = static_cast<int>(accumulation);
     }
   }
+  if (const char *env_continuous_decode_steps =
+          std::getenv("INFERFLUX_SCHED_CONTINUOUS_DECODE_STEPS")) {
+    try {
+      int v = std::stoi(env_continuous_decode_steps);
+      if (v >= 0) {
+        scheduler_config.continuous_decode_steps = v;
+      }
+    } catch (...) {
+    }
+  }
+  if (const char *env_chunked_prefill_tokens =
+          std::getenv("INFERFLUX_SCHED_CHUNKED_PREFILL_TOKENS")) {
+    auto chunk_tokens = ParsePositiveSize(env_chunked_prefill_tokens);
+    if (chunk_tokens > 0) {
+      scheduler_config.chunked_prefill_tokens = static_cast<int>(chunk_tokens);
+    }
+  }
+  if (const char *env_prefill_budget_ratio =
+          std::getenv("INFERFLUX_SCHED_MIXED_PREFILL_BUDGET_RATIO")) {
+    try {
+      const double ratio = std::stod(std::string(env_prefill_budget_ratio));
+      scheduler_config.mixed_prefill_budget_ratio = std::clamp(ratio, 0.0, 1.0);
+    } catch (...) {
+    }
+  }
+  if (const char *env_sched_policy = std::getenv("INFERFLUX_SCHED_POLICY")) {
+    const std::string policy_raw = env_sched_policy;
+    if (inferflux::IsSchedulerBatchPolicyValue(policy_raw)) {
+      scheduler_config.batch_policy = inferflux::ParseSchedulerBatchPolicy(
+          policy_raw, scheduler_config.batch_policy);
+    } else {
+      inferflux::log::Warn("server",
+                           "Invalid INFERFLUX_SCHED_POLICY '" + policy_raw +
+                               "'; keeping " +
+                               inferflux::SchedulerBatchPolicyToString(
+                                   scheduler_config.batch_policy));
+    }
+  }
   if (const char *env_session_handles =
           std::getenv("INFERFLUX_SESSION_HANDLES_ENABLED")) {
     scheduler_config.session_handles.enabled = ParseBool(env_session_handles);
@@ -1001,7 +1067,15 @@ int main(int argc, char **argv) {
           ", min_batch_size=" +
           std::to_string(scheduler_config.min_batch_size) +
           ", batch_accumulation_ms=" +
-          std::to_string(scheduler_config.batch_accumulation_ms) +
+          std::to_string(scheduler_config.batch_accumulation_ms) + ", policy=" +
+          inferflux::SchedulerBatchPolicyToString(
+              scheduler_config.batch_policy) +
+          ", continuous_decode_steps=" +
+          std::to_string(scheduler_config.continuous_decode_steps) +
+          ", chunked_prefill_tokens=" +
+          std::to_string(scheduler_config.chunked_prefill_tokens) +
+          ", mixed_prefill_budget_ratio=" +
+          std::to_string(scheduler_config.mixed_prefill_budget_ratio) +
           ", session_handles.enabled=" +
           std::string(scheduler_config.session_handles.enabled ? "true"
                                                                : "false") +
@@ -1074,7 +1148,7 @@ int main(int argc, char **argv) {
               << native_kv_cache_dtype << ".\n";
     std::cout << "[server] Native CUDA dequant cache policy: "
               << native_dequantized_cache_policy
-              << " (model default, required for fused GEMV correctness).\n";
+              << " (none default, memory-first).\n";
     std::cout << "[server] Native CUDA strict fused quantized matmul: "
               << (native_require_fused_quantized_matmul ? "enabled"
                                                         : "disabled")

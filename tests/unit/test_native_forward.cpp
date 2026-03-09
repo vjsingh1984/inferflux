@@ -5,10 +5,15 @@
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
 #include "runtime/backends/cuda/native/cublas_gemm.h"
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
+#include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/model_forward_factory.h"
 #include "runtime/backends/cuda/native/quantized_weight_map_adapter.h"
+#include "runtime/backends/cuda/native/safetensors_adapter.h"
 #include "runtime/backends/cuda/native/weight_map.h"
 #endif
+
+#include <array>
+#include <cstdlib>
 
 namespace inferflux {
 
@@ -53,6 +58,7 @@ TEST_CASE("ModelForwardFactory: supported model types", "[native_forward]") {
   // Unsupported models should return nullptr
   REQUIRE(CreateModelForward("unknown_model") == nullptr);
   REQUIRE(CreateModelForward("") == nullptr);
+  REQUIRE(CreateModelForwardTyped<__nv_bfloat16>("llama") != nullptr);
 #else
   REQUIRE(true); // Placeholder when native kernels not compiled
 #endif
@@ -79,6 +85,26 @@ TEST_CASE("NativeKernelExecutor: ExecuteUnifiedBatch returns empty when no "
   REQUIRE(outputs.empty());
 }
 
+TEST_CASE("NativeKernelExecutor: async unified-batch contract is gated by "
+          "runtime readiness",
+          "[native_forward]") {
+  NativeKernelExecutor executor;
+  REQUIRE_FALSE(executor.SupportsAsyncUnifiedBatch());
+
+  LlamaCPUBackend::UnifiedBatchInput input;
+  input.sequence_id = 0;
+  input.n_past = 0;
+  input.tokens = {1};
+  input.request_logits = true;
+
+  const auto handle = executor.SubmitUnifiedBatchAsync(
+      {input}, LlamaCPUBackend::UnifiedBatchLane::kAuto);
+  REQUIRE(handle == 0);
+
+  std::vector<LlamaCPUBackend::UnifiedBatchOutput> outputs;
+  REQUIRE_FALSE(executor.TryCollectUnifiedBatchAsync(1, &outputs));
+}
+
 // ============================================================================
 // SafetensorsLoader Config Parsing Tests
 // ============================================================================
@@ -99,6 +125,31 @@ TEST_CASE("SafetensorsLoader: GetTensor returns nullptr for unknown name",
   REQUIRE(loader.GetTensor("nonexistent") == nullptr);
   REQUIRE(loader.GetTensorNames().empty());
 }
+
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+TEST_CASE("SafetensorsWeightAccessor: FP16 path is direct non-quantized "
+          "access",
+          "[native_forward]") {
+  SafetensorsLoader::Tensor tensor;
+  tensor.name = "w";
+  tensor.shape = {4, 8};
+  tensor.dtype = "f16";
+  tensor.gpu_offset = 16;
+
+  std::array<uint8_t, 128> gpu_buffer{};
+  runtime::cuda::native::SafetensorsWeightAccessor accessor(
+      &tensor, gpu_buffer.data());
+
+  REQUIRE_FALSE(accessor.IsQuantized());
+  REQUIRE(accessor.GetDataType() == "f16");
+  REQUIRE(accessor.GetDimensions() == std::make_pair<size_t, size_t>(4, 8));
+
+  void *raw = accessor.GetGpuWeights(nullptr);
+  REQUIRE(raw == (gpu_buffer.data() + tensor.gpu_offset));
+  half *dequant = accessor.GetDequantizedGpuWeights(nullptr);
+  REQUIRE(reinterpret_cast<void *>(dequant) == raw);
+}
+#endif
 
 // ============================================================================
 // NativeKernelExecutor Native* Method Tests
@@ -254,6 +305,185 @@ TEST_CASE("FusedQuantGemm: adaptive threshold varies by quant type",
   REQUIRE(q4k_threshold >= q8_0_threshold);
   REQUIRE(q4k_threshold >= 4);
   REQUIRE(q4k_threshold <= 32);
+}
+
+TEST_CASE("FusedQuantGemm: adaptive threshold remains bounded for all target "
+          "quantized GGUF types",
+          "[native_forward]") {
+  const std::array<int, 4> target_quant_types = {
+      12, // Q4_K
+      14, // Q6_K
+      8,  // Q8_0
+      15, // Q8_K
+  };
+  for (const int quant_type : target_quant_types) {
+    const int threshold = FusedQuantGemm::GetAdaptiveThreshold(quant_type);
+    REQUIRE(threshold >= 4);
+    REQUIRE(threshold <= 32);
+  }
+}
+
+TEST_CASE("FusedQuantGemm: deterministic fallback policy by batch size for "
+          "target quant types",
+          "[native_forward]") {
+  const std::array<int, 4> target_quant_types = {
+      12, // Q4_K
+      14, // Q6_K
+      8,  // Q8_0
+      15, // Q8_K
+  };
+
+  for (const int quant_type : target_quant_types) {
+    const int threshold = FusedQuantGemm::GetAdaptiveThreshold(quant_type);
+    const int short_prefill_m = std::max(2, threshold);
+    const int batched_decode_m = threshold + 1;
+
+    // Decode and short-prefill stay on fused path.
+    REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 1));
+    REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, short_prefill_m));
+
+    // Larger M deterministically falls back to compatibility/cuBLAS path.
+    REQUIRE_FALSE(
+        FusedQuantGemm::ShouldUseFusedPath(quant_type, batched_decode_m));
+  }
+}
+
+TEST_CASE("FusedQuantGemm: deterministic fallback policy rejects invalid "
+          "inputs",
+          "[native_forward]") {
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseFusedPath(0, 1));  // F32
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseFusedPath(1, 1));  // F16
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseFusedPath(12, 0)); // non-positive M
+}
+
+TEST_CASE("FusedQuantGemm::Gemv respects deterministic fallback threshold for "
+          "all target quant types",
+          "[native_forward]") {
+  const std::array<int, 4> target_quant_types = {
+      12, // Q4_K
+      14, // Q6_K
+      8,  // Q8_0
+      15, // Q8_K
+  };
+
+  for (const int quant_type : target_quant_types) {
+    QuantizedWeightInfo info;
+    info.data = reinterpret_cast<const void *>(0x1); // Non-null sentinel
+    info.quant_type = quant_type;
+    info.num_elements = 128 * 64;
+
+    const int threshold = FusedQuantGemm::GetAdaptiveThreshold(quant_type);
+    const int m_fallback = threshold + 1;
+
+    // M > threshold must return false before any kernel dispatch.
+    const bool used = FusedQuantGemm::Gemv(info, nullptr, nullptr, m_fallback,
+                                           128, 64, nullptr);
+    REQUIRE_FALSE(used);
+  }
+}
+
+TEST_CASE(
+    "FusedQuantGemm::RmsNormGemv respects deterministic fallback threshold for "
+    "all target quant types",
+    "[native_forward]") {
+  const std::array<int, 4> target_quant_types = {
+      12, // Q4_K
+      14, // Q6_K
+      8,  // Q8_0
+      15, // Q8_K
+  };
+
+  for (const int quant_type : target_quant_types) {
+    QuantizedWeightInfo info;
+    info.data = reinterpret_cast<const void *>(0x1); // Non-null sentinel
+    info.quant_type = quant_type;
+    info.num_elements = 128 * 64;
+
+    const int threshold = FusedQuantGemm::GetAdaptiveThreshold(quant_type);
+    const int m_fallback = threshold + 1;
+
+    // M > threshold must return false before any kernel dispatch.
+    const bool used = FusedQuantGemm::RmsNormGemv(
+        info, nullptr, nullptr, nullptr, m_fallback, 128, 64, 1e-6f, nullptr);
+    REQUIRE_FALSE(used);
+  }
+}
+
+TEST_CASE("FusedQuantGemm: CUDA runtime contract launches fused decode path "
+          "and falls back above threshold",
+          "[native_forward][cuda_runtime_contract]") {
+  const char *disable_fused_env = std::getenv("INFERFLUX_DISABLE_FUSED_GEMV");
+  if (disable_fused_env &&
+      (std::string(disable_fused_env) == "1" ||
+       std::string(disable_fused_env) == "true")) {
+    SUCCEED("Fused kernels disabled via INFERFLUX_DISABLE_FUSED_GEMV.");
+    return;
+  }
+
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping CUDA runtime contract.");
+    return;
+  }
+
+  const auto run_contract = [](runtime::cuda::native::GGUF::TensorType qtype,
+                               int K, int N) {
+    const int quant_type = static_cast<int>(qtype);
+    const int threshold = FusedQuantGemm::GetAdaptiveThreshold(quant_type);
+    const int m_fused = 1;
+    const int m_fallback = threshold + 1;
+
+    const size_t weight_bytes =
+        runtime::cuda::native::CalcTensorSize(qtype, {static_cast<uint64_t>(N),
+                                                      static_cast<uint64_t>(K)});
+    REQUIRE(weight_bytes > 0);
+
+    void *d_weight = nullptr;
+    half *d_activation = nullptr;
+    half *d_output = nullptr;
+
+    REQUIRE(cudaMalloc(&d_weight, weight_bytes) == cudaSuccess);
+    REQUIRE(cudaMemset(d_weight, 0, weight_bytes) == cudaSuccess);
+    REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_activation),
+                       static_cast<size_t>(m_fallback) * K * sizeof(half)) ==
+            cudaSuccess);
+    REQUIRE(cudaMemset(d_activation, 0,
+                       static_cast<size_t>(m_fallback) * K * sizeof(half)) ==
+            cudaSuccess);
+    REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_output),
+                       static_cast<size_t>(m_fallback) * N * sizeof(half)) ==
+            cudaSuccess);
+    REQUIRE(cudaMemset(d_output, 0,
+                       static_cast<size_t>(m_fallback) * N * sizeof(half)) ==
+            cudaSuccess);
+
+    QuantizedWeightInfo info;
+    info.data = d_weight;
+    info.quant_type = quant_type;
+    info.num_elements = static_cast<int64_t>(N) * static_cast<int64_t>(K);
+
+    (void)cudaGetLastError(); // clear sticky errors before launch checks
+    const bool used_fused = FusedQuantGemm::Gemv(info, d_activation, d_output,
+                                                 m_fused, N, K, nullptr);
+    REQUIRE(used_fused);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE(cudaGetLastError() == cudaSuccess);
+
+    const bool used_fallback = FusedQuantGemm::Gemv(
+        info, d_activation, d_output, m_fallback, N, K, nullptr);
+    REQUIRE_FALSE(used_fallback);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+    REQUIRE(cudaFree(d_output) == cudaSuccess);
+    REQUIRE(cudaFree(d_activation) == cudaSuccess);
+    REQUIRE(cudaFree(d_weight) == cudaSuccess);
+  };
+
+  // Keep dimensions minimal but valid for each quant block layout.
+  run_contract(runtime::cuda::native::GGUF::TensorType::Q4_K, 256, 32);
+  run_contract(runtime::cuda::native::GGUF::TensorType::Q6_K, 256, 32);
+  run_contract(runtime::cuda::native::GGUF::TensorType::Q8_0, 32, 32);
+  run_contract(runtime::cuda::native::GGUF::TensorType::Q8_K, 256, 32);
 }
 
 // ============================================================================

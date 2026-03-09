@@ -151,6 +151,41 @@ class NativeMetricsStubTests(unittest.TestCase):
         self.assertIn("inferflux_native_kv_active_sequences", body)
         self.assertIn("inferflux_native_kv_max_sequences", body)
 
+    def test_cuda_lane_backpressure_metrics_present(self):
+        """CUDA lane reject/timeout/restart metrics are rendered."""
+        resp, body = self._get("/metrics")
+        self.assertIn(
+            "# HELP inferflux_cuda_lane_enqueue_rejects_total", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_cuda_lane_enqueue_rejects_total counter", body
+        )
+        self.assertIn(
+            'inferflux_cuda_lane_enqueue_rejects_total{lane="decode"}', body
+        )
+        self.assertIn(
+            'inferflux_cuda_lane_enqueue_rejects_total{lane="prefill"}', body
+        )
+        self.assertIn(
+            "# HELP inferflux_cuda_lane_collect_timeouts_total", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_cuda_lane_collect_timeouts_total counter", body
+        )
+        self.assertIn(
+            'inferflux_cuda_lane_collect_timeouts_total{lane="decode"}', body
+        )
+        self.assertIn(
+            'inferflux_cuda_lane_collect_timeouts_total{lane="prefill"}', body
+        )
+        self.assertIn(
+            "# HELP inferflux_cuda_lane_worker_restarts_total", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_cuda_lane_worker_restarts_total counter", body
+        )
+        self.assertIn("inferflux_cuda_lane_worker_restarts_total", body)
+
     def test_native_forward_counters_zero_in_stub(self):
         """In stub mode (no native backend), counters should be 0."""
         resp, body = self._get("/metrics")

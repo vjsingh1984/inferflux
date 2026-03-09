@@ -16,11 +16,27 @@ namespace inferflux {
 
 class BatchExecutor {
 public:
+  struct UnifiedBatchTuning {
+    // 0 disables scheduler-level decode slicing in executor loops.
+    int continuous_decode_steps{0};
+    // Upper bound on per-request prefill chunk tokens in mixed execution.
+    int chunked_prefill_tokens{512};
+    // Fraction of backend token capacity reserved for prefill work in
+    // mixed decode/prefill steps (0.0-1.0).
+    double mixed_prefill_budget_ratio{1.0};
+  };
+
   BatchExecutor(SimpleTokenizer *tokenizer,
                 std::shared_ptr<CPUDeviceContext> device,
                 std::shared_ptr<PagedKVCache> cache,
                 std::shared_ptr<ModelRouter> router,
                 std::shared_ptr<SpeculativeDecoder> speculative_decoder);
+  BatchExecutor(SimpleTokenizer *tokenizer,
+                std::shared_ptr<CPUDeviceContext> device,
+                std::shared_ptr<PagedKVCache> cache,
+                std::shared_ptr<ModelRouter> router,
+                std::shared_ptr<SpeculativeDecoder> speculative_decoder,
+                UnifiedBatchTuning tuning);
 
   std::vector<InferenceResult> ExecuteBatch(
       const RequestBatch &batch,
@@ -69,6 +85,7 @@ private:
   std::shared_ptr<PagedKVCache> cache_;
   std::shared_ptr<ModelRouter> router_;
   std::shared_ptr<SpeculativeDecoder> speculative_decoder_;
+  UnifiedBatchTuning tuning_;
 };
 
 } // namespace inferflux

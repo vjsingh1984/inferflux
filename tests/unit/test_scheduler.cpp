@@ -126,6 +126,13 @@ public:
   UnifiedBatchHandle
   SubmitUnifiedBatchAsync(const std::vector<UnifiedBatchInput> &inputs,
                           UnifiedBatchLane lane) override {
+    const int submission_ticket =
+        global_submission_ticket_.fetch_add(1, std::memory_order_relaxed) + 1;
+    int expected_ticket = 0;
+    first_submission_ticket_.compare_exchange_strong(
+        expected_ticket, submission_ticket, std::memory_order_relaxed,
+        std::memory_order_relaxed);
+
     if (lane == UnifiedBatchLane::kPrefill) {
       prefill_submissions_.fetch_add(1, std::memory_order_relaxed);
     } else if (lane == UnifiedBatchLane::kDecode) {
@@ -189,6 +196,9 @@ public:
   int PrefillPartialFallbackCalls() const {
     return prefill_partial_fallback_calls_.load(std::memory_order_relaxed);
   }
+  int FirstSubmissionTicket() const {
+    return first_submission_ticket_.load(std::memory_order_relaxed);
+  }
 
 private:
   std::vector<UnifiedBatchOutput>
@@ -217,7 +227,12 @@ private:
   std::atomic<int> auto_submissions_{0};
   std::atomic<int> prefill_fallback_calls_{0};
   std::atomic<int> prefill_partial_fallback_calls_{0};
+  std::atomic<int> first_submission_ticket_{0};
+
+  static std::atomic<int> global_submission_ticket_;
 };
+
+std::atomic<int> AsyncLaneStubBackend::global_submission_ticket_{0};
 
 class SessionLeaseStubBackend final : public ReadyStubBackend {
 public:
@@ -769,4 +784,136 @@ TEST_CASE("Scheduler does not auto-fallback for explicit model requests",
   REQUIRE(resp.no_backend);
   REQUIRE(resp.model_id.empty());
   REQUIRE(resp.completion.find("logprobs") != std::string::npos);
+}
+
+TEST_CASE("Scheduler batch policy parse and stringify are stable",
+          "[scheduler]") {
+  REQUIRE(SchedulerBatchPolicyToString(SchedulerBatchPolicy::kPriorityAge) ==
+          "priority_age");
+  REQUIRE(SchedulerBatchPolicyToString(SchedulerBatchPolicy::kLpmPriority) ==
+          "lpm_priority");
+  REQUIRE(
+      SchedulerBatchPolicyToString(SchedulerBatchPolicy::kThroughputBalanced) ==
+      "throughput_balanced");
+
+  REQUIRE(IsSchedulerBatchPolicyValue("priority_age"));
+  REQUIRE(IsSchedulerBatchPolicyValue("LPM_PRIORITY"));
+  REQUIRE(IsSchedulerBatchPolicyValue("throughput_balanced"));
+  REQUIRE_FALSE(IsSchedulerBatchPolicyValue("unknown_policy"));
+
+  REQUIRE(ParseSchedulerBatchPolicy("priority_age") ==
+          SchedulerBatchPolicy::kPriorityAge);
+  REQUIRE(ParseSchedulerBatchPolicy("lpm_priority") ==
+          SchedulerBatchPolicy::kLpmPriority);
+  REQUIRE(ParseSchedulerBatchPolicy("THROUGHPUT_BALANCED") ==
+          SchedulerBatchPolicy::kThroughputBalanced);
+  REQUIRE(ParseSchedulerBatchPolicy(
+              "invalid", SchedulerBatchPolicy::kThroughputBalanced) ==
+          SchedulerBatchPolicy::kThroughputBalanced);
+}
+
+TEST_CASE("Scheduler preserves configured batch policy", "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+
+  Scheduler::Config cfg;
+  cfg.batch_policy = SchedulerBatchPolicy::kLpmPriority;
+  cfg.continuous_decode_steps = 3;
+  cfg.chunked_prefill_tokens = 96;
+  cfg.mixed_prefill_budget_ratio = 0.4;
+  Scheduler scheduler(tokenizer, device, cache, nullptr, nullptr, nullptr,
+                      FairnessConfig{}, DisaggregatedConfig{},
+                      ModelSelectionOptions{}, cfg);
+
+  REQUIRE(scheduler.BatchPolicy() == SchedulerBatchPolicy::kLpmPriority);
+  REQUIRE(scheduler.ContinuousDecodeSteps() == 3);
+  REQUIRE(scheduler.ChunkedPrefillTokens() == 96);
+  REQUIRE(scheduler.MixedPrefillBudgetRatio() ==
+          Catch::Approx(0.4).epsilon(1e-6));
+}
+
+TEST_CASE("Scheduler normalizes mixed-step tuning bounds", "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+
+  Scheduler::Config cfg;
+  cfg.continuous_decode_steps = -7;
+  cfg.chunked_prefill_tokens = 0;
+  cfg.mixed_prefill_budget_ratio = 2.5;
+  Scheduler scheduler(tokenizer, device, cache, nullptr, nullptr, nullptr,
+                      FairnessConfig{}, DisaggregatedConfig{},
+                      ModelSelectionOptions{}, cfg);
+
+  REQUIRE(scheduler.ContinuousDecodeSteps() == 0);
+  REQUIRE(scheduler.ChunkedPrefillTokens() == 1);
+  REQUIRE(scheduler.MixedPrefillBudgetRatio() ==
+          Catch::Approx(1.0).epsilon(1e-6));
+}
+
+TEST_CASE("Scheduler lpm policy prioritizes prefix-affinity request",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      8, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto prefix_cache = std::make_shared<RadixPrefixCache>(
+      cache, [](int) {}, RadixPrefixCacheLimits{1024, 32});
+
+  auto cold_backend = std::make_shared<AsyncLaneStubBackend>("cold");
+  auto hot_backend = std::make_shared<AsyncLaneStubBackend>("hot");
+
+  ModelInfo cold_info;
+  cold_info.id = "cold-model";
+  cold_info.path = "/tmp/cold.gguf";
+  cold_info.backend = "cpu";
+  REQUIRE(router->RegisterModel(cold_info, cold_backend));
+
+  ModelInfo hot_info;
+  hot_info.id = "hot-model";
+  hot_info.path = "/tmp/hot.gguf";
+  hot_info.backend = "cpu";
+  REQUIRE(router->RegisterModel(hot_info, hot_backend));
+  REQUIRE(router->SetDefaultModel(cold_info.id));
+
+  const std::string hot_prompt = "prefix hot prompt";
+  auto hot_tokens = tokenizer.Encode(hot_prompt);
+  prefix_cache->Insert(hot_tokens, {101}, 7, hot_backend);
+
+  Scheduler::Config cfg;
+  cfg.max_batch_size = 1;
+  cfg.min_batch_size = 2;
+  cfg.batch_accumulation_ms = 20;
+  cfg.batch_policy = SchedulerBatchPolicy::kLpmPriority;
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, prefix_cache,
+                      FairnessConfig{}, DisaggregatedConfig{},
+                      ModelSelectionOptions{}, cfg);
+
+  InferenceRequest cold_req;
+  cold_req.model = cold_info.id;
+  cold_req.prompt = "cold request prompt";
+  cold_req.max_tokens = 2;
+
+  InferenceRequest hot_req;
+  hot_req.model = hot_info.id;
+  hot_req.prompt = hot_prompt;
+  hot_req.max_tokens = 2;
+
+  auto cold_future = scheduler.Generate(std::move(cold_req));
+  auto hot_future = scheduler.Generate(std::move(hot_req));
+
+  auto cold_resp = cold_future.get();
+  auto hot_resp = hot_future.get();
+  REQUIRE_FALSE(cold_resp.no_backend);
+  REQUIRE_FALSE(hot_resp.no_backend);
+
+  REQUIRE(hot_backend->FirstSubmissionTicket() > 0);
+  REQUIRE(cold_backend->FirstSubmissionTicket() > 0);
+  REQUIRE(hot_backend->FirstSubmissionTicket() <
+          cold_backend->FirstSubmissionTicket());
 }

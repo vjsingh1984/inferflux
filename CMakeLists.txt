@@ -69,6 +69,8 @@ add_library(inferflux_core
   runtime/speculative/speculative_decoder.h
   runtime/execution/batch_executor.cpp
   runtime/execution/batch_executor.h
+  runtime/execution/unified_batch_lane_dispatcher.cpp
+  runtime/execution/unified_batch_lane_dispatcher.h
   runtime/execution/parallel_context.cpp
   runtime/execution/parallel_context.h
   runtime/backends/ep_dispatch.cpp
@@ -469,6 +471,7 @@ add_executable(inferflux_tests
   tests/unit/test_structured_output.cpp
   tests/unit/test_paged_kv_cache.cpp
   tests/unit/test_unified_batching.cpp
+  tests/unit/test_lane_dispatcher.cpp
   tests/unit/test_model_registry.cpp
   tests/unit/test_model_selection.cpp
   tests/unit/test_single_model_router.cpp
@@ -483,6 +486,7 @@ add_executable(inferflux_tests
   tests/unit/test_batch_analyzer.cpp
   tests/unit/test_backend_interface.cpp
   tests/unit/test_native_forward.cpp
+  tests/unit/test_native_dequant_policy.cpp
   tests/unit/test_tokenizer_factory.cpp
   tests/unit/test_dtype_traits.cpp
   tests/unit/test_gpu_kv_cache.cpp

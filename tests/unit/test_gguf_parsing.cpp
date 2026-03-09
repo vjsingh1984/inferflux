@@ -123,6 +123,9 @@ TEST_CASE("GGUF: String to tensor type conversion", "[gguf][gguf_util]") {
   REQUIRE(StringToTensorType("q4_k_m") == GGUF::TensorType::Q4_K);
   REQUIRE(StringToTensorType("q5_k_m") == GGUF::TensorType::Q5_K);
   REQUIRE(StringToTensorType("q6_k") == GGUF::TensorType::Q6_K);
+  REQUIRE(StringToTensorType("q6_k_m") == GGUF::TensorType::Q6_K);
+  REQUIRE(StringToTensorType("q8_k") == GGUF::TensorType::Q8_K);
+  REQUIRE(StringToTensorType("q8_k_m") == GGUF::TensorType::Q8_K);
 }
 
 TEST_CASE("GGUF: Is quantized type detection", "[gguf][gguf_util]") {

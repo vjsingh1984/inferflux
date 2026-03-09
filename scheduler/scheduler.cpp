@@ -10,10 +10,57 @@
 #include "server/tracing/span.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 
 namespace inferflux {
+
+namespace {
+
+std::string ToLower(std::string value) {
+  std::transform(
+      value.begin(), value.end(), value.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
+} // namespace
+
+std::string SchedulerBatchPolicyToString(SchedulerBatchPolicy policy) {
+  switch (policy) {
+  case SchedulerBatchPolicy::kLpmPriority:
+    return "lpm_priority";
+  case SchedulerBatchPolicy::kThroughputBalanced:
+    return "throughput_balanced";
+  case SchedulerBatchPolicy::kPriorityAge:
+  default:
+    return "priority_age";
+  }
+}
+
+bool IsSchedulerBatchPolicyValue(const std::string &value) {
+  const std::string normalized = ToLower(value);
+  return normalized == "priority_age" || normalized == "lpm_priority" ||
+         normalized == "throughput_balanced";
+}
+
+SchedulerBatchPolicy
+ParseSchedulerBatchPolicy(const std::string &value,
+                          SchedulerBatchPolicy default_policy) {
+  const std::string normalized = ToLower(value);
+  if (normalized == "priority_age") {
+    return SchedulerBatchPolicy::kPriorityAge;
+  }
+  if (normalized == "lpm_priority") {
+    return SchedulerBatchPolicy::kLpmPriority;
+  }
+  if (normalized == "throughput_balanced") {
+    return SchedulerBatchPolicy::kThroughputBalanced;
+  }
+  return default_policy;
+}
 
 namespace {
 constexpr double kFairnessAgingDivisorMs =
@@ -187,6 +234,15 @@ Scheduler::Config NormalizeSchedulerConfig(const Scheduler::Config &raw) {
   if (normalized.max_batch_tokens > 131072) {
     normalized.max_batch_tokens = 131072;
   }
+  normalized.continuous_decode_steps =
+      std::max(0, normalized.continuous_decode_steps);
+  normalized.chunked_prefill_tokens =
+      std::max(1, normalized.chunked_prefill_tokens);
+  if (!std::isfinite(normalized.mixed_prefill_budget_ratio)) {
+    normalized.mixed_prefill_budget_ratio = 1.0;
+  }
+  normalized.mixed_prefill_budget_ratio =
+      std::clamp(normalized.mixed_prefill_budget_ratio, 0.0, 1.0);
   normalized.session_handles.ttl_ms =
       std::max(1, normalized.session_handles.ttl_ms);
   normalized.session_handles.max_sessions =
@@ -215,8 +271,12 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
       seq_slots_free_((1ULL << kMaxSequenceSlots) - 1) {
   static_assert(kMaxSequenceSlots <= 64,
                 "seq_slots_free_ bitmask requires kMaxSequenceSlots <= 64");
-  executor_ = std::make_unique<BatchExecutor>(&tokenizer_, device_, cache_,
-                                              router_, speculative_decoder_);
+  BatchExecutor::UnifiedBatchTuning tuning;
+  tuning.continuous_decode_steps = config_.continuous_decode_steps;
+  tuning.chunked_prefill_tokens = config_.chunked_prefill_tokens;
+  tuning.mixed_prefill_budget_ratio = config_.mixed_prefill_budget_ratio;
+  executor_ = std::make_unique<BatchExecutor>(
+      &tokenizer_, device_, cache_, router_, speculative_decoder_, tuning);
 
   // Initialize sequence slot manager for universal KV cache tracking.
   slot_manager_ = std::make_unique<scheduler::SequenceSlotManager>(
@@ -440,6 +500,9 @@ void Scheduler::DecodeWorkerLoop() {
     GlobalMetrics().RecordSchedulerIteration(
         /*prefill_requests=*/0,
         /*decode_requests=*/batch.size(), decode_tokens);
+    GlobalMetrics().RecordSchedulerPolicyIteration(
+        SchedulerBatchPolicyToString(config_.batch_policy),
+        /*prefill_requests=*/0, /*decode_requests=*/batch.size());
 
     ResolveBackends(batch);
 
@@ -731,6 +794,7 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
     std::shared_ptr<PendingRequest> pending;
     bool from_decode{false};
     std::size_t index{0};
+    double prefix_affinity_tokens{0.0};
   };
   std::vector<QueueItem> queue_items;
   // When decode workers are active they own pending_decode_; WorkerLoop must
@@ -748,6 +812,53 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
     }
   }
 
+  const bool prefix_affinity_enabled =
+      config_.batch_policy != SchedulerBatchPolicy::kPriorityAge &&
+      prefix_cache_ != nullptr;
+  if (prefix_affinity_enabled) {
+    for (auto &item : queue_items) {
+      if (item.from_decode || !item.pending) {
+        continue;
+      }
+      auto &inf = item.pending->inference;
+      const std::vector<int> *tokens = !inf.bpe_prompt_tokens.empty()
+                                           ? &inf.bpe_prompt_tokens
+                                           : &inf.prompt_tokens;
+      if (!tokens || tokens->empty()) {
+        continue;
+      }
+
+      std::shared_ptr<LlamaCPUBackend> backend_hint =
+          item.pending->resolved_backend;
+      if (!backend_hint && router_) {
+        ModelInfo *resolved = nullptr;
+        if (!inf.resolved_model.empty()) {
+          resolved = router_->ResolveExact(inf.resolved_model);
+        }
+        if (!resolved && !inf.model.empty()) {
+          resolved = router_->ResolveExact(inf.model);
+        }
+        if (!resolved) {
+          resolved = router_->Resolve(inf.model);
+        }
+        if (resolved && !resolved->id.empty()) {
+          backend_hint = router_->GetBackend(resolved->id);
+        }
+      }
+
+      RadixLookupResult lookup;
+      const bool hit =
+          prefix_cache_->Lookup(*tokens, backend_hint.get(), &lookup);
+      const bool affinity_hit = hit && lookup.matched_tokens > 0;
+      GlobalMetrics().RecordPrefixAffinityProbe(
+          affinity_hit, affinity_hit ? lookup.matched_tokens : 0);
+      if (affinity_hit) {
+        item.prefix_affinity_tokens =
+            static_cast<double>(lookup.matched_tokens);
+      }
+    }
+  }
+
   auto now = std::chrono::steady_clock::now();
   std::stable_sort(queue_items.begin(), queue_items.end(),
                    [&](const QueueItem &a, const QueueItem &b) {
@@ -761,6 +872,15 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
                                     age_a / kFairnessAgingDivisorMs;
                      double eff_b = static_cast<double>(b.pending->priority) +
                                     age_b / kFairnessAgingDivisorMs;
+                     if (config_.batch_policy ==
+                         SchedulerBatchPolicy::kLpmPriority) {
+                       eff_a += a.prefix_affinity_tokens / 32.0;
+                       eff_b += b.prefix_affinity_tokens / 32.0;
+                     } else if (config_.batch_policy ==
+                                SchedulerBatchPolicy::kThroughputBalanced) {
+                       eff_a += a.prefix_affinity_tokens / 64.0;
+                       eff_b += b.prefix_affinity_tokens / 64.0;
+                     }
                      if (eff_a != eff_b) {
                        return eff_a > eff_b;
                      }
@@ -1214,6 +1334,9 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   }
   GlobalMetrics().RecordSchedulerIteration(
       prefill_requests, metrics_decode_requests, selection.total_tokens);
+  GlobalMetrics().RecordSchedulerPolicyIteration(
+      SchedulerBatchPolicyToString(config_.batch_policy), prefill_requests,
+      metrics_decode_requests);
 
   if (use_decode_workers_) {
     GlobalMetrics().SetDecodeQueueDepth(

@@ -73,6 +73,9 @@ public:
   }
   virtual QuantizedWeightInfo LmHeadRaw() const { return {}; }
   virtual bool HasQuantizedWeights() const { return false; }
+  // Strategy-driven policy switch used by native CUDA forward kernels to
+  // force compatibility GEMM path when fused dequant kernels are disallowed.
+  virtual bool AllowFusedQuantizedMatmul() const { return true; }
 
 private:
   struct LayerWeights {

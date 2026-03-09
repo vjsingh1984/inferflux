@@ -66,6 +66,14 @@ public:
    * Queries GPU properties once on first call (thread-safe).
    */
   static int GetAdaptiveThreshold(int quant_type);
+
+  /**
+   * Deterministic dispatch policy helper used by runtime paths and tests.
+   *
+   * Returns true when a quant type is fused-kernel supported and batch size M
+   * is within the adaptive threshold for fused execution.
+   */
+  static bool ShouldUseFusedPath(int quant_type, int M);
 };
 
 } // namespace inferflux

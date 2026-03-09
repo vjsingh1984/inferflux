@@ -89,8 +89,38 @@ void MetricsRegistry::RecordSchedulerIteration(std::size_t prefill_requests,
   }
 }
 
+void MetricsRegistry::RecordSchedulerPolicyIteration(
+    const std::string &policy, std::size_t prefill_requests,
+    std::size_t decode_requests) {
+  if (prefill_requests == 0 && decode_requests == 0) {
+    return;
+  }
+  const std::string policy_label = policy.empty() ? "unknown" : policy;
+  std::string phase = "decode";
+  if (prefill_requests > 0 && decode_requests > 0) {
+    phase = "mixed";
+  } else if (prefill_requests > 0) {
+    phase = "prefill";
+  }
+  const std::string key = policy_label + "|" + phase;
+  std::lock_guard<std::mutex> lock(scheduler_policy_metrics_mutex_);
+  scheduler_policy_iterations_[key] += 1;
+}
+
 void MetricsRegistry::RecordBatchTokenBudgetSkip() {
   scheduler_batch_token_budget_skips_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordPrefixAffinityProbe(bool hit, int matched_tokens) {
+  scheduler_prefix_affinity_probes_.fetch_add(1, std::memory_order_relaxed);
+  if (!hit) {
+    return;
+  }
+  scheduler_prefix_affinity_hits_.fetch_add(1, std::memory_order_relaxed);
+  if (matched_tokens > 0) {
+    scheduler_prefix_affinity_matched_tokens_.fetch_add(
+        static_cast<uint64_t>(matched_tokens), std::memory_order_relaxed);
+  }
 }
 
 void MetricsRegistry::RecordPrefixLookup(bool hit) {
@@ -504,6 +534,47 @@ void MetricsRegistry::SetCudaLaneQueueDepth(bool decode_lane, int depth) {
   }
 }
 
+void MetricsRegistry::RecordCudaLaneEnqueueReject(bool decode_lane) {
+  if (decode_lane) {
+    cuda_decode_lane_enqueue_rejects_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    cuda_prefill_lane_enqueue_rejects_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::RecordCudaLaneCollectTimeout(bool decode_lane) {
+  if (decode_lane) {
+    cuda_decode_lane_collect_timeouts_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    cuda_prefill_lane_collect_timeouts_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::RecordCudaLaneWorkerRestart() {
+  cuda_lane_worker_restarts_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordDecodeStepLoops(const std::string &mode,
+                                            std::size_t loops) {
+  if (loops == 0) {
+    return;
+  }
+  const std::string mode_label = mode.empty() ? "unknown" : mode;
+  std::lock_guard<std::mutex> lock(scheduler_step_metrics_mutex_);
+  scheduler_decode_step_loops_[mode_label] += loops;
+}
+
+void MetricsRegistry::RecordPrefillChunkTruncation(
+    const std::string &mode, std::size_t truncated_tokens) {
+  if (truncated_tokens == 0) {
+    return;
+  }
+  const std::string mode_label = mode.empty() ? "unknown" : mode;
+  std::lock_guard<std::mutex> lock(scheduler_step_metrics_mutex_);
+  scheduler_prefill_chunk_truncations_[mode_label] += 1;
+  scheduler_prefill_chunk_truncated_tokens_[mode_label] += truncated_tokens;
+}
+
 void MetricsRegistry::RecordNativeForwardPass(bool is_decode, int batch_size,
                                               double forward_ms) {
   if (is_decode) {
@@ -674,6 +745,79 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_scheduler_batch_token_budget_skips_total{backend=\""
       << backend << "\"} " << scheduler_batch_token_budget_skips_.load()
       << "\n";
+
+  out << "# HELP inferflux_scheduler_policy_iterations_total Scheduler "
+         "iterations by queue policy and phase composition\n";
+  out << "# TYPE inferflux_scheduler_policy_iterations_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(scheduler_policy_metrics_mutex_);
+    for (const auto &[key, count] : scheduler_policy_iterations_) {
+      auto split = key.find('|');
+      if (split == std::string::npos) {
+        continue;
+      }
+      const std::string policy = key.substr(0, split);
+      const std::string phase = key.substr(split + 1);
+      out << "inferflux_scheduler_policy_iterations_total{backend=\"" << backend
+          << "\",policy=\"" << policy << "\",phase=\"" << phase << "\"} "
+          << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_scheduler_prefix_affinity_probes_total Prefix-"
+         "affinity probes performed during queue ranking\n";
+  out << "# TYPE inferflux_scheduler_prefix_affinity_probes_total counter\n";
+  out << "inferflux_scheduler_prefix_affinity_probes_total{backend=\""
+      << backend << "\"} " << scheduler_prefix_affinity_probes_.load() << "\n";
+
+  out << "# HELP inferflux_scheduler_prefix_affinity_hits_total Prefix-"
+         "affinity probes that produced reusable hits\n";
+  out << "# TYPE inferflux_scheduler_prefix_affinity_hits_total counter\n";
+  out << "inferflux_scheduler_prefix_affinity_hits_total{backend=\"" << backend
+      << "\"} " << scheduler_prefix_affinity_hits_.load() << "\n";
+
+  out << "# HELP inferflux_scheduler_prefix_affinity_matched_tokens_total "
+         "Matched tokens observed in prefix-affinity hits\n";
+  out << "# TYPE inferflux_scheduler_prefix_affinity_matched_tokens_total "
+         "counter\n";
+  out << "inferflux_scheduler_prefix_affinity_matched_tokens_total{backend=\""
+      << backend << "\"} " << scheduler_prefix_affinity_matched_tokens_.load()
+      << "\n";
+
+  out << "# HELP inferflux_scheduler_decode_step_loops_total Decode-step loop "
+         "iterations executed by mode\n";
+  out << "# TYPE inferflux_scheduler_decode_step_loops_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(scheduler_step_metrics_mutex_);
+    for (const auto &[mode, count] : scheduler_decode_step_loops_) {
+      out << "inferflux_scheduler_decode_step_loops_total{mode=\"" << mode
+          << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_scheduler_prefill_chunk_truncations_total Number "
+         "of prefill chunks truncated by mixed-step token budgets\n";
+  out << "# TYPE inferflux_scheduler_prefill_chunk_truncations_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(scheduler_step_metrics_mutex_);
+    for (const auto &[mode, count] : scheduler_prefill_chunk_truncations_) {
+      out << "inferflux_scheduler_prefill_chunk_truncations_total{mode=\""
+          << mode << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_scheduler_prefill_chunk_truncated_tokens_total "
+         "Total tokens deferred due to prefill chunk truncation\n";
+  out << "# TYPE inferflux_scheduler_prefill_chunk_truncated_tokens_total "
+         "counter\n";
+  {
+    std::lock_guard<std::mutex> lock(scheduler_step_metrics_mutex_);
+    for (const auto &[mode, count] :
+         scheduler_prefill_chunk_truncated_tokens_) {
+      out << "inferflux_scheduler_prefill_chunk_truncated_tokens_total{mode=\""
+          << mode << "\"} " << count << "\n";
+    }
+  }
 
   out << "# HELP inferflux_disagg_kv_enqueue_rejections_total "
          "Prefill-to-decode "
@@ -1265,6 +1409,28 @@ std::string MetricsRegistry::RenderPrometheus() const {
       << cuda_decode_lane_queue_depth_.load() << "\n";
   out << "inferflux_cuda_lane_queue_depth{lane=\"prefill\"} "
       << cuda_prefill_lane_queue_depth_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_lane_enqueue_rejects_total Unified-batch lane "
+         "enqueue rejects in CUDA runtime\n";
+  out << "# TYPE inferflux_cuda_lane_enqueue_rejects_total counter\n";
+  out << "inferflux_cuda_lane_enqueue_rejects_total{lane=\"decode\"} "
+      << cuda_decode_lane_enqueue_rejects_.load() << "\n";
+  out << "inferflux_cuda_lane_enqueue_rejects_total{lane=\"prefill\"} "
+      << cuda_prefill_lane_enqueue_rejects_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_lane_collect_timeouts_total Unified-batch lane "
+         "collection timeouts in CUDA runtime\n";
+  out << "# TYPE inferflux_cuda_lane_collect_timeouts_total counter\n";
+  out << "inferflux_cuda_lane_collect_timeouts_total{lane=\"decode\"} "
+      << cuda_decode_lane_collect_timeouts_.load() << "\n";
+  out << "inferflux_cuda_lane_collect_timeouts_total{lane=\"prefill\"} "
+      << cuda_prefill_lane_collect_timeouts_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_lane_worker_restarts_total CUDA lane worker "
+         "dispatcher restarts\n";
+  out << "# TYPE inferflux_cuda_lane_worker_restarts_total counter\n";
+  out << "inferflux_cuda_lane_worker_restarts_total "
+      << cuda_lane_worker_restarts_.load() << "\n";
 
   out << "# HELP inferflux_cuda_lane_overlap_events_total CUDA lane execution "
          "windows where decode/prefill overlapped\n";

@@ -157,6 +157,77 @@ TEST_CASE("MetricsRegistry records scheduler iteration composition",
                       "backend=\"cpu\"} 28") != std::string::npos);
 }
 
+TEST_CASE("MetricsRegistry records scheduler policy iteration composition",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordSchedulerPolicyIteration("lpm_priority",
+                                          /*prefill_requests=*/2,
+                                          /*decode_requests=*/0);
+  registry.RecordSchedulerPolicyIteration("lpm_priority",
+                                          /*prefill_requests=*/0,
+                                          /*decode_requests=*/3);
+  registry.RecordSchedulerPolicyIteration("throughput_balanced",
+                                          /*prefill_requests=*/1,
+                                          /*decode_requests=*/1);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_scheduler_policy_iterations_total{backend="
+                      "\"cpu\",policy=\"lpm_priority\",phase=\"prefill\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_policy_iterations_total{backend="
+                      "\"cpu\",policy=\"lpm_priority\",phase=\"decode\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_policy_iterations_total{backend="
+                      "\"cpu\",policy=\"throughput_balanced\",phase=\"mixed\"} "
+                      "1") != std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry records scheduler prefix-affinity probe counters",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordPrefixAffinityProbe(false, 0);
+  registry.RecordPrefixAffinityProbe(true, 12);
+  registry.RecordPrefixAffinityProbe(true, 8);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_scheduler_prefix_affinity_probes_total{"
+                      "backend=\"cpu\"} 3") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_prefix_affinity_hits_total{backend="
+                      "\"cpu\"} 2") != std::string::npos);
+  REQUIRE(
+      output.find("inferflux_scheduler_prefix_affinity_matched_tokens_total{"
+                  "backend=\"cpu\"} 20") != std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry records decode-step loop and prefill truncation "
+          "counters",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordDecodeStepLoops("decode_phased", 5);
+  registry.RecordDecodeStepLoops("unified_phased", 2);
+  registry.RecordPrefillChunkTruncation("unified_phased", 11);
+  registry.RecordPrefillChunkTruncation("unified_phased", 3);
+  registry.RecordPrefillChunkTruncation("unified_step", 4);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(
+      output.find(
+          "inferflux_scheduler_decode_step_loops_total{mode=\"decode_phased\"} "
+          "5") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_decode_step_loops_total{mode=\""
+                      "unified_phased\"} 2") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_prefill_chunk_truncations_total{"
+                      "mode=\"unified_phased\"} 2") != std::string::npos);
+  REQUIRE(
+      output.find("inferflux_scheduler_prefill_chunk_truncated_tokens_total{"
+                  "mode=\"unified_phased\"} 14") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_prefill_chunk_truncations_total{"
+                      "mode=\"unified_step\"} 1") != std::string::npos);
+  REQUIRE(
+      output.find("inferflux_scheduler_prefill_chunk_truncated_tokens_total{"
+                  "mode=\"unified_step\"} 4") != std::string::npos);
+}
+
 TEST_CASE("MetricsRegistry records distributed KV enqueue rejection counters",
           "[metrics]") {
   inferflux::MetricsRegistry registry;
@@ -257,6 +328,10 @@ TEST_CASE("MetricsRegistry records CUDA lane runtime metrics", "[metrics]") {
   registry.RecordCudaLaneExecutionStop(true);
   registry.SetCudaLaneQueueDepth(true, 3);
   registry.SetCudaLaneQueueDepth(false, 7);
+  registry.RecordCudaLaneEnqueueReject(true);
+  registry.RecordCudaLaneEnqueueReject(false);
+  registry.RecordCudaLaneCollectTimeout(false);
+  registry.RecordCudaLaneWorkerRestart();
 
   auto output = registry.RenderPrometheus();
   REQUIRE(output.find("inferflux_cuda_lane_submissions_total{lane=\"decode\"} "
@@ -270,6 +345,17 @@ TEST_CASE("MetricsRegistry records CUDA lane runtime metrics", "[metrics]") {
   REQUIRE(output.find("inferflux_cuda_lane_queue_depth{lane=\"decode\"} 3") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_cuda_lane_queue_depth{lane=\"prefill\"} 7") !=
+          std::string::npos);
+  REQUIRE(output.find(
+              "inferflux_cuda_lane_enqueue_rejects_total{lane=\"decode\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_enqueue_rejects_total{lane="
+                      "\"prefill\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_collect_timeouts_total{lane="
+                      "\"decode\"} 0") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_collect_timeouts_total{lane="
+                      "\"prefill\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_lane_worker_restarts_total 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_cuda_lane_overlap_events_total 1") !=
           std::string::npos);

@@ -29,6 +29,18 @@ namespace inferflux {
 
 class BatchExecutor;
 
+enum class SchedulerBatchPolicy {
+  kPriorityAge,
+  kLpmPriority,
+  kThroughputBalanced,
+};
+
+std::string SchedulerBatchPolicyToString(SchedulerBatchPolicy policy);
+bool IsSchedulerBatchPolicyValue(const std::string &value);
+SchedulerBatchPolicy ParseSchedulerBatchPolicy(
+    const std::string &value,
+    SchedulerBatchPolicy default_policy = SchedulerBatchPolicy::kPriorityAge);
+
 // Disaggregated prefill/decode configuration (§2.5).
 struct DisaggregatedConfig {
   int prefill_pool_size{0}; // 0 = unified
@@ -56,6 +68,10 @@ public:
     int max_batch_tokens;
     int min_batch_size;        // Minimum batch to wait for
     int batch_accumulation_ms; // Max wait time (0 = no waiting)
+    SchedulerBatchPolicy batch_policy{SchedulerBatchPolicy::kPriorityAge};
+    int continuous_decode_steps{0};
+    int chunked_prefill_tokens{512};
+    double mixed_prefill_budget_ratio{1.0};
     SessionHandleConfig session_handles{};
   };
 
@@ -85,6 +101,12 @@ public:
   int LiveDecodeWorkers() const;
   int ConfiguredDecodeWorkers() const {
     return disagg_config_.decode_pool_size;
+  }
+  SchedulerBatchPolicy BatchPolicy() const { return config_.batch_policy; }
+  int ContinuousDecodeSteps() const { return config_.continuous_decode_steps; }
+  int ChunkedPrefillTokens() const { return config_.chunked_prefill_tokens; }
+  double MixedPrefillBudgetRatio() const {
+    return config_.mixed_prefill_budget_ratio;
   }
   ModelRouter *Router() const { return router_.get(); }
   RadixPrefixCache *PrefixCache() const { return prefix_cache_.get(); }

@@ -3,6 +3,7 @@
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/strategy_registry.h"
 #include "runtime/backends/cuda/native_cuda_runtime.h"
+#include "runtime/execution/unified_batch_lane_dispatcher.h"
 
 #ifdef INFERFLUX_HAS_CUDA
 #include <cuda_fp16.h>
@@ -11,11 +12,9 @@
 
 #include <atomic>
 #include <filesystem>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 // Forward declarations for native kernel components
@@ -256,9 +255,13 @@ private:
       runtime::cuda::native::KvPrecision::kFp16};
   std::string kv_precision_hint_{"auto"};
   runtime::cuda::native::DequantizedCachePolicy dequantized_cache_policy_{
-      runtime::cuda::native::DequantizedCachePolicy::kModelLifetime};
-  std::string dequantized_cache_policy_hint_{"model"};
+      runtime::cuda::native::DequantizedCachePolicy::kNone};
+  std::string dequantized_cache_policy_hint_{"none"};
   bool require_fused_quantized_matmul_{false};
+  runtime::cuda::native::MatmulExecutionMode quantized_matmul_mode_{
+      runtime::cuda::native::MatmulExecutionMode::kFusedDequantTileGemm};
+  std::string quantized_matmul_strategy_id_{
+      "matmul.fused.dequant_tile_gemm.v1"};
 
   // Native kernel pipeline components (only available with CUDA)
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
@@ -314,17 +317,8 @@ private:
       prefill_lane_quantized_weight_adapter_;
   float *d_decode_logits_{nullptr};
   float *d_prefill_logits_{nullptr};
-
-  struct AsyncBatchState {
-    std::future<LaneExecutionResult> future;
-    std::vector<UnifiedBatchOutput> outputs;
-    cudaEvent_t completion_event{nullptr};
-    bool is_decode{false};
-  };
-  std::unordered_map<UnifiedBatchHandle, AsyncBatchState> async_batches_;
-  std::mutex async_batches_mutex_;
-  std::mutex lane_mutex_;
-  std::atomic<UnifiedBatchHandle> next_handle_{1};
+  UnifiedBatchLaneDispatcher lane_dispatcher_;
+  std::mutex lane_dispatcher_mutex_;
 #endif
 
   // Performance timing via cudaEvents
@@ -377,6 +371,8 @@ private:
   LaneExecutionResult
   ExecuteLaneBatchForAsync(const std::vector<UnifiedBatchInput> &inputs,
                            bool decode_lane);
+  bool EnsureLaneDispatcherStarted();
+  void StopLaneDispatcher();
 #endif
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY

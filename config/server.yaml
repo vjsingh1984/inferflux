@@ -39,7 +39,7 @@ runtime:
     attention:
       kernel: auto                  # Rule 2: 'fa2' for SM ≥ 8.0 (Ampere+), 'auto' for auto-detect
     kv_cache_dtype: auto            # KV precision policy: auto, fp16, bf16, int8, fp8
-    dequantized_cache_policy: batch # batch (memory efficient default) | model (higher reuse)
+    dequantized_cache_policy: none  # none (memory-first default) | batch (batch-boundary cleanup) | model (higher reuse)
     quantized_runtime:
       require_fused_matmul: false   # true = fail startup unless fused quantized matmul is selected
     flash_attention:
@@ -68,6 +68,10 @@ runtime:
     max_batch_tokens: 8192          # Max tokens per batch
     min_batch_size: 1               # Minimum batch size before flushing
     batch_accumulation_ms: 0        # Wait time to accumulate larger batches
+    policy: priority_age            # queue policy: priority_age | lpm_priority | throughput_balanced
+    continuous_decode_steps: 0      # 0 = disabled; >0 yields after N decode tokens per executor burst
+    chunked_prefill_tokens: 512     # Max tokens per prefill chunk in mixed execution
+    mixed_prefill_budget_ratio: 1.0 # Fraction (0.0-1.0) of backend token budget reserved for prefill
     session_handles:
       enabled: false                # Optional stateful layer (default API remains stateless)
       ttl_ms: 300000                # Session TTL in milliseconds

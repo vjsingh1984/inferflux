@@ -12,6 +12,8 @@ namespace native {
 
 std::string DequantizedCachePolicyToString(DequantizedCachePolicy policy) {
   switch (policy) {
+  case DequantizedCachePolicy::kNone:
+    return "none";
   case DequantizedCachePolicy::kModelLifetime:
     return "model";
   case DequantizedCachePolicy::kBatchLifetime:
@@ -26,6 +28,10 @@ bool ParseDequantizedCachePolicy(const std::string &raw,
     return false;
   }
   const std::string lowered = inferflux::ToLower(raw);
+  if (lowered == "none" || lowered == "off" || lowered == "disabled") {
+    *out = DequantizedCachePolicy::kNone;
+    return true;
+  }
   if (lowered == "model" || lowered == "model_lifetime") {
     *out = DequantizedCachePolicy::kModelLifetime;
     return true;

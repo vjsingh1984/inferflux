@@ -327,6 +327,18 @@ int FusedQuantGemm::GetAdaptiveThreshold(int quant_type) {
   return ComputeThreshold(base, bpw);
 }
 
+bool FusedQuantGemm::ShouldUseFusedPath(int quant_type, int M) {
+  if (M <= 0) {
+    return false;
+  }
+  auto qtype = static_cast<GGUF::TensorType>(quant_type);
+  const auto &entry = GetDispatchEntry(qtype);
+  if (!entry.fn) {
+    return false;
+  }
+  return M <= GetAdaptiveThreshold(quant_type);
+}
+
 bool FusedQuantGemm::Gemv(const QuantizedWeightInfo &weight,
                           const half *activation, half *output, int M, int N,
                           int K, cudaStream_t stream) {
@@ -351,9 +363,10 @@ bool FusedQuantGemm::Gemv(const QuantizedWeightInfo &weight,
   if (!entry.fn)
     return false; // Unsupported quant type
 
-  // Adaptive threshold: fused vs cuBLAS crossover depends on GPU and quant type
-  int threshold = GetAdaptiveThreshold(weight.quant_type);
-  if (M > threshold)
+  // Adaptive threshold: fused vs cuBLAS crossover depends on GPU and quant
+  // type.
+  const int threshold = GetAdaptiveThreshold(weight.quant_type);
+  if (!ShouldUseFusedPath(weight.quant_type, M))
     return false; // cuBLAS with tensor cores expected to be faster
 
   // Log once per quant type on first use
@@ -392,9 +405,8 @@ bool FusedQuantGemm::RmsNormGemv(const QuantizedWeightInfo &weight,
   if (!entry.fn)
     return false;
 
-  // Same adaptive threshold as regular GEMV
-  int threshold = GetAdaptiveThreshold(weight.quant_type);
-  if (M > threshold)
+  // Same adaptive threshold policy as regular GEMV.
+  if (!ShouldUseFusedPath(weight.quant_type, M))
     return false;
 
   // Log once per quant type on first use

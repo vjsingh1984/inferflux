@@ -86,6 +86,9 @@ public:
     return qwm_->GetRawLmHead();
   }
   bool HasQuantizedWeights() const override { return qwm_->IsQuantized(); }
+  bool AllowFusedQuantizedMatmul() const override {
+    return qwm_->AllowFusedQuantizedMatmul();
+  }
 
 private:
   QuantizedWeightMap *qwm_; // Non-owning

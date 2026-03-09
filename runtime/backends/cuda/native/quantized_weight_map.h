@@ -117,6 +117,12 @@ public:
   int NumLayers() const { return num_layers_; }
   bool IsQuantized() const { return is_quantized_; }
   std::string GetQuantizationType() const { return quantization_type_; }
+  void SetAllowFusedQuantizedMatmul(bool allow) {
+    allow_fused_quantized_matmul_ = allow;
+  }
+  bool AllowFusedQuantizedMatmul() const {
+    return allow_fused_quantized_matmul_;
+  }
 
   // --- Raw quantized weight accessors (for fused dequant-GEMV) ---
 
@@ -216,6 +222,7 @@ private:
   // Scratch buffer for on-demand projection dequantization
   mutable half *scratch_buffer_{nullptr};
   mutable size_t scratch_buffer_elements_{0};
+  bool allow_fused_quantized_matmul_{true};
 
   // Global weight accessors
   std::shared_ptr<IWeightAccessor> embed_tokens_accessor;
