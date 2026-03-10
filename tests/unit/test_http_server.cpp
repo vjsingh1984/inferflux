@@ -112,6 +112,44 @@ TEST_CASE("LookupHeaderValueForTest matches header names case-insensitively",
           "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01");
 }
 
+TEST_CASE("ResolveHttpRequestMetadataForTest prefers payload metadata over "
+          "headers",
+          "[http_server]") {
+  const std::string headers =
+      "POST /v1/completions HTTP/1.1\r\n"
+      "Host: 127.0.0.1\r\n"
+      "X-InferFlux-Session-Id: header-session\r\n"
+      "X-InferFlux-Client-Request-Id: header-request\r\n"
+      "traceparent: 00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01\r\n"
+      "\r\n";
+
+  const auto metadata = ResolveHttpRequestMetadataForTest(
+      headers, "payload-session", "payload-request");
+
+  REQUIRE(metadata.session_id == "payload-session");
+  REQUIRE(metadata.client_request_id == "payload-request");
+  REQUIRE(metadata.trace_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+}
+
+TEST_CASE("ResolveHttpRequestMetadataForTest falls back to headers and rejects "
+          "invalid traceparent",
+          "[http_server]") {
+  const std::string headers =
+      "POST /v1/completions HTTP/1.1\r\n"
+      "Host: 127.0.0.1\r\n"
+      "X-InferFlux-Session-Id: header-session\r\n"
+      "x-inferflux-client-request-id: header-request\r\n"
+      "TraceParent: garbage\r\n"
+      "\r\n";
+
+  const auto metadata =
+      ResolveHttpRequestMetadataForTest(headers, "", "");
+
+  REQUIRE(metadata.session_id == "header-session");
+  REQUIRE(metadata.client_request_id == "header-request");
+  REQUIRE(metadata.trace_id.empty());
+}
+
 TEST_CASE("HttpServer ready status reports healthy distributed decode pool",
           "[http_server]") {
   SimpleTokenizer tokenizer;

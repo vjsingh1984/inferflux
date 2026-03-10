@@ -10,6 +10,7 @@
 #include "server/logging/audit_logger.h"
 #include "server/metrics/metrics.h"
 #include "server/policy/guardrail.h"
+#include "server/tracing/span.h"
 
 #if INFERFLUX_ENABLE_WEBUI
 #include "webui/ui_renderer.h"
@@ -70,6 +71,36 @@ inline std::string LookupHeaderValueForTest(const std::string &headers,
     line_start = line_end + 2;
   }
   return {};
+}
+
+struct HttpRequestMetadata {
+  std::string session_id;
+  std::string client_request_id;
+  std::string trace_id;
+};
+
+// Test-visible metadata normalization helper. Payload-provided values take
+// precedence over headers; trace_id is derived from an incoming traceparent
+// header when present and valid.
+inline HttpRequestMetadata ResolveHttpRequestMetadataForTest(
+    const std::string &headers, const std::string &payload_session_id,
+    const std::string &payload_client_request_id) {
+  HttpRequestMetadata metadata;
+  metadata.session_id = payload_session_id.empty()
+                            ? LookupHeaderValueForTest(headers,
+                                                       "x-inferflux-session-id")
+                            : payload_session_id;
+  metadata.client_request_id =
+      payload_client_request_id.empty()
+          ? LookupHeaderValueForTest(headers, "x-inferflux-client-request-id")
+          : payload_client_request_id;
+  const std::string traceparent =
+      LookupHeaderValueForTest(headers, "traceparent");
+  if (!traceparent.empty()) {
+    auto parent_ctx = tracing::ParseTraceparent(traceparent);
+    metadata.trace_id = parent_ctx.trace_id;
+  }
+  return metadata;
 }
 
 class HttpServer {

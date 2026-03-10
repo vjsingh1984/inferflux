@@ -97,38 +97,7 @@ json OptionalIntToJson(const std::optional<int64_t> &value) {
 
 std::string GetHeaderValue(const std::string &headers,
                            const std::string &name) {
-  auto lower_name = name;
-  std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
-                 [](unsigned char c) {
-                   return static_cast<char>(std::tolower(c));
-                 });
-
-  std::size_t line_start = 0;
-  while (line_start < headers.size()) {
-    const std::size_t line_end = headers.find("\r\n", line_start);
-    const std::size_t current_end =
-        line_end == std::string::npos ? headers.size() : line_end;
-    const std::size_t colon = headers.find(':', line_start);
-    if (colon != std::string::npos && colon < current_end) {
-      std::string header_name = headers.substr(line_start, colon - line_start);
-      std::transform(header_name.begin(), header_name.end(), header_name.begin(),
-                     [](unsigned char c) {
-                       return static_cast<char>(std::tolower(c));
-                     });
-      if (header_name == lower_name) {
-        std::string val =
-            headers.substr(colon + 1, current_end - (colon + 1));
-        const auto s = val.find_first_not_of(" \t");
-        const auto e = val.find_last_not_of(" \t\r\n");
-        return (s == std::string::npos) ? "" : val.substr(s, e - s + 1);
-      }
-    }
-    if (line_end == std::string::npos) {
-      break;
-    }
-    line_start = line_end + 2;
-  }
-  return {};
+  return LookupHeaderValueForTest(headers, name);
 }
 
 std::string BuildResponse(const std::string &body, int status = 200,
@@ -241,6 +210,35 @@ struct CompletionRequestPayload {
   int n{1};
   int best_of{1};
 };
+
+HttpRequestMetadata ResolveHttpRequestMetadata(
+    const CompletionRequestPayload &payload, const std::string &headers) {
+  HttpRequestMetadata metadata;
+  metadata.session_id = payload.session_id.empty()
+                            ? GetHeaderValue(headers, "x-inferflux-session-id")
+                            : payload.session_id;
+  metadata.client_request_id =
+      payload.client_request_id.empty()
+          ? GetHeaderValue(headers, "x-inferflux-client-request-id")
+          : payload.client_request_id;
+
+  const std::string traceparent = GetHeaderValue(headers, "traceparent");
+  if (!traceparent.empty()) {
+    auto parent_ctx = tracing::ParseTraceparent(traceparent);
+    metadata.trace_id = parent_ctx.trace_id;
+  }
+  return metadata;
+}
+
+void ApplyHttpRequestMetadata(const HttpRequestMetadata &metadata,
+                              InferenceRequest *request) {
+  if (!request) {
+    return;
+  }
+  request->session_id = metadata.session_id;
+  request->client_request_id = metadata.client_request_id;
+  request->trace_id = metadata.trace_id;
+}
 
 json BuildCapabilitiesJson(const BackendCapabilities &capabilities) {
   return json{
@@ -2601,6 +2599,9 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
 
+    const HttpRequestMetadata request_metadata =
+        ResolveHttpRequestMetadata(parsed, headers);
+
     InferenceRequest req;
     // Note: req.prompt is set below after the tool/template block which
     // handles both the messages chat path and the direct prompt path.
@@ -2608,15 +2609,7 @@ void HttpServer::HandleClient(ClientSession &session) {
       req.max_tokens = parsed.max_tokens;
     }
     req.model = parsed.model;
-    req.session_id = parsed.session_id;
-    if (req.session_id.empty()) {
-      req.session_id = GetHeaderValue(headers, "x-inferflux-session-id");
-    }
-    req.client_request_id = parsed.client_request_id;
-    if (req.client_request_id.empty()) {
-      req.client_request_id =
-          GetHeaderValue(headers, "x-inferflux-client-request-id");
-    }
+    ApplyHttpRequestMetadata(request_metadata, &req);
     req.json_mode = parsed.json_mode;
     if (parsed.has_response_format) {
       req.has_response_format = true;
@@ -2655,16 +2648,6 @@ void HttpServer::HandleClient(ClientSession &session) {
       req.images = std::move(parsed.images);
       GlobalMetrics().RecordImagePreprocess(static_cast<int>(req.images.size()),
                                             0.0);
-    }
-
-    // W3C Trace Context (OBS-2): propagate trace-id from incoming traceparent
-    // header.
-    {
-      std::string tp_header = GetHeaderValue(headers, "traceparent");
-      if (!tp_header.empty()) {
-        auto parent_ctx = tracing::ParseTraceparent(tp_header);
-        req.trace_id = parent_ctx.trace_id;
-      }
     }
 
     // §2.3: tool schema injection + model-native chat template formatting.
