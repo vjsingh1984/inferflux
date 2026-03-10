@@ -9,6 +9,7 @@
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/kernels/dequantization.cuh"
 #include "runtime/backends/cuda/native/llama_forward.h"
+#include "runtime/backends/cuda/native/native_linear_executor.h"
 #include "runtime/backends/cuda/native/native_dispatch_policy.h"
 #include "runtime/backends/cuda/native/model_forward_factory.h"
 #include "runtime/backends/cuda/native/quantized_weight_map_adapter.h"
@@ -5062,6 +5063,73 @@ TEST_CASE("NativeDispatchPolicy: wrapper selectors preserve policy gates",
               FusedDispatchGeometry{1, 11008, 2048, 2, true, true},
               /*allow_fused_quantized_matmul=*/true, policy) ==
           FusedQuantGemm::FfnProjOperator::kFallback);
+}
+
+TEST_CASE("NativeLinearExecutor: FFN helper falls back from Q8_1 to packed "
+          "without invoking generic path",
+          "[native_forward]") {
+  std::vector<std::string> calls;
+  NativeFfnExecutionSummary summary;
+
+  const bool ok = ExecuteNativeFfnProjectionStage(
+      FusedQuantGemm::FfnProjOperator::kQ81Group, "decode", "q4_k", 1, 11008,
+      2048,
+      [&]() {
+        calls.emplace_back("q81");
+        return false;
+      },
+      [&]() {
+        calls.emplace_back("packed");
+        return true;
+      },
+      [&]() {
+        calls.emplace_back("fallback");
+        return false;
+      },
+      &summary);
+
+  REQUIRE(ok);
+  REQUIRE(calls == std::vector<std::string>{"q81", "packed"});
+  REQUIRE(summary.used_q81 == false);
+  REQUIRE(summary.used_packed);
+  REQUIRE(summary.actual_op == FusedQuantGemm::FfnProjOperator::kPackedGroup);
+}
+
+TEST_CASE("NativeLinearExecutor: down-proj helper invokes fallback only after "
+          "all fused paths miss",
+          "[native_forward]") {
+  std::vector<std::string> calls;
+  NativeDownProjExecutionSummary summary;
+
+  const bool ok = ExecuteNativeDownProjStage(
+      FusedQuantGemm::DownProjOperator::kQ81Gemv, "decode", "q4_k", 1, 2048,
+      11008,
+      [&]() {
+        calls.emplace_back("mmq");
+        return false;
+      },
+      [&]() {
+        calls.emplace_back("q81");
+        return false;
+      },
+      [&]() {
+        calls.emplace_back("packed");
+        return false;
+      },
+      [&]() {
+        calls.emplace_back("fallback");
+        return true;
+      },
+      [&](FusedQuantGemm::DownProjOperator) { calls.emplace_back("log"); },
+      &summary);
+
+  REQUIRE(ok);
+  REQUIRE(calls ==
+          std::vector<std::string>{"q81", "mmq", "packed", "fallback"});
+  REQUIRE_FALSE(summary.used_mmq);
+  REQUIRE_FALSE(summary.used_q81);
+  REQUIRE_FALSE(summary.used_packed);
+  REQUIRE(summary.actual_op == FusedQuantGemm::DownProjOperator::kFallback);
 }
 
 TEST_CASE("cuda_kernel::QuantizeRowsSymmetric quantizes once per row with "

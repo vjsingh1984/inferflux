@@ -4,6 +4,7 @@
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/llama_forward.h"
+#include "runtime/backends/cuda/native/native_linear_executor.h"
 #include "runtime/backends/cuda/native/native_dispatch_policy.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
@@ -1301,47 +1302,25 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           FusedDispatchGeometry{seq_len, intermediate_size_, hidden_size_, 2,
                                 true, true},
           g_allow_fused_quantized_matmul, execution_policy_);
-      bool used_q8_1_ffn = false;
-      bool used_packed_ffn = false;
-      auto ffn_actual_op = FusedQuantGemm::FfnProjOperator::kFallback;
-      if (ffn_selected_op == FusedQuantGemm::FfnProjOperator::kQ81Group ||
-          ffn_selected_op ==
-              FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K) {
-        used_q8_1_ffn = TryQ8_1ProjectionGroup(
-            ffn_plans, d_residual_, post_attn_norm, d_act_q8_1_, seq_len,
-            hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
-        if (used_q8_1_ffn) {
-          ffn_actual_op = ffn_selected_op;
-        }
-      } else if (ffn_selected_op ==
-                 FusedQuantGemm::FfnProjOperator::kPackedGroup) {
-        used_packed_ffn = TryPackedProjectionGroup(
-            ffn_plans, d_residual_, post_attn_norm, d_norm_out_,
-            d_packed_activation_, d_packed_activation_scales_, seq_len,
-            hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
-        if (used_packed_ffn) {
-          ffn_actual_op = ffn_selected_op;
-        }
-      }
-      if (!used_q8_1_ffn && !used_packed_ffn &&
-          ffn_selected_op != FusedQuantGemm::FfnProjOperator::kPackedGroup) {
-        used_packed_ffn = TryPackedProjectionGroup(
-            ffn_plans, d_residual_, post_attn_norm, d_norm_out_,
-            d_packed_activation_, d_packed_activation_scales_, seq_len,
-            hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
-        if (used_packed_ffn) {
-          ffn_actual_op = FusedQuantGemm::FfnProjOperator::kPackedGroup;
-        }
-      }
       const std::string ffn_quant =
           ProjectionGroupQuantLabel(gate_raw, up_raw);
-      GlobalMetrics().RecordNativeFfnProjOperator(
-          ffn_phase, FusedQuantGemm::FfnProjOperatorName(ffn_actual_op));
-      GlobalMetrics().RecordNativeFfnProjGeometry(
-          ffn_phase, FusedQuantGemm::FfnProjOperatorName(ffn_actual_op),
-          ffn_quant, seq_len, intermediate_size_, hidden_size_,
-          /*grouped_outputs=*/2);
-      if (!used_q8_1_ffn && !used_packed_ffn) {
+      NativeFfnExecutionSummary ffn_summary;
+      if (!ExecuteNativeFfnProjectionStage(
+              ffn_selected_op, ffn_phase, ffn_quant, seq_len,
+              intermediate_size_, hidden_size_,
+              [&]() {
+                return TryQ8_1ProjectionGroup(
+                    ffn_plans, d_residual_, post_attn_norm, d_act_q8_1_,
+                    seq_len, hidden_size_, rms_norm_eps_, stream_,
+                    &execution_policy_);
+              },
+              [&]() {
+                return TryPackedProjectionGroup(
+                    ffn_plans, d_residual_, post_attn_norm, d_norm_out_,
+                    d_packed_activation_, d_packed_activation_scales_, seq_len,
+                    hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
+              },
+              [&]() {
         bool ffn_norm_computed = false;
 
         if (!TryFusedRmsNormGemv<T>(gate_raw, d_residual_, post_attn_norm,
@@ -1397,6 +1376,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
             }
           }
         }
+        return true;
+      },
+              &ffn_summary)) {
+        return false;
       }
       pt.ffn_proj_ms += pt.Mark();
 
@@ -1407,78 +1390,30 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           FusedDispatchGeometry{seq_len, hidden_size_, intermediate_size_, 1,
                                 true, false},
           g_allow_fused_quantized_matmul, execution_policy_);
-      bool fused_mmq_down = false;
-      bool fused_q8_1_down = false;
-      bool fused_packed_down = false;
-      auto down_actual_op = FusedQuantGemm::DownProjOperator::kFallback;
-      if (down_selected_op == FusedQuantGemm::DownProjOperator::kMmq) {
-        fused_mmq_down = TryMmqSiluMulGemv<T>(
-            down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-            seq_len, hidden_size_, intermediate_size_, stream_, "down_proj",
-            &execution_policy_);
-        if (fused_mmq_down) {
-          down_actual_op = FusedQuantGemm::DownProjOperator::kMmq;
-        }
-        fused_q8_1_down =
-            !fused_mmq_down &&
-            TryQ8_1SiluMulGemv<T>(
-                down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-                seq_len, hidden_size_, intermediate_size_, stream_,
-                "down_proj", &execution_policy_);
-        if (fused_q8_1_down) {
-          down_actual_op = down_selected_op;
-        }
-      } else if (down_selected_op ==
-                     FusedQuantGemm::DownProjOperator::kPackedGemv) {
-        fused_packed_down = TryPackedSiluMulGemv<T>(
-            down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-            d_packed_activation_, d_packed_activation_scales_, seq_len,
-            hidden_size_, intermediate_size_, stream_, "down_proj",
-            &execution_policy_);
-        if (fused_packed_down) {
-          down_actual_op = down_selected_op;
-        }
-      } else {
-        fused_q8_1_down = TryQ8_1SiluMulGemv<T>(
-            down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-            seq_len, hidden_size_, intermediate_size_, stream_, "down_proj",
-            &execution_policy_);
-        if (fused_q8_1_down) {
-          down_actual_op = down_selected_op;
-        }
-        fused_mmq_down =
-            !fused_q8_1_down &&
-            TryMmqSiluMulGemv<T>(
-                down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-                seq_len, hidden_size_, intermediate_size_, stream_,
-                "down_proj", &execution_policy_);
-        if (fused_mmq_down) {
-          down_actual_op = FusedQuantGemm::DownProjOperator::kMmq;
-        }
-      }
-      fused_packed_down =
-          !fused_mmq_down && !fused_q8_1_down && !fused_packed_down &&
-          TryPackedSiluMulGemv<T>(
-              down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-              d_packed_activation_, d_packed_activation_scales_, seq_len,
-              hidden_size_, intermediate_size_, stream_, "down_proj",
-              &execution_policy_);
-      if (fused_packed_down) {
-        down_actual_op = FusedQuantGemm::DownProjOperator::kPackedGemv;
-      }
-      GlobalMetrics().RecordNativeDownProjOperator(
-          ffn_phase, FusedQuantGemm::DownProjOperatorName(down_actual_op));
-      GlobalMetrics().RecordNativeDownProjGeometry(
-          ffn_phase, FusedQuantGemm::DownProjOperatorName(down_actual_op),
-          ProjectionQuantLabel(down_raw), seq_len, hidden_size_,
-          intermediate_size_);
-      if (down_actual_op != FusedQuantGemm::DownProjOperator::kFallback) {
-        const std::string down_label =
-            std::string("selected down-proj operator: ") +
-            FusedQuantGemm::DownProjOperatorName(down_actual_op);
-        LogPackedGemmPath("down_proj", down_label.c_str());
-      }
-      if (!fused_mmq_down && !fused_q8_1_down && !fused_packed_down) {
+      NativeDownProjExecutionSummary down_summary;
+      if (!ExecuteNativeDownProjStage(
+              down_selected_op, ffn_phase, ProjectionQuantLabel(down_raw),
+              seq_len, hidden_size_, intermediate_size_,
+              [&]() {
+                return TryMmqSiluMulGemv<T>(
+                    down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
+                    seq_len, hidden_size_, intermediate_size_, stream_,
+                    "down_proj", &execution_policy_);
+              },
+              [&]() {
+                return TryQ8_1SiluMulGemv<T>(
+                    down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
+                    seq_len, hidden_size_, intermediate_size_, stream_,
+                    "down_proj", &execution_policy_);
+              },
+              [&]() {
+                return TryPackedSiluMulGemv<T>(
+                    down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                    d_packed_activation_, d_packed_activation_scales_, seq_len,
+                    hidden_size_, intermediate_size_, stream_, "down_proj",
+                    &execution_policy_);
+              },
+              [&]() {
         // SwiGLU
         err = cuda_kernel::SiluMul<T>(d_ffn_gate_, d_ffn_up_, d_ffn_gate_,
                                       seq_len * intermediate_size_, stream_);
@@ -1525,6 +1460,16 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
             return false;
           }
         }
+        return true;
+      },
+              [&](FusedQuantGemm::DownProjOperator actual_op) {
+                const std::string down_label =
+                    std::string("selected down-proj operator: ") +
+                    FusedQuantGemm::DownProjOperatorName(actual_op);
+                LogPackedGemmPath("down_proj", down_label.c_str());
+              },
+              &down_summary)) {
+        return false;
       }
     }
 
@@ -2005,47 +1950,24 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             FusedDispatchGeometry{B, intermediate_size_, hidden_size_, 2, true,
                                   true},
             g_allow_fused_quantized_matmul, execution_policy_);
-        bool used_q8_1_ffn = false;
-        bool used_packed_ffn = false;
-        auto ffn_actual_op = FusedQuantGemm::FfnProjOperator::kFallback;
-        if (ffn_selected_op == FusedQuantGemm::FfnProjOperator::kQ81Group ||
-            ffn_selected_op ==
-                FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K) {
-          used_q8_1_ffn = TryQ8_1ProjectionGroup(
-              ffn_plans, d_residual_, post_attn_norm, d_act_q8_1_, B,
-              hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
-          if (used_q8_1_ffn) {
-            ffn_actual_op = ffn_selected_op;
-          }
-        } else if (ffn_selected_op ==
-                   FusedQuantGemm::FfnProjOperator::kPackedGroup) {
-          used_packed_ffn = TryPackedProjectionGroup(
-              ffn_plans, d_residual_, post_attn_norm, d_norm_out_,
-              d_packed_activation_, d_packed_activation_scales_, B,
-              hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
-          if (used_packed_ffn) {
-            ffn_actual_op = ffn_selected_op;
-          }
-        }
-        if (!used_q8_1_ffn && !used_packed_ffn &&
-            ffn_selected_op != FusedQuantGemm::FfnProjOperator::kPackedGroup) {
-          used_packed_ffn = TryPackedProjectionGroup(
-              ffn_plans, d_residual_, post_attn_norm, d_norm_out_,
-              d_packed_activation_, d_packed_activation_scales_, B,
-              hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
-          if (used_packed_ffn) {
-            ffn_actual_op = FusedQuantGemm::FfnProjOperator::kPackedGroup;
-          }
-        }
         const std::string ffn_quant =
             ProjectionGroupQuantLabel(gate_raw, up_raw);
-        GlobalMetrics().RecordNativeFfnProjOperator(
-            "decode", FusedQuantGemm::FfnProjOperatorName(ffn_actual_op));
-        GlobalMetrics().RecordNativeFfnProjGeometry(
-            "decode", FusedQuantGemm::FfnProjOperatorName(ffn_actual_op),
-            ffn_quant, B, intermediate_size_, hidden_size_,
-            /*grouped_outputs=*/2);
-        if (!used_q8_1_ffn && !used_packed_ffn) {
+        NativeFfnExecutionSummary ffn_summary;
+        if (!ExecuteNativeFfnProjectionStage(
+                ffn_selected_op, "decode", ffn_quant, B, intermediate_size_,
+                hidden_size_,
+                [&]() {
+                  return TryQ8_1ProjectionGroup(
+                      ffn_plans, d_residual_, post_attn_norm, d_act_q8_1_, B,
+                      hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
+                },
+                [&]() {
+                  return TryPackedProjectionGroup(
+                      ffn_plans, d_residual_, post_attn_norm, d_norm_out_,
+                      d_packed_activation_, d_packed_activation_scales_, B,
+                      hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
+                },
+                [&]() {
           bool ffn_norm_computed = false;
 
           if (!TryFusedRmsNormGemv<T>(gate_raw, d_residual_, post_attn_norm,
@@ -2093,6 +2015,10 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                                   d_norm_out_, up_proj, d_ffn_up_);
             }
           }
+          return true;
+        },
+                &ffn_summary)) {
+          return false;
         }
         pt.ffn_proj_ms += pt.Mark();
 
@@ -2103,78 +2029,30 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             FusedDispatchGeometry{B, hidden_size_, intermediate_size_, 1, true,
                                   false},
             g_allow_fused_quantized_matmul, execution_policy_);
-        bool fused_mmq_down = false;
-        bool fused_q8_1_down = false;
-        bool fused_packed_down = false;
-        auto down_actual_op = FusedQuantGemm::DownProjOperator::kFallback;
-        if (down_selected_op == FusedQuantGemm::DownProjOperator::kMmq) {
-          fused_mmq_down = TryMmqSiluMulGemv<T>(
-              down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_, B,
-              hidden_size_, intermediate_size_, stream_, "down_proj",
-              &execution_policy_);
-          if (fused_mmq_down) {
-            down_actual_op = FusedQuantGemm::DownProjOperator::kMmq;
-          }
-          fused_q8_1_down =
-              !fused_mmq_down &&
-              TryQ8_1SiluMulGemv<T>(
-                  down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-                  B, hidden_size_, intermediate_size_, stream_, "down_proj",
-                  &execution_policy_);
-          if (fused_q8_1_down) {
-            down_actual_op = down_selected_op;
-          }
-        } else if (down_selected_op ==
-                   FusedQuantGemm::DownProjOperator::kPackedGemv) {
-          fused_packed_down = TryPackedSiluMulGemv<T>(
-              down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-              d_packed_activation_, d_packed_activation_scales_, B,
-              hidden_size_, intermediate_size_, stream_, "down_proj",
-              &execution_policy_);
-          if (fused_packed_down) {
-            down_actual_op = down_selected_op;
-          }
-        } else {
-          fused_q8_1_down = TryQ8_1SiluMulGemv<T>(
-              down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_, B,
-              hidden_size_, intermediate_size_, stream_, "down_proj",
-              &execution_policy_);
-          if (fused_q8_1_down) {
-            down_actual_op = down_selected_op;
-          }
-          fused_mmq_down =
-              !fused_q8_1_down &&
-              TryMmqSiluMulGemv<T>(
-                  down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-                  B, hidden_size_, intermediate_size_, stream_, "down_proj",
-                  &execution_policy_);
-          if (fused_mmq_down) {
-            down_actual_op = FusedQuantGemm::DownProjOperator::kMmq;
-          }
-        }
-        fused_packed_down =
-            !fused_mmq_down && !fused_q8_1_down && !fused_packed_down &&
-            TryPackedSiluMulGemv<T>(
-                down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-                d_packed_activation_, d_packed_activation_scales_, B,
-                hidden_size_, intermediate_size_, stream_, "down_proj",
-                &execution_policy_);
-        if (fused_packed_down) {
-          down_actual_op = FusedQuantGemm::DownProjOperator::kPackedGemv;
-        }
-        GlobalMetrics().RecordNativeDownProjOperator(
-            "decode", FusedQuantGemm::DownProjOperatorName(down_actual_op));
-        GlobalMetrics().RecordNativeDownProjGeometry(
-            "decode", FusedQuantGemm::DownProjOperatorName(down_actual_op),
-            ProjectionQuantLabel(down_raw), B, hidden_size_,
-            intermediate_size_);
-        if (down_actual_op != FusedQuantGemm::DownProjOperator::kFallback) {
-          const std::string down_label =
-              std::string("selected down-proj operator: ") +
-              FusedQuantGemm::DownProjOperatorName(down_actual_op);
-          LogPackedGemmPath("down_proj", down_label.c_str());
-        }
-        if (!fused_mmq_down && !fused_q8_1_down && !fused_packed_down) {
+        NativeDownProjExecutionSummary down_summary;
+        if (!ExecuteNativeDownProjStage(
+                down_selected_op, "decode", ProjectionQuantLabel(down_raw), B,
+                hidden_size_, intermediate_size_,
+                [&]() {
+                  return TryMmqSiluMulGemv<T>(
+                      down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
+                      B, hidden_size_, intermediate_size_, stream_, "down_proj",
+                      &execution_policy_);
+                },
+                [&]() {
+                  return TryQ8_1SiluMulGemv<T>(
+                      down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
+                      B, hidden_size_, intermediate_size_, stream_, "down_proj",
+                      &execution_policy_);
+                },
+                [&]() {
+                  return TryPackedSiluMulGemv<T>(
+                      down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                      d_packed_activation_, d_packed_activation_scales_, B,
+                      hidden_size_, intermediate_size_, stream_, "down_proj",
+                      &execution_policy_);
+                },
+                [&]() {
           cuda_kernel::SiluMul<T>(d_ffn_gate_, d_ffn_up_, d_ffn_gate_,
                                   B * intermediate_size_, stream_);
           pt.ffn_silu_ms += pt.Mark();
@@ -2217,6 +2095,16 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             gemm_->GemmTyped<T>(B, hidden_size_, intermediate_size_,
                                 d_ffn_gate_, down_proj, d_ffn_down_);
           }
+          return true;
+        },
+                [&](FusedQuantGemm::DownProjOperator actual_op) {
+                  const std::string down_label =
+                      std::string("selected down-proj operator: ") +
+                      FusedQuantGemm::DownProjOperatorName(actual_op);
+                  LogPackedGemmPath("down_proj", down_label.c_str());
+                },
+                &down_summary)) {
+          return false;
         }
       }
 
