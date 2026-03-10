@@ -40,7 +40,7 @@ Grid:  dim3(ceil(N / 8), M)
 
 Each warp produces one output element. Lane `j` of warp `w` accumulates `weight[out_idx][j..K:32] * activation[row][j..K:32]`. Final reduction via `__shfl_down_sync` produces the scalar result in lane 0.
 
-### V2 Thread/Block Layout (cooperative-warp, default for Q4_K/Q6_K when K≥1024)
+### V2 Thread/Block Layout (cooperative-warp, opt-in via `INFERFLUX_GEMV_V2=1`)
 
 ```
 Block: 128 threads = 4 warps x 32 lanes
@@ -52,7 +52,7 @@ Smem:  float warp_sums[4]  (16 bytes for cross-warp reduction)
 
 All 4 warps **collaborate on one output element**, each processing a strided subset of super-blocks (`blk = warp_id; blk < num_super_blocks; blk += 4`). This provides L2 cache locality (one weight row per block) vs v1 where 8 warps access 8 unrelated weight rows. Cross-warp reduction uses 16 bytes of shared memory and one `__syncthreads`.
 
-**Expected bandwidth improvement:** ~40% → ≥55% of peak (1.4x+ throughput from L2 locality alone).
+**Benchmark result:** V1 is faster on RTX 4000 Ada (0.83x vs v2's 0.79x). V2's L2 coherence benefit is offset by lower ILP and `__syncthreads` overhead. V2 may benefit GPUs with smaller L2 caches.
 
 | Property | V1 | V2 |
 |---|---|---|
@@ -63,7 +63,7 @@ All 4 warps **collaborate on one output element**, each processing a strided sub
 | Grid blocks (N=2048, M=1) | 256 | 2048 |
 | Max blocks/SM (Ada) | 8 | 12+ |
 
-**Env var control:** `INFERFLUX_GEMV_V1=1` forces v1, `INFERFLUX_GEMV_V2=1` forces v2, default auto-selects v2 for K≥1024.
+**Env var control:** V1 is the default. `INFERFLUX_GEMV_V2=1` opts in to v2 for experimentation.
 
 **Files:** `fused_dequant_gemv_v2.cuh` (kernel implementations), `fused_quant_gemm.cu` (dispatch integration).
 
@@ -177,17 +177,17 @@ Tiled matrix-multiply kernels for the down projection, using 2D thread blocks. G
 The transformer forward pass attempts dispatch paths in this order:
 
 ```
-Q8_1 grouped v2 (cooperative-warp pair/triple, K>=1024)
-  -> Q8_1 v2 single (cooperative-warp, K>=1024)
-    -> Q8_1 grouped v1 (pair/triple with fused norm+quantize)
-      -> Q8_1 column-pair v1 (M=1: 2 outputs/warp, halved grid)
-        -> Q8_1 single v1 (standalone quantize + GEMV)
-          -> Packed grouped (per-row int8, pair/triple)
-            -> Packed single
-              -> Fused RmsNorm+GEMV (dp4a if SM >= 6.1)
-                -> Standalone RmsNorm + Fused GEMV
+Q8_1 grouped (pair/triple with fused norm+quantize)
+  -> Q8_1 column-pair (M=1: 2 outputs/warp, halved grid)
+    -> Q8_1 single (standalone quantize + GEMV)
+      -> Packed grouped (per-row int8, pair/triple)
+        -> Packed single
+          -> Fused RmsNorm+GEMV (dp4a if SM >= 6.1)
+            -> Standalone RmsNorm + Fused GEMV
               -> cuBLAS FP16 (fallback)
 ```
+
+V2 cooperative-warp variants are available via `INFERFLUX_GEMV_V2=1` but not in the default dispatch chain (v1 is faster on Ada).
 
 Each path checks `FusedQuantGemm::ShouldUseFusedPath()` which compares M against an adaptive threshold:
 

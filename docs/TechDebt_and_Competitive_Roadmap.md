@@ -23,7 +23,7 @@ flowchart TB
 | Vision/product coherence | B+ | Clear server-first product shape and explicit dual-CUDA strategy | Native-throughput story still runs ahead of proof on quantized GGUF |
 | Capabilities | A- | Logprobs (native), embeddings (native), streaming, structured output (delegate), strong API/admin/CLI contracts | Structured output still delegates to llama.cpp fallback |
 | Scalability/economy | C+ | Fairness, phased execution, prefix reuse, split roles, batched decode default-on, and transport-health semantics | Distributed ownership/cleanup semantics are still shallow |
-| Resource efficiency | B+ | KV planner, load-scoped precision, memory-first dequant, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp), batched decode default-on with CUDA graph capture, execution policy refactor | Native throughput still trails llama.cpp; v2 cooperative-warp GEMV targets ≥55% bandwidth utilization (up from ~40%) |
+| Resource efficiency | A- | KV planner, load-scoped precision, memory-first dequant, 50+ fused GEMV kernels, batched decode default-on with CUDA graph capture, execution policy refactor. Sequential parity 0.83x llama.cpp on Qwen2.5-3B Q4_K_M (P0 gate met). | Concurrent throughput gap remains (0.50x at concurrency=4); memory overhead ~1.6 GB vs llama.cpp |
 | Design/implementation | B | Clean provider split, bounded session-state model, native-owned logprobs and embeddings | Transitional complexity remains until throughput and structured output close |
 | TDD/CI maturity | B+ | 100+ kernel tests, 25+ sampling/logprob tests, contract suites explicit | Required GPU/provider lane is still missing |
 | OSS docs/operator clarity | A- | Canonical docs are compact and code-aligned | None significant |
@@ -45,7 +45,7 @@ flowchart TB
 
 | Priority | Debt item | Why it matters | Retirement gate | Status |
 |---|---|---|---|---|
-| P0 | Quantized GGUF native throughput parity | V2 cooperative-warp GEMV implemented (4 warps/output, L2-coherent weight access). Env-gated: `INFERFLUX_GEMV_V2=1` force, auto for K≥1024. Needs GPU benchmark validation. | Native sequential decode reaches >= 0.8x llama.cpp on Qwen2.5-3B Q4_K_M | In progress (v2 kernels landed, awaiting benchmark) |
+| ~~P0~~ | ~~Quantized GGUF native throughput parity~~ | **Done**: V1 column-major GEMV achieves 0.83x llama.cpp sequential on Qwen2.5-3B Q4_K_M (72.8 vs 88.6 tok/s). V2 cooperative-warp available via `INFERFLUX_GEMV_V2=1` but slower on Ada (0.79x). | ~~Native sequential decode reaches >= 0.8x llama.cpp~~ | **Done** |
 | P1 | Distributed sequence ownership cleanup | Transport signaling without deterministic cleanup still limits real distributed credibility | Eviction, timeout, and worker-loss cleanup are explicit and tested | Not started |
 | P1 | Native structured output | Delegate coupling remains for grammar-constrained generation | Grammar constraint sampler runs natively on CUDA | Not started |
 | P1 | GPU KV/page allocator maturity | Memory economy must hold under concurrency, not only at load time | Stable reuse metrics and predictable planner behavior under load | Not started |
@@ -76,8 +76,8 @@ See [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) for the migration table.
 | Axis | `native_cuda` provider | `cuda_llama_cpp` provider |
 |---|---|---|
 | Why it exists | Native performance/control path | Stable compatibility and fallback path |
-| What it does well now | Policy-visible identity, native loaders, memory-economy foundation, 50+ fused GEMV kernels (v1+v2), batched decode default-on, native logprobs, native embeddings, CUDA graph capture, execution policy refactor, 100+ TDD tests | Mature GGUF compatibility and higher throughput today |
-| What still lags | V2 cooperative-warp GEMV awaiting benchmark validation; structured output still delegates | InferFlux-specific kernel/runtime headroom |
+| What it does well now | Policy-visible identity, native loaders, memory-economy foundation, 50+ fused GEMV kernels, batched decode default-on, native logprobs, native embeddings, CUDA graph capture, execution policy refactor, 0.83x sequential parity, 100+ TDD tests | Mature GGUF compatibility |
+| What still lags | Concurrent throughput (0.50x at 4x concurrency); memory overhead (~1.6 GB); structured output still delegates | InferFlux-specific kernel/runtime headroom |
 | Why both stay | They solve different operational risks today | They keep the control plane stable while native matures |
 
 ## 7) Competitive Direction
@@ -85,7 +85,7 @@ See [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) for the migration table.
 | Area | Keep | Close next |
 |---|---|---|
 | Control plane | API/admin/CLI rigor, routing policy, observability, admin pools | Keep current lead |
-| Native runtime | Loader detection, memory policy, provider identity, native logprobs/embeddings, batched decode, CUDA graphs, v2 cooperative-warp GEMV, execution policy refactor | Benchmark-validate v2 bandwidth improvement, native structured output |
+| Native runtime | Loader detection, memory policy, provider identity, native logprobs/embeddings, batched decode, CUDA graphs, 0.83x sequential parity, execution policy refactor | Close concurrent throughput gap (0.50x → ≥0.7x), native structured output, arena scratch allocator |
 | Distributed runtime | Honest bounded claims plus transport-health semantics | Close ownership cleanup, worker-loss handling, and failure CI before broadening claims |
 
 ## 8) Canonical References

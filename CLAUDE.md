@@ -156,8 +156,7 @@ Only structured output (grammar-constrained generation) still delegates to the l
 **Key CUDA env vars:** (centralized in `NativeExecutionPolicy::FromEnv()`)
 - `INFERFLUX_DISABLE_BATCHED_DECODE=1` — opt out of batched decode (default-on)
 - `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` — disable pre-quantized Q8_1 activation path
-- `INFERFLUX_GEMV_V1=1` — force v1 column-major GEMV kernels (bypass cooperative-warp v2)
-- `INFERFLUX_GEMV_V2=1` — force v2 cooperative-warp GEMV (default: auto, v2 for K≥1024)
+- `INFERFLUX_GEMV_V2=1` — opt-in to v2 cooperative-warp GEMV (default: v1 column-major, faster on Ada)
 - `INFERFLUX_NATIVE_TIMING_SAMPLE_RATE=N` — record CUDA event timing every Nth batch (0=off)
 - `INFERFLUX_CUDA_PHASE_OVERLAP` — enable prefill/decode lane overlap
 - `INFERFLUX_CUDA_ATTENTION_KERNEL` — force attention kernel (`auto`, `fa2`, `standard`)

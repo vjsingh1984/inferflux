@@ -55,7 +55,7 @@ flowchart TD
 
 | Priority | Gate | Status |
 |---|---|---|
-| P0 | Close weight bandwidth gap (40% -> 60%+ utilization) | In progress: v2 cooperative-warp GEMV kernels landed (Q4_K/Q6_K/Q8_0/Q8_K), auto-enabled for K≥1024. Awaiting GPU benchmark validation. |
+| ~~P0~~ | ~~Close weight bandwidth gap~~ | **Done**: V1 column-major GEMV achieves 0.83x sequential parity on Qwen2.5-3B Q4_K_M. V2 cooperative-warp available via `INFERFLUX_GEMV_V2=1` for experimentation. |
 | ~~P0~~ | ~~Promote batched decode to default-on~~ | **Done**: default-on, opt-out via `INFERFLUX_DISABLE_BATCHED_DECODE=1` |
 | ~~P0~~ | ~~Enable CUDA graph capture by default for batched decode~~ | **Done**: graphs captured and replayed for B=1-4, active alongside batched decode |
 | P1 | Keep memory-first dequant as the default | Done: Q8_1 path needs zero dequant caches |

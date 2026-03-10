@@ -1880,27 +1880,15 @@ bool DispatchQ8_1GemvTripleRowPair(const void *data0, const void *data1,
 // V2 cooperative-warp dispatch helpers
 // ============================================================================
 
-// Returns >=0 when v2 kernels should be used.
-// -1 = force v1, 0 = auto (v2 when K>=1024), 1 = force v2.
-int GemvV2Mode() {
-  static const int mode = [] {
-    if (auto *v = std::getenv("INFERFLUX_GEMV_V1"))
-      return -1;
-    if (auto *v = std::getenv("INFERFLUX_GEMV_V2"))
-      return 1;
-    return 0; // auto
-  }();
-  return mode;
-}
-
+// Returns true only when v2 kernels are explicitly requested.
+// Auto mode defaults to v1 (faster on RTX 4000 Ada: 0.83x vs 0.79x).
+// V2 cooperative-warp kernels are retained for experimentation on GPUs
+// where L2 cache pressure from v1's 8-row-per-block pattern dominates.
 bool UseV2(int K) {
-  const int mode = GemvV2Mode();
-  if (mode < 0)
-    return false;
-  if (mode > 0)
-    return true;
-  // Auto: use v2 for K >= 1024 (4+ super-blocks of QK_K=256)
-  return K >= 1024;
+  static const bool forced = [] {
+    return std::getenv("INFERFLUX_GEMV_V2") != nullptr;
+  }();
+  return forced;
 }
 
 // Single-output v2 dispatch for Q4_K and Q6_K.
