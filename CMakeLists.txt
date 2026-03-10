@@ -53,6 +53,7 @@ add_library(inferflux_core
   runtime/backends/cuda/native/safetensors_parser.h
   runtime/backends/cuda/native_kernel_executor.cpp
   runtime/backends/cuda/native_kernel_executor.h
+  runtime/backends/cuda/native/native_bootstrap_config.cpp
   model/tokenizer_factory.cpp
   model/tokenizer_factory.h
   runtime/backends/backend_capabilities.cpp
@@ -218,7 +219,6 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   # Add native CUDA C++ sources to inferflux_core
   target_sources(inferflux_core PRIVATE
     runtime/backends/cuda/native/cublas_gemm.cpp
-    runtime/backends/cuda/native/native_bootstrap_config.cpp
     runtime/backends/cuda/native/native_dispatch_policy.cpp
     runtime/backends/cuda/native/weight_map.cpp
     runtime/backends/cuda/native/model_forward_factory.cpp

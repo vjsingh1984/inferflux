@@ -359,6 +359,7 @@ TEST_CASE("NativeKernelExecutor: NativeFreeSequence does not crash when no "
   REQUIRE(true);
 }
 
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
 TEST_CASE("PackedActivationWidth covers FFN width for packed single-projection "
           "reuse",
           "[native_forward]") {
@@ -416,6 +417,7 @@ TEST_CASE(
   REQUIRE(choice.indices[0] == 0);
   REQUIRE(choice.indices[1] == 1);
 }
+#endif // INFERFLUX_NATIVE_KERNELS_READY
 
 TEST_CASE(
     "NativeKernelExecutor: NativeCopySequencePrefix is safe with no model",

@@ -2882,6 +2882,13 @@ bool NativeKernelExecutor::RunNativeInference(
   return false;
 }
 
+bool NativeKernelExecutor::ConfigureDequantizedCachePolicy(
+    const std::string &) {
+  return false;
+}
+
+void NativeKernelExecutor::ReleaseBatchScopedDequantizedCache() {}
+
 #endif // INFERFLUX_HAS_CUDA
 
 // ==========================================================================
