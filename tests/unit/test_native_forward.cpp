@@ -9,6 +9,7 @@
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/kernels/dequantization.cuh"
 #include "runtime/backends/cuda/native/llama_forward.h"
+#include "runtime/backends/cuda/native/native_dispatch_policy.h"
 #include "runtime/backends/cuda/native/model_forward_factory.h"
 #include "runtime/backends/cuda/native/quantized_weight_map_adapter.h"
 #include "runtime/backends/cuda/native/safetensors_adapter.h"
@@ -5029,6 +5030,38 @@ TEST_CASE("FusedQuantGemm: FFN grouped selector falls back to packed path "
               q4k, q4k, FusedDispatchGeometry{1, 11008, 2048, 2, true, true},
               false, true) ==
           FusedQuantGemm::FfnProjOperator::kPackedGroup);
+}
+
+TEST_CASE("NativeDispatchPolicy: wrapper selectors preserve policy gates",
+          "[native_forward]") {
+  NativeExecutionPolicy policy;
+  const int q4k =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  const QuantizedWeightInfo raw{reinterpret_cast<const void *>(0x1), q4k,
+                                2048LL * 11008LL};
+  const MmqWeightInfo mmq{reinterpret_cast<const void *>(0x2), q4k, 2048, 11008,
+                          FusedQuantGemm::kDownProjMmqTileCols};
+
+  REQUIRE(SelectNativeDownProjOperator(
+              raw, mmq,
+              FusedDispatchGeometry{1, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/false, policy) ==
+          FusedQuantGemm::DownProjOperator::kFallback);
+
+  policy.disable_q81_activations = true;
+  REQUIRE(SelectNativeDownProjOperator(
+              raw, mmq,
+              FusedDispatchGeometry{1, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true, policy) ==
+          FusedQuantGemm::DownProjOperator::kPackedGemv);
+
+  policy.disable_q81_activations = false;
+  policy.force_cublas = true;
+  REQUIRE(SelectNativeFfnProjOperator(
+              raw, raw,
+              FusedDispatchGeometry{1, 11008, 2048, 2, true, true},
+              /*allow_fused_quantized_matmul=*/true, policy) ==
+          FusedQuantGemm::FfnProjOperator::kFallback);
 }
 
 TEST_CASE("cuda_kernel::QuantizeRowsSymmetric quantizes once per row with "

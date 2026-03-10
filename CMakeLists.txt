@@ -218,6 +218,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   # Add native CUDA C++ sources to inferflux_core
   target_sources(inferflux_core PRIVATE
     runtime/backends/cuda/native/cublas_gemm.cpp
+    runtime/backends/cuda/native/native_dispatch_policy.cpp
     runtime/backends/cuda/native/weight_map.cpp
     runtime/backends/cuda/native/model_forward_factory.cpp
     runtime/backends/cuda/native/transformer_forward.cu

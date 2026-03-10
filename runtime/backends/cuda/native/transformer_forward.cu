@@ -4,6 +4,7 @@
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/llama_forward.h"
+#include "runtime/backends/cuda/native/native_dispatch_policy.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
 
@@ -25,28 +26,6 @@
 namespace inferflux {
 
 namespace {
-
-std::string ProjectionQuantLabel(const QuantizedWeightInfo &weight) {
-  if (!weight.data) {
-    return "unknown";
-  }
-  return runtime::cuda::native::TensorTypeToString(
-      static_cast<runtime::cuda::native::GGUF::TensorType>(weight.quant_type));
-}
-
-std::string ProjectionGroupQuantLabel(const QuantizedWeightInfo &first,
-                                      const QuantizedWeightInfo &second) {
-  if (!first.data || !second.data) {
-    return "unknown";
-  }
-  if (first.quant_type == second.quant_type) {
-    return ProjectionQuantLabel(first);
-  }
-  return "mixed";
-}
-
-const NativeExecutionPolicy &
-ResolveForwardPolicy(const NativeExecutionPolicy *policy);
 
 // Phase timing: sync-based per-phase breakdown when
 // INFERFLUX_NATIVE_PHASE_TIMING=1 Serializes GPU pipeline — for
@@ -106,7 +85,7 @@ void DebugDumpLogits(const float *d_logits, int vocab_size,
                      const std::vector<int> &token_ids, int n_past,
                      cudaStream_t stream,
                      const NativeExecutionPolicy *policy = nullptr) {
-  if (!ResolveForwardPolicy(policy).debug_logits)
+  if (!ResolveNativeExecutionPolicy(policy).debug_logits)
     return;
   constexpr int TOP_N = 10;
   std::vector<float> h_logits(vocab_size);
@@ -146,7 +125,7 @@ void DebugDumpLogits(const float *d_logits, int vocab_size,
 void DebugDumpHidden(const char *label, const void *d_data, int count,
                      cudaStream_t stream,
                      const NativeExecutionPolicy *policy = nullptr) {
-  if (!ResolveForwardPolicy(policy).debug_logits)
+  if (!ResolveNativeExecutionPolicy(policy).debug_logits)
     return;
   // Read as half, convert to float
   std::vector<half> h_data(count);
@@ -209,127 +188,6 @@ private:
   bool prev_{true};
 };
 
-bool ForceCublasRequested(const NativeExecutionPolicy &policy) {
-  return policy.force_cublas;
-}
-
-const NativeExecutionPolicy &
-ResolveForwardPolicy(const NativeExecutionPolicy *policy) {
-  if (policy) {
-    return *policy;
-  }
-  static thread_local NativeExecutionPolicy env_policy;
-  env_policy = NativeExecutionPolicy::FromEnv();
-  return env_policy;
-}
-
-bool PackedActivationsDisabled(const NativeExecutionPolicy &policy) {
-  return policy.disable_prepacked_activations;
-}
-
-bool Q81ActivationsDisabled(const NativeExecutionPolicy &policy) {
-  return policy.disable_q81_activations;
-}
-
-bool ProjectionHasGraphSafeKernel(const QuantizedWeightInfo &raw, int M, int N,
-                                  int K, bool includes_rmsnorm,
-                                  const NativeExecutionPolicy &policy) {
-  if (ForceCublasRequested(policy) || !g_allow_fused_quantized_matmul ||
-      !raw.data || raw.quant_type < 0 || M <= 0 || N <= 0 || K <= 0) {
-    return false;
-  }
-
-  const FusedDispatchGeometry geometry{M, N, K, 1, true, includes_rmsnorm};
-  if (!FusedQuantGemm::ShouldUseFusedPath(raw.quant_type, geometry)) {
-    return false;
-  }
-
-  if (!Q81ActivationsDisabled(policy) &&
-      FusedQuantGemm::SupportsQ8_1Activations(raw.quant_type)) {
-    return true;
-  }
-  if (!PackedActivationsDisabled(policy) &&
-      FusedQuantGemm::SupportsPackedActivations(raw.quant_type)) {
-    return true;
-  }
-
-  return true;
-}
-
-FusedQuantGemm::DownProjOperator
-SelectDownProjOperator(const QuantizedWeightInfo &raw,
-                       const MmqWeightInfo &mmq_weight, int M, int N, int K,
-                       const NativeExecutionPolicy &policy) {
-  if (ForceCublasRequested(policy) || !g_allow_fused_quantized_matmul) {
-    return FusedQuantGemm::DownProjOperator::kFallback;
-  }
-
-  const bool allow_q81 = !Q81ActivationsDisabled(policy);
-  const bool allow_packed = !PackedActivationsDisabled(policy);
-  const bool allow_mmq =
-      mmq_weight.data != nullptr && FusedQuantGemm::IsDownProjMmqEnabled(&policy);
-  return FusedQuantGemm::SelectDownProjOperator(
-      raw.quant_type, FusedDispatchGeometry{M, N, K, 1, true, false},
-      allow_q81, allow_packed, allow_mmq, &policy);
-}
-
-FusedQuantGemm::FfnProjOperator
-SelectFfnProjOperator(const QuantizedWeightInfo &gate_raw,
-                      const QuantizedWeightInfo &up_raw, int M, int N, int K,
-                      bool includes_rmsnorm,
-                      const NativeExecutionPolicy &policy) {
-  if (ForceCublasRequested(policy) || !g_allow_fused_quantized_matmul) {
-    return FusedQuantGemm::FfnProjOperator::kFallback;
-  }
-
-  return FusedQuantGemm::SelectFfnProjOperator(
-      gate_raw.quant_type, up_raw.quant_type,
-      FusedDispatchGeometry{M, N, K, 2, true, includes_rmsnorm},
-      !Q81ActivationsDisabled(policy), !PackedActivationsDisabled(policy),
-      &policy);
-}
-
-template <typename T>
-bool DecodeGraphCaptureSafe(const WeightMap *weights, int num_layers, int M,
-                            int hidden_size, int num_heads, int num_kv_heads,
-                            int head_dim, int intermediate_size,
-                            int vocab_size,
-                            const NativeExecutionPolicy &policy) {
-  if (!weights || !weights->HasQuantizedWeights()) {
-    return false;
-  }
-
-  for (int layer = 0; layer < num_layers; ++layer) {
-    if (!ProjectionHasGraphSafeKernel(weights->LayerQProjRaw(layer), M,
-                                      num_heads * head_dim, hidden_size,
-                                      /*includes_rmsnorm=*/true, policy) ||
-        !ProjectionHasGraphSafeKernel(weights->LayerKProjRaw(layer), M,
-                                      num_kv_heads * head_dim, hidden_size,
-                                      /*includes_rmsnorm=*/true, policy) ||
-        !ProjectionHasGraphSafeKernel(weights->LayerVProjRaw(layer), M,
-                                      num_kv_heads * head_dim, hidden_size,
-                                      /*includes_rmsnorm=*/true, policy) ||
-        !ProjectionHasGraphSafeKernel(weights->LayerOProjRaw(layer), M,
-                                      hidden_size, num_heads * head_dim,
-                                      /*includes_rmsnorm=*/false, policy) ||
-        !ProjectionHasGraphSafeKernel(weights->LayerGateProjRaw(layer), M,
-                                      intermediate_size, hidden_size,
-                                      /*includes_rmsnorm=*/true, policy) ||
-        !ProjectionHasGraphSafeKernel(weights->LayerUpProjRaw(layer), M,
-                                      intermediate_size, hidden_size,
-                                      /*includes_rmsnorm=*/true, policy) ||
-        !ProjectionHasGraphSafeKernel(weights->LayerDownProjRaw(layer), M,
-                                      hidden_size, intermediate_size,
-                                      /*includes_rmsnorm=*/false, policy)) {
-      return false;
-    }
-  }
-
-  return ProjectionHasGraphSafeKernel(weights->LmHeadRaw(), M, vocab_size,
-                                      hidden_size,
-                                      /*includes_rmsnorm=*/true, policy);
-}
-
 // Fused dequant-GEMV dispatch: only valid for half (FP16) type.
 // Returns true if the fused kernel was launched.
 template <typename T>
@@ -344,7 +202,7 @@ bool TryFusedGemv<half>(const QuantizedWeightInfo &raw, const half *input,
                         half *output, int M, int N, int K, cudaStream_t stream,
                         const char *proj_name,
                         const NativeExecutionPolicy *policy) {
-  const auto &policy_ref = ResolveForwardPolicy(policy);
+  const auto &policy_ref = ResolveNativeExecutionPolicy(policy);
   if (ForceCublasRequested(policy_ref) || !g_allow_fused_quantized_matmul)
     return false;
   bool ok =
@@ -372,7 +230,7 @@ bool TryFusedRmsNormGemv<half>(const QuantizedWeightInfo &raw,
                                half *output, int M, int N, int K, float eps,
                                cudaStream_t stream, const char *proj_name,
                                const NativeExecutionPolicy *policy) {
-  const auto &policy_ref = ResolveForwardPolicy(policy);
+  const auto &policy_ref = ResolveNativeExecutionPolicy(policy);
   if (ForceCublasRequested(policy_ref) || !g_allow_fused_quantized_matmul)
     return false;
   bool ok =
@@ -406,7 +264,7 @@ bool TryPackedGemv<half>(const QuantizedWeightInfo &raw, const half *input,
                          float *packed_scales, int M, int N, int K,
                          cudaStream_t stream, const char *proj_name,
                          const NativeExecutionPolicy *policy) {
-  const auto &policy_ref = ResolveForwardPolicy(policy);
+  const auto &policy_ref = ResolveNativeExecutionPolicy(policy);
   if (PackedActivationsDisabled(policy_ref) || !raw.data || !input || !output ||
       !packed_activation ||
       !packed_scales || M <= 0 || N <= 0 || K <= 0 ||
@@ -447,7 +305,7 @@ bool TryPackedRmsNormGemv<half>(const QuantizedWeightInfo &raw,
                                 int N, int K, float eps, cudaStream_t stream,
                                 const char *proj_name,
                                 const NativeExecutionPolicy *policy) {
-  const auto &policy_ref = ResolveForwardPolicy(policy);
+  const auto &policy_ref = ResolveNativeExecutionPolicy(policy);
   if (PackedActivationsDisabled(policy_ref) || !raw.data || !residual ||
       !norm_weight || !normalized ||
       !packed_activation || !packed_scales || !output || M <= 0 || N <= 0 ||
@@ -498,7 +356,7 @@ bool TryPackedProjectionGroup(
     const half *residual, const half *norm_weight, half *normalized,
     int8_t *packed_activation, float *packed_scales, int M, int K, float eps,
     cudaStream_t stream, const NativeExecutionPolicy *policy) {
-  const auto &policy_ref = ResolveForwardPolicy(policy);
+  const auto &policy_ref = ResolveNativeExecutionPolicy(policy);
   if (PackedActivationsDisabled(policy_ref) || !residual || !norm_weight ||
       !normalized ||
       !packed_activation || !packed_scales || M <= 0 || K <= 0) {
@@ -618,7 +476,7 @@ bool TryQ8_1ProjectionGroup(
     const std::array<PackedProjectionPlan<half>, GroupSize> &plans,
     const half *input, const half *norm_weight, void *act_q8_1, int M, int K,
     float eps, cudaStream_t stream, const NativeExecutionPolicy *policy) {
-  const auto &policy_ref = ResolveForwardPolicy(policy);
+  const auto &policy_ref = ResolveNativeExecutionPolicy(policy);
   if (Q81ActivationsDisabled(policy_ref) || !input || !act_q8_1 || M <= 0 ||
       K <= 0) {
     return false;
@@ -790,7 +648,7 @@ bool TryQ8_1Gemv<half>(const QuantizedWeightInfo &raw, const half *input,
                        half *output, void *act_q8_1, int M, int N, int K,
                        cudaStream_t stream, const char *proj_name,
                        const NativeExecutionPolicy *policy) {
-  const auto &policy_ref = ResolveForwardPolicy(policy);
+  const auto &policy_ref = ResolveNativeExecutionPolicy(policy);
   if (Q81ActivationsDisabled(policy_ref) || !raw.data || !input || !output ||
       !act_q8_1 || M <= 0 ||
       N <= 0 || K <= 0 ||
@@ -824,7 +682,7 @@ bool TryPackedSiluMulGemv<half>(const QuantizedWeightInfo &raw,
                                 int M, int N, int K, cudaStream_t stream,
                                 const char *proj_name,
                                 const NativeExecutionPolicy *policy) {
-  const auto &policy_ref = ResolveForwardPolicy(policy);
+  const auto &policy_ref = ResolveNativeExecutionPolicy(policy);
   if (PackedActivationsDisabled(policy_ref) || !raw.data || !gate || !up ||
       !output || !packed_activation ||
       !packed_scales || M <= 0 || N <= 0 || K <= 0 ||
@@ -863,7 +721,7 @@ bool TryQ8_1SiluMulGemv<half>(const QuantizedWeightInfo &raw, const half *gate,
                               int M, int N, int K, cudaStream_t stream,
                               const char *proj_name,
                               const NativeExecutionPolicy *policy) {
-  const auto &policy_ref = ResolveForwardPolicy(policy);
+  const auto &policy_ref = ResolveNativeExecutionPolicy(policy);
   if (Q81ActivationsDisabled(policy_ref) || !raw.data || !gate || !up ||
       !output || !act_q8_1 || M <= 0 || N <= 0 || K <= 0 ||
       !FusedQuantGemm::SupportsQ8_1Activations(raw.quant_type) ||
@@ -1438,9 +1296,11 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           {{gate_raw, d_ffn_gate_, intermediate_size_},
            {up_raw, d_ffn_up_, intermediate_size_}}};
       const char *ffn_phase = seq_len == 1 ? "decode" : "prefill";
-      const auto ffn_selected_op = SelectFfnProjOperator(
-          gate_raw, up_raw, seq_len, intermediate_size_, hidden_size_,
-          /*includes_rmsnorm=*/true, execution_policy_);
+      const auto ffn_selected_op = SelectNativeFfnProjOperator(
+          gate_raw, up_raw,
+          FusedDispatchGeometry{seq_len, intermediate_size_, hidden_size_, 2,
+                                true, true},
+          g_allow_fused_quantized_matmul, execution_policy_);
       bool used_q8_1_ffn = false;
       bool used_packed_ffn = false;
       auto ffn_actual_op = FusedQuantGemm::FfnProjOperator::kFallback;
@@ -1542,9 +1402,11 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
       auto down_raw = weights_->LayerDownProjRaw(layer);
       auto down_mmq = weights_->LayerDownProjMmq(layer);
-      const auto down_selected_op = SelectDownProjOperator(
-          down_raw, down_mmq, seq_len, hidden_size_, intermediate_size_,
-          execution_policy_);
+      const auto down_selected_op = SelectNativeDownProjOperator(
+          down_raw, down_mmq,
+          FusedDispatchGeometry{seq_len, hidden_size_, intermediate_size_, 1,
+                                true, false},
+          g_allow_fused_quantized_matmul, execution_policy_);
       bool fused_mmq_down = false;
       bool fused_q8_1_down = false;
       bool fused_packed_down = false;
@@ -1845,9 +1707,10 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   const bool phase_timing_enabled = policy.phase_timing_enabled;
   const bool graph_disabled = policy.disable_cuda_graph;
   const bool capture_safe =
-      DecodeGraphCaptureSafe<T>(weights_, num_layers_, B, hidden_size_,
-                                num_heads_, num_kv_heads_, head_dim_,
-                                intermediate_size_, vocab_size_, policy);
+      DecodeGraphCaptureSafe(weights_, num_layers_, B, hidden_size_, num_heads_,
+                             num_kv_heads_, head_dim_, intermediate_size_,
+                             vocab_size_, g_allow_fused_quantized_matmul,
+                             policy);
   if (graph_enabled_ && !graph_disabled && !phase_timing_enabled &&
       !capture_safe) {
     static bool logged_graph_fallback = false;
@@ -2137,9 +2000,11 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
         const std::array<PackedProjectionPlan<T>, 2> ffn_plans = {
             {{gate_raw, d_ffn_gate_, intermediate_size_},
              {up_raw, d_ffn_up_, intermediate_size_}}};
-        const auto ffn_selected_op = SelectFfnProjOperator(
-            gate_raw, up_raw, B, intermediate_size_, hidden_size_,
-            /*includes_rmsnorm=*/true, execution_policy_);
+        const auto ffn_selected_op = SelectNativeFfnProjOperator(
+            gate_raw, up_raw,
+            FusedDispatchGeometry{B, intermediate_size_, hidden_size_, 2, true,
+                                  true},
+            g_allow_fused_quantized_matmul, execution_policy_);
         bool used_q8_1_ffn = false;
         bool used_packed_ffn = false;
         auto ffn_actual_op = FusedQuantGemm::FfnProjOperator::kFallback;
@@ -2233,9 +2098,11 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
 
         auto down_raw = weights_->LayerDownProjRaw(layer);
         auto down_mmq = weights_->LayerDownProjMmq(layer);
-        const auto down_selected_op = SelectDownProjOperator(
-            down_raw, down_mmq, B, hidden_size_, intermediate_size_,
-            execution_policy_);
+        const auto down_selected_op = SelectNativeDownProjOperator(
+            down_raw, down_mmq,
+            FusedDispatchGeometry{B, hidden_size_, intermediate_size_, 1, true,
+                                  false},
+            g_allow_fused_quantized_matmul, execution_policy_);
         bool fused_mmq_down = false;
         bool fused_q8_1_down = false;
         bool fused_packed_down = false;
