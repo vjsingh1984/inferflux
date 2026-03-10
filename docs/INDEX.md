@@ -48,6 +48,7 @@ graph TD
 | Developer workflow + CI contracts | [DeveloperGuide](DeveloperGuide.md) |
 | Grades and execution plan | [Roadmap](Roadmap.md), [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |
 | Modernization migration guide | [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) |
+| Maintenance simplification review | [MAINTENANCE_REVIEW](MAINTENANCE_REVIEW.md) |
 | Competitive positioning | [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md) |
 | GGUF runtime contract | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md) |
 | FP16 status | [FP16_STATUS](FP16_STATUS.md) |

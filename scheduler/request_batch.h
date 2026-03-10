@@ -63,7 +63,7 @@ inline bool IsBackendEmptyResponse(const InferenceResult &result) {
          IsBackendEmptyResponse(result.completion);
 }
 
-// Phase of an inference request in the continuous batching pipeline.
+// Phase of an inference request in the scheduler-driven batching pipeline.
 enum class RequestPhase {
   kPending,  // Queued, not yet scheduled.
   kPrefill,  // In prefill (prompt processing).
@@ -74,7 +74,7 @@ enum class RequestPhase {
 
 // InferenceRequest holds per-request state for the scheduler.
 // It replaces the legacy GenerateRequest DTO with a richer structure that
-// supports continuous batching, priority scheduling, and per-request
+// supports scheduler-driven batching, priority scheduling, and per-request
 // accounting.
 struct InferenceRequest {
   uint64_t id{0};
@@ -146,7 +146,7 @@ struct InferenceRequest {
   std::string response_format_error;
   StructuredConstraint response_constraint;
 
-  // Persistent execution state for iteration-level continuous batching.
+  // Persistent execution state for step-wise batch execution.
   // These fields allow BatchExecutor to pause and resume a request at any token
   // step without losing progress.
   bool exec_active{true};

@@ -43,7 +43,7 @@ public:
       const std::vector<std::shared_ptr<LlamaCPUBackend>> &backend_overrides);
 
   // Perform exactly one inference iteration (step) for the given batch.
-  // This is the foundational block for iteration-level continuous batching.
+  // This is the foundational block for step-wise batch execution.
   // Unlike ExecuteBatch, this does not loop internally; it processes exactly
   // one token per request and returns.  The caller (Scheduler) must loop and
   // can insert new requests between calls.
