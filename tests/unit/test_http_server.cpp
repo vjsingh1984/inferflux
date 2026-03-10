@@ -252,6 +252,29 @@ TEST_CASE("BuildGenerationExecutionContext derives trace header and stream "
           std::string::npos);
 }
 
+TEST_CASE("Tool stub helpers normalize fallback tool metadata", "[http_server]") {
+  REQUIRE(IsToolStubCompletion(true, ""));
+  REQUIRE(IsToolStubCompletion(false, "No model backend is loaded"));
+  REQUIRE_FALSE(IsToolStubCompletion(false, "regular completion"));
+
+  const ToolCallResult no_hint =
+      BuildStubToolCall("lookup_weather", /*include_hint=*/false);
+  REQUIRE(no_hint.detected);
+  REQUIRE(no_hint.call_id == "call_stub_lookup_weather");
+  REQUIRE(no_hint.function_name == "lookup_weather");
+  REQUIRE(no_hint.arguments_json == "{\"reason\":\"no_model_available\"}");
+
+  const ToolCallResult with_hint =
+      BuildStubToolCall("lookup_weather", /*include_hint=*/true);
+  REQUIRE(with_hint.detected);
+  REQUIRE(with_hint.arguments_json.find("\"hint\"") != std::string::npos);
+
+  REQUIRE(BuildToolStateLogLine(true, "No model backend is loaded") ==
+          "tool_state no_backend=1 contains_stub=1");
+  REQUIRE(BuildStubToolLogLine("lookup_weather") ==
+          "[tools] stub tool call for lookup_weather");
+}
+
 TEST_CASE("HttpServer ready status reports healthy distributed decode pool",
           "[http_server]") {
   SimpleTokenizer tokenizer;

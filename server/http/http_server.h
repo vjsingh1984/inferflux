@@ -79,6 +79,49 @@ struct HttpRequestMetadata {
   std::string trace_id;
 };
 
+struct ToolCallResult {
+  bool detected{false};
+  std::string call_id;
+  std::string function_name;
+  std::string arguments_json; // JSON-encoded arguments object.
+};
+
+inline bool IsToolStubCompletion(bool no_backend, std::string_view completion) {
+  return no_backend ||
+         completion.find("No model backend is loaded") != std::string::npos;
+}
+
+inline ToolCallResult BuildStubToolCall(std::string function_name,
+                                        bool include_hint = false) {
+  ToolCallResult result;
+  if (function_name.empty()) {
+    return result;
+  }
+  result.detected = true;
+  result.function_name = std::move(function_name);
+  result.call_id = "call_stub_" + result.function_name;
+  if (include_hint) {
+    result.arguments_json =
+        "{\"reason\":\"no_model_available\",\"hint\":\"set "
+        "INFERFLUX_MODEL_PATH or configure models[]\"}";
+  } else {
+    result.arguments_json = "{\"reason\":\"no_model_available\"}";
+  }
+  return result;
+}
+
+inline std::string BuildToolStateLogLine(bool no_backend,
+                                         std::string_view completion) {
+  return "tool_state no_backend=" + std::to_string(no_backend) +
+         " contains_stub=" +
+         std::to_string(completion.find("No model backend is loaded") !=
+                        std::string::npos);
+}
+
+inline std::string BuildStubToolLogLine(std::string_view function_name) {
+  return "[tools] stub tool call for " + std::string(function_name);
+}
+
 struct HttpGenerationRequestEnvelopeInput {
   std::string prompt;
   std::string model{"unknown"};

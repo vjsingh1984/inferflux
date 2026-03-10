@@ -137,13 +137,6 @@ struct Tool {
   ToolFunction function;
 };
 
-struct ToolCallResult {
-  bool detected{false};
-  std::string call_id;
-  std::string function_name;
-  std::string arguments_json; // JSON-encoded arguments object.
-};
-
 namespace {
 
 constexpr std::size_t kKiB = 1024ULL;
@@ -332,6 +325,16 @@ ResolvedGenerationPrompt ResolveGenerationPrompt(
         result.prompt.empty() ? tool_prefix : tool_prefix + "\n" + result.prompt;
   }
   return result;
+}
+
+std::string ResolveToolFallbackName(const CompletionRequestPayload &payload) {
+  if (!payload.tools.empty() && !payload.tools.front().function.name.empty()) {
+    return payload.tools.front().function.name;
+  }
+  if (!payload.first_tool_name.empty()) {
+    return payload.first_tool_name;
+  }
+  return {};
 }
 
 json BuildCapabilitiesJson(const BackendCapabilities &capabilities) {
@@ -2896,20 +2899,13 @@ void HttpServer::HandleClient(ClientSession &session) {
       // Detect tool calls per choice.
       std::vector<ToolCallResult> tool_calls;
       tool_calls.reserve(all_results.size());
+      const std::string fallback_tool_name = ResolveToolFallbackName(parsed);
       for (auto &r : all_results) {
         if (use_tools) {
-          bool is_stub =
-              r.no_backend || r.completion.find("No model backend is loaded") !=
-                                  std::string::npos;
-          if (is_stub && !parsed.tools.empty()) {
-            ToolCallResult tc;
-            tc.detected = true;
-            tc.function_name = parsed.tools.front().function.name;
-            if (tc.function_name.empty())
-              tc.function_name = "stub_tool";
-            tc.call_id = "call_stub_" + tc.function_name;
-            tc.arguments_json = json{{"reason", "no_model_available"}}.dump();
-            tool_calls.push_back(std::move(tc));
+          if (IsToolStubCompletion(r.no_backend, r.completion) &&
+              !fallback_tool_name.empty()) {
+            tool_calls.push_back(
+                BuildStubToolCall(fallback_tool_name, /*include_hint=*/false));
           } else {
             tool_calls.push_back(DetectToolCall(r.completion));
           }
@@ -3028,20 +3024,11 @@ void HttpServer::HandleClient(ClientSession &session) {
         if (parsed.stream) {
           // SSE headers were already sent. Complete the stream body rather than
           // sending a second HTTP response (which would corrupt the framing).
-          ToolCallResult nb_tc;
-          if (use_tools &&
-              (!parsed.tools.empty() || !parsed.first_tool_name.empty())) {
-            std::string fname = !parsed.tools.empty()
-                                    ? parsed.tools.front().function.name
-                                    : parsed.first_tool_name;
-            if (fname.empty())
-              fname = "stub_tool";
-            nb_tc.detected = true;
-            nb_tc.function_name = fname;
-            nb_tc.call_id = "call_stub_" + fname;
-            nb_tc.arguments_json =
-                json{{"reason", "no_model_available"}}.dump();
-          }
+          const ToolCallResult nb_tc =
+              use_tools
+                  ? BuildStubToolCall(ResolveToolFallbackName(parsed),
+                                      /*include_hint=*/false)
+                  : ToolCallResult{};
           {
             std::lock_guard<std::mutex> lock(*stream_mutex);
             if (nb_tc.detected) {
@@ -3095,36 +3082,22 @@ void HttpServer::HandleClient(ClientSession &session) {
       // responses).
       ToolCallResult tool_call;
       if (use_tools) {
-        bool stub_completion =
-            result.no_backend ||
-            result.completion.find("No model backend is loaded") !=
-                std::string::npos;
-        LogToolEvent("tool_state no_backend=" +
-                     std::to_string(result.no_backend) + " contains_stub=" +
-                     std::to_string(
-                         result.completion.find("No model backend is loaded") !=
-                         std::string::npos));
-        if (stub_completion &&
-            (!parsed.tools.empty() || !parsed.first_tool_name.empty())) {
-          std::string fallback_name = !parsed.tools.empty()
-                                          ? parsed.tools.front().function.name
-                                          : parsed.first_tool_name;
-          if (fallback_name.empty()) {
-            fallback_name = "stub_tool";
-          }
-          json arguments = {
-              {"reason", "no_model_available"},
-              {"hint", "set INFERFLUX_MODEL_PATH or configure models[]"}};
-          tool_call.detected = true;
-          tool_call.function_name = fallback_name;
-          tool_call.call_id = "call_stub_" + fallback_name;
-          tool_call.arguments_json = arguments.dump();
-          std::string log_line = "[tools] stub tool call for " + fallback_name;
+        const bool stub_completion =
+            IsToolStubCompletion(result.no_backend, result.completion);
+        LogToolEvent(BuildToolStateLogLine(result.no_backend,
+                                           result.completion));
+        if (stub_completion) {
+          tool_call = BuildStubToolCall(ResolveToolFallbackName(parsed),
+                                        /*include_hint=*/true);
+        }
+        if (tool_call.detected) {
+          const std::string log_line =
+              BuildStubToolLogLine(tool_call.function_name);
           LogToolEvent(log_line);
           std::cout << log_line << std::endl;
           if (audit_logger_) {
             audit_logger_->Log(auth_ctx.subject, execution_context.model,
-                               "tool_call_stub", arguments.dump());
+                               "tool_call_stub", tool_call.arguments_json);
           }
         } else {
           tool_call = DetectToolCall(result.completion);
