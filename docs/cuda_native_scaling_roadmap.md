@@ -116,30 +116,54 @@ In contrast, cuda_llama_cpp scales 2.59x from c=1 to c=16.
 
 ---
 
-### Phase 3: Study llama.cpp Kernel Implementation (NEXT STEP)
+### Phase 3: Study llama.cpp Kernel Implementation ✅ COMPLETE (March 10, 2026)
 
 **Goal**: Deep dive into llama.cpp kernel design to understand batch optimization techniques
 
-**Tasks**:
-1. [ ] Study llama.cpp GEMV kernels
-   - Read `external/llama.cpp/ggml-cuda.cu` for GEMV implementation
-   - Understand cooperative multi-sequence processing
-   - Document memory coalescing patterns
+**Completed tasks**:
+1. ✅ Study llama.cpp GEMV kernels
+   - Read `external/llama.cpp/ggml/src/ggml-cuda/mmvq.cu` for GEMV implementation
+   - Understood cooperative multi-sequence processing
+   - Documented memory coalescing patterns
 
-2. [ ] Compare with cuda_native kernels
-   - Analyze cuda_native `fused_dequant_gemv.cuh` vs llama.cpp approach
-   - Identify specific differences causing efficiency gap
-   - Document applicable patterns
+2. ✅ Compare with cuda_native kernels
+   - Analyzed cuda_native `fused_dequant_gemv.cuh` vs llama.cpp approach
+   - Identified specific differences causing efficiency gap
+   - Documented applicable patterns
 
-3. [ ] Design cuda_native improvement strategy
-   - Map llama.cpp techniques to cuda_native architecture
-   - Prioritize changes based on effort vs. impact
-   - Create detailed implementation plan for Sprint 3-4
+3. ✅ Design cuda_native improvement strategy
+   - Mapped llama.cpp techniques to cuda_native architecture
+   - Prioritized changes based on effort vs. impact
+   - Created detailed implementation plan for Sprint 3-4
 
-**Expected deliverables**:
-- llama.cpp kernel study document
-- cuda_native improvement design document
+**Deliverables**:
+- llama.cpp kernel study document: `docs/PHASE3_KERNEL_ANALYSIS.md`
+- cuda_native improvement design document (included in PHASE3_KERNEL_ANALYSIS.md)
 - Detailed Sprint 3-4 implementation plan
+
+**Key Findings - Template-Based Batch Processing**:
+
+| Aspect | cuda_native | llama.cpp |
+|--------|-------------|-----------|
+| **Batch processing** | One sequence per kernel | Multiple sequences per kernel |
+| **Accumulator** | Single `float acc` | Array `float tmp[ncols_dst][...]` |
+| **Template parameters** | None | Batch size (`int ncols_dst`) is template param |
+| **Warp count** | Fixed (8 warps) | Adaptive (4/2/1 warps based on batch) |
+| **Weight loading** | Per sequence | Shared across sequences (amortized) |
+| **Loop structure** | Single sequence | Nested loops with batch unrolling |
+| **Memory bandwidth** | Not amortized | Amortized across batch |
+
+**Root cause identified**: llama.cpp uses template-based batch processing where:
+- Batch size is a compile-time template parameter (`int ncols_dst`)
+- Accumulator sized for batch: `float tmp[ncols_dst][rows_per_cuda_block]`
+- Weights loaded ONCE per iteration, shared across ALL sequences
+- Loop unrolling: `#pragma unroll for (int j = 0; j < ncols_dst; ++j)`
+- Result: Memory bandwidth amortized across batch (-38% memcpy time at c=16)
+
+**Implementation priorities**:
+1. ⭐ **Template-based batch kernels** (HIGH effort, HIGH reward)
+2. **Adaptive warp configuration** (MEDIUM effort, MEDIUM reward)
+3. **Kernel fusion for multiple projections** (HIGH effort, MEDIUM reward)
 
 ---
 
@@ -244,31 +268,91 @@ In contrast, cuda_llama_cpp scales 2.59x from c=1 to c=16.
 
 - ✅ Complete Phase 1 profiling (Nsight Systems c=1 and c=16)
 - ✅ Complete Phase 2 profiling (cuda_llama_cpp c=1 and c=16)
-- ✅ Write findings documents (both ANALYSIS.md files)
-- ✅ Identify scaling bottleneck: Kernel efficiency, not kernel count
+- ✅ Complete Phase 3: Study llama.cpp kernel implementation
+- ✅ Identify scaling bottleneck: Template-based batch processing
+- ✅ Design improvement strategy with clear priorities
 
-### Sprint 2: Study llama.cpp Kernels (Week 2) ⬅️ NEXT
+### Sprint 2: Prototype Template-Based Batch Kernels (Week 2) ⬅️ NEXT
 
-- [ ] Complete Phase 3: Study llama.cpp kernel implementation
-- [ ] Document cooperative multi-sequence processing techniques
-- [ ] Analyze memory coalescing patterns
-- [ ] Design batch-optimized kernel architecture for cuda_native
-- [ ] Create detailed implementation plan for Sprint 3-4
+**Goal**: Implement llama.cpp-style template-based batch processing
 
-### Sprint 3: Batch-Optimized Kernel Implementation (Weeks 3-4)
+**Tasks**:
+1. Create template-based batch GEMV kernel variant for Q4_K
+   - Add template parameter for batch size: `template <int BatchSize>`
+   - Implement batch-aware accumulator: `float batch_acc[BatchSize]`
+   - Weight loading ONCE per block iteration
+   - Loop unrolling for batch dimension
 
-- [ ] Implement Option A: Batch-optimized GEMV kernels based on llama.cpp findings
-- [ ] Implement Option B: Wave-level scheduling for cooperative processing
-- [ ] Reduce kernel launch count via fusion (target: 2,464 from 5,667)
-- [ ] Benchmark and validate improvements (target: 1.5x scaling)
+2. Implement for batch sizes 1, 2, 4, 8, 16
+   - Specialized kernels for each batch size
+   - Compile-time optimization via template instantiation
+   - Register allocation optimized per batch size
 
-### Sprint 4: Performance Validation & Refinement (Weeks 5-7)
+3. Add dispatch logic
+   - Runtime batch size detection
+   - Select appropriate specialized kernel
+   - Fallback to current implementation for unsupported sizes
 
-- [ ] Implement Option D: Adaptive kernel dispatch (c=1 vs c>1)
-- [ ] Optimize memory access patterns for batching
-- [ ] Full regression testing
-- [ ] Performance validation (target: 1.5-2x scaling)
-- [ ] Documentation and examples
+4. Benchmark and validate
+   - Compare with current implementation
+   - Profile memory bandwidth utilization
+   - Measure kernel launch count reduction
+
+**Expected outcome**: 57% reduction in kernel launches (5,667 → 2,464), 1.3x scaling improvement
+
+### Sprint 3: Adaptive Configuration & Optimization (Weeks 3-4)
+
+**Goal**: Implement adaptive warp count and optimize for throughput
+
+**Tasks**:
+1. Implement adaptive warp count
+   - 4 warps for batch 1-4
+   - 2 warps for batch 5-8
+   - 1 warp for batch >8
+
+2. Optimize memory access patterns
+   - Shared memory allocation per batch
+   - Coalesced weight loading across batch
+   - Reduce memory bandwidth contention
+
+3. Implement kernel fusion for multiple projections
+   - Fuse gate/up/down projections
+   - Reduce kernel launch count
+   - Amortize weight loading
+
+4. Comprehensive benchmarking
+   - Profile with Nsight Systems
+   - Compare with llama.cpp baseline
+   - Identify remaining bottlenecks
+
+**Expected outcome**: Match llama.cpp memory efficiency (-20% memcpy time at c=16), 1.5x scaling
+
+### Sprint 4: Production Integration & Validation (Weeks 5-7)
+
+**Goal**: Production-ready implementation with comprehensive testing
+
+**Tasks**:
+1. Production integration
+   - Integrate into `FusedQuantGemm` dispatch
+   - Add fallback logic for edge cases
+   - Update documentation
+
+2. Comprehensive testing
+   - Unit tests for new kernel variants
+   - Integration tests with real models
+   - Regression tests for existing functionality
+
+3. Performance validation
+   - Benchmark across models (TinyLlama, Qwen2.5-3B, etc.)
+   - Profile at concurrency levels 1, 2, 4, 8, 16
+   - Compare with llama.cpp and cuda_native baseline
+
+4. Documentation and examples
+   - Kernel architecture documentation
+   - Performance tuning guide
+   - Backend selection recommendations
+
+**Expected outcome**: Production-ready implementation with 1.5-2x scaling, comprehensive testing, documentation
 
 ---
 
