@@ -114,5 +114,19 @@ cudaError_t BatchedKvAppend(const T *k_new, const T *v_new, T **d_k_dst,
                             T **d_v_dst, int batch_size, int kv_dim,
                             cudaStream_t stream);
 
+// ============================================================================
+// Embedding extraction kernels
+// ============================================================================
+
+/**
+ * MeanPool: Average hidden states across token positions.
+ * input layout: [seq_len, hidden_size] (T, e.g. half or nv_bfloat16)
+ * output layout: [hidden_size] (float)
+ * Each output[i] = (1/seq_len) * sum_{t=0..seq_len-1} input[t*hidden_size + i]
+ */
+template <typename T>
+cudaError_t MeanPool(const T *input, float *output, int seq_len,
+                     int hidden_size, cudaStream_t stream);
+
 } // namespace cuda_kernel
 } // namespace inferflux

@@ -48,6 +48,10 @@ class FusedQuantGemm {
 public:
   static constexpr int kDownProjMmqTileCols = 8;
 
+  // V2 cooperative-warp GEMV constants (visible to callers for graph capture).
+  static constexpr int kGemvWarpsPerBlockV2 = 4;
+  static constexpr int kGemvThreadsPerBlockV2 = kGemvWarpsPerBlockV2 * 32;
+
   enum class FfnProjOperator {
     kFallback = 0,
     kQ81Group,

@@ -630,5 +630,56 @@ BatchedKvAppend<__nv_bfloat16>(const __nv_bfloat16 *, const __nv_bfloat16 *,
                                 __nv_bfloat16 **, __nv_bfloat16 **, int, int,
                                 cudaStream_t);
 
+// ============================================================================
+// Mean-pooling kernel for embedding extraction
+// ============================================================================
+
+template <typename T>
+__global__ void MeanPoolKernel(const T *__restrict__ input,
+                               float *__restrict__ output, int seq_len,
+                               int hidden_size) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= hidden_size)
+    return;
+  float sum = 0.0f;
+  for (int t = 0; t < seq_len; ++t) {
+    sum += __half2float(input[t * hidden_size + idx]);
+  }
+  output[idx] = sum / static_cast<float>(seq_len);
+}
+
+// BF16 specialization
+template <>
+__global__ void MeanPoolKernel<__nv_bfloat16>(
+    const __nv_bfloat16 *__restrict__ input, float *__restrict__ output,
+    int seq_len, int hidden_size) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= hidden_size)
+    return;
+  float sum = 0.0f;
+  for (int t = 0; t < seq_len; ++t) {
+    sum += __bfloat162float(input[t * hidden_size + idx]);
+  }
+  output[idx] = sum / static_cast<float>(seq_len);
+}
+
+template <typename T>
+cudaError_t MeanPool(const T *input, float *output, int seq_len,
+                     int hidden_size, cudaStream_t stream) {
+  if (seq_len <= 0 || hidden_size <= 0) {
+    return cudaSuccess;
+  }
+  int threads = 256;
+  int blocks = (hidden_size + threads - 1) / threads;
+  MeanPoolKernel<T>
+      <<<blocks, threads, 0, stream>>>(input, output, seq_len, hidden_size);
+  return cudaGetLastError();
+}
+
+template cudaError_t MeanPool<half>(const half *, float *, int, int,
+                                    cudaStream_t);
+template cudaError_t MeanPool<__nv_bfloat16>(const __nv_bfloat16 *, float *,
+                                              int, int, cudaStream_t);
+
 } // namespace cuda_kernel
 } // namespace inferflux

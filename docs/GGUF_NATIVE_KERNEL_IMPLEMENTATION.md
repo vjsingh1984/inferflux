@@ -27,7 +27,7 @@ flowchart LR
 
 | Path | What it is best at today | Current caution |
 |---|---|---|
-| `native_cuda` | First-party runtime control, native metrics, memory policy control, 40+ fused GEMV kernels with Q8_1/dp4a/RmsNorm fusion, batched decode kernels, adaptive dispatch geometry | Single-sequence throughput gap vs llama.cpp (~0.35-0.76x depending on model size); batched decode path still opt-in |
+| `native_cuda` | First-party runtime control, native metrics, memory policy control, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp) with Q8_1/dp4a/RmsNorm fusion, batched decode default-on, adaptive dispatch geometry, native logprobs, native embeddings, execution policy refactor | Single-sequence throughput gap vs llama.cpp (~0.35-0.76x); v2 cooperative-warp GEMV targeting ≥55% bandwidth utilization |
 | `cuda_llama_cpp` | Stable GGUF compatibility and lower operational risk, higher single-sequence throughput today | Lower ceiling for InferFlux-specific runtime innovation |
 
 ## 3) Runtime Components
@@ -59,9 +59,12 @@ All quantization types have 100+ TDD test cases covering correctness, dispatch g
 |---|---|
 | Decode GEMV (M=1) | Q8_1 pre-quantized path is the default hot path for all quant types. Activations quantized once to `block_q8_1` format (per-32-element scales matching llama.cpp), reused across sibling projections via L2 cache. Improved TinyLlama tok/s by 49% (161 -> 240). |
 | Grouped projections | Q/K/V triple and gate/up pair launches share a single fused RmsNorm+Quantize kernel followed by grouped Q8_1 GEMV (one kernel for 2-3 outputs). Eliminates 2-5 redundant quantization passes per layer. The specialized `q8_1_group_hot_q4k` decode fast path remains experimental, is disabled by default, and is now gated in both selector and kernel dispatch so generic `q8_1_group` no longer falls into the risky fixed-block kernel accidentally. |
-| Batched decode (B>1) | Three batched kernels (BatchedRoPE, BatchedKvAppend, FlashDecodeMultiSeq) replace per-sequence loops. Reduces kernel launches from 264 to 66 for B=4, 22 layers. Opt-in via `INFERFLUX_ENABLE_BATCHED_DECODE=1`. |
+| Batched decode (B>1) | Three batched kernels (BatchedRoPE, BatchedKvAppend, FlashDecodeMultiSeq) replace per-sequence loops. Reduces kernel launches from 264 to 66 for B=4, 22 layers. Default-on; opt-out via `INFERFLUX_DISABLE_BATCHED_DECODE=1`. |
+| Native logprobs | GPU logits copied D2H after sampling, then `ComputeLogprob()` computes log-softmax + top-N alternatives. `SupportsLogprobsContract() = true`. No parity delegate needed for OpenAI `logprobs`/`top_logprobs` spec. |
+| Native embeddings | Full forward pass through all transformer layers, then final RmsNorm to all positions, then `MeanPool` CUDA kernel for mean-pooled embedding extraction. `SupportsEmbeddingsContract() = true`. Delegate fallback only if native extraction fails. |
 | Down projection | Hybrid selector: generic `Q8_1` GEMV for the safe default path, optional fixed-block `Q8_1` hot path for the exact `M=1,N=2048,K=11008` decode envelope, row-pair/row-quad for M>1, MMQ for large M (`Q4_K`/`Q6_K`), cuBLAS fallback. MMQ threshold tunable via `INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH`. |
 | 2D grid GEMV | All M values use single kernel launch via `dim3(ceil(N/8), M)`. Replaced tiled GEMM. Improved B=4 decode from 125ms to 12.6ms. |
+| Column-pair GEMV (M=1) | For M=1 decode, Q4_K and Q6_K Q8_1 kernels use column-pair variant: each warp computes 2 output columns, halving grid.x to `dim3(ceil(N/16), 1)`. Reduces kernel launch overhead and improves ILP via interleaved weight row processing. |
 | dp4a int8 | Hardware `__dp4a()` on SM >= 6.1 for all quant types. Both standalone and fused-with-RmsNorm variants. |
 | Fused RmsNorm+GEMV | 9 kernel variants (4 standard + 4 dp4a + FP16). Saves 45 kernel launches per decode step. |
 | Observability | `/metrics` exports FFN operator counts (`q8_1_group_hot_q4k` / `q8_1_group` / `packed_group` / `fallback`), down-proj mix (`q8_1_gemv` / `q8_1_gemv_hot_fixed` / `q8_1_gemv_row_pair` / `q8_1_gemv_row_quad` / `packed_gemv` / `mmq` / `fallback`), geometry counters, and forward batch-size buckets by phase |
@@ -78,13 +81,11 @@ Experimental tuning knob:
   Re-enables the exact-shape fixed-block `down_proj` kernel (`M=1,N=2048,K=11008`) for controlled experiments only. It is parity-tested in isolation but remains default-off because the full concurrent benchmark still showed small lexical drift for the repeated hash-table prompt.
 
 Benchmark harness tuning knobs:
-- `INFERFLUX_BENCH_ENABLE_BATCHED_DECODE`
 - `INFERFLUX_BENCH_MIN_BATCH_SIZE`
 - `INFERFLUX_BENCH_BATCH_ACCUMULATION_MS`
 - `INFERFLUX_BENCH_DECODE_BURST_TOKENS`
 - `INFERFLUX_BENCH_NATIVE_TIMING_SAMPLE_RATE`
   Use `0` for pure throughput runs; use `N>1` to sample native CUDA timing every `N`th work item without timing every prefill request.
-  The harness default for `INFERFLUX_BENCH_ENABLE_BATCHED_DECODE` is now `1` so native throughput probes measure the real batched-decode path instead of the per-sequence fallback. This is a benchmark default only; the server runtime stays conservative until the broader batched-decode stability gate is closed.
   The harness default for `INFERFLUX_BENCH_DECODE_BURST_TOKENS` is now `0`.
   `>1` remains an explicit experiment only until native batched decode parity is closed.
 

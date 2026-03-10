@@ -2342,6 +2342,69 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   return true;
 }
 
+// ============================================================================
+// EmbedForward: mean-pooled embedding extraction
+// ============================================================================
+
+template <typename T>
+bool LlamaForwardTyped<T>::EmbedForward(const std::vector<int> &token_ids,
+                                        int sequence_id, float *d_output) {
+  NVTX_SCOPE("EmbedForward");
+  const int seq_len = static_cast<int>(token_ids.size());
+  if (seq_len <= 0 || !d_output)
+    return false;
+
+  // Run the full forward pass (embedding + all layers + LM head).
+  // We discard the logits but keep d_residual_ which holds the final
+  // hidden states after all transformer layers.
+  // Allocate a temporary FP32 logits buffer for the throwaway output.
+  float *d_throwaway = nullptr;
+  cudaError_t alloc_err = cudaMalloc(&d_throwaway, vocab_size_ * sizeof(float));
+  if (alloc_err != cudaSuccess) {
+    log::Error("llama_forward", "EmbedForward: cudaMalloc for logits failed");
+    return false;
+  }
+
+  bool fwd_ok = Forward(token_ids, 0, sequence_id, d_throwaway);
+  cudaFree(d_throwaway);
+  if (!fwd_ok) {
+    log::Error("llama_forward", "EmbedForward: forward pass failed");
+    return false;
+  }
+
+  // d_residual_ now holds [seq_len, hidden_size] after all layers.
+  // Apply final RmsNorm to ALL positions and mean-pool.
+  {
+    NVTX_SCOPE("EmbedPool");
+    const T *final_norm_w =
+        reinterpret_cast<const T *>(weights_->FinalNorm());
+
+    // RmsNorm all positions: d_residual_ -> d_norm_out_
+    auto err = cuda_kernel::RmsNorm<T>(d_residual_, final_norm_w, d_norm_out_,
+                                       seq_len, hidden_size_, rms_norm_eps_,
+                                       stream_);
+    if (err != cudaSuccess) {
+      log::Error("llama_forward", "EmbedForward: final norm failed");
+      return false;
+    }
+
+    // Mean-pool across token positions: [seq_len, hidden_size] -> [hidden_size]
+    err = cuda_kernel::MeanPool<T>(d_norm_out_, d_output, seq_len,
+                                   hidden_size_, stream_);
+    if (err != cudaSuccess) {
+      log::Error("llama_forward", "EmbedForward: mean pool failed");
+      return false;
+    }
+  }
+
+  // Free the KV cache slot used for the forward pass.
+  if (kv_cache_) {
+    kv_cache_->ClearSequenceAsync(sequence_id, stream_);
+  }
+
+  return true;
+}
+
 // Explicit template instantiations
 template class LlamaForwardTyped<half>;
 template class LlamaForwardTyped<__nv_bfloat16>;

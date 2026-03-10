@@ -85,6 +85,30 @@ public:
   virtual int VocabSize() const = 0;
 
   /**
+   * Run a forward pass for embedding extraction (mean-pooled hidden states).
+   *
+   * Runs all transformer layers, applies final RmsNorm, then mean-pools
+   * across token positions. Returns FP32 embeddings on device.
+   *
+   * @param token_ids    Input token IDs
+   * @param sequence_id  KV cache sequence slot
+   * @param d_output     Output: [hidden_size] FP32 embeddings on device
+   * @return true on success
+   */
+  virtual bool EmbedForward(const std::vector<int> &token_ids, int sequence_id,
+                            float *d_output) {
+    (void)token_ids;
+    (void)sequence_id;
+    (void)d_output;
+    return false; // Default: not supported
+  }
+
+  /**
+   * Return the hidden size for embedding dimension calculations.
+   */
+  virtual int HiddenSize() const = 0;
+
+  /**
    * Free scratch buffers.
    */
   virtual void FreeScratchBuffers() = 0;

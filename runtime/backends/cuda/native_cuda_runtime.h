@@ -133,6 +133,16 @@ public:
 
   /// Returns the vocabulary size (number of logits per position).
   virtual int NativeVocabSize() const { return 0; }
+
+  /// Compute mean-pooled embeddings for the given text.
+  /// Returns FP32 embedding vector of size hidden_size, or empty on failure.
+  virtual std::vector<float> NativeEmbed(const std::string &text) {
+    (void)text;
+    return {};
+  }
+
+  /// Returns the embedding dimension (hidden_size).
+  virtual int NativeEmbedDims() const { return 0; }
 };
 
 std::unique_ptr<NativeCudaRuntime> CreateNativeCudaRuntime();

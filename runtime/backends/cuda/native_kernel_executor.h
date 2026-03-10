@@ -229,6 +229,8 @@ public:
   const ITokenizer *NativeGetTokenizer() const override;
   int CopyLastLogitsToHost(float *host_buf, int buf_size) override;
   int NativeVocabSize() const override;
+  std::vector<float> NativeEmbed(const std::string &text) override;
+  int NativeEmbedDims() const override;
 
   // Native-specific functionality
   bool HasFlashAttention2() const { return has_flash_attention_2_; }

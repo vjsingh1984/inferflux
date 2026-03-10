@@ -1,7 +1,7 @@
 # Native GEMV Kernel Architecture
 
 **Status:** Canonical
-**Snapshot date:** March 9, 2026
+**Snapshot date:** March 10, 2026
 
 This document describes the geometry, dispatch, and TDD structure of the native fused dequantization GEMV kernels that form the throughput-critical hot path in InferFlux's native CUDA backend.
 
@@ -29,7 +29,7 @@ flowchart TD
 
 ## 2) Kernel Geometry
 
-### Thread/Block Layout
+### V1 Thread/Block Layout (column-major warp assignment)
 
 ```
 Block: 256 threads = 8 warps x 32 lanes
@@ -39,6 +39,33 @@ Grid:  dim3(ceil(N / 8), M)
 ```
 
 Each warp produces one output element. Lane `j` of warp `w` accumulates `weight[out_idx][j..K:32] * activation[row][j..K:32]`. Final reduction via `__shfl_down_sync` produces the scalar result in lane 0.
+
+### V2 Thread/Block Layout (cooperative-warp, default for Q4_K/Q6_K when K≥1024)
+
+```
+Block: 128 threads = 4 warps x 32 lanes
+Grid:  dim3(N, 1, M)
+       blockIdx.x: single output column (1 output per block)
+       blockIdx.z: input row (batch element)
+Smem:  float warp_sums[4]  (16 bytes for cross-warp reduction)
+```
+
+All 4 warps **collaborate on one output element**, each processing a strided subset of super-blocks (`blk = warp_id; blk < num_super_blocks; blk += 4`). This provides L2 cache locality (one weight row per block) vs v1 where 8 warps access 8 unrelated weight rows. Cross-warp reduction uses 16 bytes of shared memory and one `__syncthreads`.
+
+**Expected bandwidth improvement:** ~40% → ≥55% of peak (1.4x+ throughput from L2 locality alone).
+
+| Property | V1 | V2 |
+|---|---|---|
+| Warps per output | 1 | 4 (cooperative) |
+| Weight rows per block | 8 (unrelated) | 1 (coherent) |
+| Threads per block | 256 | 128 |
+| Shared memory | 0 bytes | 16 bytes |
+| Grid blocks (N=2048, M=1) | 256 | 2048 |
+| Max blocks/SM (Ada) | 8 | 12+ |
+
+**Env var control:** `INFERFLUX_GEMV_V1=1` forces v1, `INFERFLUX_GEMV_V2=1` forces v2, default auto-selects v2 for K≥1024.
+
+**Files:** `fused_dequant_gemv_v2.cuh` (kernel implementations), `fused_quant_gemm.cu` (dispatch integration).
 
 ### Shared Memory
 
@@ -122,6 +149,17 @@ The highest-throughput path. Activations are quantized to `block_q8_1` format (3
 
 Grouped dispatch (pair/triple) launches a single kernel that computes 2 or 3 output projections sharing the same activation data.
 
+### 3i) Column-Pair Q8_1 GEMV (Q4_K, Q6_K)
+
+For M=1 decode, each warp computes **two output columns** instead of one, halving grid.x. Both outputs share the same Q8_1 activation loads (L2 cached), and the two independent accumulations provide better instruction-level parallelism.
+
+| Variant | Grid X dimension | Outputs per warp | Use case |
+|---|---|---|---|
+| Single | ceil(N/8) | 1 | Fallback |
+| ColPair | ceil(N/16) | 2 | M = 1 decode |
+| RowPair | ceil(N/8) | 1 (2 rows) | M = 2-3 |
+| RowQuad | ceil(N/8) | 1 (4 rows) | M >= 4 |
+
 ### 3g) Q8_1 Quantization Kernels
 
 | Kernel | Input | Output | Use case |
@@ -139,13 +177,16 @@ Tiled matrix-multiply kernels for the down projection, using 2D thread blocks. G
 The transformer forward pass attempts dispatch paths in this order:
 
 ```
-Q8_1 grouped (pair/triple with fused norm+quantize)
-  -> Q8_1 single (standalone quantize + GEMV)
-    -> Packed grouped (per-row int8, pair/triple)
-      -> Packed single
-        -> Fused RmsNorm+GEMV (dp4a if SM >= 6.1)
-          -> Standalone RmsNorm + Fused GEMV
-            -> cuBLAS FP16 (fallback)
+Q8_1 grouped v2 (cooperative-warp pair/triple, K>=1024)
+  -> Q8_1 v2 single (cooperative-warp, K>=1024)
+    -> Q8_1 grouped v1 (pair/triple with fused norm+quantize)
+      -> Q8_1 column-pair v1 (M=1: 2 outputs/warp, halved grid)
+        -> Q8_1 single v1 (standalone quantize + GEMV)
+          -> Packed grouped (per-row int8, pair/triple)
+            -> Packed single
+              -> Fused RmsNorm+GEMV (dp4a if SM >= 6.1)
+                -> Standalone RmsNorm + Fused GEMV
+              -> cuBLAS FP16 (fallback)
 ```
 
 Each path checks `FusedQuantGemm::ShouldUseFusedPath()` which compares M against an adaptive threshold:
@@ -186,7 +227,7 @@ For a 22-layer model at B=1: ~155 kernel launches per token (7 GEMV + 2 norm-qua
 
 ## 6) Batched Decode Kernels
 
-When `INFERFLUX_ENABLE_BATCHED_DECODE=1` and B > 1, three batched kernels replace per-sequence loops:
+When B > 1, three batched kernels replace per-sequence loops (default-on; opt-out via `INFERFLUX_DISABLE_BATCHED_DECODE=1`):
 
 | Kernel | Grid | Purpose |
 |---|---|---|
@@ -196,7 +237,7 @@ When `INFERFLUX_ENABLE_BATCHED_DECODE=1` and B > 1, three batched kernels replac
 
 Bulk KV pointer arrays (`d_all_k_append_ptrs_`, etc.) are pre-computed for all layers in a single H2D upload, eliminating per-layer pointer copies.
 
-**Status:** Verified working. Isolated synthetic tests pass (6 cases, 4531 assertions). Integration verified with 8 concurrent Qwen2.5-3B Q4_K_M requests producing correct coherent responses. CUDA graphs captured for B=1-4 (599 nodes, 36 layers). Opt-in via `INFERFLUX_ENABLE_BATCHED_DECODE=1`.
+**Status:** Default-on. Isolated synthetic tests pass (6 cases, 4531 assertions). Integration verified with 8 concurrent Qwen2.5-3B Q4_K_M requests producing correct coherent responses. CUDA graphs captured for B=1-4 (599 nodes, 36 layers). Opt-out via `INFERFLUX_DISABLE_BATCHED_DECODE=1`.
 
 ## 7) CUDA Graph Capture
 

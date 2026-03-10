@@ -33,9 +33,11 @@ flowchart TD
 | Area | Implemented now | Still missing |
 |---|---|---|
 | Loader selection | Loader detected from artifact structure/metadata | None at the contract level |
-| GEMV kernel coverage | 40+ fused kernels: standard, dp4a, RmsNorm-fused, packed int8, Q8_1 pre-quantized (single/pair/triple/rowpair/rowquad), MMQ down-proj. All via 2D grid `dim3(ceil(N/8), M)`. | Weight bandwidth utilization ~40% vs llama.cpp ~60% |
+| GEMV kernel coverage | 50+ fused kernels: v1 column-major (standard, dp4a, RmsNorm-fused, packed int8, Q8_1 single/pair/triple/rowpair/rowquad/colpair, MMQ) + v2 cooperative-warp (Q4_K/Q6_K/Q8_0/Q8_K single, grouped, rowpair). V2 default for K≥1024: 4 warps collaborate on 1 output for L2-coherent weight access. Env control: `INFERFLUX_GEMV_V1=1`/`INFERFLUX_GEMV_V2=1`. | V2 awaiting GPU benchmark validation (target ≥55% bandwidth) |
 | Activation quantization | Q8_1 pre-quantized path (per-32-element blocks matching llama.cpp format). Fused RmsNorm+Quantize kernels for norm groups. Activation reuse across sibling projections via L2 cache. | No persistent thread GEMV or kernel fusion across projections |
-| Batched decode | BatchedRoPE, BatchedKvAppend, FlashDecodeMultiSeq verified working with 8 concurrent Qwen2.5-3B requests. CUDA graphs captured for B=1-4. Row-pair/quad dispatch active. Opt-in via `INFERFLUX_ENABLE_BATCHED_DECODE=1`. | Promote to default-on after sustained load testing |
+| Batched decode | BatchedRoPE, BatchedKvAppend, FlashDecodeMultiSeq default-on. CUDA graphs captured for B=1-4. Row-pair/quad dispatch active. Opt-out via `INFERFLUX_DISABLE_BATCHED_DECODE=1`. | None — promoted to default |
+| Native logprobs | GPU logits D2H + `ComputeLogprob()`. `SupportsLogprobsContract() = true`. OpenAI `logprobs`/`top_logprobs` spec. | None — no parity delegate needed |
+| Native embeddings | Full forward + final RmsNorm + `MeanPool` kernel. `SupportsEmbeddingsContract() = true`. `/v1/embeddings` on native path. | Delegate fallback only if native fails |
 | Dispatch policy | Adaptive threshold `base_threshold(SM) * 16/bpw` with geometry-aware boosts. Priority: Q8_1 > packed > fused RmsNorm+GEMV > standard GEMV > cuBLAS. | Threshold tuning is empirical, not auto-calibrated |
 | Memory policy | `dequant_cache_policy=none` is the default. Q8_1 path needs zero dequantized caches. | None at the policy level |
 | KV policy | KV precision is load-scoped; planner auto-tunes sequence budget against VRAM. `INFERFLUX_NATIVE_KV_MAX_BATCH` / `INFERFLUX_NATIVE_KV_MAX_SEQ` for explicit sizing. | Lower-precision KV needs proof |
@@ -53,9 +55,9 @@ flowchart TD
 
 | Priority | Gate | Status |
 |---|---|---|
-| P0 | Close weight bandwidth gap (40% -> 60%+ utilization) | In progress: Q8_1 improved 49%, further vectorization needed |
-| P0 | Promote batched decode to default-on | Ready: verified with 8 concurrent Qwen2.5-3B requests + CUDA graph capture. Needs sustained load testing. |
-| P0 | Enable CUDA graph capture by default for batched decode | Ready: graphs captured and replayed for B=1-4. Promote alongside batched decode. |
+| P0 | Close weight bandwidth gap (40% -> 60%+ utilization) | In progress: v2 cooperative-warp GEMV kernels landed (Q4_K/Q6_K/Q8_0/Q8_K), auto-enabled for K≥1024. Awaiting GPU benchmark validation. |
+| ~~P0~~ | ~~Promote batched decode to default-on~~ | **Done**: default-on, opt-out via `INFERFLUX_DISABLE_BATCHED_DECODE=1` |
+| ~~P0~~ | ~~Enable CUDA graph capture by default for batched decode~~ | **Done**: graphs captured and replayed for B=1-4, active alongside batched decode |
 | P1 | Keep memory-first dequant as the default | Done: Q8_1 path needs zero dequant caches |
 | P1 | Promote lower-precision KV only after quality proof | Not started |
 

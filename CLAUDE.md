@@ -99,6 +99,12 @@ The CMake target `inferflux_core` links all modules into a single library consum
 
 **Tech debt tracker:** `docs/TechDebt_and_Competitive_Roadmap.md` — consult at session start for priorities.
 
+**Canonical docs (keep in sync with code changes):**
+- `docs/GEMV_KERNEL_ARCHITECTURE.md` — kernel geometry, dispatch priority, TDD coverage
+- `docs/GGUF_NATIVE_KERNEL_IMPLEMENTATION.md` — native GGUF runtime guide, operator status
+- `docs/MONITORING.md` — observability signals, tuning levers, profiling workflow
+- `docs/design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE.md` — design rules and next gates
+
 ## Coding Conventions
 
 - **C++17**, all symbols in `inferflux` namespace, helpers in anonymous namespaces
@@ -141,15 +147,54 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 
 ## CUDA Development
 
-**Native CUDA backend:** `runtime/backends/cuda/native_cuda_backend.cpp` and `runtime/backends/cuda/native_cuda_runtime.cpp` provide the canonical native CUDA path used by `cuda_native`.
+**Two-backend architecture:** The CUDA path has two providers that both accept GGUF models:
+- `native_cuda` (`runtime/backends/cuda/native_cuda_backend.cpp`, `native_kernel_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp). Still trails llama.cpp on single-sequence throughput (~0.35-0.76x).
+- `cuda_llama_cpp` — delegates to llama.cpp for inference. Higher throughput today, lower ceiling for InferFlux-specific innovation.
 
-**Phase overlap:** Mixed-batch decode prioritization with configurable prefill/decode overlap. Enable via `runtime.cuda.phase_overlap.enabled` or `INFERFLUX_CUDA_PHASE_OVERLAP`. Monitor via Prometheus metrics: `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_completions_total`, `inferflux_cuda_lane_overlap_events_total`, `inferflux_cuda_lane_overlap_duration_ms_total`.
+Only structured output (grammar-constrained generation) still delegates to the llama.cpp parity backend. Logprobs and embeddings are native.
 
-**Attention kernels:** Multiple CUDA attention implementations with automatic selection. Configure via `runtime.cuda.attention.kernel` or `INFERFLUX_CUDA_ATTENTION_KERNEL` (`auto`, `fa2`, `standard`). Monitor fallbacks via `inferflux_cuda_attention_kernel_fallbacks_total`.
+**Key CUDA env vars:** (centralized in `NativeExecutionPolicy::FromEnv()`)
+- `INFERFLUX_DISABLE_BATCHED_DECODE=1` — opt out of batched decode (default-on)
+- `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` — disable pre-quantized Q8_1 activation path
+- `INFERFLUX_GEMV_V1=1` — force v1 column-major GEMV kernels (bypass cooperative-warp v2)
+- `INFERFLUX_GEMV_V2=1` — force v2 cooperative-warp GEMV (default: auto, v2 for K≥1024)
+- `INFERFLUX_NATIVE_TIMING_SAMPLE_RATE=N` — record CUDA event timing every Nth batch (0=off)
+- `INFERFLUX_CUDA_PHASE_OVERLAP` — enable prefill/decode lane overlap
+- `INFERFLUX_CUDA_ATTENTION_KERNEL` — force attention kernel (`auto`, `fa2`, `standard`)
+- `INFERFLUX_NATIVE_KV_MAX_BATCH` / `INFERFLUX_NATIVE_KV_MAX_SEQ` — KV cache sizing
 
-**Native CUDA metrics:** The native kernel executor (`runtime/backends/cuda/native_kernel_executor.cpp`) reports per-forward-pass timing and batching metrics via Prometheus: `inferflux_native_forward_passes_total{phase}`, `inferflux_native_forward_batch_tokens_total`, `inferflux_native_forward_duration_ms` (histogram), `inferflux_native_sampling_duration_ms` (histogram), `inferflux_native_kv_active_sequences`, `inferflux_native_kv_max_sequences`. NVTX annotations are added for Nsight Systems profiling (ranges: Forward, Embedding, Layer, QKV_Projection, RoPE, KV_Append, FlashAttention2, O_Projection, FFN, LM_Head, Sampling).
+**Native CUDA kernel files:**
+- `runtime/backends/cuda/native/kernels/fused_dequant_gemv.cuh` — v1 GEMV kernels (column-major, 8 warps/block)
+- `runtime/backends/cuda/native/kernels/fused_dequant_gemv_v2.cuh` — v2 GEMV kernels (cooperative 4-warp, L2-friendly)
+- `runtime/backends/cuda/native/fused_quant_gemm.cu` — dispatch tables, v1/v2 selection, threshold logic
+- `runtime/backends/cuda/native/transformer_forward.cu` — forward pass wiring
+- `runtime/backends/cuda/native/cuda_kernels.cu` — batched RoPE/KvAppend, MeanPool, utility kernels
+- `runtime/backends/cuda/kernels/flash_attention.cu` — FlashAttention-2 and FlashDecodeMultiSeq
 
-**Throughput validation:** Use `scripts/run_throughput_gate.py` for performance regression testing. The script validates tok/s thresholds, CUDA lane submissions, overlap metrics, native forward pass counters (`--require-native-forward-passes`), and backend provider exposure.
+**Native CUDA policy and execution files:**
+- `runtime/backends/cuda/native/native_execution_policy.h` — `NativeExecutionPolicy` struct, env var parsing
+- `runtime/backends/cuda/native/native_dispatch_policy.{h,cpp}` — operator selection, dispatch decisions
+- `runtime/backends/cuda/native/native_bootstrap_config.{h,cpp}` — KV cache sizing, startup config
+- `runtime/backends/cuda/native/native_linear_executor.h` — projection stage execution with fallback chains
+
+**Native CUDA metrics:** Prometheus at `/metrics`: `inferflux_native_forward_passes_total{phase}`, `inferflux_native_forward_batch_tokens_total`, `inferflux_native_forward_duration_ms`, `inferflux_native_sampling_duration_ms`, `inferflux_native_kv_active_sequences`, `inferflux_native_kv_max_sequences`, FFN/down-proj operator counters. NVTX annotations for Nsight Systems profiling.
+
+**Throughput validation:**
+```bash
+# Performance regression gate
+./scripts/run_throughput_gate.py --server-bin ./build/inferfluxd --config config/server.cuda.yaml \
+  --backend cuda --min-completion-tok-per-sec 120
+
+# Native vs llama.cpp comparison benchmark
+bash scripts/run_gguf_comparison_benchmark.sh
+```
+
+## Disaggregated Runtime
+
+`runtime/disaggregated/` implements split prefill/decode with KV transfer:
+- `kv_channel.h` — ticket-based KV handoff with lifecycle tracking (create/transfer/consume/timeout)
+- `shm_kv_transport.h` — shared-memory transport for process-local KV transfer
+- Health signals: timeout streak/debt metrics influence `/readyz` and optional fail-closed admission
 
 ## Commits & PRs
 

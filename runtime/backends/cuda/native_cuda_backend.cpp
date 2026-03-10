@@ -725,9 +725,7 @@ bool NativeCudaBackend::SupportsStructuredOutputContract() const {
   return IsParityDelegateAvailable();
 }
 
-bool NativeCudaBackend::SupportsEmbeddingsContract() const {
-  return IsParityDelegateAvailable();
-}
+bool NativeCudaBackend::SupportsEmbeddingsContract() const { return true; }
 
 bool NativeCudaBackend::IsParityDelegateAvailable() const {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
@@ -804,6 +802,15 @@ TokenLogprob NativeCudaBackend::CollectNativeLogprob(int token_id,
 }
 
 std::vector<float> NativeCudaBackend::EmbedForParity(const std::string &text) {
+  // Try native embedding first.
+  std::lock_guard<std::recursive_mutex> runtime_lock(runtime_mutex_);
+  if (runtime_ && runtime_->NativeEmbedDims() > 0) {
+    auto result = runtime_->NativeEmbed(text);
+    if (!result.empty()) {
+      return result;
+    }
+  }
+  // Fall back to parity delegate.
   auto backend = EnsureParityBackend();
   if (!backend || !backend->IsReady()) {
     return {};
@@ -812,6 +819,15 @@ std::vector<float> NativeCudaBackend::EmbedForParity(const std::string &text) {
 }
 
 int NativeCudaBackend::EmbedDimsForParity() const {
+  // Try native first.
+  std::lock_guard<std::recursive_mutex> runtime_lock(runtime_mutex_);
+  if (runtime_) {
+    int dims = runtime_->NativeEmbedDims();
+    if (dims > 0) {
+      return dims;
+    }
+  }
+  // Fall back to parity delegate.
   auto backend = EnsureParityBackend();
   if (!backend || !backend->IsReady()) {
     return 0;

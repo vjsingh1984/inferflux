@@ -21,6 +21,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -3150,6 +3151,53 @@ const ITokenizer *NativeKernelExecutor::NativeGetTokenizer() const {
 
 int NativeKernelExecutor::NativeVocabSize() const {
   return model_config_.vocab_size;
+}
+
+int NativeKernelExecutor::NativeEmbedDims() const {
+  return model_config_.hidden_size;
+}
+
+std::vector<float> NativeKernelExecutor::NativeEmbed(const std::string &text) {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!model_forward_ || !tokenizer_ || model_config_.hidden_size <= 0) {
+    return {};
+  }
+  std::vector<int> tokens = tokenizer_->Tokenize(text, /*add_bos=*/false);
+  if (tokens.empty()) {
+    return {};
+  }
+
+  const int hidden = model_config_.hidden_size;
+
+  // Device buffer for the output embedding.
+  float *d_embed = nullptr;
+  cudaError_t err = cudaMalloc(&d_embed, hidden * sizeof(float));
+  if (err != cudaSuccess) {
+    log::Error("native_kernel_executor",
+               "NativeEmbed: cudaMalloc failed for embedding buffer");
+    return {};
+  }
+
+  // Use a temporary sequence ID for the embedding pass.
+  static std::atomic<int> embed_seq_counter{900000};
+  const int embed_seq_id = embed_seq_counter.fetch_add(1);
+
+  bool ok = model_forward_->EmbedForward(tokens, embed_seq_id, d_embed);
+  if (!ok) {
+    cudaFree(d_embed);
+    return {};
+  }
+
+  std::vector<float> result(hidden);
+  cudaMemcpyAsync(result.data(), d_embed, hidden * sizeof(float),
+                  cudaMemcpyDeviceToHost, compute_stream_);
+  cudaStreamSynchronize(compute_stream_);
+  cudaFree(d_embed);
+  return result;
+#else
+  (void)text;
+  return {};
+#endif
 }
 
 int NativeKernelExecutor::CopyLastLogitsToHost(float *host_buf, int buf_size) {

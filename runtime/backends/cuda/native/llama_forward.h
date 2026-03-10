@@ -111,6 +111,9 @@ public:
   std::string ModelType() const override { return "llama"; }
 
   int VocabSize() const override { return vocab_size_; }
+  int HiddenSize() const override { return hidden_size_; }
+  bool EmbedForward(const std::vector<int> &token_ids, int sequence_id,
+                    float *d_output) override;
 
 private:
   // Model config

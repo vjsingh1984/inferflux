@@ -70,7 +70,9 @@ Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 | Phased fairness resume | `inferflux_empty_generations_total` plus unified-batch regression tests | Empty generations should not spike after a fairness-slice change; resumed phased requests must carry only the next feed token |
 | Slot/request identity debugging | `INFERFLUX_DEBUG_SEQUENCE_SLOTS=1` and `INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING=1` | Logs must include `request_id` plus `sequence_generation`; slot id alone is not enough once leases are reused |
 | Compatibility-path EOG parity | local GGUF tokenizer/backend regression tests | `cuda_llama_cpp` should stop on GGUF end-of-generation tokens, not just model EOS |
-| Batched decode active | `INFERFLUX_ENABLE_BATCHED_DECODE=1` + batch buckets in `bucket="2"` or higher | When enabled, B>1 decode uses BatchedRoPE/KvAppend/FlashDecodeMultiSeq instead of per-sequence loop. Opt-in until compute-sanitizer validates stability. |
+| Batched decode active | Batch buckets in `bucket="2"` or higher | Default-on. B>1 decode uses BatchedRoPE/KvAppend/FlashDecodeMultiSeq instead of per-sequence loop. Opt-out via `INFERFLUX_DISABLE_BATCHED_DECODE=1`. |
+| Native logprobs | `logprobs` field in completion response is non-null when `logprobs: true` | Native path computes log-softmax from GPU logits (D2H copy). No parity delegate needed. |
+| Native embeddings | `/v1/embeddings` returns vectors | Native MeanPool kernel extracts embeddings. Falls back to delegate only if native fails. |
 | Q8_1 activation path | startup log shows `using Q8_1 grouped triple GEMV` or `using Q8_1 pre-quantized GEMV` | Confirms pre-quantized Q8_1 activations are active (highest throughput path). Disable with `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` for A/B testing. |
 | Overlap activity | `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_overlap_events_total` | Non-zero deltas confirm mixed-workload lane activity |
 | Native KV sizing | `inferflux_native_kv_requested_max_seq`, `inferflux_native_kv_planned_max_seq`, `inferflux_native_kv_budget_bytes` | Planned values below requested show KV auto-tune is protecting VRAM |
@@ -85,13 +87,11 @@ Benchmark-only experiment:
   Enables the exact-shape fixed-block `down_proj` kernel for the observed `M=1,N=2048,K=11008` decode envelope. Keep it off for normal runs until the full concurrent benchmark reaches the same exact-match bar as the generic path.
 
 Benchmark harness knobs:
-- `INFERFLUX_BENCH_ENABLE_BATCHED_DECODE=<0|1>`
 - `INFERFLUX_BENCH_MIN_BATCH_SIZE=<n>`
 - `INFERFLUX_BENCH_BATCH_ACCUMULATION_MS=<ms>`
 - `INFERFLUX_BENCH_DECODE_BURST_TOKENS=<n>`
 - `INFERFLUX_BENCH_NATIVE_TIMING_SAMPLE_RATE=<n>`
   `0` disables native CUDA event timing; `N>0` records every `N`th native work item across both decode batches and prefill requests.
-  The harness default for `INFERFLUX_BENCH_ENABLE_BATCHED_DECODE` is `1`, because otherwise the benchmark measures the native per-sequence decode fallback and systematically understates throughput. The server runtime default is still separate and remains opt-in until the broader batched-decode stability gate is closed.
   The harness default for `INFERFLUX_BENCH_DECODE_BURST_TOKENS` is `0`; use `>1` only for explicit throughput experiments because native exact-match parity is not closed there yet.
 - `INFERFLUX_BENCH_DEBUG_SEQUENCE_SLOTS=1`
 - `INFERFLUX_BENCH_DEBUG_UNIFIED_ASSEMBLY=1`

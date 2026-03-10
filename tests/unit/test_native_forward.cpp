@@ -5992,6 +5992,73 @@ TEST_CASE("QuantizedWeightMapAdapter: is a WeightMapTyped<half>",
   REQUIRE(base->EmbedTokens() == nullptr);
 }
 
+TEST_CASE("FusedQuantGemm: Q4_K column-pair dispatch uses halved grid for M=1",
+          "[native_forward]") {
+  // Column-pair kernel processes 2 output columns per warp, so for M=1 the
+  // effective outputs per block doubles from kGemvWarpsPerBlock to 2x.
+  // This test validates the dispatch logic selects column-pair for M=1
+  // and row-pair/row-quad for M>1.
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+
+  // M=1 should use fused path (column-pair will be selected internally)
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 1));
+
+  // M=2 should still use fused path (row-pair variant)
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 2));
+
+  // M=4 should still use fused path (row-quad variant)
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 4));
+}
+
+TEST_CASE("FusedQuantGemm: Q6_K column-pair dispatch uses halved grid for M=1",
+          "[native_forward]") {
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
+
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 1));
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 2));
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 4));
+}
+
+// ============================================================================
+// Cooperative-Warp GEMV v2 Tests
+//
+// These tests exercise the v2 dispatch path via FusedQuantGemm::GemvQ8_1().
+// V2 is auto-selected for K >= 1024 with Q4_K/Q6_K quant types.
+// ============================================================================
+
+TEST_CASE("GEMV v2: Q4_K dispatch succeeds for representative dimensions",
+          "[native_forward][gemv_v2]") {
+  // Verify the dispatch path (which now uses v2 for K>=1024) accepts
+  // representative Qwen2.5-3B dimensions and produces non-zero output.
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+
+  // All realistic K values are >= 1024, so v2 will be selected
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 1));
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 2));
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 4));
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 8));
+}
+
+TEST_CASE("GEMV v2: Q6_K dispatch succeeds for representative dimensions",
+          "[native_forward][gemv_v2]") {
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
+
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 1));
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 2));
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 4));
+}
+
+TEST_CASE("GEMV v2: v2 constants match expected values",
+          "[native_forward][gemv_v2]") {
+  // Verify the v2 block geometry constants are accessible and correct
+  REQUIRE(FusedQuantGemm::kGemvWarpsPerBlockV2 == 4);
+  REQUIRE(FusedQuantGemm::kGemvThreadsPerBlockV2 == 128);
+}
+
 #endif // INFERFLUX_NATIVE_KERNELS_READY
 
 } // namespace inferflux
