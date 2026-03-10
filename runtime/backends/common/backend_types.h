@@ -27,6 +27,34 @@ struct UnifiedBatchInput {
   uint64_t sequence_generation{0};
 };
 
+// Canonical request->unified-batch metadata projection used by both the
+// scheduler-side phased prefill path and executor-side unified batching.
+template <typename BatchInput = UnifiedBatchInput>
+inline BatchInput
+MakeUnifiedBatchInput(const InferenceRequest &request, int sequence_id,
+                      uint64_t sequence_generation, int n_past,
+                      std::vector<int> tokens, bool request_logits) {
+  BatchInput input;
+  input.sequence_id = sequence_id;
+  input.n_past = n_past;
+  input.tokens = std::move(tokens);
+  input.request_logits = request_logits;
+  input.sampling = request.sampling;
+  input.request_id = static_cast<int64_t>(request.id);
+  input.client_request_id = request.client_request_id;
+  input.sequence_generation = sequence_generation;
+  return input;
+}
+
+template <typename BatchInput = UnifiedBatchInput>
+inline BatchInput
+MakeUnifiedBatchInput(const InferenceRequest &request, int n_past,
+                      std::vector<int> tokens, bool request_logits) {
+  return MakeUnifiedBatchInput<BatchInput>(
+      request, request.sequence_id, request.sequence_generation, n_past,
+      std::move(tokens), request_logits);
+}
+
 /// Output for one sequence in a unified batch execution.
 struct UnifiedBatchOutput {
   int token{-1};     // Next sampled token; -1 = EOS or error

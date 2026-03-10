@@ -105,3 +105,47 @@ TEST_CASE("UnifiedBatch types basic properties", "[backend_types]") {
   UnifiedBatchHandle handle = 0;
   REQUIRE(handle == 0);
 }
+
+TEST_CASE("MakeUnifiedBatchInput copies canonical request metadata",
+          "[backend_types]") {
+  InferenceRequest request;
+  request.id = 42;
+  request.sequence_id = 7;
+  request.sequence_generation = 9;
+  request.client_request_id = "bench-42";
+  request.sampling.temperature = 0.3f;
+
+  auto input = MakeUnifiedBatchInput(request, /*n_past=*/11, {3, 4, 5},
+                                     /*request_logits=*/false);
+
+  REQUIRE(input.sequence_id == 7);
+  REQUIRE(input.sequence_generation == 9);
+  REQUIRE(input.n_past == 11);
+  REQUIRE(input.tokens == std::vector<int>{3, 4, 5});
+  REQUIRE(input.request_logits == false);
+  REQUIRE(input.request_id == 42);
+  REQUIRE(input.client_request_id == "bench-42");
+  REQUIRE(input.sampling.temperature == Catch::Approx(0.3f));
+}
+
+TEST_CASE("MakeUnifiedBatchInput supports explicit sequence lease overrides",
+          "[backend_types]") {
+  InferenceRequest request;
+  request.id = 77;
+  request.sequence_id = 1;
+  request.sequence_generation = 2;
+  request.client_request_id = "prefill-77";
+
+  auto input = MakeUnifiedBatchInput(request, /*sequence_id=*/12,
+                                     /*sequence_generation=*/34,
+                                     /*n_past=*/5, {8, 9},
+                                     /*request_logits=*/true);
+
+  REQUIRE(input.sequence_id == 12);
+  REQUIRE(input.sequence_generation == 34);
+  REQUIRE(input.n_past == 5);
+  REQUIRE(input.tokens == std::vector<int>{8, 9});
+  REQUIRE(input.request_logits == true);
+  REQUIRE(input.request_id == 77);
+  REQUIRE(input.client_request_id == "prefill-77");
+}

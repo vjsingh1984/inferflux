@@ -106,21 +106,6 @@ void LogUnifiedAssemblyState(std::string_view stage, const InferenceRequest &req
           json(DebugSnippet(completion)).dump());
 }
 
-LlamaCPUBackend::UnifiedBatchInput
-MakeUnifiedBatchInput(const InferenceRequest &req, int n_past,
-                      std::vector<int> tokens, bool request_logits) {
-  LlamaCPUBackend::UnifiedBatchInput input;
-  input.sequence_id = req.sequence_id;
-  input.n_past = n_past;
-  input.tokens = std::move(tokens);
-  input.request_logits = request_logits;
-  input.sampling = req.sampling;
-  input.request_id = static_cast<int64_t>(req.id);
-  input.client_request_id = req.client_request_id;
-  input.sequence_generation = req.sequence_generation;
-  return input;
-}
-
 // RAII guard that calls SetupSampler before execution and TeardownSampler on
 // scope exit.  Always sets up a sampler chain (grammar optional), so sampling
 // params (temperature, top_p, …) are always in effect.
@@ -976,11 +961,11 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
             req->bpe_prompt_tokens.begin() + req->prefill_offset + chunk_size);
 
         // Only request logits on the final chunk of the prefill.
-        batch_inputs.push_back(MakeUnifiedBatchInput(
+        batch_inputs.push_back(MakeUnifiedBatchInput<LlamaCPUBackend::UnifiedBatchInput>(
             *req, req->prefill_offset, std::move(chunk), is_last_chunk));
         active_idx.push_back(i);
       } else if (states[i].tokens_generated < states[i].decode_limit) {
-        batch_inputs.push_back(MakeUnifiedBatchInput(
+        batch_inputs.push_back(MakeUnifiedBatchInput<LlamaCPUBackend::UnifiedBatchInput>(
             *req, req->n_past, {states[i].current_token}, true));
         active_idx.push_back(i);
       } else {
@@ -1292,12 +1277,12 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
       std::vector<int> chunk(
           req->bpe_prompt_tokens.begin() + req->prefill_offset,
           req->bpe_prompt_tokens.begin() + req->prefill_offset + chunk_size);
-      batch_inputs.push_back(MakeUnifiedBatchInput(
+      batch_inputs.push_back(MakeUnifiedBatchInput<LlamaCPUBackend::UnifiedBatchInput>(
           *req, req->prefill_offset, std::move(chunk), is_last_chunk));
       active_reqs.push_back(req);
     } else if (req->exec_tokens_generated < req->exec_decode_limit) {
       batch_inputs.push_back(
-          MakeUnifiedBatchInput(*req, req->n_past, {req->exec_current_token},
+          MakeUnifiedBatchInput<LlamaCPUBackend::UnifiedBatchInput>(*req, req->n_past, {req->exec_current_token},
                                 true));
       active_reqs.push_back(req);
     } else {

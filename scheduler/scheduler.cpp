@@ -257,15 +257,9 @@ bool ExecutePhasedPrefillStep(LlamaCPUBackend *backend,
         chunk_end == static_cast<int>(prompt_tokens.size());
 
     std::vector<LlamaCPUBackend::UnifiedBatchInput> inputs;
-    LlamaCPUBackend::UnifiedBatchInput input;
-    input.sequence_id = sequence_id;
-    input.n_past = chunk_start;
-    input.tokens = std::move(chunk);
-    input.request_logits = request_logits;
-    input.sampling = inference.sampling;
-    input.request_id = static_cast<int64_t>(inference.id);
-    input.sequence_generation = state.sequence_generation;
-    inputs.push_back(std::move(input));
+    inputs.push_back(
+        MakeUnifiedBatchInput<LlamaCPUBackend::UnifiedBatchInput>(inference, sequence_id, state.sequence_generation,
+                              chunk_start, std::move(chunk), request_logits));
 
     std::vector<LlamaCPUBackend::UnifiedBatchOutput> outputs;
     if (backend->SupportsAsyncUnifiedBatch()) {
