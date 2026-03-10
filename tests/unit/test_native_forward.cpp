@@ -480,6 +480,172 @@ TEST_CASE("WeightMapTyped: HasQuantizedWeights returns false by default",
   REQUIRE(wm.LmHeadRaw().data == nullptr);
 }
 
+TEST_CASE("FusedFFNGemmQ4K preserves per-row FFN outputs across output tiles",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping fused FFN Q4_K parity.");
+    return;
+  }
+
+  constexpr int M = 2;
+  constexpr int K = 256;
+  constexpr int NInter = 256;
+  constexpr int NHidden = 12;
+  constexpr int BlocksPerGateRow = K / QK_K;
+  constexpr int BlocksPerDownRow = NInter / QK_K;
+
+  auto encode_half = [](float value) {
+    const half h = __float2half(value);
+    unsigned short bits = 0;
+    std::memcpy(&bits, &h, sizeof(bits));
+    return bits;
+  };
+
+  auto make_q4_rows = [&](int rows, int blocks_per_row, int seed) {
+    std::vector<runtime::cuda::native::block_q4_k> blocks(
+        static_cast<size_t>(rows) * blocks_per_row);
+    for (int row = 0; row < rows; ++row) {
+      for (int blk = 0; blk < blocks_per_row; ++blk) {
+        auto &block = blocks[static_cast<size_t>(row) * blocks_per_row + blk];
+        block.d = encode_half(
+            0.02f * static_cast<float>(((row + blk + seed) % 5) + 1));
+        block.dmin = encode_half(
+            0.01f * static_cast<float>(((row + blk + seed) % 3) + 1));
+        for (int i = 0; i < 12; ++i) {
+          block.scales[i] = static_cast<unsigned char>(
+              (seed * 17 + row * 7 + blk * 11 + i * 5) & 0xFF);
+        }
+        for (int i = 0; i < QK_K / 2; ++i) {
+          block.qs[i] = static_cast<unsigned char>(
+              (seed * 13 + row * 19 + blk * 23 + i * 3) & 0xFF);
+        }
+      }
+    }
+    return blocks;
+  };
+
+  const auto h_gate = make_q4_rows(NInter, BlocksPerGateRow, 3);
+  const auto h_up = make_q4_rows(NInter, BlocksPerGateRow, 7);
+  const auto h_down = make_q4_rows(NHidden, BlocksPerDownRow, 11);
+  const std::vector<half> h_input = MakeWaveTensor(M * K, 0.015f, -0.0025f);
+
+  runtime::cuda::native::block_q4_k *d_gate = nullptr;
+  runtime::cuda::native::block_q4_k *d_up = nullptr;
+  runtime::cuda::native::block_q4_k *d_down = nullptr;
+  half *d_input = nullptr;
+  half *d_output = nullptr;
+  half *d_gate_deq = nullptr;
+  half *d_up_deq = nullptr;
+  half *d_down_deq = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_gate),
+                     h_gate.size() * sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_up),
+                     h_up.size() * sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_down),
+                     h_down.size() *
+                             sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_input),
+                     h_input.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_output),
+                     M * NHidden * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_gate_deq),
+                     NInter * K * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_up_deq),
+                     NInter * K * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_down_deq),
+                     NHidden * NInter * sizeof(half)) == cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_gate, h_gate.data(),
+                     h_gate.size() *
+                         sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_up, h_up.data(),
+                     h_up.size() * sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_down, h_down.data(),
+                     h_down.size() *
+                         sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(d_gate, d_gate_deq,
+                                                 NInter * K) == cudaSuccess);
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(d_up, d_up_deq,
+                                                 NInter * K) == cudaSuccess);
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(d_down, d_down_deq,
+                                                 NHidden * NInter) ==
+          cudaSuccess);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  QuantizedWeightInfo gate_info{d_gate,
+                                static_cast<int>(
+                                    runtime::cuda::native::GGUF::TensorType::Q4_K),
+                                static_cast<int64_t>(NInter) * K};
+  QuantizedWeightInfo up_info{d_up,
+                              static_cast<int>(
+                                  runtime::cuda::native::GGUF::TensorType::Q4_K),
+                              static_cast<int64_t>(NInter) * K};
+  QuantizedWeightInfo down_info{
+      d_down,
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K),
+      static_cast<int64_t>(NHidden) * NInter};
+  REQUIRE(FusedQuantGemm::FusedFfnQ4K(gate_info, up_info, down_info, d_input,
+                                      d_output, M, NInter, NHidden, K,
+                                      nullptr));
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> gate_deq = CopyDeviceHalfs(d_gate_deq, NInter * K);
+  const std::vector<half> up_deq = CopyDeviceHalfs(d_up_deq, NInter * K);
+  const std::vector<half> down_deq =
+      CopyDeviceHalfs(d_down_deq, NHidden * NInter);
+  const std::vector<half> out = CopyDeviceHalfs(d_output, M * NHidden);
+
+  auto silu = [](float x) {
+    return x * (1.0f / (1.0f + std::exp(-x)));
+  };
+
+  std::vector<float> ref(M * NHidden, 0.0f);
+  for (int m = 0; m < M; ++m) {
+    std::vector<float> hidden(NInter, 0.0f);
+    for (int inter = 0; inter < NInter; ++inter) {
+      float gate_acc = 0.0f;
+      float up_acc = 0.0f;
+      for (int i = 0; i < K; ++i) {
+        const float x = __half2float(h_input[m * K + i]);
+        gate_acc += x * __half2float(gate_deq[inter * K + i]);
+        up_acc += x * __half2float(up_deq[inter * K + i]);
+      }
+      hidden[inter] = silu(gate_acc) * up_acc;
+    }
+    for (int out_idx = 0; out_idx < NHidden; ++out_idx) {
+      float acc = 0.0f;
+      for (int inter = 0; inter < NInter; ++inter) {
+        acc += hidden[inter] *
+               __half2float(down_deq[out_idx * NInter + inter]);
+      }
+      ref[m * NHidden + out_idx] = acc;
+    }
+  }
+
+  for (int i = 0; i < M * NHidden; ++i) {
+    REQUIRE(__half2float(out[i]) == Catch::Approx(ref[i]).margin(2.0f));
+  }
+
+  REQUIRE(cudaFree(d_down_deq) == cudaSuccess);
+  REQUIRE(cudaFree(d_up_deq) == cudaSuccess);
+  REQUIRE(cudaFree(d_gate_deq) == cudaSuccess);
+  REQUIRE(cudaFree(d_output) == cudaSuccess);
+  REQUIRE(cudaFree(d_input) == cudaSuccess);
+  REQUIRE(cudaFree(d_down) == cudaSuccess);
+  REQUIRE(cudaFree(d_up) == cudaSuccess);
+  REQUIRE(cudaFree(d_gate) == cudaSuccess);
+}
+
 TEST_CASE("BatchedRoPE matches per-sequence decode RoPE",
           "[native_forward][cuda_runtime_contract]") {
   int device_count = 0;
@@ -5074,8 +5240,9 @@ TEST_CASE("NativeLinearExecutor: FFN helper falls back from Q8_1 to packed "
   NativeFfnExecutionSummary summary;
 
   const bool ok = ExecuteNativeFfnProjectionStage(
-      FusedQuantGemm::FfnProjOperator::kQ81Group, "decode", "q4_k", 1, 11008,
-      2048,
+      FusedQuantGemm::FfnProjOperator::kQ81Group, "decode", "q4_k",
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K), 1,
+      11008, 2048,
       [&]() {
         calls.emplace_back("q81");
         return false;
@@ -5154,8 +5321,9 @@ TEST_CASE("NativeLinearExecutor: down-proj helper invokes fallback only after "
   NativeDownProjExecutionSummary summary;
 
   const bool ok = ExecuteNativeDownProjStage(
-      FusedQuantGemm::DownProjOperator::kQ81Gemv, "decode", "q4_k", 1, 2048,
-      11008,
+      FusedQuantGemm::DownProjOperator::kQ81Gemv, "decode", "q4_k",
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K), 1,
+      2048, 11008,
       [&]() {
         calls.emplace_back("mmq");
         return false;
@@ -5182,6 +5350,32 @@ TEST_CASE("NativeLinearExecutor: down-proj helper invokes fallback only after "
   REQUIRE_FALSE(summary.used_q81);
   REQUIRE_FALSE(summary.used_packed);
   REQUIRE(summary.actual_op == FusedQuantGemm::DownProjOperator::kFallback);
+}
+
+TEST_CASE("FusedQuantGemm: metric names distinguish V2 hot-path variants",
+          "[native_forward]") {
+  const int q4k =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  const int q6k =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
+  const int q8k =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q8_K);
+
+  REQUIRE(FusedQuantGemm::FfnProjOperatorMetricName(
+              FusedQuantGemm::FfnProjOperator::kQ81Group, q4k, 2048) ==
+          std::string("q8_1_group"));
+  REQUIRE(FusedQuantGemm::FfnProjOperatorMetricName(
+              FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K, q4k, 2048) ==
+          std::string("q8_1_group_hot_q4k"));
+  REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
+              FusedQuantGemm::DownProjOperator::kQ81GemvRowPair, q6k, 2, 11008) ==
+          std::string("q8_1_gemv_row_pair"));
+  REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
+              FusedQuantGemm::DownProjOperator::kQ81Gemv, q8k, 1, 11008) ==
+          std::string("q8_1_gemv"));
+  REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
+              FusedQuantGemm::DownProjOperator::kMmq, q4k, 2, 11008) ==
+          std::string("mmq"));
 }
 
 TEST_CASE("cuda_kernel::QuantizeRowsSymmetric quantizes once per row with "

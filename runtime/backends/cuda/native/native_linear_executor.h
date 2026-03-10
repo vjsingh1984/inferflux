@@ -68,9 +68,10 @@ bool ExecuteNativeGroupedProjectionStage(TryQ81Fn &&try_q81_group,
 template <typename TryQ81Fn, typename TryPackedFn, typename FallbackFn>
 bool ExecuteNativeFfnProjectionStage(
     FusedQuantGemm::FfnProjOperator selected_op, const char *phase,
-    const std::string &quant_label, int batch_rows, int intermediate_size,
-    int hidden_size, TryQ81Fn &&try_q81_group, TryPackedFn &&try_packed_group,
-    FallbackFn &&run_fallback, NativeFfnExecutionSummary *summary = nullptr) {
+    const std::string &quant_label, int quant_type, int batch_rows,
+    int intermediate_size, int hidden_size, TryQ81Fn &&try_q81_group,
+    TryPackedFn &&try_packed_group, FallbackFn &&run_fallback,
+    NativeFfnExecutionSummary *summary = nullptr) {
   NativeFfnExecutionSummary local_summary;
 
   if (selected_op == FusedQuantGemm::FfnProjOperator::kQ81Group ||
@@ -94,11 +95,11 @@ bool ExecuteNativeFfnProjectionStage(
     }
   }
 
-  GlobalMetrics().RecordNativeFfnProjOperator(
-      phase, FusedQuantGemm::FfnProjOperatorName(local_summary.actual_op));
+  const char *metric_op = FusedQuantGemm::FfnProjOperatorMetricName(
+      local_summary.actual_op, quant_type, hidden_size);
+  GlobalMetrics().RecordNativeFfnProjOperator(phase, metric_op);
   GlobalMetrics().RecordNativeFfnProjGeometry(
-      phase, FusedQuantGemm::FfnProjOperatorName(local_summary.actual_op),
-      quant_label, batch_rows, intermediate_size, hidden_size,
+      phase, metric_op, quant_label, batch_rows, intermediate_size, hidden_size,
       /*grouped_outputs=*/2);
 
   if (summary) {
@@ -123,9 +124,9 @@ template <typename TryMmqFn, typename TryQ81Fn, typename TryPackedFn,
           typename FallbackFn, typename LogFn>
 bool ExecuteNativeDownProjStage(
     FusedQuantGemm::DownProjOperator selected_op, const char *phase,
-    const std::string &quant_label, int batch_rows, int hidden_size,
-    int intermediate_size, TryMmqFn &&try_mmq, TryQ81Fn &&try_q81,
-    TryPackedFn &&try_packed, FallbackFn &&run_fallback,
+    const std::string &quant_label, int quant_type, int batch_rows,
+    int hidden_size, int intermediate_size, TryMmqFn &&try_mmq,
+    TryQ81Fn &&try_q81, TryPackedFn &&try_packed, FallbackFn &&run_fallback,
     LogFn &&log_selected_operator,
     NativeDownProjExecutionSummary *summary = nullptr) {
   NativeDownProjExecutionSummary local_summary;
@@ -167,11 +168,11 @@ bool ExecuteNativeDownProjStage(
     }
   }
 
-  GlobalMetrics().RecordNativeDownProjOperator(
-      phase, FusedQuantGemm::DownProjOperatorName(local_summary.actual_op));
+  const char *metric_op = FusedQuantGemm::DownProjOperatorMetricName(
+      local_summary.actual_op, quant_type, batch_rows, intermediate_size);
+  GlobalMetrics().RecordNativeDownProjOperator(phase, metric_op);
   GlobalMetrics().RecordNativeDownProjGeometry(
-      phase, FusedQuantGemm::DownProjOperatorName(local_summary.actual_op),
-      quant_label, batch_rows, hidden_size, intermediate_size);
+      phase, metric_op, quant_label, batch_rows, hidden_size, intermediate_size);
 
   if (local_summary.actual_op != FusedQuantGemm::DownProjOperator::kFallback) {
     std::forward<LogFn>(log_selected_operator)(local_summary.actual_op);

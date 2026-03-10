@@ -124,8 +124,8 @@ with open(out_path, "w") as f:
 
 prefill = summary.get("prefill", {})
 decode = summary.get("decode", {})
-print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ("q8_1_gemv", "q8_1_gemv_hot_fixed", "q8_1_gemv_row_pair", "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback")))
-print("decode=" + ",".join(f"{k}:{decode.get(k, 0)}" for k in ("q8_1_gemv", "q8_1_gemv_hot_fixed", "q8_1_gemv_row_pair", "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback")))
+print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ("q8_1_gemv_v2", "q8_1_gemv", "q8_1_gemv_hot_fixed", "q8_1_gemv_row_pair_v2", "q8_1_gemv_row_pair", "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback")))
+print("decode=" + ",".join(f"{k}:{decode.get(k, 0)}" for k in ("q8_1_gemv_v2", "q8_1_gemv", "q8_1_gemv_hot_fixed", "q8_1_gemv_row_pair_v2", "q8_1_gemv_row_pair", "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback")))
 PYEOF
 }
 
@@ -160,8 +160,8 @@ with open(out_path, "w") as f:
 
 prefill = summary.get("prefill", {})
 decode = summary.get("decode", {})
-print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ("q8_1_group_hot_q4k", "q8_1_group", "packed_group", "fallback")))
-print("decode=" + ",".join(f"{k}:{decode.get(k, 0)}" for k in ("q8_1_group_hot_q4k", "q8_1_group", "packed_group", "fallback")))
+print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ("q8_1_group_hot_q4k", "q8_1_group_v2", "q8_1_group", "packed_group", "fallback")))
+print("decode=" + ",".join(f"{k}:{decode.get(k, 0)}" for k in ("q8_1_group_hot_q4k", "q8_1_group_v2", "q8_1_group", "packed_group", "fallback")))
 PYEOF
 }
 

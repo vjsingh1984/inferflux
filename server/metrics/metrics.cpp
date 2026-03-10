@@ -716,6 +716,7 @@ void MetricsRegistry::RecordNativeFfnProjOperator(std::string_view phase,
   const std::string phase_label = NormalizeNativePhase(phase);
   const std::string op_label =
       op == "q8_1_group_hot_q4k" ? "q8_1_group_hot_q4k"
+      : op == "q8_1_group_v2"    ? "q8_1_group_v2"
       : op == "q8_1_group"       ? "q8_1_group"
       : op == "packed_group"     ? "packed_group"
       : op == "fallback"         ? "fallback"
@@ -746,8 +747,10 @@ void MetricsRegistry::RecordNativeDownProjOperator(std::string_view phase,
   const std::string phase_label = NormalizeNativePhase(phase);
   const std::string op_label =
       op == "mmq"                  ? "mmq"
+      : op == "q8_1_gemv_v2"       ? "q8_1_gemv_v2"
       : op == "q8_1_gemv"          ? "q8_1_gemv"
       : op == "q8_1_gemv_hot_fixed" ? "q8_1_gemv_hot_fixed"
+      : op == "q8_1_gemv_row_pair_v2" ? "q8_1_gemv_row_pair_v2"
       : op == "q8_1_gemv_row_pair" ? "q8_1_gemv_row_pair"
       : op == "q8_1_gemv_row_quad" ? "q8_1_gemv_row_quad"
       : op == "packed_gemv"        ? "packed_gemv"
@@ -1646,7 +1649,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_native_ffn_proj_operator_total counter\n";
   {
     static constexpr const char *kPhases[] = {"prefill", "decode"};
-    static constexpr const char *kOps[] = {"q8_1_group_hot_q4k", "q8_1_group",
+    static constexpr const char *kOps[] = {"q8_1_group_hot_q4k",
+                                           "q8_1_group_v2", "q8_1_group",
                                            "packed_group", "fallback"};
     std::lock_guard<std::mutex> lock(native_ffn_proj_operator_mutex_);
     for (const char *phase : kPhases) {
@@ -1667,7 +1671,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
   {
     static constexpr const char *kPhases[] = {"prefill", "decode"};
     static constexpr const char *kOps[] = {
-        "q8_1_gemv", "q8_1_gemv_hot_fixed", "q8_1_gemv_row_pair",
+        "q8_1_gemv_v2", "q8_1_gemv", "q8_1_gemv_hot_fixed",
+        "q8_1_gemv_row_pair_v2", "q8_1_gemv_row_pair",
         "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback"};
     std::lock_guard<std::mutex> lock(native_down_proj_operator_mutex_);
     for (const char *phase : kPhases) {

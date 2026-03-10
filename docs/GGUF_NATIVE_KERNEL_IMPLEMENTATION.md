@@ -67,7 +67,7 @@ All quantization types have 100+ TDD test cases covering correctness, dispatch g
 | Column-pair GEMV (M=1) | For M=1 decode, Q4_K and Q6_K Q8_1 kernels use column-pair variant: each warp computes 2 output columns, halving grid.x to `dim3(ceil(N/16), 1)`. Reduces kernel launch overhead and improves ILP via interleaved weight row processing. |
 | dp4a int8 | Hardware `__dp4a()` on SM >= 6.1 for all quant types. Both standalone and fused-with-RmsNorm variants. |
 | Fused RmsNorm+GEMV | 9 kernel variants (4 standard + 4 dp4a + FP16). Saves 45 kernel launches per decode step. |
-| Observability | `/metrics` exports FFN operator counts (`q8_1_group_hot_q4k` / `q8_1_group` / `packed_group` / `fallback`), down-proj mix (`q8_1_gemv` / `q8_1_gemv_hot_fixed` / `q8_1_gemv_row_pair` / `q8_1_gemv_row_quad` / `packed_gemv` / `mmq` / `fallback`), geometry counters, and forward batch-size buckets by phase |
+| Observability | `/metrics` exports FFN operator counts (`q8_1_group_hot_q4k` / `q8_1_group_v2` / `q8_1_group` / `packed_group` / `fallback`), down-proj mix (`q8_1_gemv_v2` / `q8_1_gemv` / `q8_1_gemv_hot_fixed` / `q8_1_gemv_row_pair_v2` / `q8_1_gemv_row_pair` / `q8_1_gemv_row_quad` / `packed_gemv` / `mmq` / `fallback`), geometry counters, and forward batch-size buckets by phase |
 | Terminal token policy | Both backends stop on GGUF end-of-generation tokens |
 | Split handoff | Process-local native decode workers now transfer ownership of the existing sequence slot on `KVChannel` instead of serializing KV to a blob and hydrating into a second slot. Cross-process transports still use serialize/hydrate. |
 

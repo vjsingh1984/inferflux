@@ -205,6 +205,22 @@ public:
                        const NativeExecutionPolicy *policy = nullptr);
 
   /**
+   * Explicit fused FFN prototype for Q4_K weights.
+   *
+   * This is currently a bring-up/testing entry point only. It uses an
+   * output-tiled design that reuses activated intermediate values across a
+   * hidden-output tile, but it is not yet selected by the runtime hot path.
+   * Exposing it here allows the kernel to be compiled and parity-tested
+   * through the main native CUDA test suite before any rollout decision.
+   */
+  static bool FusedFfnQ4K(const QuantizedWeightInfo &gate_weight,
+                          const QuantizedWeightInfo &up_weight,
+                          const QuantizedWeightInfo &down_weight,
+                          const half *activation, half *output, int M,
+                          int N_inter, int N_hidden, int K,
+                          cudaStream_t stream);
+
+  /**
    * MMQ-style tiled down-projection path for transformed GGUF weights.
    *
    * This is an additive migration path used only for native GGUF decode on
@@ -246,6 +262,8 @@ public:
                         const NativeExecutionPolicy *policy = nullptr);
 
   static const char *FfnProjOperatorName(FfnProjOperator op);
+  static const char *FfnProjOperatorMetricName(FfnProjOperator op,
+                                               int quant_type, int k);
 
   /**
    * Hybrid down-proj operator selector.
@@ -260,6 +278,8 @@ public:
                          const NativeExecutionPolicy *policy = nullptr);
 
   static const char *DownProjOperatorName(DownProjOperator op);
+  static const char *DownProjOperatorMetricName(DownProjOperator op,
+                                                int quant_type, int m, int k);
 
   /**
    * Grouped Q8_1 GEMV for two sibling projections (single kernel launch).

@@ -1344,7 +1344,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           ProjectionGroupQuantLabel(gate_raw, up_raw);
       NativeFfnExecutionSummary ffn_summary;
       if (!ExecuteNativeFfnProjectionStage(
-              ffn_selected_op, ffn_phase, ffn_quant, seq_len,
+              ffn_selected_op, ffn_phase, ffn_quant, gate_raw.quant_type,
+              seq_len,
               intermediate_size_, hidden_size_,
               [&]() {
                 return TryQ8_1ProjectionGroup(
@@ -1453,7 +1454,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       NativeDownProjExecutionSummary down_summary;
       if (!ExecuteNativeDownProjStage(
               down_selected_op, ffn_phase, ProjectionQuantLabel(down_raw),
-              seq_len, hidden_size_, intermediate_size_,
+              down_raw.quant_type, seq_len, hidden_size_, intermediate_size_,
               [&]() {
                 return TryMmqSiluMulGemv<T>(
                     down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
@@ -2055,7 +2056,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             ProjectionGroupQuantLabel(gate_raw, up_raw);
         NativeFfnExecutionSummary ffn_summary;
         if (!ExecuteNativeFfnProjectionStage(
-                ffn_selected_op, "decode", ffn_quant, B, intermediate_size_,
+                ffn_selected_op, "decode", ffn_quant, gate_raw.quant_type, B, intermediate_size_,
                 hidden_size_,
                 [&]() {
                   return TryQ8_1ProjectionGroup(
@@ -2153,8 +2154,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             g_allow_fused_quantized_matmul, execution_policy_);
         NativeDownProjExecutionSummary down_summary;
         if (!ExecuteNativeDownProjStage(
-                down_selected_op, "decode", ProjectionQuantLabel(down_raw), B,
-                hidden_size_, intermediate_size_,
+                down_selected_op, "decode", ProjectionQuantLabel(down_raw),
+                down_raw.quant_type, B, hidden_size_, intermediate_size_,
                 [&]() {
                   return TryMmqSiluMulGemv<T>(
                       down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,

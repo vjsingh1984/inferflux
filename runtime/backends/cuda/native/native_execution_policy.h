@@ -32,7 +32,6 @@ struct NativeExecutionPolicy {
   bool enable_downproj_mmq{false};
   int downproj_mmq_min_batch_override{-1};
   bool use_vectorized_loads{false};
-  bool enable_fused_ffn{false};
 
   static NativeExecutionPolicy FromEnv() {
     NativeExecutionPolicy policy;
@@ -87,8 +86,6 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", -1, 1, 64);
     policy.use_vectorized_loads =
         ParseBoolEnv("INFERFLUX_USE_VECTORIZED_LOADS", false);
-    policy.enable_fused_ffn =
-        ParseBoolEnv("INFERFLUX_ENABLE_FUSED_FFN", false);
     return policy;
   }
 

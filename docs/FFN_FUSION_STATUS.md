@@ -2,13 +2,16 @@
 
 **Date**: March 10, 2026
 **Task**: #12 - Implement FFN kernel fusion (gate+up+SiLU+down)
-**Status**: ⏳ IN PROGRESS - Proof of Concept Complete
+**Status**: ⏳ IN PROGRESS - Tiled bring-up kernel working, benchmarked slower than baseline
 
 ---
 
 ## Summary
 
-FFN kernel fusion implementation is in progress. Phase 1 (analysis and profiling) is complete. Phase 2 (implementation) has begun with initial kernel design, but requires further development and testing.
+FFN kernel fusion implementation is in progress. Phase 1 (analysis and
+profiling) is complete. Phase 2 now has a parity-tested tiled bring-up kernel
+that reuses activated intermediate values across an output tile, but it is not
+yet selected by the runtime hot path.
 
 ---
 
@@ -63,41 +66,52 @@ FFN kernel fusion implementation is in progress. Phase 1 (analysis and profiling
 
 1. **`runtime/backends/cuda/native/kernels/fused_ffn_gemm.cuh`** ⏳ PARTIAL
    - ✅ SwiGLU activation function
-   - ✅ Kernel signature and interface
-   - ✅ Basic kernel structure
-   - ⏳ **Needs**: Bug fixes and optimization
-   - ⏳ **Needs**: Correct down_proj weight indexing
+   - ✅ Correct `down_proj` Q4_K indexing
+   - ✅ Output-tiled kernel structure
+   - ✅ Activated intermediate tile reuse across hidden-output tile
+   - ⏳ **Needs**: Performance validation on live FFN geometry
+   - ⏳ **Needs**: Controlled runtime rollout
 
-2. **`runtime/backends/cuda/native/native_execution_policy.h`** ✅ UPDATED
-   - ✅ Added `enable_fused_ffn` flag
-   - ✅ Added `INFERFLUX_ENABLE_FUSED_FFN` env var parsing
+2. **Runtime policy** ✅ CLEANED UP
+   - ✅ No runtime rollout flag kept
+   - ✅ The fused FFN path remains a benchmark/testing path only until it wins
 
 ### Files To Be Created
 
-3. **Dispatch wrapper** ⏳ TODO
-   - `fused_quant_gemm.cu`: Add `DispatchFusedFFN` function
-   - Runtime selection based on `enable_fused_ffn` flag
-   - Fallback to current implementation
+3. **Dispatch wrapper** ✅ DONE
+   - `fused_quant_gemm.cu`: `FusedQuantGemm::FusedFfnQ4K(...)`
+   - Explicit bring-up/testing entry point
+   - Not runtime-selected yet
 
-4. **Integration** ⏳ TODO
-   - `transformer_forward.cu`: Replace 3-stage FFN with fused kernel call
-   - Handle geometry constraints (N_inter size limits)
+4. **Integration** ⏸️ DEFERRED
+   - `transformer_forward.cu` is intentionally unchanged
+   - runtime rollout is blocked on performance, not correctness
 
-5. **Correctness Test** ⏳ TODO
-   - `tests/unit/test_fused_ffn.cu`
-   - Bit-exact comparison with baseline
-   - Test various geometries
+5. **Correctness Test** ✅ DONE
+   - `tests/unit/test_native_forward.cpp`
+   - CUDA parity check against dequantized FP16 reference
+   - Exercises multiple intermediate tiles and multiple output tiles
 
-6. **Performance Benchmark** ⏳ TODO
-   - Isolated kernel benchmark
-   - Full-model throughput measurement
-   - Comparison to baseline
+6. **Performance Benchmark** ✅ DONE
+   - Isolated benchmark executable: `benchmark_fused_ffn`
+   - Compares the real current FFN path vs `FusedFfnQ4K(...)`
+   - Measured on the live decode geometry:
+     - `M=1, K=2048, N_inter=11008, N_hidden=2048`
+     - baseline: `0.118 ms`
+     - fused: `32.741 ms`
+     - speedup: `0.004x`
+     - max abs diff: `0.001463`
+     - `M=2`
+     - baseline: `0.181 ms`
+     - fused: `59.791 ms`
+     - speedup: `0.003x`
+     - max abs diff: `0.001463`
 
 ---
 
 ## Kernel Design Challenges
 
-### Challenge 1: Intermediate Dimension Size ❌
+### Challenge 1: Intermediate Dimension Size ✅ Resolved for bring-up
 
 **Problem**: The intermediate dimension (N_inter) is large (e.g., 5632 for Qwen2.5-3B with hidden=2048, expansion=2.75).
 
@@ -105,13 +119,13 @@ FFN kernel fusion implementation is in progress. Phase 1 (analysis and profiling
 - **Issue**: 5632 × 4 bytes = 22KB per intermediate value
 - **Result**: Doesn't fit in shared memory (typically 48KB max)
 
-**Revised Approach**: Stream intermediate dimensions
-- Compute gate+up for one intermediate dimension at a time
-- Apply SwiGLU
-- Immediately multiply by down_proj weight and accumulate
-- **Status**: ⏳ Implemented but needs debugging
+**Revised Approach**: Tile intermediate dimensions
+- Compute a tile of gate+up activations once
+- Store activated tile in shared memory
+- Reuse that tile across a hidden-output tile
+- **Status**: ✅ Implemented for the Q4_K bring-up kernel
 
-### Challenge 2: Weight Layout Complexity ⏳
+### Challenge 2: Weight Layout Complexity ✅ Resolved
 
 **Problem**: Three weight matrices with different layouts:
 - `gate_weight`: [K × N_inter] stored as [N_inter, num_blocks]
@@ -120,14 +134,21 @@ FFN kernel fusion implementation is in progress. Phase 1 (analysis and profiling
 
 **Issue**: Correct indexing for down_weight when iterating through intermediate dimensions
 
-**Status**: ⏳ Needs correction in kernel code
+**Resolution**:
+- `Q4_K` packs along the reduction dimension
+- for `down_proj`, that reduction dimension is `N_inter`
+- `5632 / 256 = 22`, so the Qwen FFN shape is valid
+
+**Status**: ✅ Corrected in kernel code
 
 ### Challenge 3: Thread Block Organization ⏳
 
-**Current Design**:
-- Each thread block computes one output dimension (N_hidden)
-- 8 warps per block (256 threads)
-- Warps stride through intermediate dimensions
+**Current Bring-Up Design**:
+- One CTA computes one batch row
+- One CTA owns an 8-output hidden tile
+- 8 warps per CTA (256 threads)
+- Activated intermediate values are produced in 32-element tiles
+- The same activated tile is reused across all 8 outputs
 
 **Potential Issues**:
 - Load imbalance if N_inter not evenly divisible by 8
@@ -164,61 +185,33 @@ __global__ void FusedFFNGemmQ4K(
 
 **Algorithm**:
 1. Load activation row into shared memory
-2. For each intermediate dimension (strided across warps):
-   a. Compute gate_proj(activation)
-   b. Compute up_proj(activation)
-   c. Warp reduction
-   d. Apply SwiGLU
-   e. Multiply by down_proj weight
-   f. Accumulate
-3. Final warp reduction
-4. Write output
+2. For each 32-element intermediate tile:
+   a. Compute gate and up activations once per intermediate
+   b. Store `SwiGLU(gate, up)` into shared memory
+   c. Reuse that activated tile across an 8-output hidden tile
+   d. Accumulate down-proj outputs warp-by-warp
+3. Write the 8-output tile
 
 ---
 
 ## Known Issues and Fixes Needed
 
-### Issue 1: Down Projection Weight Indexing
+### Remaining Issues
 
-**Current Code** (incorrect):
-```cpp
-const BlockType *down_wrow = down_weight + out_idx * num_blocks;
-```
+### Issue 1: Runtime rollout is intentionally blocked
 
-**Problem**: This assumes down_weight is indexed by output dimension first, but we need to iterate through intermediate dimensions.
+The tiled kernel is parity-correct, but the isolated benchmark shows it is
+dramatically slower than the live FFN path:
+- current path: `q8_1_group` + `SiluMulQuantizeQ8_1` + `q8_1_gemv`
+- fused path: `FusedFfnQ4K(...)`
+- result: no rollout
 
-**Correct Approach**:
-```cpp
-// For each intermediate dimension 'inter_idx':
-//   We need down_weight[inter_idx][out_idx]
-//   In row-major storage: down_weight[inter_idx * num_blocks_per_row + out_idx/threads_per_block]
-```
+### Issue 2: No hot-path integration yet
 
-**Fix Needed**: ⏳ Correct the down_weight indexing logic
+`transformer_forward.cu` still uses the existing FFN path. That is deliberate
+until a fused FFN design has evidence of a real throughput win.
 
-### Issue 2: Quantization in Down Projection
-
-**Current Code** (incorrect):
-```cpp
-const float q_val = (pair == 0) ? q_lo : q_hi;
-const float d_sc = (pair == 0) ? d_sc_lo : d_sc_hi;
-down_acc += (d_sc * q_val - dm_m) * activated;
-```
-
-**Problem**: Down_proj should dequantize the weight properly, not use raw quantized values.
-
-**Fix Needed**: ⏳ Use proper dequantization for down_proj weights
-
-### Issue 3: Activation Scaling
-
-**Current Code** (missing):
-```cpp
-down_acc += (d_sc * q_val - dm_m) * activated;
-```
-
-**Problem**: The down_proj multiplies its dequantized weights by the activated intermediate value. But the activated value is a scalar for the intermediate dimension, while the quantized weights are for the K dimension.
-
-**Fix Needed**: ⏳ Re-evaluate the down_proj computation logic
+**Fix Needed**: redesign around a different operator strategy, not this kernel
 
 ---
 
@@ -226,17 +219,14 @@ down_acc += (d_sc * q_val - dm_m) * activated;
 
 Given the complexity, I recommend a **simplified two-pass approach**:
 
-### Pass 1: Compute Activated Intermediate (gate+up+SiLU)
-- Each thread block computes all intermediate dimensions
-- Writes activated intermediate to global memory
-- Still saves 1 kernel launch vs current (3 → 2)
+### Keep the current runtime FFN path
+- grouped `Q8_1` gate/up kernels
+- fused `SiluMulQuantizeQ8_1`
+- `Q8_1`/packed/MMQ down-proj dispatch
 
-### Pass 2: Down Projection
-- Reads activated intermediate from global memory
-- Computes down_proj
-- This is the current approach with SiLU fused
-
-**Benefit**: Simpler, less bug-prone
+### Future fusion work must beat the current path in isolation first
+- the current tiled `FusedFfnQ4K(...)` design does not
+- do not reintroduce a runtime rollout flag until a replacement wins
 **Drawback**: Still writes intermediate to global memory
 **Estimated Improvement**: 2-4% (vs 3-8% for full fusion)
 
@@ -246,25 +236,20 @@ Given the complexity, I recommend a **simplified two-pass approach**:
 
 ### Immediate (Required for Completion)
 
-1. **Fix Kernel Bugs** ⏳ CRITICAL
-   - Correct down_proj weight indexing
-   - Fix quantization logic in down projection
-   - Verify activation scaling
+1. **Keep runtime rollout off** ✅
+   - current FFN hot path remains faster
+   - no runtime flag is kept for the fused bring-up path
 
-2. **Create Correctness Test** ⏳ CRITICAL
-   - Test against baseline for bit-exact match
-   - Start with small geometry (K=128, N_inter=256, N_hidden=128)
-   - Scale up to real model sizes
+2. **Use the isolated benchmark as the entry gate** ✅
+   - `benchmark_fused_ffn` is now the required proof step
+   - no runtime integration without a measured win on the live geometry
 
-3. **Add Dispatch Logic** ⏳ REQUIRED
-   - Create wrapper function in `fused_quant_gemm.cu`
-   - Add runtime selection based on `enable_fused_ffn`
-   - Handle fallback for unsupported geometries
+3. **Redesign the fused operator** ⏳ REQUIRED
+   - current tiled design is parity-correct but throughput-negative
+   - next candidate must reduce compute duplication without collapsing occupancy
 
-4. **Integrate into Transformer Forward** ⏳ REQUIRED
-   - Modify `transformer_forward.cu`
-   - Replace 3-stage FFN with single kernel call
-   - Ensure compatibility with existing code
+4. **Integrate only after a benchmark win** ⏳ REQUIRED
+   - `transformer_forward.cu` remains unchanged until that happens
 
 ### Short-term (Week 1)
 

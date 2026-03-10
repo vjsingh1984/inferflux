@@ -8,6 +8,7 @@
 #include "runtime/backends/cuda/native/kernels/fused_dequant_gemm.cuh"
 #include "runtime/backends/cuda/native/kernels/fused_dequant_gemv.cuh"
 #include "runtime/backends/cuda/native/kernels/fused_dequant_gemv_v2.cuh"
+#include "runtime/backends/cuda/native/kernels/fused_ffn_gemm.cuh"
 // Vectorized kernel: optimized memory access patterns for better bandwidth
 #include "runtime/backends/cuda/native/kernels/fused_dequant_gemv_vectorized.cuh"
 #include "server/logging/logger.h"
@@ -56,6 +57,8 @@ public:
 private:
   const NativeExecutionPolicy *prev_{nullptr};
 };
+
+bool UseV2(int K);
 
 // ============================================================================
 // GPU-adaptive threshold computation
@@ -1255,6 +1258,17 @@ const char *FusedQuantGemm::FfnProjOperatorName(
   }
 }
 
+const char *FusedQuantGemm::FfnProjOperatorMetricName(
+    FusedQuantGemm::FfnProjOperator op, int quant_type, int k) {
+  const auto qtype = static_cast<GGUF::TensorType>(quant_type);
+  if (op == FusedQuantGemm::FfnProjOperator::kQ81Group &&
+      UseV2(k) &&
+      (qtype == GGUF::TensorType::Q4_K || qtype == GGUF::TensorType::Q6_K)) {
+    return "q8_1_group_v2";
+  }
+  return FfnProjOperatorName(op);
+}
+
 FusedQuantGemm::DownProjOperator FusedQuantGemm::SelectDownProjOperator(
     int quant_type, const FusedDispatchGeometry &geometry, bool allow_q81,
     bool allow_packed, bool allow_mmq, const NativeExecutionPolicy *policy) {
@@ -1357,6 +1371,21 @@ const char *FusedQuantGemm::DownProjOperatorName(
   default:
     return "fallback";
   }
+}
+
+const char *FusedQuantGemm::DownProjOperatorMetricName(
+    FusedQuantGemm::DownProjOperator op, int quant_type, int m, int k) {
+  const auto qtype = static_cast<GGUF::TensorType>(quant_type);
+  if (UseV2(k) &&
+      (qtype == GGUF::TensorType::Q4_K || qtype == GGUF::TensorType::Q6_K)) {
+    if (op == FusedQuantGemm::DownProjOperator::kQ81Gemv) {
+      return "q8_1_gemv_v2";
+    }
+    if (op == FusedQuantGemm::DownProjOperator::kQ81GemvRowPair && m > 1) {
+      return "q8_1_gemv_row_pair_v2";
+    }
+  }
+  return DownProjOperatorName(op);
 }
 
 bool FusedQuantGemm::Gemv(const QuantizedWeightInfo &weight,
@@ -2419,6 +2448,42 @@ bool FusedQuantGemm::GemvQ8_1(const QuantizedWeightInfo &weight,
   }
 
   return entry.fn(weight.data, act_q8_1, output, M, N, K, stream);
+}
+
+bool FusedQuantGemm::FusedFfnQ4K(const QuantizedWeightInfo &gate_weight,
+                                 const QuantizedWeightInfo &up_weight,
+                                 const QuantizedWeightInfo &down_weight,
+                                 const half *activation, half *output, int M,
+                                 int N_inter, int N_hidden, int K,
+                                 cudaStream_t stream) {
+  const auto gate_type =
+      static_cast<GGUF::TensorType>(gate_weight.quant_type);
+  const auto up_type = static_cast<GGUF::TensorType>(up_weight.quant_type);
+  const auto down_type =
+      static_cast<GGUF::TensorType>(down_weight.quant_type);
+  if (!gate_weight.data || !up_weight.data || !down_weight.data || !activation ||
+      !output || M <= 0 || N_inter <= 0 || N_hidden <= 0 || K <= 0) {
+    return false;
+  }
+  if (gate_type != GGUF::TensorType::Q4_K || up_type != GGUF::TensorType::Q4_K ||
+      down_type != GGUF::TensorType::Q4_K) {
+    return false;
+  }
+  if ((K % QK_K) != 0 || (N_inter % QK_K) != 0) {
+    return false;
+  }
+
+  constexpr int kOutputTile = kGemvWarpsPerBlock;
+  const dim3 grid((N_hidden + kOutputTile - 1) / kOutputTile, M);
+  const dim3 block(kGemvThreadsPerBlock);
+  const size_t smem =
+      static_cast<size_t>(K + 32) * sizeof(float);
+  FusedFFNGemmQ4K<block_q4_k><<<grid, block, smem, stream>>>(
+      static_cast<const block_q4_k *>(gate_weight.data),
+      static_cast<const block_q4_k *>(up_weight.data),
+      static_cast<const block_q4_k *>(down_weight.data), activation, output,
+      N_inter, N_hidden, M, K);
+  return cudaGetLastError() == cudaSuccess;
 }
 
 bool FusedQuantGemm::GemvQ8_1Pair(

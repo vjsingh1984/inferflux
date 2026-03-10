@@ -159,6 +159,10 @@ class NativeMetricsStubTests(unittest.TestCase):
             body,
         )
         self.assertIn(
+            'inferflux_native_ffn_proj_operator_total{phase="prefill",operator="q8_1_group_v2"}',
+            body,
+        )
+        self.assertIn(
             'inferflux_native_ffn_proj_operator_total{phase="prefill",operator="q8_1_group"}',
             body,
         )
@@ -173,11 +177,19 @@ class NativeMetricsStubTests(unittest.TestCase):
             "# TYPE inferflux_native_down_proj_operator_total counter", body
         )
         self.assertIn(
+            'inferflux_native_down_proj_operator_total{phase="prefill",operator="q8_1_gemv_v2"}',
+            body,
+        )
+        self.assertIn(
             'inferflux_native_down_proj_operator_total{phase="prefill",operator="q8_1_gemv"}',
             body,
         )
         self.assertIn(
             'inferflux_native_down_proj_operator_total{phase="prefill",operator="q8_1_gemv_hot_fixed"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_down_proj_operator_total{phase="prefill",operator="q8_1_gemv_row_pair_v2"}',
             body,
         )
         self.assertIn(
