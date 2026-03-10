@@ -1,5 +1,6 @@
 #include "runtime/execution/batch_executor.h"
 #include "runtime/backends/backend_utils.h"
+#include "scheduler/request_debug.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 
@@ -93,17 +94,17 @@ void LogUnifiedAssemblyState(std::string_view stage, const InferenceRequest &req
   if (!UnifiedAssemblyDebugEnabled() || !ConsumeUnifiedAssemblyBudget()) {
     return;
   }
-  log::Info(
-      "batch_executor",
-      "unified_assembly[" + std::string(stage) + "]: request_id=" +
-          std::to_string(req.id) + ", sequence_id=" +
-          std::to_string(req.sequence_id) + ", n_past=" + std::to_string(n_past) +
-          ", token=" + std::to_string(token) + ", generated=" +
-          std::to_string(tokens_generated) + ", stop_hit=" +
-          std::string(stop_hit ? "true" : "false") + ", active=" +
-          std::string(active ? "true" : "false") + ", piece=" +
-          json(DebugSnippet(piece)).dump() + ", completion=" +
-          json(DebugSnippet(completion)).dump());
+  std::string message = "unified_assembly[" + std::string(stage) + "]: " +
+                        BuildRequestDebugContext(req);
+  AppendRequestDebugField(&message, "n_past", n_past);
+  AppendRequestDebugField(&message, "token", token);
+  AppendRequestDebugField(&message, "generated", tokens_generated);
+  AppendRequestDebugField(&message, "stop_hit", stop_hit);
+  AppendRequestDebugField(&message, "active", active);
+  AppendRequestDebugField(&message, "piece", json(DebugSnippet(piece)).dump());
+  AppendRequestDebugField(&message, "completion",
+                          json(DebugSnippet(completion)).dump());
+  log::Info("batch_executor", message);
 }
 
 // RAII guard that calls SetupSampler before execution and TeardownSampler on

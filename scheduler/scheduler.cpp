@@ -4,6 +4,7 @@
 #include "runtime/execution/parallel_context.h"
 #include "runtime/structured_output/structured_output_adapter.h"
 #include "scheduler/model_selection.h"
+#include "scheduler/request_debug.h"
 #include "scheduler/request_requeue.h"
 #include "scheduler/single_model_router.h"
 #include "server/logging/logger.h"
@@ -64,15 +65,15 @@ void LogSequenceSlotEvent(std::string_view stage, int64_t request_id,
   if (!SequenceSlotDebugEnabled()) {
     return;
   }
-  std::string message =
-      "sequence_slot[" + std::string(stage) + "]: request_id=" +
-      std::to_string(request_id) + ", sequence_id=" +
-      std::to_string(sequence_id) + ", sequence_generation=" +
-      std::to_string(sequence_generation) + ", phase=" +
-      RequestPhaseDebugString(phase) + ", n_past=" + std::to_string(n_past) +
-      ", remaining_decode_tokens=" + std::to_string(remaining_decode_tokens);
+  std::string message = "sequence_slot[" + std::string(stage) + "]: " +
+                        BuildRequestDebugContext(request_id, {}, sequence_id,
+                                                 sequence_generation);
+  AppendRequestDebugField(&message, "phase", RequestPhaseDebugString(phase));
+  AppendRequestDebugField(&message, "n_past", n_past);
+  AppendRequestDebugField(&message, "remaining_decode_tokens",
+                          remaining_decode_tokens);
   if (!detail.empty()) {
-    message += ", detail=" + std::string(detail);
+    AppendRequestDebugField(&message, "detail", detail);
   }
   log::Info("scheduler", message);
 }
@@ -1692,14 +1693,22 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       Span fairness_span(
           "scheduler.fairness.yield", tracing::ChildContext(parent_ctx),
           [req_id = inference->id,
+           client_request_id = inference->client_request_id,
+           sequence_id = inference->sequence_id,
+           sequence_generation = inference->sequence_generation,
            remaining = inference->remaining_decode_tokens,
            slice = inference->last_timeslice_tokens, slice_tokens](
               const std::string &name, const SpanContext &ctx, double ms) {
-            std::cout << "[fairness] " << name << " request=" << req_id
-                      << " trace=" << ctx.trace_id << " limit=" << slice
-                      << " generated=" << slice_tokens
-                      << " remaining=" << remaining << " duration_ms=" << ms
-                      << std::endl;
+            std::string message = name + ": " + BuildRequestDebugContext(
+                                                   req_id, client_request_id,
+                                                   sequence_id,
+                                                   sequence_generation);
+            AppendRequestDebugField(&message, "trace_id", ctx.trace_id);
+            AppendRequestDebugField(&message, "limit", slice);
+            AppendRequestDebugField(&message, "generated", slice_tokens);
+            AppendRequestDebugField(&message, "remaining", remaining);
+            AppendRequestDebugField(&message, "duration_ms", ms);
+            std::cout << "[fairness] " << message << std::endl;
           });
       fairness_span.Finish();
       requeue.push_back(pending);
@@ -1808,11 +1817,19 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
       Span resume_span(
           "scheduler.fairness.resume", tracing::ChildContext(parent_ctx),
           [req_id = pending->inference.id,
+           client_request_id = pending->inference.client_request_id,
+           sequence_id = pending->inference.sequence_id,
+           sequence_generation = pending->inference.sequence_generation,
            remaining = pending->inference.remaining_decode_tokens](
               const std::string &name, const SpanContext &ctx, double ms) {
-            std::cout << "[fairness] " << name << " request=" << req_id
-                      << " trace=" << ctx.trace_id << " remaining=" << remaining
-                      << " duration_ms=" << ms << std::endl;
+            std::string message = name + ": " + BuildRequestDebugContext(
+                                                   req_id, client_request_id,
+                                                   sequence_id,
+                                                   sequence_generation);
+            AppendRequestDebugField(&message, "trace_id", ctx.trace_id);
+            AppendRequestDebugField(&message, "remaining", remaining);
+            AppendRequestDebugField(&message, "duration_ms", ms);
+            std::cout << "[fairness] " << message << std::endl;
           });
       resume_span.Finish();
     }

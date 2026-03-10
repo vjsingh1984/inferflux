@@ -4,6 +4,7 @@
 #include "runtime/disaggregated/kv_channel.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "scheduler/fairness_controller.h"
+#include "scheduler/request_debug.h"
 #include "scheduler/request_requeue.h"
 #define private public
 #include "scheduler/scheduler.h"
@@ -92,6 +93,36 @@ bool WaitForCondition(
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   return predicate();
+}
+
+TEST_CASE("BuildRequestDebugContext includes stable caller tag and lease "
+          "identity",
+          "[scheduler]") {
+  InferenceRequest request;
+  request.id = 42;
+  request.client_request_id = "bench-42";
+  request.sequence_id = 7;
+  request.sequence_generation = 11;
+
+  const std::string message = BuildRequestDebugContext(request);
+
+  REQUIRE(message ==
+          "request_id=42, client_request_id=bench-42, sequence_id=7, "
+          "sequence_generation=11");
+}
+
+TEST_CASE("AppendRequestDebugField appends typed fields consistently",
+          "[scheduler]") {
+  std::string message = BuildRequestDebugContext(
+      /*request_id=*/9, /*client_request_id=*/"", /*sequence_id=*/-1,
+      /*sequence_generation=*/0);
+
+  AppendRequestDebugField(&message, "trace_id", "abcd");
+  AppendRequestDebugField(&message, "remaining", 5);
+  AppendRequestDebugField(&message, "active", true);
+
+  REQUIRE(message == "request_id=9, sequence_id=-1, sequence_generation=0, "
+                     "trace_id=abcd, remaining=5, active=true");
 }
 
 class ReadyStubBackend : public LlamaCPUBackend {
