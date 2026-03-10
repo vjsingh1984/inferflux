@@ -24,6 +24,39 @@
 
 namespace inferflux {
 
+namespace {
+
+class ScopedEnvVar {
+public:
+  ScopedEnvVar(std::string name, const char *value) : name_(std::move(name)) {
+    const char *existing = std::getenv(name_.c_str());
+    if (existing) {
+      had_original_ = true;
+      original_ = existing;
+    }
+    if (value) {
+      REQUIRE(setenv(name_.c_str(), value, 1) == 0);
+    } else {
+      REQUIRE(unsetenv(name_.c_str()) == 0);
+    }
+  }
+
+  ~ScopedEnvVar() {
+    if (had_original_) {
+      setenv(name_.c_str(), original_.c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+private:
+  std::string name_;
+  std::string original_;
+  bool had_original_{false};
+};
+
+} // namespace
+
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
 namespace {
 
@@ -115,6 +148,34 @@ TEST_CASE("NativeKernelExecutor: Name and fallback state", "[native_forward]") {
   REQUIRE_FALSE(executor.IsFallback());
   REQUIRE(executor.FallbackReason().empty());
   REQUIRE(executor.BackendHandle() == nullptr);
+}
+
+TEST_CASE("NativeExecutionPolicy loads hot-path policy from env",
+          "[native_forward]") {
+  ScopedEnvVar enable_batched("INFERFLUX_ENABLE_BATCHED_DECODE", "1");
+  ScopedEnvVar disable_graph("INFERFLUX_DISABLE_CUDA_GRAPH", "1");
+  ScopedEnvVar force_cublas("INFERFLUX_FORCE_CUBLAS", "1");
+  ScopedEnvVar disable_packed("INFERFLUX_DISABLE_PREPACKED_ACTIVATIONS", "1");
+  ScopedEnvVar disable_q81("INFERFLUX_DISABLE_Q8_1_ACTIVATIONS", "1");
+  ScopedEnvVar disable_fused("INFERFLUX_DISABLE_FUSED_GEMV", "1");
+  ScopedEnvVar grouped_hot("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K",
+                           "1");
+  ScopedEnvVar downproj_hot(
+      "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1");
+  ScopedEnvVar enable_mmq("INFERFLUX_ENABLE_DOWNPROJ_MMQ", "1");
+  ScopedEnvVar mmq_min_batch("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", "7");
+
+  const auto policy = NativeExecutionPolicy::FromEnv();
+  REQUIRE(policy.enable_batched_decode);
+  REQUIRE(policy.disable_cuda_graph);
+  REQUIRE(policy.force_cublas);
+  REQUIRE(policy.disable_prepacked_activations);
+  REQUIRE(policy.disable_q81_activations);
+  REQUIRE(policy.disable_fused_gemv);
+  REQUIRE(policy.enable_experimental_q81_grouped_hot_q4k);
+  REQUIRE(policy.enable_experimental_q81_downproj_hot_fixed);
+  REQUIRE(policy.enable_downproj_mmq);
+  REQUIRE(policy.downproj_mmq_min_batch_override == 7);
 }
 
 TEST_CASE("NativeKernelExecutor: ExecuteUnifiedBatch returns empty when no "

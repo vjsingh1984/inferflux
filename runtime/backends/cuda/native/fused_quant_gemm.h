@@ -2,6 +2,7 @@
 
 #include <array>
 
+#include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/weight_map.h"
 
 #ifdef INFERFLUX_HAS_CUDA
@@ -77,7 +78,8 @@ public:
    * @return true if fused kernel was launched, false to fall back to cuBLAS
    */
   static bool Gemv(const QuantizedWeightInfo &weight, const half *activation,
-                   half *output, int M, int N, int K, cudaStream_t stream);
+                   half *output, int M, int N, int K, cudaStream_t stream,
+                   const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Fused RmsNorm+GEMV: computes normalization inside the GEMV kernel's shared
@@ -100,7 +102,8 @@ public:
   static bool RmsNormGemv(const QuantizedWeightInfo &weight,
                           const half *residual, const half *norm_weight,
                           half *output, int M, int N, int K, float rms_norm_eps,
-                          cudaStream_t stream);
+                          cudaStream_t stream,
+                          const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Attempt a fused dequant-GEMV using pre-quantized int8 activations packed
@@ -111,7 +114,8 @@ public:
    */
   static bool GemvPacked(const QuantizedWeightInfo &weight,
                          const PackedActivationInfo &activation, half *output,
-                         int M, int N, int K, cudaStream_t stream);
+                         int M, int N, int K, cudaStream_t stream,
+                         const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Attempt a single packed-activation launch for two sibling projections.
@@ -190,10 +194,11 @@ public:
    * @param K  Inner dimension (must be multiple of 32)
    * @param stream  CUDA stream
    * @return true if Q8_1 kernel was launched, false if unsupported
-   */
+  */
   static bool GemvQ8_1(const QuantizedWeightInfo &weight,
-                        const void *act_q8_1, half *output, int M, int N,
-                        int K, cudaStream_t stream);
+                       const void *act_q8_1, half *output, int M, int N, int K,
+                       cudaStream_t stream,
+                       const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * MMQ-style tiled down-projection path for transformed GGUF weights.
@@ -203,9 +208,10 @@ public:
    */
   static bool DownProjMmq(const MmqWeightInfo &weight, const void *act_q8_1,
                           half *output, int M, int N, int K,
-                          cudaStream_t stream);
+                          cudaStream_t stream,
+                          const NativeExecutionPolicy *policy = nullptr);
 
-  static bool IsDownProjMmqEnabled();
+  static bool IsDownProjMmqEnabled(const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Build a tile-major MMQ layout for a quantized tensor.
@@ -232,7 +238,8 @@ public:
   static FfnProjOperator
   SelectFfnProjOperator(int quant_type0, int quant_type1,
                         const FusedDispatchGeometry &geometry, bool allow_q81,
-                        bool allow_packed);
+                        bool allow_packed,
+                        const NativeExecutionPolicy *policy = nullptr);
 
   static const char *FfnProjOperatorName(FfnProjOperator op);
 
@@ -245,7 +252,8 @@ public:
    */
   static DownProjOperator
   SelectDownProjOperator(int quant_type, const FusedDispatchGeometry &geometry,
-                         bool allow_q81, bool allow_packed, bool allow_mmq);
+                         bool allow_q81, bool allow_packed, bool allow_mmq,
+                         const NativeExecutionPolicy *policy = nullptr);
 
   static const char *DownProjOperatorName(DownProjOperator op);
 
@@ -254,14 +262,16 @@ public:
    */
   static bool GemvQ8_1Pair(
       const std::array<PackedProjectionSpec, 2> &projections,
-      const void *act_q8_1, int M, int K, cudaStream_t stream);
+      const void *act_q8_1, int M, int K, cudaStream_t stream,
+      const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Grouped Q8_1 GEMV for three sibling projections (single kernel launch).
    */
   static bool GemvQ8_1Triple(
       const std::array<PackedProjectionSpec, 3> &projections,
-      const void *act_q8_1, int M, int K, cudaStream_t stream);
+      const void *act_q8_1, int M, int K, cudaStream_t stream,
+      const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Returns true when a quant type supports Q8_1 activation GEMV.
@@ -278,7 +288,9 @@ public:
    */
   static bool
   ShouldUseSpecializedQ8_1GroupedFastPath(int quant_type,
-                                          const FusedDispatchGeometry &geometry);
+                                          const FusedDispatchGeometry &geometry,
+                                          const NativeExecutionPolicy *policy =
+                                              nullptr);
 
   /**
    * Get the adaptive M threshold for a given quant type.

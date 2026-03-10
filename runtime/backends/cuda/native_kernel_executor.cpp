@@ -1223,6 +1223,8 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
       DestroyLaneOverlapResources();
       return false;
     }
+    decode_lane_forward_->SetExecutionPolicy(execution_policy_);
+    prefill_lane_forward_->SetExecutionPolicy(execution_policy_);
   } else {
     if (!decode_lane_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
                                           decode_lane_gemm_.get(),
@@ -1235,6 +1237,8 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
       DestroyLaneOverlapResources();
       return false;
     }
+    decode_lane_forward_->SetExecutionPolicy(execution_policy_);
+    prefill_lane_forward_->SetExecutionPolicy(execution_policy_);
   }
 
   decode_lane_sampler_ = std::make_unique<GpuSampler>();
@@ -1619,6 +1623,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
                  "Failed to initialize forward pass for GGUF model");
       return false;
     }
+    model_forward_->SetExecutionPolicy(execution_policy_);
   } else {
     weight_map_ = std::make_unique<WeightMap>();
     if (!weight_map_->Build(*loader_, config)) {
@@ -1641,6 +1646,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
       log::Error("native_kernel_executor", "Failed to initialize forward pass");
       return false;
     }
+    model_forward_->SetExecutionPolicy(execution_policy_);
   }
 
   // 4. Initialize GPU sampler
@@ -1804,6 +1810,7 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
     dequantized_cache_policy_hint_ = env_dequant_policy;
   }
   ConfigureDequantizedCachePolicy(dequantized_cache_policy_hint_);
+  execution_policy_ = NativeExecutionPolicy::FromEnv();
   log::Info(
       "native_kernel_executor",
       "Phase overlap: " +

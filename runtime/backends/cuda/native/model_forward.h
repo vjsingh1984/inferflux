@@ -2,6 +2,7 @@
 
 #include "runtime/backends/cuda/native/cublas_gemm.h"
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
+#include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/weight_map.h"
 #include "runtime/backends/cuda/native_kernel_executor.h"
 
@@ -75,6 +76,8 @@ public:
    * Subclasses should propagate to cuBLAS handle and sampler.
    */
   virtual void SetStream(cudaStream_t /*stream*/) {}
+
+  virtual void SetExecutionPolicy(const NativeExecutionPolicy & /*policy*/) {}
 
   /**
    * Return the vocab size for offset calculations in batched forward.

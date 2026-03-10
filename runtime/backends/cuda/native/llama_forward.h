@@ -104,6 +104,7 @@ public:
                     int batch_size) override;
 
   void SetStream(cudaStream_t stream) override;
+  void SetExecutionPolicy(const NativeExecutionPolicy &policy) override;
 
   void FreeScratchBuffers() override;
 
@@ -171,6 +172,7 @@ private:
   cudaGraphExec_t decode_graph_exec_{nullptr};
   int graph_batch_size_{0};
   bool graph_enabled_{true};
+  NativeExecutionPolicy execution_policy_{};
 
   bool AllocateScratch();
 };

@@ -57,14 +57,8 @@ struct PhaseTiming {
       lm_head_ms{0};
   int forward_count{0};
 
-  static bool IsEnabled() {
-    static const bool e =
-        std::getenv("INFERFLUX_NATIVE_PHASE_TIMING") != nullptr;
-    return e;
-  }
-
-  void Begin(cudaStream_t s) {
-    if (!IsEnabled())
+  void Begin(cudaStream_t s, bool should_enable) {
+    if (!should_enable)
       return;
     enabled = true;
     stream = s;
@@ -212,24 +206,33 @@ private:
   bool prev_{true};
 };
 
-bool ForceCublasRequested() {
-  return std::getenv("INFERFLUX_FORCE_CUBLAS") != nullptr;
+bool ForceCublasRequested(const NativeExecutionPolicy &policy) {
+  return policy.force_cublas;
 }
 
-bool PackedActivationsDisabled() {
-  const char *env = std::getenv("INFERFLUX_DISABLE_PREPACKED_ACTIVATIONS");
-  return env && (std::string(env) == "1" || std::string(env) == "true");
+const NativeExecutionPolicy &
+ResolveForwardPolicy(const NativeExecutionPolicy *policy) {
+  if (policy) {
+    return *policy;
+  }
+  static thread_local NativeExecutionPolicy env_policy;
+  env_policy = NativeExecutionPolicy::FromEnv();
+  return env_policy;
 }
 
-bool Q81ActivationsDisabled() {
-  const char *env = std::getenv("INFERFLUX_DISABLE_Q8_1_ACTIVATIONS");
-  return env && (std::string(env) == "1" || std::string(env) == "true");
+bool PackedActivationsDisabled(const NativeExecutionPolicy &policy) {
+  return policy.disable_prepacked_activations;
+}
+
+bool Q81ActivationsDisabled(const NativeExecutionPolicy &policy) {
+  return policy.disable_q81_activations;
 }
 
 bool ProjectionHasGraphSafeKernel(const QuantizedWeightInfo &raw, int M, int N,
-                                  int K, bool includes_rmsnorm) {
-  if (ForceCublasRequested() || !g_allow_fused_quantized_matmul || !raw.data ||
-      raw.quant_type < 0 || M <= 0 || N <= 0 || K <= 0) {
+                                  int K, bool includes_rmsnorm,
+                                  const NativeExecutionPolicy &policy) {
+  if (ForceCublasRequested(policy) || !g_allow_fused_quantized_matmul ||
+      !raw.data || raw.quant_type < 0 || M <= 0 || N <= 0 || K <= 0) {
     return false;
   }
 
@@ -238,11 +241,11 @@ bool ProjectionHasGraphSafeKernel(const QuantizedWeightInfo &raw, int M, int N,
     return false;
   }
 
-  if (!Q81ActivationsDisabled() &&
+  if (!Q81ActivationsDisabled(policy) &&
       FusedQuantGemm::SupportsQ8_1Activations(raw.quant_type)) {
     return true;
   }
-  if (!PackedActivationsDisabled() &&
+  if (!PackedActivationsDisabled(policy) &&
       FusedQuantGemm::SupportsPackedActivations(raw.quant_type)) {
     return true;
   }
@@ -252,39 +255,43 @@ bool ProjectionHasGraphSafeKernel(const QuantizedWeightInfo &raw, int M, int N,
 
 FusedQuantGemm::DownProjOperator
 SelectDownProjOperator(const QuantizedWeightInfo &raw,
-                       const MmqWeightInfo &mmq_weight, int M, int N, int K) {
-  if (ForceCublasRequested() || !g_allow_fused_quantized_matmul) {
+                       const MmqWeightInfo &mmq_weight, int M, int N, int K,
+                       const NativeExecutionPolicy &policy) {
+  if (ForceCublasRequested(policy) || !g_allow_fused_quantized_matmul) {
     return FusedQuantGemm::DownProjOperator::kFallback;
   }
 
-  const bool allow_q81 = !Q81ActivationsDisabled();
-  const bool allow_packed = !PackedActivationsDisabled();
+  const bool allow_q81 = !Q81ActivationsDisabled(policy);
+  const bool allow_packed = !PackedActivationsDisabled(policy);
   const bool allow_mmq =
-      mmq_weight.data != nullptr && FusedQuantGemm::IsDownProjMmqEnabled();
+      mmq_weight.data != nullptr && FusedQuantGemm::IsDownProjMmqEnabled(&policy);
   return FusedQuantGemm::SelectDownProjOperator(
       raw.quant_type, FusedDispatchGeometry{M, N, K, 1, true, false},
-      allow_q81, allow_packed, allow_mmq);
+      allow_q81, allow_packed, allow_mmq, &policy);
 }
 
 FusedQuantGemm::FfnProjOperator
 SelectFfnProjOperator(const QuantizedWeightInfo &gate_raw,
                       const QuantizedWeightInfo &up_raw, int M, int N, int K,
-                      bool includes_rmsnorm) {
-  if (ForceCublasRequested() || !g_allow_fused_quantized_matmul) {
+                      bool includes_rmsnorm,
+                      const NativeExecutionPolicy &policy) {
+  if (ForceCublasRequested(policy) || !g_allow_fused_quantized_matmul) {
     return FusedQuantGemm::FfnProjOperator::kFallback;
   }
 
   return FusedQuantGemm::SelectFfnProjOperator(
       gate_raw.quant_type, up_raw.quant_type,
       FusedDispatchGeometry{M, N, K, 2, true, includes_rmsnorm},
-      !Q81ActivationsDisabled(), !PackedActivationsDisabled());
+      !Q81ActivationsDisabled(policy), !PackedActivationsDisabled(policy),
+      &policy);
 }
 
 template <typename T>
 bool DecodeGraphCaptureSafe(const WeightMap *weights, int num_layers, int M,
                             int hidden_size, int num_heads, int num_kv_heads,
                             int head_dim, int intermediate_size,
-                            int vocab_size) {
+                            int vocab_size,
+                            const NativeExecutionPolicy &policy) {
   if (!weights || !weights->HasQuantizedWeights()) {
     return false;
   }
@@ -292,53 +299,54 @@ bool DecodeGraphCaptureSafe(const WeightMap *weights, int num_layers, int M,
   for (int layer = 0; layer < num_layers; ++layer) {
     if (!ProjectionHasGraphSafeKernel(weights->LayerQProjRaw(layer), M,
                                       num_heads * head_dim, hidden_size,
-                                      /*includes_rmsnorm=*/true) ||
+                                      /*includes_rmsnorm=*/true, policy) ||
         !ProjectionHasGraphSafeKernel(weights->LayerKProjRaw(layer), M,
                                       num_kv_heads * head_dim, hidden_size,
-                                      /*includes_rmsnorm=*/true) ||
+                                      /*includes_rmsnorm=*/true, policy) ||
         !ProjectionHasGraphSafeKernel(weights->LayerVProjRaw(layer), M,
                                       num_kv_heads * head_dim, hidden_size,
-                                      /*includes_rmsnorm=*/true) ||
+                                      /*includes_rmsnorm=*/true, policy) ||
         !ProjectionHasGraphSafeKernel(weights->LayerOProjRaw(layer), M,
                                       hidden_size, num_heads * head_dim,
-                                      /*includes_rmsnorm=*/false) ||
+                                      /*includes_rmsnorm=*/false, policy) ||
         !ProjectionHasGraphSafeKernel(weights->LayerGateProjRaw(layer), M,
                                       intermediate_size, hidden_size,
-                                      /*includes_rmsnorm=*/true) ||
+                                      /*includes_rmsnorm=*/true, policy) ||
         !ProjectionHasGraphSafeKernel(weights->LayerUpProjRaw(layer), M,
                                       intermediate_size, hidden_size,
-                                      /*includes_rmsnorm=*/true) ||
+                                      /*includes_rmsnorm=*/true, policy) ||
         !ProjectionHasGraphSafeKernel(weights->LayerDownProjRaw(layer), M,
                                       hidden_size, intermediate_size,
-                                      /*includes_rmsnorm=*/false)) {
+                                      /*includes_rmsnorm=*/false, policy)) {
       return false;
     }
   }
 
   return ProjectionHasGraphSafeKernel(weights->LmHeadRaw(), M, vocab_size,
                                       hidden_size,
-                                      /*includes_rmsnorm=*/true);
+                                      /*includes_rmsnorm=*/true, policy);
 }
 
 // Fused dequant-GEMV dispatch: only valid for half (FP16) type.
 // Returns true if the fused kernel was launched.
 template <typename T>
 bool TryFusedGemv(const QuantizedWeightInfo &, const T *, T *, int, int, int,
-                  cudaStream_t, const char * = nullptr) {
+                  cudaStream_t, const char * = nullptr,
+                  const NativeExecutionPolicy * = nullptr) {
   return false; // BF16 and other types: no fused path
 }
 
 template <>
 bool TryFusedGemv<half>(const QuantizedWeightInfo &raw, const half *input,
                         half *output, int M, int N, int K, cudaStream_t stream,
-                        const char *proj_name) {
-  // If INFERFLUX_FORCE_CUBLAS=1, skip fused kernels entirely
-  static const bool force_cublas =
-      std::getenv("INFERFLUX_FORCE_CUBLAS") != nullptr;
-  if (force_cublas || !g_allow_fused_quantized_matmul)
+                        const char *proj_name,
+                        const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveForwardPolicy(policy);
+  if (ForceCublasRequested(policy_ref) || !g_allow_fused_quantized_matmul)
     return false;
   bool ok =
-      raw.data && FusedQuantGemm::Gemv(raw, input, output, M, N, K, stream);
+      raw.data &&
+      FusedQuantGemm::Gemv(raw, input, output, M, N, K, stream, policy);
   if (proj_name)
     LogGemmPath(proj_name, ok);
   return ok;
@@ -350,7 +358,8 @@ bool TryFusedGemv<half>(const QuantizedWeightInfo &raw, const half *input,
 template <typename T>
 bool TryFusedRmsNormGemv(const QuantizedWeightInfo &, const T *, const T *, T *,
                          int, int, int, float, cudaStream_t,
-                         const char * = nullptr) {
+                         const char * = nullptr,
+                         const NativeExecutionPolicy * = nullptr) {
   return false; // BF16 and other types: no fused path
 }
 
@@ -358,14 +367,15 @@ template <>
 bool TryFusedRmsNormGemv<half>(const QuantizedWeightInfo &raw,
                                const half *residual, const half *norm_weight,
                                half *output, int M, int N, int K, float eps,
-                               cudaStream_t stream, const char *proj_name) {
-  static const bool force_cublas =
-      std::getenv("INFERFLUX_FORCE_CUBLAS") != nullptr;
-  if (force_cublas || !g_allow_fused_quantized_matmul)
+                               cudaStream_t stream, const char *proj_name,
+                               const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveForwardPolicy(policy);
+  if (ForceCublasRequested(policy_ref) || !g_allow_fused_quantized_matmul)
     return false;
   bool ok =
       raw.data && FusedQuantGemm::RmsNormGemv(raw, residual, norm_weight,
-                                              output, M, N, K, eps, stream);
+                                              output, M, N, K, eps, stream,
+                                              policy);
   if (proj_name) {
     static std::unordered_map<const char *, bool> logged;
     if (!logged.count(proj_name)) {
@@ -382,7 +392,8 @@ bool TryFusedRmsNormGemv<half>(const QuantizedWeightInfo &raw,
 template <typename T>
 bool TryPackedGemv(const QuantizedWeightInfo &, const T *, T *, int8_t *,
                    float *, int, int, int, cudaStream_t,
-                   const char * = nullptr) {
+                   const char * = nullptr,
+                   const NativeExecutionPolicy * = nullptr) {
   return false;
 }
 
@@ -390,12 +401,11 @@ template <>
 bool TryPackedGemv<half>(const QuantizedWeightInfo &raw, const half *input,
                          half *output, int8_t *packed_activation,
                          float *packed_scales, int M, int N, int K,
-                         cudaStream_t stream, const char *proj_name) {
-  static const bool disabled = [] {
-    const char *env = std::getenv("INFERFLUX_DISABLE_PREPACKED_ACTIVATIONS");
-    return env && (std::string(env) == "1" || std::string(env) == "true");
-  }();
-  if (disabled || !raw.data || !input || !output || !packed_activation ||
+                         cudaStream_t stream, const char *proj_name,
+                         const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveForwardPolicy(policy);
+  if (PackedActivationsDisabled(policy_ref) || !raw.data || !input || !output ||
+      !packed_activation ||
       !packed_scales || M <= 0 || N <= 0 || K <= 0 ||
       !FusedQuantGemm::SupportsPackedActivations(raw.quant_type) ||
       !FusedQuantGemm::ShouldUseFusedPath(
@@ -411,7 +421,7 @@ bool TryPackedGemv<half>(const QuantizedWeightInfo &raw, const half *input,
 
   PackedActivationInfo packed{packed_activation, packed_scales};
   const bool ok =
-      FusedQuantGemm::GemvPacked(raw, packed, output, M, N, K, stream);
+      FusedQuantGemm::GemvPacked(raw, packed, output, M, N, K, stream, policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using packed-activation fused dequant-GEMV");
   }
@@ -421,7 +431,8 @@ bool TryPackedGemv<half>(const QuantizedWeightInfo &raw, const half *input,
 template <typename T>
 bool TryPackedRmsNormGemv(const QuantizedWeightInfo &, const T *, const T *,
                           T *, int8_t *, float *, T *, int, int, int, float,
-                          cudaStream_t, const char * = nullptr) {
+                          cudaStream_t, const char * = nullptr,
+                          const NativeExecutionPolicy * = nullptr) {
   return false;
 }
 
@@ -431,12 +442,11 @@ bool TryPackedRmsNormGemv<half>(const QuantizedWeightInfo &raw,
                                 half *normalized, int8_t *packed_activation,
                                 float *packed_scales, half *output, int M,
                                 int N, int K, float eps, cudaStream_t stream,
-                                const char *proj_name) {
-  static const bool disabled = [] {
-    const char *env = std::getenv("INFERFLUX_DISABLE_PREPACKED_ACTIVATIONS");
-    return env && (std::string(env) == "1" || std::string(env) == "true");
-  }();
-  if (disabled || !raw.data || !residual || !norm_weight || !normalized ||
+                                const char *proj_name,
+                                const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveForwardPolicy(policy);
+  if (PackedActivationsDisabled(policy_ref) || !raw.data || !residual ||
+      !norm_weight || !normalized ||
       !packed_activation || !packed_scales || !output || M <= 0 || N <= 0 ||
       K <= 0 || !FusedQuantGemm::SupportsPackedActivations(raw.quant_type) ||
       !FusedQuantGemm::ShouldUseFusedPath(
@@ -457,7 +467,7 @@ bool TryPackedRmsNormGemv<half>(const QuantizedWeightInfo &raw,
 
   PackedActivationInfo packed{packed_activation, packed_scales};
   const bool ok =
-      FusedQuantGemm::GemvPacked(raw, packed, output, M, N, K, stream);
+      FusedQuantGemm::GemvPacked(raw, packed, output, M, N, K, stream, policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name,
                       "using packed-activation fused RmsNorm+dequant-GEMV");
@@ -474,7 +484,8 @@ template <typename T> struct PackedProjectionPlan {
 template <size_t GroupSize, typename T>
 bool TryPackedProjectionGroup(
     const std::array<PackedProjectionPlan<T>, GroupSize> &, const T *,
-    const T *, T *, int8_t *, float *, int, int, float, cudaStream_t) {
+    const T *, T *, int8_t *, float *, int, int, float, cudaStream_t,
+    const NativeExecutionPolicy * = nullptr) {
   return false;
 }
 
@@ -483,12 +494,10 @@ bool TryPackedProjectionGroup(
     const std::array<PackedProjectionPlan<half>, GroupSize> &plans,
     const half *residual, const half *norm_weight, half *normalized,
     int8_t *packed_activation, float *packed_scales, int M, int K, float eps,
-    cudaStream_t stream) {
-  static const bool disabled = [] {
-    const char *env = std::getenv("INFERFLUX_DISABLE_PREPACKED_ACTIVATIONS");
-    return env && (std::string(env) == "1" || std::string(env) == "true");
-  }();
-  if (disabled || !residual || !norm_weight || !normalized ||
+    cudaStream_t stream, const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveForwardPolicy(policy);
+  if (PackedActivationsDisabled(policy_ref) || !residual || !norm_weight ||
+      !normalized ||
       !packed_activation || !packed_scales || M <= 0 || K <= 0) {
     return false;
   }
@@ -573,7 +582,7 @@ bool TryPackedProjectionGroup(
     }
     const auto &plan = plans[i];
     if (!FusedQuantGemm::GemvPacked(plan.raw, packed, plan.output, M,
-                                    plan.output_cols, K, stream)) {
+                                    plan.output_cols, K, stream, policy)) {
       return false;
     }
   }
@@ -596,7 +605,8 @@ bool TryPackedProjectionGroup(
 template <size_t GroupSize, typename T>
 bool TryQ8_1ProjectionGroup(
     const std::array<PackedProjectionPlan<T>, GroupSize> &, const T *,
-    const T *, void *, int, int, float, cudaStream_t) {
+    const T *, void *, int, int, float, cudaStream_t,
+    const NativeExecutionPolicy * = nullptr) {
   return false;
 }
 
@@ -604,12 +614,10 @@ template <size_t GroupSize>
 bool TryQ8_1ProjectionGroup(
     const std::array<PackedProjectionPlan<half>, GroupSize> &plans,
     const half *input, const half *norm_weight, void *act_q8_1, int M, int K,
-    float eps, cudaStream_t stream) {
-  static const bool disabled = [] {
-    const char *env = std::getenv("INFERFLUX_DISABLE_Q8_1_ACTIVATIONS");
-    return env && (std::string(env) == "1" || std::string(env) == "true");
-  }();
-  if (disabled || !input || !act_q8_1 || M <= 0 || K <= 0) {
+    float eps, cudaStream_t stream, const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveForwardPolicy(policy);
+  if (Q81ActivationsDisabled(policy_ref) || !input || !act_q8_1 || M <= 0 ||
+      K <= 0) {
     return false;
   }
 
@@ -663,7 +671,8 @@ bool TryQ8_1ProjectionGroup(
           {plans[1].raw, plans[1].output, plans[1].output_cols},
           {plans[2].raw, plans[2].output, plans[2].output_cols},
       }};
-      if (FusedQuantGemm::GemvQ8_1Triple(grouped, act_q8_1, M, K, stream)) {
+      if (FusedQuantGemm::GemvQ8_1Triple(grouped, act_q8_1, M, K, stream,
+                                         policy)) {
         LogPackedGemmPath("q8_1_triple", "using Q8_1 grouped triple GEMV");
         return true;
       }
@@ -677,7 +686,8 @@ bool TryQ8_1ProjectionGroup(
         {plans[i].raw, plans[i].output, plans[i].output_cols},
         {plans[j].raw, plans[j].output, plans[j].output_cols},
     }};
-    if (FusedQuantGemm::GemvQ8_1Pair(grouped, act_q8_1, M, K, stream)) {
+    if (FusedQuantGemm::GemvQ8_1Pair(grouped, act_q8_1, M, K, stream,
+                                     policy)) {
       completed[i] = true;
       completed[j] = true;
       used_grouped = true;
@@ -690,7 +700,7 @@ bool TryQ8_1ProjectionGroup(
     }
     const auto &plan = plans[i];
     if (!FusedQuantGemm::GemvQ8_1(plan.raw, act_q8_1, plan.output, M,
-                                  plan.output_cols, K, stream)) {
+                                  plan.output_cols, K, stream, policy)) {
       return false;
     }
   }
@@ -710,14 +720,16 @@ bool TryQ8_1ProjectionGroup(
 // Standalone Q8_1 GEMV for single projections without norm fusion.
 template <typename T>
 bool TryMmqGemv(const MmqWeightInfo &, const T *, T *, void *, int, int, int,
-                cudaStream_t, const char * = nullptr) {
+                cudaStream_t, const char * = nullptr,
+                const NativeExecutionPolicy * = nullptr) {
   return false;
 }
 
 template <>
 bool TryMmqGemv<half>(const MmqWeightInfo &weight, const half *input,
                       half *output, void *act_q8_1, int M, int N, int K,
-                      cudaStream_t stream, const char *proj_name) {
+                      cudaStream_t stream, const char *proj_name,
+                      const NativeExecutionPolicy *policy) {
   if (!weight.data || !input || !output || !act_q8_1 || M <= 0 || N <= 0 ||
       K <= 0 || N != weight.rows || K != weight.cols) {
     return false;
@@ -725,7 +737,8 @@ bool TryMmqGemv<half>(const MmqWeightInfo &weight, const half *input,
 
   FusedQuantGemm::QuantizeRowQ8_1(input, act_q8_1, M, K, stream);
   const bool ok =
-      FusedQuantGemm::DownProjMmq(weight, act_q8_1, output, M, N, K, stream);
+      FusedQuantGemm::DownProjMmq(weight, act_q8_1, output, M, N, K, stream,
+                                  policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using MMQ-style tiled Q8_1 down-proj");
   }
@@ -735,7 +748,8 @@ bool TryMmqGemv<half>(const MmqWeightInfo &weight, const half *input,
 template <typename T>
 bool TryMmqSiluMulGemv(const MmqWeightInfo &, const T *, const T *, T *, void *,
                        int, int, int, cudaStream_t,
-                       const char * = nullptr) {
+                       const char * = nullptr,
+                       const NativeExecutionPolicy * = nullptr) {
   return false;
 }
 
@@ -743,7 +757,8 @@ template <>
 bool TryMmqSiluMulGemv<half>(const MmqWeightInfo &weight, const half *gate,
                              const half *up, half *output, void *act_q8_1,
                              int M, int N, int K, cudaStream_t stream,
-                             const char *proj_name) {
+                             const char *proj_name,
+                             const NativeExecutionPolicy *policy) {
   if (!weight.data || !gate || !up || !output || !act_q8_1 || M <= 0 ||
       N <= 0 || K <= 0 || N != weight.rows || K != weight.cols) {
     return false;
@@ -751,7 +766,8 @@ bool TryMmqSiluMulGemv<half>(const MmqWeightInfo &weight, const half *gate,
 
   FusedQuantGemm::SiluMulQuantizeQ8_1(gate, up, act_q8_1, M, K, stream);
   const bool ok =
-      FusedQuantGemm::DownProjMmq(weight, act_q8_1, output, M, N, K, stream);
+      FusedQuantGemm::DownProjMmq(weight, act_q8_1, output, M, N, K, stream,
+                                  policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name,
                       "using MMQ-style tiled fused SwiGLU down-proj");
@@ -761,19 +777,19 @@ bool TryMmqSiluMulGemv<half>(const MmqWeightInfo &weight, const half *gate,
 
 template <typename T>
 bool TryQ8_1Gemv(const QuantizedWeightInfo &, const T *, T *, void *, int, int,
-                 int, cudaStream_t, const char * = nullptr) {
+                 int, cudaStream_t, const char * = nullptr,
+                 const NativeExecutionPolicy * = nullptr) {
   return false;
 }
 
 template <>
 bool TryQ8_1Gemv<half>(const QuantizedWeightInfo &raw, const half *input,
                        half *output, void *act_q8_1, int M, int N, int K,
-                       cudaStream_t stream, const char *proj_name) {
-  static const bool disabled = [] {
-    const char *env = std::getenv("INFERFLUX_DISABLE_Q8_1_ACTIVATIONS");
-    return env && (std::string(env) == "1" || std::string(env) == "true");
-  }();
-  if (disabled || !raw.data || !input || !output || !act_q8_1 || M <= 0 ||
+                       cudaStream_t stream, const char *proj_name,
+                       const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveForwardPolicy(policy);
+  if (Q81ActivationsDisabled(policy_ref) || !raw.data || !input || !output ||
+      !act_q8_1 || M <= 0 ||
       N <= 0 || K <= 0 ||
       !FusedQuantGemm::SupportsQ8_1Activations(raw.quant_type) ||
       !FusedQuantGemm::ShouldUseFusedPath(
@@ -782,7 +798,8 @@ bool TryQ8_1Gemv<half>(const QuantizedWeightInfo &raw, const half *input,
   }
 
   FusedQuantGemm::QuantizeRowQ8_1(input, act_q8_1, M, K, stream);
-  bool ok = FusedQuantGemm::GemvQ8_1(raw, act_q8_1, output, M, N, K, stream);
+  bool ok =
+      FusedQuantGemm::GemvQ8_1(raw, act_q8_1, output, M, N, K, stream, policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using Q8_1 pre-quantized GEMV");
   }
@@ -792,7 +809,8 @@ bool TryQ8_1Gemv<half>(const QuantizedWeightInfo &raw, const half *input,
 template <typename T>
 bool TryPackedSiluMulGemv(const QuantizedWeightInfo &, const T *, const T *,
                           T *, int8_t *, float *, int, int, int, cudaStream_t,
-                          const char * = nullptr) {
+                          const char * = nullptr,
+                          const NativeExecutionPolicy * = nullptr) {
   return false;
 }
 
@@ -801,12 +819,11 @@ bool TryPackedSiluMulGemv<half>(const QuantizedWeightInfo &raw,
                                 const half *gate, const half *up, half *output,
                                 int8_t *packed_activation, float *packed_scales,
                                 int M, int N, int K, cudaStream_t stream,
-                                const char *proj_name) {
-  static const bool disabled = [] {
-    const char *env = std::getenv("INFERFLUX_DISABLE_PREPACKED_ACTIVATIONS");
-    return env && (std::string(env) == "1" || std::string(env) == "true");
-  }();
-  if (disabled || !raw.data || !gate || !up || !output || !packed_activation ||
+                                const char *proj_name,
+                                const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveForwardPolicy(policy);
+  if (PackedActivationsDisabled(policy_ref) || !raw.data || !gate || !up ||
+      !output || !packed_activation ||
       !packed_scales || M <= 0 || N <= 0 || K <= 0 ||
       !FusedQuantGemm::SupportsPackedActivations(raw.quant_type) ||
       !FusedQuantGemm::ShouldUseFusedPath(
@@ -822,7 +839,7 @@ bool TryPackedSiluMulGemv<half>(const QuantizedWeightInfo &raw,
 
   PackedActivationInfo packed{packed_activation, packed_scales};
   const bool ok =
-      FusedQuantGemm::GemvPacked(raw, packed, output, M, N, K, stream);
+      FusedQuantGemm::GemvPacked(raw, packed, output, M, N, K, stream, policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using fused SwiGLU + packed-activation GEMV");
   }
@@ -832,7 +849,8 @@ bool TryPackedSiluMulGemv<half>(const QuantizedWeightInfo &raw,
 template <typename T>
 bool TryQ8_1SiluMulGemv(const QuantizedWeightInfo &, const T *, const T *, T *,
                         void *, int, int, int, cudaStream_t,
-                        const char * = nullptr) {
+                        const char * = nullptr,
+                        const NativeExecutionPolicy * = nullptr) {
   return false;
 }
 
@@ -840,13 +858,11 @@ template <>
 bool TryQ8_1SiluMulGemv<half>(const QuantizedWeightInfo &raw, const half *gate,
                               const half *up, half *output, void *act_q8_1,
                               int M, int N, int K, cudaStream_t stream,
-                              const char *proj_name) {
-  static const bool disabled = [] {
-    const char *env = std::getenv("INFERFLUX_DISABLE_Q8_1_ACTIVATIONS");
-    return env && (std::string(env) == "1" || std::string(env) == "true");
-  }();
-  if (disabled || !raw.data || !gate || !up || !output || !act_q8_1 || M <= 0 ||
-      N <= 0 || K <= 0 ||
+                              const char *proj_name,
+                              const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveForwardPolicy(policy);
+  if (Q81ActivationsDisabled(policy_ref) || !raw.data || !gate || !up ||
+      !output || !act_q8_1 || M <= 0 || N <= 0 || K <= 0 ||
       !FusedQuantGemm::SupportsQ8_1Activations(raw.quant_type) ||
       !FusedQuantGemm::ShouldUseFusedPath(
           raw.quant_type, FusedDispatchGeometry{M, N, K, 1, true, false})) {
@@ -855,7 +871,7 @@ bool TryQ8_1SiluMulGemv<half>(const QuantizedWeightInfo &raw, const half *gate,
 
   FusedQuantGemm::SiluMulQuantizeQ8_1(gate, up, act_q8_1, M, K, stream);
   const bool ok =
-      FusedQuantGemm::GemvQ8_1(raw, act_q8_1, output, M, N, K, stream);
+      FusedQuantGemm::GemvQ8_1(raw, act_q8_1, output, M, N, K, stream, policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using fused SwiGLU + Q8_1 GEMV");
   }
@@ -1118,7 +1134,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
   int kv_len = n_past + seq_len;
   cudaError_t err;
   PhaseTiming pt;
-  pt.Begin(stream_);
+  pt.Begin(stream_, execution_policy_.phase_timing_enabled);
 
   // Step 1: Upload token_ids to GPU
   err = cudaMemcpyAsync(d_token_ids_, token_ids.data(), seq_len * sizeof(int),
@@ -1180,20 +1196,21 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       // Priority: Q8_1 > packed per-row > fused RmsNorm+GEMV > cuBLAS
       const bool used_q8_1_qkv = TryQ8_1ProjectionGroup(
           qkv_plans, d_residual_, input_norm, d_act_q8_1_, seq_len,
-          hidden_size_, rms_norm_eps_, stream_);
+          hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
       const bool used_packed_qkv =
           !used_q8_1_qkv &&
           TryPackedProjectionGroup(qkv_plans, d_residual_, input_norm,
                                    d_norm_out_, d_packed_activation_,
                                    d_packed_activation_scales_, seq_len,
-                                   hidden_size_, rms_norm_eps_, stream_);
+                                   hidden_size_, rms_norm_eps_, stream_,
+                                   &execution_policy_);
       if (!used_q8_1_qkv && !used_packed_qkv) {
         bool norm_computed = false;
 
         if (!TryFusedRmsNormGemv<T>(q_raw, d_residual_, input_norm, d_q_,
                                     seq_len, num_heads_ * head_dim_,
                                     hidden_size_, rms_norm_eps_, stream_,
-                                    "q_proj")) {
+                                    "q_proj", &execution_policy_)) {
           // Fallback: standalone RmsNorm + GEMV/cuBLAS
           if (!norm_computed) {
             err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_,
@@ -1208,7 +1225,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           }
           if (!TryFusedGemv<T>(q_raw, d_norm_out_, d_q_, seq_len,
                                num_heads_ * head_dim_, hidden_size_, stream_,
-                               "q_proj")) {
+                               "q_proj", &execution_policy_)) {
             const T *q_proj =
                 reinterpret_cast<const T *>(weights_->LayerQProj(layer));
             if (!gemm_->GemmTyped<T>(seq_len, num_heads_ * head_dim_,
@@ -1222,7 +1239,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         if (!TryFusedRmsNormGemv<T>(k_raw, d_residual_, input_norm, d_k_new_,
                                     seq_len, num_kv_heads_ * head_dim_,
                                     hidden_size_, rms_norm_eps_, stream_,
-                                    "k_proj")) {
+                                    "k_proj", &execution_policy_)) {
           if (!norm_computed) {
             err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_,
                                           seq_len, hidden_size_, rms_norm_eps_,
@@ -1236,7 +1253,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           }
           if (!TryFusedGemv<T>(k_raw, d_norm_out_, d_k_new_, seq_len,
                                num_kv_heads_ * head_dim_, hidden_size_, stream_,
-                               "k_proj")) {
+                               "k_proj", &execution_policy_)) {
             const T *k_proj =
                 reinterpret_cast<const T *>(weights_->LayerKProj(layer));
             if (!gemm_->GemmTyped<T>(seq_len, num_kv_heads_ * head_dim_,
@@ -1251,7 +1268,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         if (!TryFusedRmsNormGemv<T>(v_raw, d_residual_, input_norm, d_v_new_,
                                     seq_len, num_kv_heads_ * head_dim_,
                                     hidden_size_, rms_norm_eps_, stream_,
-                                    "v_proj")) {
+                                    "v_proj", &execution_policy_)) {
           if (!norm_computed) {
             err = cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_,
                                           seq_len, hidden_size_, rms_norm_eps_,
@@ -1265,7 +1282,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           }
           if (!TryFusedGemv<T>(v_raw, d_norm_out_, d_v_new_, seq_len,
                                num_kv_heads_ * head_dim_, hidden_size_, stream_,
-                               "v_proj")) {
+                               "v_proj", &execution_policy_)) {
             const T *v_proj =
                 reinterpret_cast<const T *>(weights_->LayerVProj(layer));
             if (!gemm_->GemmTyped<T>(seq_len, num_kv_heads_ * head_dim_,
@@ -1376,15 +1393,15 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       NVTX_SCOPE("O_Projection");
       auto o_raw = weights_->LayerOProjRaw(layer);
       if (!TryQ8_1Gemv<T>(o_raw, d_attn_out_, d_norm_out_, d_act_q8_1_, seq_len,
-                          hidden_size_, num_heads_ * head_dim_, stream_,
-                          "o_proj") &&
+                          hidden_size_, num_heads_ * head_dim_, stream_, "o_proj",
+                          &execution_policy_) &&
           !TryPackedGemv<T>(o_raw, d_attn_out_, d_norm_out_,
                             d_packed_activation_, d_packed_activation_scales_,
                             seq_len, hidden_size_, num_heads_ * head_dim_,
-                            stream_, "o_proj") &&
+                            stream_, "o_proj", &execution_policy_) &&
           !TryFusedGemv<T>(o_raw, d_attn_out_, d_norm_out_, seq_len,
                            hidden_size_, num_heads_ * head_dim_, stream_,
-                           "o_proj")) {
+                           "o_proj", &execution_policy_)) {
         const T *o_proj =
             reinterpret_cast<const T *>(weights_->LayerOProj(layer));
         if (!gemm_->GemmTyped<T>(seq_len, hidden_size_, num_heads_ * head_dim_,
@@ -1418,7 +1435,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       const char *ffn_phase = seq_len == 1 ? "decode" : "prefill";
       const auto ffn_selected_op = SelectFfnProjOperator(
           gate_raw, up_raw, seq_len, intermediate_size_, hidden_size_,
-          /*includes_rmsnorm=*/true);
+          /*includes_rmsnorm=*/true, execution_policy_);
       bool used_q8_1_ffn = false;
       bool used_packed_ffn = false;
       auto ffn_actual_op = FusedQuantGemm::FfnProjOperator::kFallback;
@@ -1427,7 +1444,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
               FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K) {
         used_q8_1_ffn = TryQ8_1ProjectionGroup(
             ffn_plans, d_residual_, post_attn_norm, d_act_q8_1_, seq_len,
-            hidden_size_, rms_norm_eps_, stream_);
+            hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
         if (used_q8_1_ffn) {
           ffn_actual_op = ffn_selected_op;
         }
@@ -1436,7 +1453,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         used_packed_ffn = TryPackedProjectionGroup(
             ffn_plans, d_residual_, post_attn_norm, d_norm_out_,
             d_packed_activation_, d_packed_activation_scales_, seq_len,
-            hidden_size_, rms_norm_eps_, stream_);
+            hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
         if (used_packed_ffn) {
           ffn_actual_op = ffn_selected_op;
         }
@@ -1446,7 +1463,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         used_packed_ffn = TryPackedProjectionGroup(
             ffn_plans, d_residual_, post_attn_norm, d_norm_out_,
             d_packed_activation_, d_packed_activation_scales_, seq_len,
-            hidden_size_, rms_norm_eps_, stream_);
+            hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
         if (used_packed_ffn) {
           ffn_actual_op = FusedQuantGemm::FfnProjOperator::kPackedGroup;
         }
@@ -1465,7 +1482,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         if (!TryFusedRmsNormGemv<T>(gate_raw, d_residual_, post_attn_norm,
                                     d_ffn_gate_, seq_len, intermediate_size_,
                                     hidden_size_, rms_norm_eps_, stream_,
-                                    "gate_proj")) {
+                                    "gate_proj", &execution_policy_)) {
           if (!ffn_norm_computed) {
             err = cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm,
                                           d_norm_out_, seq_len, hidden_size_,
@@ -1478,7 +1495,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           }
           if (!TryFusedGemv<T>(gate_raw, d_norm_out_, d_ffn_gate_, seq_len,
                                intermediate_size_, hidden_size_, stream_,
-                               "gate_proj")) {
+                               "gate_proj", &execution_policy_)) {
             const T *gate_proj =
                 reinterpret_cast<const T *>(weights_->LayerGateProj(layer));
             if (!gemm_->GemmTyped<T>(seq_len, intermediate_size_, hidden_size_,
@@ -1492,7 +1509,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         if (!TryFusedRmsNormGemv<T>(up_raw, d_residual_, post_attn_norm,
                                     d_ffn_up_, seq_len, intermediate_size_,
                                     hidden_size_, rms_norm_eps_, stream_,
-                                    "up_proj")) {
+                                    "up_proj", &execution_policy_)) {
           if (!ffn_norm_computed) {
             err = cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm,
                                           d_norm_out_, seq_len, hidden_size_,
@@ -1505,7 +1522,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           }
           if (!TryFusedGemv<T>(up_raw, d_norm_out_, d_ffn_up_, seq_len,
                                intermediate_size_, hidden_size_, stream_,
-                               "up_proj")) {
+                               "up_proj", &execution_policy_)) {
             const T *up_proj =
                 reinterpret_cast<const T *>(weights_->LayerUpProj(layer));
             if (!gemm_->GemmTyped<T>(seq_len, intermediate_size_, hidden_size_,
@@ -1521,7 +1538,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       auto down_raw = weights_->LayerDownProjRaw(layer);
       auto down_mmq = weights_->LayerDownProjMmq(layer);
       const auto down_selected_op = SelectDownProjOperator(
-          down_raw, down_mmq, seq_len, hidden_size_, intermediate_size_);
+          down_raw, down_mmq, seq_len, hidden_size_, intermediate_size_,
+          execution_policy_);
       bool fused_mmq_down = false;
       bool fused_q8_1_down = false;
       bool fused_packed_down = false;
@@ -1529,7 +1547,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       if (down_selected_op == FusedQuantGemm::DownProjOperator::kMmq) {
         fused_mmq_down = TryMmqSiluMulGemv<T>(
             down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-            seq_len, hidden_size_, intermediate_size_, stream_, "down_proj");
+            seq_len, hidden_size_, intermediate_size_, stream_, "down_proj",
+            &execution_policy_);
         if (fused_mmq_down) {
           down_actual_op = FusedQuantGemm::DownProjOperator::kMmq;
         }
@@ -1538,7 +1557,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
             TryQ8_1SiluMulGemv<T>(
                 down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
                 seq_len, hidden_size_, intermediate_size_, stream_,
-                "down_proj");
+                "down_proj", &execution_policy_);
         if (fused_q8_1_down) {
           down_actual_op = down_selected_op;
         }
@@ -1547,14 +1566,16 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         fused_packed_down = TryPackedSiluMulGemv<T>(
             down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
             d_packed_activation_, d_packed_activation_scales_, seq_len,
-            hidden_size_, intermediate_size_, stream_, "down_proj");
+            hidden_size_, intermediate_size_, stream_, "down_proj",
+            &execution_policy_);
         if (fused_packed_down) {
           down_actual_op = down_selected_op;
         }
       } else {
         fused_q8_1_down = TryQ8_1SiluMulGemv<T>(
             down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-            seq_len, hidden_size_, intermediate_size_, stream_, "down_proj");
+            seq_len, hidden_size_, intermediate_size_, stream_, "down_proj",
+            &execution_policy_);
         if (fused_q8_1_down) {
           down_actual_op = down_selected_op;
         }
@@ -1563,7 +1584,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
             TryMmqSiluMulGemv<T>(
                 down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
                 seq_len, hidden_size_, intermediate_size_, stream_,
-                "down_proj");
+                "down_proj", &execution_policy_);
         if (fused_mmq_down) {
           down_actual_op = FusedQuantGemm::DownProjOperator::kMmq;
         }
@@ -1573,7 +1594,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           TryPackedSiluMulGemv<T>(
               down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
               d_packed_activation_, d_packed_activation_scales_, seq_len,
-              hidden_size_, intermediate_size_, stream_, "down_proj");
+              hidden_size_, intermediate_size_, stream_, "down_proj",
+              &execution_policy_);
       if (fused_packed_down) {
         down_actual_op = FusedQuantGemm::DownProjOperator::kPackedGemv;
       }
@@ -1604,26 +1626,30 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         if (down_selected_op == FusedQuantGemm::DownProjOperator::kMmq) {
           down_ok = TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
                                   d_act_q8_1_, seq_len, hidden_size_,
-                                  intermediate_size_, stream_, "down_proj") ||
+                                  intermediate_size_, stream_, "down_proj",
+                                  &execution_policy_) ||
                     TryQ8_1Gemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
                                    d_act_q8_1_, seq_len, hidden_size_,
-                                   intermediate_size_, stream_, "down_proj");
+                                   intermediate_size_, stream_, "down_proj",
+                                   &execution_policy_);
         } else {
           down_ok = TryQ8_1Gemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
                                    d_act_q8_1_, seq_len, hidden_size_,
-                                   intermediate_size_, stream_, "down_proj") ||
+                                   intermediate_size_, stream_, "down_proj",
+                                   &execution_policy_) ||
                     TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
                                   d_act_q8_1_, seq_len, hidden_size_,
-                                  intermediate_size_, stream_, "down_proj");
+                                  intermediate_size_, stream_, "down_proj",
+                                  &execution_policy_);
         }
         if (!down_ok &&
             !TryPackedGemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
                               d_packed_activation_, d_packed_activation_scales_,
                               seq_len, hidden_size_, intermediate_size_,
-                              stream_, "down_proj") &&
+                              stream_, "down_proj", &execution_policy_) &&
             !TryFusedGemv<T>(down_raw, d_ffn_gate_, d_ffn_down_, seq_len,
                              hidden_size_, intermediate_size_, stream_,
-                             "down_proj")) {
+                             "down_proj", &execution_policy_)) {
           const T *down_proj =
               reinterpret_cast<const T *>(weights_->LayerDownProj(layer));
           if (!gemm_->GemmTyped<T>(seq_len, hidden_size_, intermediate_size_,
@@ -1655,12 +1681,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     auto lm_raw = weights_->LmHeadRaw();
     bool lm_q8_1_ok = false;
     {
-      static const bool q8_1_disabled = [] {
-        const char *env = std::getenv("INFERFLUX_DISABLE_Q8_1_ACTIVATIONS");
-        return env && (std::string(env) == "1" || std::string(env) == "true");
-      }();
       if constexpr (std::is_same_v<T, half>) {
-        if (!q8_1_disabled && lm_raw.data && d_act_q8_1_ &&
+        if (!Q81ActivationsDisabled(execution_policy_) && lm_raw.data &&
+            d_act_q8_1_ &&
             FusedQuantGemm::SupportsQ8_1Activations(lm_raw.quant_type) &&
             FusedQuantGemm::ShouldUseFusedPath(
                 lm_raw.quant_type,
@@ -1671,7 +1694,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                                    rms_norm_eps_, stream_);
           lm_q8_1_ok =
               FusedQuantGemm::GemvQ8_1(lm_raw, d_act_q8_1_, d_logits_typed_, 1,
-                                       vocab_size_, hidden_size_, stream_);
+                                       vocab_size_, hidden_size_, stream_,
+                                       &execution_policy_);
           if (lm_q8_1_ok) {
             LogPackedGemmPath("lm_head",
                               "using Q8_1 fused RmsNorm+Quantize+GEMV");
@@ -1683,10 +1707,12 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         !TryPackedRmsNormGemv<T>(
             lm_raw, last_hidden, final_norm, d_norm_out_, d_packed_activation_,
             d_packed_activation_scales_, d_logits_typed_, 1, vocab_size_,
-            hidden_size_, rms_norm_eps_, stream_, "lm_head") &&
+            hidden_size_, rms_norm_eps_, stream_, "lm_head",
+            &execution_policy_) &&
         !TryFusedRmsNormGemv<T>(lm_raw, last_hidden, final_norm,
                                 d_logits_typed_, 1, vocab_size_, hidden_size_,
-                                rms_norm_eps_, stream_, "lm_head")) {
+                                rms_norm_eps_, stream_, "lm_head",
+                                &execution_policy_)) {
       // Fallback: standalone RmsNorm + GEMV/cuBLAS
       err = cuda_kernel::RmsNorm<T>(last_hidden, final_norm, d_norm_out_, 1,
                                     hidden_size_, rms_norm_eps_, stream_);
@@ -1695,7 +1721,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         return false;
       }
       if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, 1, vocab_size_,
-                           hidden_size_, stream_, "lm_head")) {
+                           hidden_size_, stream_, "lm_head",
+                           &execution_policy_)) {
         const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
         if (!gemm_->GemmTyped<T>(1, vocab_size_, hidden_size_, d_norm_out_,
                                  lm_head, d_logits_typed_)) {
@@ -1727,6 +1754,12 @@ void LlamaForwardTyped<T>::SetStream(cudaStream_t stream) {
 }
 
 template <typename T>
+void LlamaForwardTyped<T>::SetExecutionPolicy(
+    const NativeExecutionPolicy &policy) {
+  execution_policy_ = policy;
+}
+
+template <typename T>
 bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                                         const std::vector<int> &n_past,
                                         const std::vector<int> &sequence_ids,
@@ -1734,13 +1767,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   NVTX_SCOPE("BatchForward");
   if (batch_size <= 0)
     return false;
-  // Batched decode opt-in: set INFERFLUX_ENABLE_BATCHED_DECODE=1 to use
-  // batched kernels (BatchedRoPE, BatchedKvAppend, FlashDecodeMultiSeq).
-  // Default: per-sequence Forward() loop (serialized but stable).
-  static const bool use_batched = [] {
-    const char *env = std::getenv("INFERFLUX_ENABLE_BATCHED_DECODE");
-    return env && (std::string(env) == "1" || std::string(env) == "true");
-  }();
+  const auto &policy = execution_policy_;
+  const bool use_batched = policy.enable_batched_decode;
   if (!use_batched) {
     bool all_ok = true;
     for (int b = 0; b < batch_size; ++b) {
@@ -1808,13 +1836,12 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   // CUDA graph capture eliminates per-kernel launch overhead
   // (~5-10μs × 250+ kernels = 1-2ms/token). Enabled by default;
   // disable with INFERFLUX_DISABLE_CUDA_GRAPH=1.
-  const bool phase_timing_enabled = PhaseTiming::IsEnabled();
-  static const bool graph_disabled =
-      std::getenv("INFERFLUX_DISABLE_CUDA_GRAPH") != nullptr;
+  const bool phase_timing_enabled = policy.phase_timing_enabled;
+  const bool graph_disabled = policy.disable_cuda_graph;
   const bool capture_safe =
       DecodeGraphCaptureSafe<T>(weights_, num_layers_, B, hidden_size_,
                                 num_heads_, num_kv_heads_, head_dim_,
-                                intermediate_size_, vocab_size_);
+                                intermediate_size_, vocab_size_, policy);
   if (graph_enabled_ && !graph_disabled && !phase_timing_enabled &&
       !capture_safe) {
     static bool logged_graph_fallback = false;
@@ -1828,7 +1855,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   bool use_graph = ShouldUseDecodeGraph(graph_enabled_, graph_disabled,
                                         phase_timing_enabled, capture_safe);
   PhaseTiming pt;
-  pt.Begin(stream_);
+  pt.Begin(stream_, phase_timing_enabled);
 
   // Fast path: replay existing graph if batch size matches
   if (use_graph && decode_graph_exec_ && graph_batch_size_ == B) {
@@ -1913,19 +1940,21 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
              {v_raw, d_v_new_, num_kv_heads_ * head_dim_}}};
         const bool used_q8_1_qkv = TryQ8_1ProjectionGroup(
             qkv_plans, d_residual_, input_norm, d_act_q8_1_, B, hidden_size_,
-            rms_norm_eps_, stream_);
+            rms_norm_eps_, stream_, &execution_policy_);
         const bool used_packed_qkv =
             !used_q8_1_qkv &&
             TryPackedProjectionGroup(qkv_plans, d_residual_, input_norm,
                                      d_norm_out_, d_packed_activation_,
                                      d_packed_activation_scales_, B,
-                                     hidden_size_, rms_norm_eps_, stream_);
+                                     hidden_size_, rms_norm_eps_, stream_,
+                                     &execution_policy_);
         if (!used_q8_1_qkv && !used_packed_qkv) {
           bool norm_computed = false;
 
           if (!TryFusedRmsNormGemv<T>(q_raw, d_residual_, input_norm, d_q_, B,
                                       num_heads_ * head_dim_, hidden_size_,
-                                      rms_norm_eps_, stream_, "q_proj")) {
+                                      rms_norm_eps_, stream_, "q_proj",
+                                      &execution_policy_)) {
             if (!norm_computed) {
               cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, B,
                                       hidden_size_, rms_norm_eps_, stream_);
@@ -1933,7 +1962,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             }
             if (!TryFusedGemv<T>(q_raw, d_norm_out_, d_q_, B,
                                  num_heads_ * head_dim_, hidden_size_, stream_,
-                                 "q_proj")) {
+                                 "q_proj", &execution_policy_)) {
               if (capturing) {
                 capture_abort = true;
                 return false;
@@ -1948,7 +1977,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
           if (!TryFusedRmsNormGemv<T>(k_raw, d_residual_, input_norm, d_k_new_,
                                       B, num_kv_heads_ * head_dim_,
                                       hidden_size_, rms_norm_eps_, stream_,
-                                      "k_proj")) {
+                                      "k_proj", &execution_policy_)) {
             if (!norm_computed) {
               cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, B,
                                       hidden_size_, rms_norm_eps_, stream_);
@@ -1956,7 +1985,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             }
             if (!TryFusedGemv<T>(k_raw, d_norm_out_, d_k_new_, B,
                                  num_kv_heads_ * head_dim_, hidden_size_,
-                                 stream_, "k_proj")) {
+                                 stream_, "k_proj", &execution_policy_)) {
               if (capturing) {
                 capture_abort = true;
                 return false;
@@ -1971,7 +2000,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
           if (!TryFusedRmsNormGemv<T>(v_raw, d_residual_, input_norm, d_v_new_,
                                       B, num_kv_heads_ * head_dim_,
                                       hidden_size_, rms_norm_eps_, stream_,
-                                      "v_proj")) {
+                                      "v_proj", &execution_policy_)) {
             if (!norm_computed) {
               cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, B,
                                       hidden_size_, rms_norm_eps_, stream_);
@@ -1979,7 +2008,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             }
             if (!TryFusedGemv<T>(v_raw, d_norm_out_, d_v_new_, B,
                                  num_kv_heads_ * head_dim_, hidden_size_,
-                                 stream_, "v_proj")) {
+                                 stream_, "v_proj", &execution_policy_)) {
               if (capturing) {
                 capture_abort = true;
                 return false;
@@ -2070,13 +2099,14 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
         auto o_raw = weights_->LayerOProjRaw(layer);
         if (!TryQ8_1Gemv<T>(o_raw, d_attn_out_, d_norm_out_, d_act_q8_1_, B,
                             hidden_size_, num_heads_ * head_dim_, stream_,
-                            "o_proj") &&
+                            "o_proj", &execution_policy_) &&
             !TryPackedGemv<T>(o_raw, d_attn_out_, d_norm_out_,
                               d_packed_activation_, d_packed_activation_scales_,
                               B, hidden_size_, num_heads_ * head_dim_, stream_,
-                              "o_proj") &&
+                              "o_proj", &execution_policy_) &&
             !TryFusedGemv<T>(o_raw, d_attn_out_, d_norm_out_, B, hidden_size_,
-                             num_heads_ * head_dim_, stream_, "o_proj")) {
+                             num_heads_ * head_dim_, stream_, "o_proj",
+                             &execution_policy_)) {
           if (capturing) {
             capture_abort = true;
             return false;
@@ -2103,7 +2133,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
              {up_raw, d_ffn_up_, intermediate_size_}}};
         const auto ffn_selected_op = SelectFfnProjOperator(
             gate_raw, up_raw, B, intermediate_size_, hidden_size_,
-            /*includes_rmsnorm=*/true);
+            /*includes_rmsnorm=*/true, execution_policy_);
         bool used_q8_1_ffn = false;
         bool used_packed_ffn = false;
         auto ffn_actual_op = FusedQuantGemm::FfnProjOperator::kFallback;
@@ -2112,7 +2142,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                 FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K) {
           used_q8_1_ffn = TryQ8_1ProjectionGroup(
               ffn_plans, d_residual_, post_attn_norm, d_act_q8_1_, B,
-              hidden_size_, rms_norm_eps_, stream_);
+              hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
           if (used_q8_1_ffn) {
             ffn_actual_op = ffn_selected_op;
           }
@@ -2121,7 +2151,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
           used_packed_ffn = TryPackedProjectionGroup(
               ffn_plans, d_residual_, post_attn_norm, d_norm_out_,
               d_packed_activation_, d_packed_activation_scales_, B,
-              hidden_size_, rms_norm_eps_, stream_);
+              hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
           if (used_packed_ffn) {
             ffn_actual_op = ffn_selected_op;
           }
@@ -2131,7 +2161,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
           used_packed_ffn = TryPackedProjectionGroup(
               ffn_plans, d_residual_, post_attn_norm, d_norm_out_,
               d_packed_activation_, d_packed_activation_scales_, B,
-              hidden_size_, rms_norm_eps_, stream_);
+              hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
           if (used_packed_ffn) {
             ffn_actual_op = FusedQuantGemm::FfnProjOperator::kPackedGroup;
           }
@@ -2150,7 +2180,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
           if (!TryFusedRmsNormGemv<T>(gate_raw, d_residual_, post_attn_norm,
                                       d_ffn_gate_, B, intermediate_size_,
                                       hidden_size_, rms_norm_eps_, stream_,
-                                      "gate_proj")) {
+                                      "gate_proj", &execution_policy_)) {
             if (!ffn_norm_computed) {
               cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm, d_norm_out_,
                                       B, hidden_size_, rms_norm_eps_, stream_);
@@ -2158,7 +2188,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             }
             if (!TryFusedGemv<T>(gate_raw, d_norm_out_, d_ffn_gate_, B,
                                  intermediate_size_, hidden_size_, stream_,
-                                 "gate_proj")) {
+                                 "gate_proj", &execution_policy_)) {
               if (capturing) {
                 capture_abort = true;
                 return false;
@@ -2173,7 +2203,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
           if (!TryFusedRmsNormGemv<T>(up_raw, d_residual_, post_attn_norm,
                                       d_ffn_up_, B, intermediate_size_,
                                       hidden_size_, rms_norm_eps_, stream_,
-                                      "up_proj")) {
+                                      "up_proj", &execution_policy_)) {
             if (!ffn_norm_computed) {
               cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm, d_norm_out_,
                                       B, hidden_size_, rms_norm_eps_, stream_);
@@ -2181,7 +2211,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             }
             if (!TryFusedGemv<T>(up_raw, d_norm_out_, d_ffn_up_, B,
                                  intermediate_size_, hidden_size_, stream_,
-                                 "up_proj")) {
+                                 "up_proj", &execution_policy_)) {
               if (capturing) {
                 capture_abort = true;
                 return false;
@@ -2198,7 +2228,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
         auto down_raw = weights_->LayerDownProjRaw(layer);
         auto down_mmq = weights_->LayerDownProjMmq(layer);
         const auto down_selected_op = SelectDownProjOperator(
-            down_raw, down_mmq, B, hidden_size_, intermediate_size_);
+            down_raw, down_mmq, B, hidden_size_, intermediate_size_,
+            execution_policy_);
         bool fused_mmq_down = false;
         bool fused_q8_1_down = false;
         bool fused_packed_down = false;
@@ -2206,7 +2237,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
         if (down_selected_op == FusedQuantGemm::DownProjOperator::kMmq) {
           fused_mmq_down = TryMmqSiluMulGemv<T>(
               down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_, B,
-              hidden_size_, intermediate_size_, stream_, "down_proj");
+              hidden_size_, intermediate_size_, stream_, "down_proj",
+              &execution_policy_);
           if (fused_mmq_down) {
             down_actual_op = FusedQuantGemm::DownProjOperator::kMmq;
           }
@@ -2214,7 +2246,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
               !fused_mmq_down &&
               TryQ8_1SiluMulGemv<T>(
                   down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-                  B, hidden_size_, intermediate_size_, stream_, "down_proj");
+                  B, hidden_size_, intermediate_size_, stream_, "down_proj",
+                  &execution_policy_);
           if (fused_q8_1_down) {
             down_actual_op = down_selected_op;
           }
@@ -2223,14 +2256,16 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
           fused_packed_down = TryPackedSiluMulGemv<T>(
               down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
               d_packed_activation_, d_packed_activation_scales_, B,
-              hidden_size_, intermediate_size_, stream_, "down_proj");
+              hidden_size_, intermediate_size_, stream_, "down_proj",
+              &execution_policy_);
           if (fused_packed_down) {
             down_actual_op = down_selected_op;
           }
         } else {
           fused_q8_1_down = TryQ8_1SiluMulGemv<T>(
               down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_, B,
-              hidden_size_, intermediate_size_, stream_, "down_proj");
+              hidden_size_, intermediate_size_, stream_, "down_proj",
+              &execution_policy_);
           if (fused_q8_1_down) {
             down_actual_op = down_selected_op;
           }
@@ -2238,7 +2273,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
               !fused_q8_1_down &&
               TryMmqSiluMulGemv<T>(
                   down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-                  B, hidden_size_, intermediate_size_, stream_, "down_proj");
+                  B, hidden_size_, intermediate_size_, stream_, "down_proj",
+                  &execution_policy_);
           if (fused_mmq_down) {
             down_actual_op = FusedQuantGemm::DownProjOperator::kMmq;
           }
@@ -2248,7 +2284,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             TryPackedSiluMulGemv<T>(
                 down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
                 d_packed_activation_, d_packed_activation_scales_, B,
-                hidden_size_, intermediate_size_, stream_, "down_proj");
+                hidden_size_, intermediate_size_, stream_, "down_proj",
+                &execution_policy_);
         if (fused_packed_down) {
           down_actual_op = FusedQuantGemm::DownProjOperator::kPackedGemv;
         }
@@ -2274,29 +2311,30 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             down_ok = TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
                                     d_act_q8_1_, B, hidden_size_,
                                     intermediate_size_, stream_,
-                                    "down_proj") ||
+                                    "down_proj", &execution_policy_) ||
                       TryQ8_1Gemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
                                      d_act_q8_1_, B, hidden_size_,
-                                     intermediate_size_, stream_,
-                                     "down_proj");
+                                     intermediate_size_, stream_, "down_proj",
+                                     &execution_policy_);
           } else {
             down_ok = TryQ8_1Gemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
                                      d_act_q8_1_, B, hidden_size_,
-                                     intermediate_size_, stream_,
-                                     "down_proj") ||
+                                     intermediate_size_, stream_, "down_proj",
+                                     &execution_policy_) ||
                       TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
                                     d_act_q8_1_, B, hidden_size_,
                                     intermediate_size_, stream_,
-                                    "down_proj");
+                                    "down_proj", &execution_policy_);
           }
           if (!down_ok &&
               !TryPackedGemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
                                 d_packed_activation_,
                                 d_packed_activation_scales_, B, hidden_size_,
-                                intermediate_size_, stream_, "down_proj") &&
+                                intermediate_size_, stream_, "down_proj",
+                                &execution_policy_) &&
               !TryFusedGemv<T>(down_raw, d_ffn_gate_, d_ffn_down_, B,
                                hidden_size_, intermediate_size_, stream_,
-                               "down_proj")) {
+                               "down_proj", &execution_policy_)) {
             if (capturing) {
               capture_abort = true;
               return false;
@@ -2322,11 +2360,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       // Q8_1 fused RmsNorm+Quantize+GEMV for LM head
       bool lm_q8_1_ok = false;
       if constexpr (std::is_same_v<T, half>) {
-        static const bool q8_1_disabled = [] {
-          const char *env = std::getenv("INFERFLUX_DISABLE_Q8_1_ACTIVATIONS");
-          return env && (std::string(env) == "1" || std::string(env) == "true");
-        }();
-        if (!q8_1_disabled && lm_raw.data && d_act_q8_1_ &&
+        if (!Q81ActivationsDisabled(execution_policy_) && lm_raw.data &&
+            d_act_q8_1_ &&
             FusedQuantGemm::SupportsQ8_1Activations(lm_raw.quant_type) &&
             FusedQuantGemm::ShouldUseFusedPath(
                 lm_raw.quant_type,
@@ -2337,7 +2372,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                                                    rms_norm_eps_, stream_);
           lm_q8_1_ok =
               FusedQuantGemm::GemvQ8_1(lm_raw, d_act_q8_1_, d_logits_typed_, B,
-                                       vocab_size_, hidden_size_, stream_);
+                                       vocab_size_, hidden_size_, stream_,
+                                       &execution_policy_);
         }
       }
       if (!lm_q8_1_ok &&
@@ -2345,14 +2381,16 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                                    d_packed_activation_,
                                    d_packed_activation_scales_, d_logits_typed_,
                                    B, vocab_size_, hidden_size_, rms_norm_eps_,
-                                   stream_, "lm_head") &&
+                                   stream_, "lm_head", &execution_policy_) &&
           !TryFusedRmsNormGemv<T>(lm_raw, d_residual_, final_norm,
                                   d_logits_typed_, B, vocab_size_, hidden_size_,
-                                  rms_norm_eps_, stream_, "lm_head")) {
+                                  rms_norm_eps_, stream_, "lm_head",
+                                  &execution_policy_)) {
         cuda_kernel::RmsNorm<T>(d_residual_, final_norm, d_norm_out_, B,
                                 hidden_size_, rms_norm_eps_, stream_);
         if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, B,
-                             vocab_size_, hidden_size_, stream_, "lm_head")) {
+                             vocab_size_, hidden_size_, stream_, "lm_head",
+                             &execution_policy_)) {
           if (capturing) {
             capture_abort = true;
             return false;

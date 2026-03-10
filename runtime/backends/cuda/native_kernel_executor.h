@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/model_loader.h"
+#include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/strategy_registry.h"
 #include "runtime/backends/cuda/native_cuda_runtime.h"
 #include "runtime/execution/unified_batch_lane_dispatcher.h"
@@ -351,6 +352,7 @@ private:
   // Controlled by INFERFLUX_NATIVE_TIMING_SAMPLE_RATE env var.
   int timing_sample_rate_{0};
   int timing_batch_counter_{0};
+  NativeExecutionPolicy execution_policy_{};
 
   struct NativePerfAccumulator {
     std::atomic<double> prefill_ms{0.0};
