@@ -37,4 +37,8 @@ __pycache__/
 # Local profiling outputs and backup scratch files.
 nsys_reports/
 gguf_benchmark_results/
+multi_backend_benchmark_results/
+cuda_native_profile_*/
+llama_cpp_profile_*/
+concurrent_fix_validation_*/
 *.old

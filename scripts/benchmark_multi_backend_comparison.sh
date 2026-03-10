@@ -2,7 +2,7 @@
 #
 # Multi-Backend Comparison Benchmark
 #
-# Benchmarks Ollama (Windows/WSL), cuda_native, and cuda_llama_cpp backends.
+# Benchmarks cuda_native, cuda_llama_cpp, Ollama, and LM Studio backends.
 # Measures throughput, latency percentiles, and GPU memory consumption across
 # multiple concurrency levels to generate scaling curves.
 #
@@ -13,12 +13,15 @@
 #
 # Environment Variables:
 #   OLLAMA_HOST           - Ollama server URL (default: http://192.168.1.20:11434)
+#   LMSTUDIO_HOST         - LM Studio server URL (default: http://192.168.1.20:1234)
+#   LMSTUDIO_MODEL        - LM Studio model id (default: auto-discover first /v1/models entry)
 #   CONCURRENCY_LEVELS    - Comma-separated concurrency levels (default: 1,2,4,8,16)
 #   NUM_REQUESTS          - Requests per concurrency level (default: 32)
 #   MAX_TOKENS            - Max tokens per request (default: 64)
 #   OUTPUT_DIR            - Results directory (default: ./multi_backend_benchmark_results)
 #   SKIP_OLLAMA           - Skip Ollama benchmark (default: false)
-#   BUILD_DIR             - Build directory (default: ./build)
+#   SKIP_LMSTUDIO         - Skip LM Studio benchmark (default: false)
+#   BUILD_DIR             - Build directory (default: auto-detect ./build or ./build-cuda)
 #   PORT_NATIVE           - Port for cuda_native (default: 18090)
 #   PORT_LLAMA            - Port for cuda_llama_cpp (default: 18091)
 
@@ -37,7 +40,7 @@ NC='\033[0m'
 
 DEFAULT_MODEL="models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf"
 MODEL_PATH="${1:-${MODEL_PATH:-$DEFAULT_MODEL}}"
-BUILD_DIR="${BUILD_DIR:-./build}"
+BUILD_DIR="${BUILD_DIR:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-./multi_backend_benchmark_results}"
 CONCURRENCY_LEVELS="${CONCURRENCY_LEVELS:-1,2,4,8,16}"
 NUM_REQUESTS="${NUM_REQUESTS:-32}"
@@ -48,9 +51,12 @@ API_KEY="${API_KEY:-dev-key-123}"
 PORT_NATIVE="${PORT_NATIVE:-18090}"
 PORT_LLAMA="${PORT_LLAMA:-18091}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://192.168.1.20:11434}"
+LMSTUDIO_HOST="${LMSTUDIO_HOST:-http://192.168.1.20:1234}"
+LMSTUDIO_MODEL="${LMSTUDIO_MODEL:-}"
 
 # Skip Ollama?
 SKIP_OLLAMA="${SKIP_OLLAMA:-false}"
+SKIP_LMSTUDIO="${SKIP_LMSTUDIO:-false}"
 
 # Logging
 log()      { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $1"; }
@@ -58,6 +64,25 @@ log_ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
 log_err()  { echo -e "${RED}[ERR]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 header()   { echo -e "\n${BOLD}$1${NC}"; echo "$(printf '=%.0s' $(seq 1 ${#1}))"; }
+
+resolve_build_dir() {
+    if [ -n "$BUILD_DIR" ]; then
+        echo "$BUILD_DIR"
+        return 0
+    fi
+
+    if [ -f "./build/inferfluxd" ]; then
+        echo "./build"
+        return 0
+    fi
+
+    if [ -f "./build-cuda/inferfluxd" ]; then
+        echo "./build-cuda"
+        return 0
+    fi
+
+    echo "./build"
+}
 
 # ============================================================================
 # GPU Memory Measurement
@@ -227,6 +252,38 @@ check_ollama_available() {
     return 0
 }
 
+check_lmstudio_available() {
+    log "Checking LM Studio availability at $LMSTUDIO_HOST..."
+
+    local models_json
+    models_json=$(curl -sf "$LMSTUDIO_HOST/v1/models" 2>/dev/null) || {
+        log_warn "LM Studio not available at $LMSTUDIO_HOST"
+        log_warn "Set LMSTUDIO_HOST=http://your-host:port or SKIP_LMSTUDIO=true"
+        return 1
+    }
+
+    if [ -z "$LMSTUDIO_MODEL" ]; then
+        LMSTUDIO_MODEL=$(printf '%s' "$models_json" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    models = data.get('data', [])
+    print(models[0].get('id', '') if models else '')
+except Exception:
+    print('')
+")
+    fi
+
+    if [ -z "$LMSTUDIO_MODEL" ]; then
+        log_warn \"LM Studio responded but no model id could be discovered from /v1/models\"
+        log_warn \"Set LMSTUDIO_MODEL explicitly\"
+        return 1
+    fi
+
+    log_ok "LM Studio is available (model=$LMSTUDIO_MODEL)"
+    return 0
+}
+
 # ============================================================================
 # Request Runner
 # ============================================================================
@@ -303,13 +360,49 @@ print(json.dumps({'request_id': '$request_id', 'text': text.strip(), 'tokens': t
     echo "$text" > "$output_file"
 }
 
+send_lmstudio_request() {
+    local prompt=$1 max_tokens=$2 output_file=$3 request_id=$4
+
+    mkdir -p "$(dirname "$output_file")"
+
+    local start_ns=$(date +%s%N)
+    local prompt_json
+    prompt_json=$(printf '%s' "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+
+    local response
+    response=$(curl -sf -X POST "${LMSTUDIO_HOST}/v1/completions" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\":\"${LMSTUDIO_MODEL}\",\"prompt\":$prompt_json,\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
+        --max-time 120 2>/dev/null) || {
+        echo "ERROR" > "$output_file"
+        return 1
+    }
+
+    local end_ns=$(date +%s%N)
+    local latency_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    local text
+    text=$(echo "$response" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+text = d.get('choices', [{}])[0].get('text', '')
+tokens = d.get('usage', {}).get('completion_tokens', 0)
+print(json.dumps({'request_id': '$request_id', 'text': text.strip(), 'tokens': tokens, 'latency_ms': $latency_ms}))
+" 2>/dev/null) || {
+        echo "PARSE_ERROR" > "$output_file"
+        return 1
+    }
+
+    echo "$text" > "$output_file"
+}
+
 # ============================================================================
 # Benchmark Runner
 # ============================================================================
 
 run_benchmark() {
     local backend=$1 concurrency=$2 port_or_url=$3
-    local is_ollama=$4
+    local backend_kind=$4
 
     local results_dir="$OUTPUT_DIR/responses_${backend}/c${concurrency}"
     mkdir -p "$results_dir"
@@ -318,11 +411,17 @@ run_benchmark() {
     log "  Warmup (2 requests)..."
     for i in 0 1; do
         local prompt="${PROMPTS[$((i % ${#PROMPTS[@]}))]}"
-        if [ "$is_ollama" = "true" ]; then
-            send_ollama_request "$prompt" "$MAX_TOKENS" "/dev/null" "warmup-$i" || true
-        else
-            send_inferflux_request "$port_or_url" "$prompt" "$MAX_TOKENS" "/dev/null" "warmup-$i" || true
-        fi
+        case "$backend_kind" in
+            ollama)
+                send_ollama_request "$prompt" "$MAX_TOKENS" "/dev/null" "warmup-$i" || true
+                ;;
+            lmstudio)
+                send_lmstudio_request "$prompt" "$MAX_TOKENS" "/dev/null" "warmup-$i" || true
+                ;;
+            *)
+                send_inferflux_request "$port_or_url" "$prompt" "$MAX_TOKENS" "/dev/null" "warmup-$i" || true
+                ;;
+        esac
     done
 
     # Measure GPU memory after warmup
@@ -353,11 +452,17 @@ run_benchmark() {
         local outfile="$results_dir/req_${i}.json"
         local request_id="bench-c${concurrency}-${i}"
 
-        if [ "$is_ollama" = "true" ]; then
-            send_ollama_request "$prompt" "$MAX_TOKENS" "$outfile" "$request_id" &
-        else
-            send_inferflux_request "$port_or_url" "$prompt" "$MAX_TOKENS" "$outfile" "$request_id" &
-        fi
+        case "$backend_kind" in
+            ollama)
+                send_ollama_request "$prompt" "$MAX_TOKENS" "$outfile" "$request_id" &
+                ;;
+            lmstudio)
+                send_lmstudio_request "$prompt" "$MAX_TOKENS" "$outfile" "$request_id" &
+                ;;
+            *)
+                send_inferflux_request "$port_or_url" "$prompt" "$MAX_TOKENS" "$outfile" "$request_id" &
+                ;;
+        esac
         pids+=($!)
 
         # Enforce concurrency limit
@@ -455,6 +560,8 @@ EOF
 # ============================================================================
 
 main() {
+    BUILD_DIR=$(resolve_build_dir)
+
     header "Multi-Backend Comparison Benchmark"
     echo "  Model:       $MODEL_PATH"
     echo "  GPU:         $(gpu_name)"
@@ -462,6 +569,7 @@ main() {
     echo "  Requests:    $NUM_REQUESTS per concurrency level"
     echo "  Max tokens:  $MAX_TOKENS"
     echo "  Concurrency: $CONCURRENCY_LEVELS"
+    echo "  Build dir:   $BUILD_DIR"
     echo ""
 
     mkdir -p "$OUTPUT_DIR"
@@ -493,17 +601,20 @@ main() {
 
     # Backend configurations
     declare -A BACKEND_PORTS
-    declare -A BACKEND_IS_OLLAMA
+    declare -A BACKEND_KIND
     declare -A BACKEND_AVAILABLE
 
     BACKEND_PORTS[cuda_native]=$PORT_NATIVE
-    BACKEND_IS_OLLAMA[cuda_native]=false
+    BACKEND_KIND[cuda_native]=inferflux
 
     BACKEND_PORTS[cuda_llama_cpp]=$PORT_LLAMA
-    BACKEND_IS_OLLAMA[cuda_llama_cpp]=false
+    BACKEND_KIND[cuda_llama_cpp]=inferflux
 
     BACKEND_PORTS[ollama]="$OLLAMA_HOST"
-    BACKEND_IS_OLLAMA[ollama]=true
+    BACKEND_KIND[ollama]=ollama
+
+    BACKEND_PORTS[lmstudio]="$LMSTUDIO_HOST"
+    BACKEND_KIND[lmstudio]=lmstudio
 
     # Check Ollama availability
     if [ "$SKIP_OLLAMA" = "true" ]; then
@@ -513,6 +624,15 @@ main() {
         BACKEND_AVAILABLE[ollama]=true
     else
         BACKEND_AVAILABLE[ollama]=false
+    fi
+
+    if [ "$SKIP_LMSTUDIO" = "true" ]; then
+        log_warn "Skipping LM Studio benchmark (SKIP_LMSTUDIO=true)"
+        BACKEND_AVAILABLE[lmstudio]=false
+    elif check_lmstudio_available; then
+        BACKEND_AVAILABLE[lmstudio]=true
+    else
+        BACKEND_AVAILABLE[lmstudio]=false
     fi
 
     # Start InferFlux servers
@@ -529,7 +649,7 @@ main() {
     done
 
     # Run benchmarks for all backends and concurrency levels
-    for backend in cuda_native cuda_llama_cpp ollama; do
+    for backend in cuda_native cuda_llama_cpp ollama lmstudio; do
         if [ "${BACKEND_AVAILABLE[$backend]}" != "true" ]; then
             continue
         fi
@@ -539,9 +659,9 @@ main() {
             header "Benchmarking: $backend @ concurrency=$concurrency"
 
             local port_or_url="${BACKEND_PORTS[$backend]}"
-            local is_ollama="${BACKEND_IS_OLLAMA[$backend]}"
+            local backend_kind="${BACKEND_KIND[$backend]}"
 
-            if ! run_benchmark "$backend" "$concurrency" "$port_or_url" "$is_ollama"; then
+            if ! run_benchmark "$backend" "$concurrency" "$port_or_url" "$backend_kind"; then
                 log_warn "  Some requests failed for $backend @ c=$concurrency"
             fi
 
@@ -579,7 +699,7 @@ import json, os, sys
 output_dir = sys.argv[1]
 concurrency_levels = sys.argv[2].split(',')
 
-backends = ['cuda_native', 'cuda_llama_cpp', 'ollama']
+backends = ['cuda_native', 'cuda_llama_cpp', 'ollama', 'lmstudio']
 
 # Load all results
 results = {}
@@ -653,7 +773,7 @@ output_dir = sys.argv[1]
 concurrency_levels = sys.argv[2].split(',')
 model_path = sys.argv[3]
 
-backends = ['cuda_native', 'cuda_llama_cpp', 'ollama']
+backends = ['cuda_native', 'cuda_llama_cpp', 'ollama', 'lmstudio']
 
 combined = {
     'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),

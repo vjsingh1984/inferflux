@@ -44,7 +44,9 @@ graph TD
 | Runtime architecture | [Architecture](Architecture.md) |
 | API surface | [API_SURFACE](API_SURFACE.md) |
 | Configuration | [CONFIG_REFERENCE](CONFIG_REFERENCE.md) |
+| **Benchmark results (validated vs Ollama)** | **[benchmarks](benchmarks.md)** ⭐ |
 | Monitoring and tuning | [MONITORING](MONITORING.md) |
+| **cuda_native scaling improvement plan** | **[cuda_native_scaling_roadmap](cuda_native_scaling_roadmap.md)** ⭐ |
 | Developer workflow + CI contracts | [DeveloperGuide](DeveloperGuide.md) |
 | Grades and execution plan | [Roadmap](Roadmap.md), [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |
 | Modernization migration guide | [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) |
