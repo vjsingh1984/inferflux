@@ -16,6 +16,31 @@ struct NativeFfnExecutionSummary {
   bool used_packed{false};
 };
 
+struct NativeGroupedProjectionSummary {
+  bool used_q81{false};
+  bool used_packed{false};
+};
+
+template <typename TryQ81Fn, typename TryPackedFn, typename FallbackFn>
+bool ExecuteNativeGroupedProjectionStage(TryQ81Fn &&try_q81_group,
+                                         TryPackedFn &&try_packed_group,
+                                         FallbackFn &&run_fallback,
+                                         NativeGroupedProjectionSummary *summary =
+                                             nullptr) {
+  NativeGroupedProjectionSummary local_summary;
+  local_summary.used_q81 = std::forward<TryQ81Fn>(try_q81_group)();
+  if (!local_summary.used_q81) {
+    local_summary.used_packed = std::forward<TryPackedFn>(try_packed_group)();
+  }
+  if (summary) {
+    *summary = local_summary;
+  }
+  if (!local_summary.used_q81 && !local_summary.used_packed) {
+    return std::forward<FallbackFn>(run_fallback)();
+  }
+  return true;
+}
+
 template <typename TryQ81Fn, typename TryPackedFn, typename FallbackFn>
 bool ExecuteNativeFfnProjectionStage(
     FusedQuantGemm::FfnProjOperator selected_op, const char *phase,

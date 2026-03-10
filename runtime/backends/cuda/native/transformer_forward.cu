@@ -1056,17 +1056,19 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
            {k_raw, d_k_new_, num_kv_heads_ * head_dim_},
            {v_raw, d_v_new_, num_kv_heads_ * head_dim_}}};
       // Priority: Q8_1 > packed per-row > fused RmsNorm+GEMV > cuBLAS
-      const bool used_q8_1_qkv = TryQ8_1ProjectionGroup(
-          qkv_plans, d_residual_, input_norm, d_act_q8_1_, seq_len,
-          hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
-      const bool used_packed_qkv =
-          !used_q8_1_qkv &&
-          TryPackedProjectionGroup(qkv_plans, d_residual_, input_norm,
-                                   d_norm_out_, d_packed_activation_,
-                                   d_packed_activation_scales_, seq_len,
-                                   hidden_size_, rms_norm_eps_, stream_,
-                                   &execution_policy_);
-      if (!used_q8_1_qkv && !used_packed_qkv) {
+      if (!ExecuteNativeGroupedProjectionStage(
+              [&]() {
+                return TryQ8_1ProjectionGroup(
+                    qkv_plans, d_residual_, input_norm, d_act_q8_1_, seq_len,
+                    hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
+              },
+              [&]() {
+                return TryPackedProjectionGroup(
+                    qkv_plans, d_residual_, input_norm, d_norm_out_,
+                    d_packed_activation_, d_packed_activation_scales_, seq_len,
+                    hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
+              },
+              [&]() {
         bool norm_computed = false;
 
         if (!TryFusedRmsNormGemv<T>(q_raw, d_residual_, input_norm, d_q_,
@@ -1155,6 +1157,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
             }
           }
         }
+        return true;
+      })) {
+        return false;
       }
 
       // Add biases if present (Qwen2 has q/k/v biases)
@@ -1752,17 +1757,19 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             {{q_raw, d_q_, num_heads_ * head_dim_},
              {k_raw, d_k_new_, num_kv_heads_ * head_dim_},
              {v_raw, d_v_new_, num_kv_heads_ * head_dim_}}};
-        const bool used_q8_1_qkv = TryQ8_1ProjectionGroup(
-            qkv_plans, d_residual_, input_norm, d_act_q8_1_, B, hidden_size_,
-            rms_norm_eps_, stream_, &execution_policy_);
-        const bool used_packed_qkv =
-            !used_q8_1_qkv &&
-            TryPackedProjectionGroup(qkv_plans, d_residual_, input_norm,
-                                     d_norm_out_, d_packed_activation_,
-                                     d_packed_activation_scales_, B,
-                                     hidden_size_, rms_norm_eps_, stream_,
-                                     &execution_policy_);
-        if (!used_q8_1_qkv && !used_packed_qkv) {
+        if (!ExecuteNativeGroupedProjectionStage(
+                [&]() {
+                  return TryQ8_1ProjectionGroup(
+                      qkv_plans, d_residual_, input_norm, d_act_q8_1_, B,
+                      hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
+                },
+                [&]() {
+                  return TryPackedProjectionGroup(
+                      qkv_plans, d_residual_, input_norm, d_norm_out_,
+                      d_packed_activation_, d_packed_activation_scales_, B,
+                      hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
+                },
+                [&]() {
           bool norm_computed = false;
 
           if (!TryFusedRmsNormGemv<T>(q_raw, d_residual_, input_norm, d_q_, B,
@@ -1833,6 +1840,9 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                                   d_norm_out_, v_proj, d_v_new_);
             }
           }
+          return true;
+        })) {
+          return false;
         }
 
         // Biases (if present)

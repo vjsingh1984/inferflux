@@ -5095,6 +5095,33 @@ TEST_CASE("NativeLinearExecutor: FFN helper falls back from Q8_1 to packed "
   REQUIRE(summary.actual_op == FusedQuantGemm::FfnProjOperator::kPackedGroup);
 }
 
+TEST_CASE("NativeLinearExecutor: grouped projection helper uses packed path "
+          "before generic fallback",
+          "[native_forward]") {
+  std::vector<std::string> calls;
+  NativeGroupedProjectionSummary summary;
+
+  const bool ok = ExecuteNativeGroupedProjectionStage(
+      [&]() {
+        calls.emplace_back("q81");
+        return false;
+      },
+      [&]() {
+        calls.emplace_back("packed");
+        return true;
+      },
+      [&]() {
+        calls.emplace_back("fallback");
+        return false;
+      },
+      &summary);
+
+  REQUIRE(ok);
+  REQUIRE(calls == std::vector<std::string>{"q81", "packed"});
+  REQUIRE_FALSE(summary.used_q81);
+  REQUIRE(summary.used_packed);
+}
+
 TEST_CASE("NativeLinearExecutor: down-proj helper invokes fallback only after "
           "all fused paths miss",
           "[native_forward]") {
