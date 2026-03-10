@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/model_loader.h"
+#include "runtime/backends/cuda/native/native_bootstrap_config.h"
 #include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/strategy_registry.h"
 #include "runtime/backends/cuda/native_cuda_runtime.h"
@@ -263,7 +264,7 @@ private:
   InferenceDtype inference_dtype_{InferenceDtype::kFP16};
   runtime::cuda::native::KvPrecision kv_precision_{
       runtime::cuda::native::KvPrecision::kFp16};
-  std::string kv_precision_hint_{"auto"};
+  NativeBootstrapConfig bootstrap_config_{};
   runtime::cuda::native::DequantizedCachePolicy dequantized_cache_policy_{
       runtime::cuda::native::DequantizedCachePolicy::kNone};
   std::string dequantized_cache_policy_hint_{"none"};

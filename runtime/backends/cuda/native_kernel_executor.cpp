@@ -111,42 +111,9 @@ bool CheckedMulSize(std::size_t a, std::size_t b, std::size_t *out) {
 }
 
 // Use inferflux::ToLower from string_utils.h (included via header chain).
-// Local wrappers for backward compatibility with call sites.
+// Local wrapper for backward compatibility with call sites.
 std::string ToLowerAscii(const std::string &value) {
   return inferflux::ToLower(value);
-}
-
-bool ParsePositiveIntSetting(const char *raw, int *out) {
-  if (!raw || !out) {
-    return false;
-  }
-  char *end = nullptr;
-  const long parsed = std::strtol(raw, &end, 10);
-  if (end == raw || *end != '\0' || parsed <= 0 ||
-      parsed > static_cast<long>(std::numeric_limits<int>::max())) {
-    return false;
-  }
-  *out = static_cast<int>(parsed);
-  return true;
-}
-
-bool ParsePositiveDoubleSetting(const char *raw, double *out) {
-  if (!raw || !out) {
-    return false;
-  }
-  char *end = nullptr;
-  const double parsed = std::strtod(raw, &end);
-  if (end == raw || *end != '\0' || !std::isfinite(parsed) || parsed <= 0.0) {
-    return false;
-  }
-  *out = parsed;
-  return true;
-}
-
-bool ParseBoolSetting(const char *raw, bool fallback) {
-  if (!raw)
-    return fallback;
-  return inferflux::ParseBool(raw);
 }
 
 bool DecodeMappingDebugEnabled(
@@ -1270,19 +1237,16 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
 bool NativeKernelExecutor::InitializeNativePipeline() {
   const auto &config = model_config_;
 
-  // Detect inference dtype from model config (overridable via env var)
+  // Detect inference dtype from model config (overridable via bootstrap env).
   bool want_bf16 = (config.torch_dtype == "bfloat16");
-  const char *dtype_override = std::getenv("INFERFLUX_NATIVE_DTYPE");
-  if (dtype_override) {
-    if (std::string(dtype_override) == "fp16") {
-      want_bf16 = false;
-      log::Info("native_kernel_executor",
-                "INFERFLUX_NATIVE_DTYPE=fp16 override: forcing FP16 pipeline");
-    } else if (std::string(dtype_override) == "bf16") {
-      want_bf16 = true;
-      log::Info("native_kernel_executor",
-                "INFERFLUX_NATIVE_DTYPE=bf16 override: forcing BF16 pipeline");
-    }
+  if (bootstrap_config_.ForceFp16()) {
+    want_bf16 = false;
+    log::Info("native_kernel_executor",
+              "INFERFLUX_NATIVE_DTYPE=fp16 override: forcing FP16 pipeline");
+  } else if (bootstrap_config_.ForceBf16()) {
+    want_bf16 = true;
+    log::Info("native_kernel_executor",
+              "INFERFLUX_NATIVE_DTYPE=bf16 override: forcing BF16 pipeline");
   }
   if (want_bf16 && !CheckBF16Support()) {
     log::Warn("native_kernel_executor",
@@ -1291,14 +1255,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   }
   inference_dtype_ = want_bf16 ? InferenceDtype::kBF16 : InferenceDtype::kFP16;
 
-  std::string kv_precision_choice = kv_precision_hint_;
-  if (const char *env_kv_precision = std::getenv("INFERFLUX_NATIVE_KV_DTYPE")) {
-    kv_precision_choice = env_kv_precision;
-  }
-  kv_precision_choice = ToLowerAscii(kv_precision_choice);
-  if (kv_precision_choice.empty()) {
-    kv_precision_choice = "auto";
-  }
+  const std::string &kv_precision_choice = bootstrap_config_.kv_precision_choice;
 
   if (kv_precision_choice == "auto") {
     kv_precision_ = want_bf16 ? runtime::cuda::native::KvPrecision::kBf16
@@ -1342,20 +1299,16 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   // 2. Allocate KV cache (independent precision policy)
   // Defaults can be overridden via env vars to reduce GPU memory usage.
   // Default max_batch is scheduler-aligned to avoid reserving unused slots.
-  int max_batch = 16;
-  int max_seq = 4096;
-  bool max_seq_overridden = false;
-  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_MAX_BATCH")) {
-    int val = 0;
-    if (ParsePositiveIntSetting(env, &val) && val <= 128) {
-      max_batch = val;
-      log::Info("native_kernel_executor",
-                "KV cache max_batch overridden to " + std::to_string(val));
-    } else {
-      log::Warn("native_kernel_executor",
-                "Ignoring invalid INFERFLUX_NATIVE_KV_MAX_BATCH='" +
-                    std::string(env) + "'");
-    }
+  int max_batch = bootstrap_config_.kv_max_batch;
+  int max_seq = bootstrap_config_.kv_max_seq;
+  bool max_seq_overridden = bootstrap_config_.kv_max_seq_overridden;
+  if (!bootstrap_config_.invalid_kv_max_batch.empty()) {
+    log::Warn("native_kernel_executor",
+              "Ignoring invalid INFERFLUX_NATIVE_KV_MAX_BATCH='" +
+                  bootstrap_config_.invalid_kv_max_batch + "'");
+  } else if (max_batch != 16) {
+    log::Info("native_kernel_executor",
+              "KV cache max_batch overridden to " + std::to_string(max_batch));
   }
   // Scheduler allocates sequence slot IDs 0..15, so KV cache needs ≥16 slots.
   constexpr int kMinKvBatch = 16;
@@ -1366,51 +1319,32 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
                   "), clamping to " + std::to_string(kMinKvBatch));
     max_batch = kMinKvBatch;
   }
-  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_MAX_SEQ")) {
-    int val = 0;
-    if (ParsePositiveIntSetting(env, &val) && val <= 131072) {
-      max_seq = val;
-      max_seq_overridden = true;
-      log::Info("native_kernel_executor",
-                "KV cache max_seq overridden to " + std::to_string(val));
-    } else {
-      log::Warn("native_kernel_executor",
-                "Ignoring invalid INFERFLUX_NATIVE_KV_MAX_SEQ='" +
-                    std::string(env) + "'");
-    }
+  if (!bootstrap_config_.invalid_kv_max_seq.empty()) {
+    log::Warn("native_kernel_executor",
+              "Ignoring invalid INFERFLUX_NATIVE_KV_MAX_SEQ='" +
+                  bootstrap_config_.invalid_kv_max_seq + "'");
+  } else if (max_seq_overridden) {
+    log::Info("native_kernel_executor",
+              "KV cache max_seq overridden to " + std::to_string(max_seq));
   }
   if (config.max_position_embeddings > 0 &&
       config.max_position_embeddings < max_seq) {
     max_seq = config.max_position_embeddings;
   }
 
-  bool kv_auto_tune = true;
-  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_AUTO_TUNE")) {
-    kv_auto_tune = ParseBoolSetting(env, true);
+  const bool kv_auto_tune = bootstrap_config_.kv_auto_tune;
+  const std::size_t kv_budget_bytes = bootstrap_config_.kv_budget_bytes;
+  if (!bootstrap_config_.invalid_kv_budget_mb.empty()) {
+    log::Warn("native_kernel_executor",
+              "Ignoring invalid INFERFLUX_NATIVE_KV_BUDGET_MB='" +
+                  bootstrap_config_.invalid_kv_budget_mb + "'");
   }
 
-  std::size_t kv_budget_bytes = 0;
-  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_BUDGET_MB")) {
-    int budget_mb = 0;
-    if (ParsePositiveIntSetting(env, &budget_mb)) {
-      kv_budget_bytes = static_cast<std::size_t>(budget_mb) * kMiB;
-    } else {
-      log::Warn("native_kernel_executor",
-                "Ignoring invalid INFERFLUX_NATIVE_KV_BUDGET_MB='" +
-                    std::string(env) + "'");
-    }
-  }
-
-  double kv_budget_ratio = 0.30;
-  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_FREE_MEM_RATIO")) {
-    double parsed = 0.0;
-    if (ParsePositiveDoubleSetting(env, &parsed) && parsed <= 1.0) {
-      kv_budget_ratio = parsed;
-    } else {
-      log::Warn("native_kernel_executor",
-                "Ignoring invalid INFERFLUX_NATIVE_KV_FREE_MEM_RATIO='" +
-                    std::string(env) + "'");
-    }
+  const double kv_budget_ratio = bootstrap_config_.kv_budget_ratio;
+  if (!bootstrap_config_.invalid_kv_free_mem_ratio.empty()) {
+    log::Warn("native_kernel_executor",
+              "Ignoring invalid INFERFLUX_NATIVE_KV_FREE_MEM_RATIO='" +
+                  bootstrap_config_.invalid_kv_free_mem_ratio + "'");
   }
 
   std::size_t free_bytes = 0;
@@ -1772,8 +1706,9 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   // Initialize phase overlap settings from config
   overlap_enabled_ = config.cuda_phase_overlap_scaffold;
   min_prefill_tokens_ = config.cuda_phase_overlap_min_prefill_tokens;
-  kv_precision_hint_ = config.native_kv_cache_dtype;
   dequantized_cache_policy_hint_ = config.native_dequantized_cache_policy;
+  bootstrap_config_ =
+      NativeBootstrapConfig::FromEnv(config.native_kv_cache_dtype);
   require_fused_quantized_matmul_ =
       config.native_require_fused_quantized_matmul;
   execution_policy_ = NativeExecutionPolicy::FromEnv();
@@ -1794,7 +1729,8 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
       "Phase overlap: " +
           std::string(overlap_enabled_ ? "enabled" : "disabled") +
           ", min_prefill_tokens=" + std::to_string(min_prefill_tokens_) +
-          ", kv_dtype_hint=" + kv_precision_hint_ + ", dequant_cache_policy=" +
+          ", kv_dtype_hint=" + bootstrap_config_.kv_precision_choice +
+          ", dequant_cache_policy=" +
           dequantized_cache_policy_hint_ + ", require_fused_quantized_matmul=" +
           std::string(require_fused_quantized_matmul_ ? "true" : "false"));
 
@@ -1829,8 +1765,7 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
     bool skip_bf16 = false;
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
     {
-      const char *dtype_override = std::getenv("INFERFLUX_NATIVE_DTYPE");
-      bool force_fp16 = dtype_override && std::string(dtype_override) == "fp16";
+      bool force_fp16 = bootstrap_config_.ForceFp16();
       if (model_config_.torch_dtype == "bfloat16" && CheckBF16Support() &&
           !force_fp16) {
         skip_bf16 = true;
