@@ -134,6 +134,42 @@ inline InferenceRequest BuildGenerationRequestEnvelope(
   return request;
 }
 
+struct HttpGenerationExecutionContext {
+  std::string model;
+  std::string audit_prompt;
+  std::string trace_response_header;
+  std::string stream_id;
+  std::time_t stream_created_at{0};
+};
+
+inline HttpGenerationExecutionContext BuildGenerationExecutionContext(
+    const InferenceRequest &request, bool is_legacy_completions,
+    bool stream_enabled, std::time_t stream_created_at = 0) {
+  HttpGenerationExecutionContext context;
+  context.model = request.model;
+  context.audit_prompt = request.prompt;
+
+  SpanContext parent_ctx;
+  parent_ctx.trace_id = request.trace_id;
+  SpanContext request_ctx = tracing::ChildContext(parent_ctx);
+  if (request_ctx.valid()) {
+    context.trace_response_header =
+        "traceparent: " + request_ctx.ToTraceparent() + "\r\n";
+  }
+  if (is_legacy_completions) {
+    context.trace_response_header +=
+        "Deprecation: true\r\n"
+        "Sunset: 2025-06-01\r\n"
+        "Link: </v1/chat/completions>; rel=\"successor-version\"\r\n";
+  }
+  if (stream_enabled && stream_created_at > 0) {
+    context.stream_created_at = stream_created_at;
+    context.stream_id =
+        std::string("chatcmpl-") + std::to_string(stream_created_at);
+  }
+  return context;
+}
+
 // Test-visible metadata normalization helper. Payload-provided values take
 // precedence over headers; trace_id is derived from an incoming traceparent
 // header when present and valid.

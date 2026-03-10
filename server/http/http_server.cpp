@@ -100,6 +100,12 @@ std::string GetHeaderValue(const std::string &headers,
   return LookupHeaderValueForTest(headers, name);
 }
 
+std::time_t CurrentUnixTimeSeconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
 std::string BuildResponse(const std::string &body, int status = 200,
                           std::string_view status_text = "OK",
                           const std::string &extra_headers = "") {
@@ -2810,6 +2816,10 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
       return;
     }
+    const HttpGenerationExecutionContext execution_context =
+        BuildGenerationExecutionContext(
+            req, is_legacy_completions, parsed.stream,
+            parsed.stream ? CurrentUnixTimeSeconds() : 0);
     // ── Multi-completion path (n>1 or best_of>1) ──────────────────────────
     // Must be handled before the streaming setup because n>1 is incompatible
     // with SSE streaming (no way to interleave independent completion tokens).
@@ -2915,71 +2925,42 @@ void HttpServer::HandleClient(ClientSession &session) {
                                 total_completion_tokens);
       }
       if (audit_logger_ && !all_results.empty()) {
-        audit_logger_->LogRequest(auth_ctx.subject, parsed.model, req.prompt,
+        audit_logger_->LogRequest(auth_ctx.subject, execution_context.model,
+                                  execution_context.audit_prompt,
                                   all_results[0].completion,
                                   all_results[0].prompt_tokens,
                                   total_completion_tokens);
       }
 
-      SpanContext mc_parent;
-      mc_parent.trace_id = req.trace_id;
-      SpanContext mc_ctx = tracing::ChildContext(mc_parent);
-      std::string mc_trace_hdr;
-      if (mc_ctx.valid())
-        mc_trace_hdr = "traceparent: " + mc_ctx.ToTraceparent() + "\r\n";
-
       SendAll(session, BuildResponse(BuildCompletionBody(
                                          all_results, total_completion_tokens,
                                          parsed, chat_mode, tool_calls),
-                                     200, "OK", mc_trace_hdr));
+                                     200, "OK",
+                                     execution_context.trace_response_header));
       return;
     }
     // ── End multi-completion path ──────────────────────────────────────────
 
-    // Build a child SpanContext for this request so downstream services can
-    // correlate spans. The traceparent is emitted in the response header.
-    SpanContext parent_ctx;
-    parent_ctx.trace_id = req.trace_id;
-    SpanContext request_ctx = tracing::ChildContext(parent_ctx);
-    std::string trace_response_header;
-    if (request_ctx.valid()) {
-      trace_response_header =
-          "traceparent: " + request_ctx.ToTraceparent() + "\r\n";
-    }
-    if (is_legacy_completions) {
-      trace_response_header +=
-          "Deprecation: true\r\n"
-          "Sunset: 2025-06-01\r\n"
-          "Link: </v1/chat/completions>; rel=\"successor-version\"\r\n";
-    }
-
-    std::string stream_id;
-    std::time_t stream_ts = 0;
     auto stream_mutex = std::make_shared<std::mutex>();
     auto stream_active = std::make_shared<std::atomic<bool>>(false);
-    auto stream_had_chunk = std::make_shared<std::atomic<bool>>(false);
     auto stream_cancel_flag = std::make_shared<std::atomic<bool>>(false);
     // Declared here (outer scope) so they're visible in both the streaming
     // setup block and the post-Generate streaming completion block.
     auto token_buffer = std::make_shared<std::vector<std::string>>();
     bool buffer_tokens = use_tools;
     if (parsed.stream) {
-      stream_ts = std::chrono::duration_cast<std::chrono::seconds>(
-                      std::chrono::system_clock::now().time_since_epoch())
-                      .count();
       stream_active->store(true);
-      stream_id = std::string("chatcmpl-") + std::to_string(stream_ts);
       std::string stream_headers = "HTTP/1.1 200 OK\r\n"
                                    "Content-Type: text/event-stream\r\n"
                                    "Cache-Control: no-cache\r\n"
                                    "Connection: keep-alive\r\n" +
-                                   trace_response_header + "\r\n";
+                                   execution_context.trace_response_header +
+                                   "\r\n";
       if (!SendAll(session, stream_headers)) {
         return;
       }
       req.cancellation_flag = stream_cancel_flag;
       ClientSession *stream_session = &session;
-      std::string stream_model = parsed.model;
       // §2.3: when tools are active we cannot stream tokens as content deltas
       // because we don't know until the full completion arrives whether the
       // model produced a tool_call JSON envelope or plain text.  Buffer all
@@ -2991,10 +2972,9 @@ void HttpServer::HandleClient(ClientSession &session) {
       // per-token streaming path runs unchanged.
       bool stream_collect_logprobs = req.collect_logprobs;
       req.on_token = [this, stream_session, stream_mutex, stream_active,
-                      stream_had_chunk, stream_cancel_flag, stream_id,
-                      stream_model, stream_ts, token_buffer, buffer_tokens,
-                      stream_collect_logprobs](const std::string &chunk,
-                                               const TokenLogprob *lp) {
+                      stream_cancel_flag, token_buffer, buffer_tokens,
+                      stream_collect_logprobs, execution_context](
+                         const std::string &chunk, const TokenLogprob *lp) {
         if (chunk.empty() || !stream_active->load()) {
           return;
         }
@@ -3008,7 +2988,8 @@ void HttpServer::HandleClient(ClientSession &session) {
         // delta (no splitting) so the logprob is paired 1:1 with its token.
         if (stream_collect_logprobs && lp != nullptr) {
           std::string payload = BuildStreamChunk(
-              stream_id, stream_model, stream_ts, chunk, false, "stop", lp);
+              execution_context.stream_id, execution_context.model,
+              execution_context.stream_created_at, chunk, false, "stop", lp);
           std::lock_guard<std::mutex> lock(*stream_mutex);
           if (!stream_active->load()) {
             return;
@@ -3018,13 +2999,13 @@ void HttpServer::HandleClient(ClientSession &session) {
             stream_cancel_flag->store(true);
             return;
           }
-          stream_had_chunk->store(true);
           return;
         }
         auto pieces = SplitForStreaming(chunk);
         for (const auto &piece : pieces) {
-          std::string payload = BuildStreamChunk(stream_id, stream_model,
-                                                 stream_ts, piece, false);
+          std::string payload = BuildStreamChunk(
+              execution_context.stream_id, execution_context.model,
+              execution_context.stream_created_at, piece, false);
           std::lock_guard<std::mutex> lock(*stream_mutex);
           if (!stream_active->load()) {
             return;
@@ -3034,12 +3015,9 @@ void HttpServer::HandleClient(ClientSession &session) {
             stream_cancel_flag->store(true);
             return;
           }
-          stream_had_chunk->store(true);
         }
       };
     }
-
-    const std::string audit_prompt = req.prompt;
     try {
       auto future = scheduler_->Generate(std::move(req));
       auto result = future.get();
@@ -3068,13 +3046,21 @@ void HttpServer::HandleClient(ClientSession &session) {
             std::lock_guard<std::mutex> lock(*stream_mutex);
             if (nb_tc.detected) {
               SendAll(session, BuildToolCallStreamChunks(
-                                   stream_id, parsed.model, stream_ts, nb_tc));
+                                   execution_context.stream_id,
+                                   execution_context.model,
+                                   execution_context.stream_created_at,
+                                   nb_tc));
             } else {
               SendAll(session,
-                      BuildStreamChunk(stream_id, parsed.model, stream_ts,
+                      BuildStreamChunk(execution_context.stream_id,
+                                       execution_context.model,
+                                       execution_context.stream_created_at,
                                        result.completion, false));
-              SendAll(session, BuildStreamChunk(stream_id, parsed.model,
-                                                stream_ts, "", true));
+              SendAll(session, BuildStreamChunk(
+                                   execution_context.stream_id,
+                                   execution_context.model,
+                                   execution_context.stream_created_at, "",
+                                   true));
             }
             SendAll(session, "data: [DONE]\n\n");
           }
@@ -3082,12 +3068,12 @@ void HttpServer::HandleClient(ClientSession &session) {
         } else {
           auto payload =
               BuildResponse(BuildCompletionBody(result, parsed, chat_mode), 200,
-                            "OK", trace_response_header);
+                            "OK", execution_context.trace_response_header);
           SendAll(session, payload);
         }
         if (audit_logger_) {
-          audit_logger_->Log(auth_ctx.subject, parsed.model, "no_backend",
-                             result.completion);
+          audit_logger_->Log(auth_ctx.subject, execution_context.model,
+                             "no_backend", result.completion);
         }
         return;
       }
@@ -3100,9 +3086,10 @@ void HttpServer::HandleClient(ClientSession &session) {
                                     result.speculative.reused_tokens);
       }
       if (audit_logger_) {
-        audit_logger_->LogRequest(auth_ctx.subject, parsed.model, audit_prompt,
-                                  result.completion, result.prompt_tokens,
-                                  result.completion_tokens);
+        audit_logger_->LogRequest(
+            auth_ctx.subject, execution_context.model,
+            execution_context.audit_prompt, result.completion,
+            result.prompt_tokens, result.completion_tokens);
       }
       // §2.3: detect tool call in model output (used by non-streaming
       // responses).
@@ -3136,8 +3123,8 @@ void HttpServer::HandleClient(ClientSession &session) {
           LogToolEvent(log_line);
           std::cout << log_line << std::endl;
           if (audit_logger_) {
-            audit_logger_->Log(auth_ctx.subject, parsed.model, "tool_call_stub",
-                               arguments.dump());
+            audit_logger_->Log(auth_ctx.subject, execution_context.model,
+                               "tool_call_stub", arguments.dump());
           }
         } else {
           tool_call = DetectToolCall(result.completion);
@@ -3153,32 +3140,40 @@ void HttpServer::HandleClient(ClientSession &session) {
               // §2.3: emit structured tool_calls delta sequence (role → name →
               // args → finish).
               SendAll(session,
-                      BuildToolCallStreamChunks(stream_id, parsed.model,
-                                                stream_ts, tool_call));
+                      BuildToolCallStreamChunks(
+                          execution_context.stream_id, execution_context.model,
+                          execution_context.stream_created_at, tool_call));
             } else if (buffer_tokens && !token_buffer->empty()) {
               // Model produced plain text despite tools[] being present (no
               // tool call detected).  Replay the buffered tokens as content
               // deltas.
               for (const auto &tok : *token_buffer) {
                 for (const auto &piece : SplitForStreaming(tok)) {
-                  SendAll(session, BuildStreamChunk(stream_id, parsed.model,
-                                                    stream_ts, piece, false));
+                  SendAll(session,
+                          BuildStreamChunk(execution_context.stream_id,
+                                           execution_context.model,
+                                           execution_context.stream_created_at,
+                                           piece, false));
                 }
               }
               SendAll(session,
-                      BuildStreamChunk(stream_id, parsed.model, stream_ts, "",
+                      BuildStreamChunk(execution_context.stream_id,
+                                       execution_context.model,
+                                       execution_context.stream_created_at, "",
                                        true, stream_finish_reason));
             } else {
               SendAll(session,
-                      BuildStreamChunk(stream_id, parsed.model, stream_ts, "",
+                      BuildStreamChunk(execution_context.stream_id,
+                                       execution_context.model,
+                                       execution_context.stream_created_at, "",
                                        true, stream_finish_reason));
             }
             if (parsed.stream_include_usage) {
               json uc;
-              uc["id"] = stream_id;
+              uc["id"] = execution_context.stream_id;
               uc["object"] = "chat.completion.chunk";
-              uc["created"] = stream_ts;
-              uc["model"] = parsed.model;
+              uc["created"] = execution_context.stream_created_at;
+              uc["model"] = execution_context.model;
               uc["choices"] = json::array();
               uc["usage"] = {{"prompt_tokens", result.prompt_tokens},
                              {"completion_tokens", result.completion_tokens},
@@ -3194,7 +3189,7 @@ void HttpServer::HandleClient(ClientSession &session) {
       } else {
         auto payload = BuildResponse(
             BuildCompletionBody(result, parsed, chat_mode, tool_call), 200,
-            "OK", trace_response_header);
+            "OK", execution_context.trace_response_header);
         SendAll(session, payload);
       }
     } catch (const std::exception &ex) {
@@ -3204,7 +3199,8 @@ void HttpServer::HandleClient(ClientSession &session) {
       auto payload = BuildResponse(BuildErrorBody(ex.what()), 500, "Error");
       SendAll(session, payload);
       if (audit_logger_) {
-        audit_logger_->Log(auth_ctx.subject, parsed.model, "error", ex.what());
+        audit_logger_->Log(auth_ctx.subject, execution_context.model, "error",
+                           ex.what());
       }
     }
     return;

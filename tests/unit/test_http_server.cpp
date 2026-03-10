@@ -226,6 +226,32 @@ TEST_CASE("BuildGenerationRequestEnvelope keeps multimodal payload attached",
   REQUIRE(request.images.front().image_id == "img-1");
 }
 
+TEST_CASE("BuildGenerationExecutionContext derives trace header and stream "
+          "identity from request",
+          "[http_server]") {
+  InferenceRequest request;
+  request.model = "qwen";
+  request.prompt = "hello";
+  request.trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+  const auto context = BuildGenerationExecutionContext(
+      request, /*is_legacy_completions=*/true, /*stream_enabled=*/true,
+      /*stream_created_at=*/42);
+
+  REQUIRE(context.model == "qwen");
+  REQUIRE(context.audit_prompt == "hello");
+  REQUIRE(context.stream_id == "chatcmpl-42");
+  REQUIRE(context.stream_created_at == 42);
+  REQUIRE(context.trace_response_header.find(
+              "traceparent: 00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-") !=
+          std::string::npos);
+  REQUIRE(context.trace_response_header.find("Deprecation: true\r\n") !=
+          std::string::npos);
+  REQUIRE(context.trace_response_header.find(
+              "Link: </v1/chat/completions>; rel=\"successor-version\"\r\n") !=
+          std::string::npos);
+}
+
 TEST_CASE("HttpServer ready status reports healthy distributed decode pool",
           "[http_server]") {
   SimpleTokenizer tokenizer;
