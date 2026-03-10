@@ -62,9 +62,12 @@ public:
       int max_sessions{1024};
     };
 
+    // Default batch limits optimized for concurrent throughput.
+    // max_batch_size=16 allows GPU to process more concurrent requests without
+    // queueing. See docs/concurrent_throughput_investigation.md for rationale.
     Config()
-        : max_batch_size(4), max_batch_tokens(8192), min_batch_size(1),
-          batch_accumulation_ms(0) {}
+        : max_batch_size(16), max_batch_tokens(16384), min_batch_size(1),
+          batch_accumulation_ms(2) {}
     int max_batch_size;
     int max_batch_tokens;
     int min_batch_size; // Preferred batch target during accumulation windows
