@@ -76,6 +76,62 @@ Look for:
 | low reuse/hit rate | cache metrics | increase KV pages and validate prefix reuse path |
 | CUDA underutilization | backend metrics + logs | enable/tune FA2 and phase overlap when supported |
 
+Sequence-slot / native decode debug capture:
+
+```bash
+INFERFLUX_DEBUG_SEQUENCE_SLOTS=1 \
+INFERFLUX_DEBUG_UNIFIED_ASSEMBLY=1 \
+INFERFLUX_DEBUG_UNIFIED_ASSEMBLY_LIMIT=256 \
+INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING=1 \
+INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING_LIMIT=256 \
+INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION=1 \
+INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION_LIMIT=128 \
+./build/inferfluxd --config config/server.cuda.yaml
+```
+
+Use this when output drift or reuse corruption is suspected.
+Expected log keys:
+- `sequence_slot[...]`: request id, slot id, sequence generation, phase, decode budget
+- `slot[...]`: acquire/retire/reuse lifecycle in the slot manager
+- `decode_mapping[...]`: request id, slot id, sequence generation, sampled token, piece
+- `unified_assembly[...]`: emitted piece/completion after phased prefill or decode resume
+- `operator_select[...]`: FFN/down-proj operator choice with exact `M/N/K` geometry
+
+Process-local native split handoff:
+- On the default in-process `KVChannel`, native decode workers now keep the same sequence slot and transfer ownership directly.
+- Blob serialize/hydrate is still expected for cross-process transports such as shared-memory handoff.
+- If a process-local native run still shows second-slot hydrate behavior, treat it as a handoff regression.
+
+Benchmark harness equivalent:
+
+```bash
+INFERFLUX_BENCH_LOG_LEVEL=info \
+INFERFLUX_BENCH_DEBUG_SEQUENCE_SLOTS=1 \
+INFERFLUX_BENCH_DEBUG_UNIFIED_ASSEMBLY=1 \
+INFERFLUX_BENCH_NATIVE_DEBUG_DECODE_MAPPING=1 \
+INFERFLUX_BENCH_NATIVE_DEBUG_OPERATOR_SELECTION=1 \
+bash scripts/run_gguf_comparison_benchmark.sh
+```
+
+If benchmark exact-match regresses while native throughput rises only slightly:
+- check `decode_burst_tokens` first
+- the harness default is `0`
+- `INFERFLUX_BENCH_DECODE_BURST_TOKENS>1` is experiment-only for native today and can reduce exact-match parity before it produces a meaningful throughput win
+
+To localize the first native-vs-llama decode divergence from debug logs:
+
+```bash
+python3 scripts/compare_decode_traces.py \
+  /path/to/server_cuda_native.log \
+  /path/to/server_cuda_llama_cpp.log \
+  --json
+```
+
+When the logs include stable caller tags such as the benchmark runner's
+`client_request_id=bench-<index>`, the comparator aligns on that tag first.
+That avoids false mismatches from backend-specific scheduler `request_id`
+ordering on mixed-prompt batches.
+
 ## 7) Platform-Specific Notes
 
 | Platform | Issue | Fix |

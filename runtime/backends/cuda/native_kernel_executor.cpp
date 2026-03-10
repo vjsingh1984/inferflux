@@ -1,6 +1,8 @@
 #include "runtime/backends/cuda/native_kernel_executor.h"
+#include "model/gguf_tokenizer.h"
 #include "model/tokenizer_factory.h"
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
+#include "runtime/backends/cuda/native/kv_cache_planner.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
 #include "runtime/backends/cuda/native/quantized_weight_map_adapter.h"
@@ -22,6 +24,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -113,10 +116,183 @@ std::string ToLowerAscii(const std::string &value) {
   return inferflux::ToLower(value);
 }
 
+bool ParsePositiveIntSetting(const char *raw, int *out) {
+  if (!raw || !out) {
+    return false;
+  }
+  char *end = nullptr;
+  const long parsed = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || parsed <= 0 ||
+      parsed > static_cast<long>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+  *out = static_cast<int>(parsed);
+  return true;
+}
+
+bool ParsePositiveDoubleSetting(const char *raw, double *out) {
+  if (!raw || !out) {
+    return false;
+  }
+  char *end = nullptr;
+  const double parsed = std::strtod(raw, &end);
+  if (end == raw || *end != '\0' || !std::isfinite(parsed) || parsed <= 0.0) {
+    return false;
+  }
+  *out = parsed;
+  return true;
+}
+
 bool ParseBoolSetting(const char *raw, bool fallback) {
   if (!raw)
     return fallback;
   return inferflux::ParseBool(raw);
+}
+
+bool DecodeMappingDebugEnabled() {
+  static const bool enabled =
+      std::getenv("INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING") != nullptr;
+  return enabled;
+}
+
+bool ConsumeDecodeMappingBudget() {
+  static const int initial_budget = [] {
+    int parsed = 32;
+    if (const char *env =
+            std::getenv("INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING_LIMIT")) {
+      int value = 0;
+      if (ParsePositiveIntSetting(env, &value)) {
+        parsed = value;
+      }
+    }
+    return parsed;
+  }();
+  static std::atomic<int> remaining(initial_budget);
+  int current = remaining.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (remaining.compare_exchange_weak(current, current - 1,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool NativeLogitsDebugEnabled() {
+  static const bool enabled = std::getenv("INFERFLUX_DEBUG_LOGITS") != nullptr;
+  return enabled;
+}
+
+bool ConsumeNativeLogitsBudget() {
+  static const int initial_budget = [] {
+    int parsed = 64;
+    if (const char *env = std::getenv("INFERFLUX_DEBUG_LOGITS_LIMIT")) {
+      int value = 0;
+      if (ParsePositiveIntSetting(env, &value)) {
+        parsed = value;
+      }
+    }
+    return parsed;
+  }();
+  static std::atomic<int> remaining(initial_budget);
+  int current = remaining.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (remaining.compare_exchange_weak(current, current - 1,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+void LogNativeTopLogits(std::string_view stage, const float *d_logits_row,
+                        int vocab_size, int64_t request_id,
+                        std::string_view client_request_id, int sequence_id,
+                        uint64_t sequence_generation, int n_past) {
+  if (!NativeLogitsDebugEnabled() || !ConsumeNativeLogitsBudget() ||
+      !d_logits_row || vocab_size <= 0) {
+    return;
+  }
+
+  std::vector<float> h_logits(static_cast<std::size_t>(vocab_size));
+  if (cudaMemcpy(h_logits.data(), d_logits_row, sizeof(float) * vocab_size,
+                 cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return;
+  }
+
+  constexpr std::size_t kTopK = 5;
+  std::vector<std::pair<float, int>> scored(static_cast<std::size_t>(vocab_size));
+  for (int i = 0; i < vocab_size; ++i) {
+    scored[static_cast<std::size_t>(i)] = {h_logits[static_cast<std::size_t>(i)], i};
+  }
+  const std::size_t top_n =
+      std::min<std::size_t>(kTopK, scored.size());
+  std::partial_sort(scored.begin(), scored.begin() + top_n, scored.end(),
+                    [](const auto &a, const auto &b) {
+                      return a.first > b.first;
+                    });
+
+  std::string payload;
+  for (std::size_t i = 0; i < top_n; ++i) {
+    if (!payload.empty()) {
+      payload += " ";
+    }
+    payload += "[" + std::to_string(scored[i].second) + "]=" +
+               std::to_string(scored[i].first);
+  }
+
+  const std::string client_prefix =
+      client_request_id.empty()
+          ? std::string()
+          : "client_request_id=" + std::string(client_request_id) + ", ";
+  inferflux::log::Info(
+      "native_kernel_executor",
+      "debug_logits[" + std::string(stage) + "]: " + client_prefix +
+          "request_id=" +
+          std::to_string(request_id) + ", sequence_id=" +
+          std::to_string(sequence_id) + ", sequence_generation=" +
+          std::to_string(sequence_generation) + ", n_past=" +
+          std::to_string(n_past) + " top-5: " + payload);
+}
+#endif
+
+void LogSampleMapping(std::string_view stage, int input_idx, int64_t request_id,
+                      std::string_view client_request_id, int sequence_id,
+                      uint64_t sequence_generation, int n_past, int token_count,
+                      int token_id,
+                      const inferflux::ITokenizer *tokenizer) {
+  if (!DecodeMappingDebugEnabled() || !ConsumeDecodeMappingBudget()) {
+    return;
+  }
+  const std::string piece =
+      (tokenizer && token_id >= 0) ? tokenizer->TokenToString(token_id)
+                                   : std::string();
+  inferflux::log::Info(
+      "native_kernel_executor",
+      std::string(stage) + ": input_idx=" + std::to_string(input_idx) + ", " +
+          (client_request_id.empty()
+               ? std::string()
+               : "client_request_id=" + std::string(client_request_id) + ", ") +
+          "request_id=" + std::to_string(request_id) +
+          ", sequence_id=" + std::to_string(sequence_id) +
+          ", sequence_generation=" + std::to_string(sequence_generation) +
+          ", n_past=" + std::to_string(n_past) +
+          ", token_count=" + std::to_string(token_count) +
+          ", sampled_token=" + std::to_string(token_id) + ", piece=" + piece);
+}
+
+std::string VisibleTokenPiece(const inferflux::ITokenizer *tokenizer,
+                              int token_id) {
+  if (!tokenizer || token_id < 0) {
+    return {};
+  }
+  if (tokenizer->IsTerminalGeneratedToken(token_id)) {
+    return {};
+  }
+  return tokenizer->TokenToString(token_id);
 }
 
 std::string
@@ -170,11 +346,11 @@ void WarmQuantizedLaneCache(inferflux::QuantizedWeightMap *weight_map) {
     return;
   }
 
-  // Warm permanent-cache tensors up front so overlap lanes don't race
-  // first-touch dequantized cache creation in the shared GGUF loader.
+  // Warm only small permanent-cache tensors up front so overlap lanes don't
+  // race first-touch dequantized cache creation in the shared GGUF loader.
+  // Keep lm_head lazy to avoid eager large allocations in memory-first mode.
   (void)weight_map->EmbedTokens();
   (void)weight_map->FinalNorm();
-  (void)weight_map->LmHead();
   const int layers = weight_map->NumLayers();
   for (int layer = 0; layer < layers; ++layer) {
     (void)weight_map->LayerInputNorm(layer);
@@ -659,6 +835,18 @@ NativeKernelExecutor::NativeKernelExecutor() = default;
 
 NativeKernelExecutor::~NativeKernelExecutor() {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
+  for (auto &pending : pending_sequence_releases_) {
+    if (pending.compute_done) {
+      cudaEventDestroy(pending.compute_done);
+    }
+    if (pending.decode_done) {
+      cudaEventDestroy(pending.decode_done);
+    }
+    if (pending.prefill_done) {
+      cudaEventDestroy(pending.prefill_done);
+    }
+  }
+  pending_sequence_releases_.clear();
   StopLaneDispatcher();
   DestroyLaneOverlapResources();
   model_forward_.reset();
@@ -812,8 +1000,7 @@ bool NativeKernelExecutor::ConfigureDequantizedCachePolicy(
       runtime::cuda::native::DequantizedCachePolicy::kNone;
   if (!runtime::cuda::native::ParseDequantizedCachePolicy(policy, &parsed)) {
     log::Warn("native_kernel_executor", "Invalid dequantized cache policy '" +
-                                            policy +
-                                            "'; falling back to none");
+                                            policy + "'; falling back to none");
     parsed = runtime::cuda::native::DequantizedCachePolicy::kNone;
     policy = "none";
   }
@@ -1166,15 +1353,20 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
 
   // 2. Allocate KV cache (independent precision policy)
   // Defaults can be overridden via env vars to reduce GPU memory usage.
-  // Minimum max_batch is 16 (scheduler uses kMaxSequenceSlots=16 slot IDs).
-  int max_batch = 32;
+  // Default max_batch is scheduler-aligned to avoid reserving unused slots.
+  int max_batch = 16;
   int max_seq = 4096;
+  bool max_seq_overridden = false;
   if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_MAX_BATCH")) {
-    int val = std::atoi(env);
-    if (val > 0 && val <= 128) {
+    int val = 0;
+    if (ParsePositiveIntSetting(env, &val) && val <= 128) {
       max_batch = val;
       log::Info("native_kernel_executor",
                 "KV cache max_batch overridden to " + std::to_string(val));
+    } else {
+      log::Warn("native_kernel_executor",
+                "Ignoring invalid INFERFLUX_NATIVE_KV_MAX_BATCH='" +
+                    std::string(env) + "'");
     }
   }
   // Scheduler allocates sequence slot IDs 0..15, so KV cache needs ≥16 slots.
@@ -1187,16 +1379,118 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     max_batch = kMinKvBatch;
   }
   if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_MAX_SEQ")) {
-    int val = std::atoi(env);
-    if (val > 0 && val <= 131072) {
+    int val = 0;
+    if (ParsePositiveIntSetting(env, &val) && val <= 131072) {
       max_seq = val;
+      max_seq_overridden = true;
       log::Info("native_kernel_executor",
                 "KV cache max_seq overridden to " + std::to_string(val));
+    } else {
+      log::Warn("native_kernel_executor",
+                "Ignoring invalid INFERFLUX_NATIVE_KV_MAX_SEQ='" +
+                    std::string(env) + "'");
     }
   }
   if (config.max_position_embeddings > 0 &&
       config.max_position_embeddings < max_seq) {
     max_seq = config.max_position_embeddings;
+  }
+
+  bool kv_auto_tune = true;
+  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_AUTO_TUNE")) {
+    kv_auto_tune = ParseBoolSetting(env, true);
+  }
+
+  std::size_t kv_budget_bytes = 0;
+  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_BUDGET_MB")) {
+    int budget_mb = 0;
+    if (ParsePositiveIntSetting(env, &budget_mb)) {
+      kv_budget_bytes = static_cast<std::size_t>(budget_mb) * kMiB;
+    } else {
+      log::Warn("native_kernel_executor",
+                "Ignoring invalid INFERFLUX_NATIVE_KV_BUDGET_MB='" +
+                    std::string(env) + "'");
+    }
+  }
+
+  double kv_budget_ratio = 0.30;
+  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_FREE_MEM_RATIO")) {
+    double parsed = 0.0;
+    if (ParsePositiveDoubleSetting(env, &parsed) && parsed <= 1.0) {
+      kv_budget_ratio = parsed;
+    } else {
+      log::Warn("native_kernel_executor",
+                "Ignoring invalid INFERFLUX_NATIVE_KV_FREE_MEM_RATIO='" +
+                    std::string(env) + "'");
+    }
+  }
+
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  if (kv_auto_tune && kv_budget_bytes == 0) {
+    const cudaError_t mem_info_status =
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (mem_info_status != cudaSuccess) {
+      log::Warn("native_kernel_executor",
+                "cudaMemGetInfo failed for KV auto-tuning: " +
+                    std::string(cudaGetErrorString(mem_info_status)));
+      free_bytes = 0;
+      total_bytes = 0;
+    }
+  }
+
+  const std::size_t kv_element_bytes = sizeof(half);
+  runtime::cuda::native::KvCachePlanInput kv_plan_input;
+  kv_plan_input.requested_max_batch = max_batch;
+  kv_plan_input.requested_max_seq = max_seq;
+  kv_plan_input.min_max_batch = kMinKvBatch;
+  kv_plan_input.min_max_seq = 128;
+  kv_plan_input.model_max_position_embeddings = config.max_position_embeddings;
+  kv_plan_input.bytes_per_token_per_sequence =
+      runtime::cuda::native::EstimateKvBytesPerTokenPerSequence(
+          config.num_hidden_layers, config.num_key_value_heads, config.head_dim,
+          kv_element_bytes);
+  kv_plan_input.auto_tune_enabled = kv_auto_tune;
+  kv_plan_input.max_seq_overridden = max_seq_overridden;
+  kv_plan_input.explicit_budget_bytes = kv_budget_bytes;
+  kv_plan_input.free_bytes = free_bytes;
+  kv_plan_input.budget_ratio = kv_budget_ratio;
+
+  const auto kv_plan = runtime::cuda::native::PlanKvCache(kv_plan_input);
+  GlobalMetrics().RecordNativeKvAutoTunePlan(
+      kv_plan_input.requested_max_seq, kv_plan.max_seq, kv_plan.requested_bytes,
+      kv_plan.planned_bytes, kv_plan.budget_bytes);
+  max_batch = kv_plan.max_batch;
+  max_seq = kv_plan.max_seq;
+
+  if (kv_plan.auto_tuned_seq) {
+    log::Info(
+        "native_kernel_executor",
+        "KV auto-tune reduced max_seq to " + std::to_string(max_seq) +
+            " (requested_bytes=" +
+            std::to_string(kv_plan.requested_bytes / kMiB) +
+            " MiB, budget=" + std::to_string(kv_plan.budget_bytes / kMiB) +
+            " MiB, planned=" + std::to_string(kv_plan.planned_bytes / kMiB) +
+            " MiB" +
+            (total_bytes > 0
+                 ? ", free/total=" + std::to_string(free_bytes / kMiB) + "/" +
+                       std::to_string(total_bytes / kMiB) + " MiB"
+                 : "") +
+            ")");
+  } else {
+    const std::string budget_source =
+        kv_budget_bytes > 0 ? "explicit"
+                            : (free_bytes > 0 ? "free_mem" : "none");
+    log::Info("native_kernel_executor",
+              "KV allocation plan: max_batch=" + std::to_string(max_batch) +
+                  ", max_seq=" + std::to_string(max_seq) + ", estimated=" +
+                  std::to_string(kv_plan.planned_bytes / kMiB) +
+                  " MiB, auto_tune=" + (kv_auto_tune ? "on" : "off") +
+                  ", budget_source=" + budget_source +
+                  (free_bytes > 0
+                       ? ", free/total=" + std::to_string(free_bytes / kMiB) +
+                             "/" + std::to_string(total_bytes / kMiB) + " MiB"
+                       : ""));
   }
 
   if (kv_precision_ == runtime::cuda::native::KvPrecision::kBf16) {
@@ -1216,6 +1510,8 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     }
     kv_cache_ = std::move(cache);
   }
+  GlobalMetrics().SetNativeKvCacheOccupancy(/*active_sequences=*/0,
+                                            /*max_sequences=*/max_batch);
 
   // 2.5. Strategy selection (foundation layer for native quantized runtime).
   runtime::cuda::native::QuantizedRuntimeStrategyRegistry &registry =
@@ -1375,14 +1671,38 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     return false;
   }
 
-  // 6. Load tokenizer via factory (LlamaTokenizer for GGUF, HFTokenizer for
-  // safetensors/hf, with automatic fallback).
+  // 6. Load tokenizer. GGUF models prefer metadata-backed BPE so strict
+  // native startup does not re-enter llama.cpp just to tokenize prompts.
   {
+    tokenizer_.reset();
+    if (auto *gguf_loader =
+            dynamic_cast<runtime::cuda::native::GGUFModelLoader *>(
+                model_loader_.get())) {
+      auto gguf_tokenizer = std::make_unique<GGUFTokenizer>();
+      if (gguf_tokenizer->InitializeFromMetadata(
+              gguf_loader->TokenizerPieces(), gguf_loader->TokenizerMerges(),
+              gguf_loader->TokenizerPreTokenizer(),
+              gguf_loader->TokenizerBosTokenId(),
+              gguf_loader->TokenizerEosTokenId(),
+              gguf_loader->TokenizerAddBosToken(),
+              gguf_loader->TokenizerChatTemplate())) {
+        tokenizer_ = std::move(gguf_tokenizer);
+        log::Info("native_kernel_executor",
+                  "Initialized GGUF metadata tokenizer");
+      } else {
+        fallback_mode_ = true;
+        fallback_reason_ =
+            "native GGUF tokenizer unavailable; using llama.cpp tokenizer";
+        log::Warn("native_kernel_executor", fallback_reason_);
+      }
+    }
     const std::string tokenizer_path =
         model_loader_ ? loaded_model_path_.string() : loader_->GetModelPath();
     const std::string model_format =
         model_loader_ ? model_loader_->GetFormat() : "safetensors";
-    tokenizer_ = CreateTokenizer(tokenizer_path, model_format);
+    if (!tokenizer_) {
+      tokenizer_ = CreateTokenizer(tokenizer_path, model_format);
+    }
     if (!tokenizer_) {
       log::Error("native_kernel_executor",
                  "Failed to initialize tokenizer for model path: " +
@@ -1393,7 +1713,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
 
   // 9. Read timing sample-rate from environment.
   //    0 or negative → disable event recording entirely (max throughput).
-  //    N > 0         → record events every Nth batch (default 1 = always).
+  //    N > 0         → record events every Nth batch (default 0 = disabled).
   {
     const char *env = std::getenv("INFERFLUX_NATIVE_TIMING_SAMPLE_RATE");
     if (env) {
@@ -1452,6 +1772,8 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   log::Info("native_kernel_executor",
             "Loading native CUDA model from: " + model_path.string());
   loaded_model_path_ = model_path;
+  fallback_mode_ = false;
+  fallback_reason_.clear();
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   StopLaneDispatcher();
 #endif
@@ -1660,9 +1982,12 @@ NativeKernelExecutor::ExecuteLaneBatch(
 
   struct DecodeEntry {
     int input_idx;
+    int64_t request_id;
+    std::string client_request_id;
     int token_id;
     int n_past;
     int sequence_id;
+    uint64_t sequence_generation;
     float temperature;
     int top_k;
     float top_p;
@@ -1675,10 +2000,17 @@ NativeKernelExecutor::ExecuteLaneBatch(
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto &input = inputs[i];
     if (input.tokens.size() == 1 && input.request_logits) {
-      decode_group.push_back({static_cast<int>(i), input.tokens[0],
-                              input.n_past, input.sequence_id,
-                              input.sampling.temperature, input.sampling.top_k,
-                              input.sampling.top_p, input.sampling.seed});
+      decode_group.push_back({static_cast<int>(i),
+                              input.request_id,
+                              input.client_request_id,
+                              input.tokens[0],
+                              input.n_past,
+                              input.sequence_id,
+                              input.sequence_generation,
+                              input.sampling.temperature,
+                              input.sampling.top_k,
+                              input.sampling.top_p,
+                              input.sampling.seed});
     } else {
       prefill_indices.push_back(static_cast<int>(i));
     }
@@ -1701,6 +2033,7 @@ NativeKernelExecutor::ExecuteLaneBatch(
       std::vector<float> batch_temps(B);
       std::vector<int> batch_top_ks(B);
       std::vector<float> batch_top_ps(B);
+      std::vector<uint32_t> batch_seeds(B);
       for (int b = 0; b < B; ++b) {
         const auto &entry = decode_group[offset + static_cast<size_t>(b)];
         batch_tokens[b] = entry.token_id;
@@ -1709,6 +2042,7 @@ NativeKernelExecutor::ExecuteLaneBatch(
         batch_temps[b] = entry.temperature;
         batch_top_ks[b] = entry.top_k;
         batch_top_ps[b] = entry.top_p;
+        batch_seeds[b] = entry.seed;
       }
 
       const auto forward_start = std::chrono::steady_clock::now();
@@ -1734,24 +2068,58 @@ NativeKernelExecutor::ExecuteLaneBatch(
       std::vector<int> sampled_tokens;
       const auto sample_start = std::chrono::steady_clock::now();
       resources.sampler->SampleBatch(resources.logits, B, batch_temps,
-                                     batch_top_ks, batch_top_ps,
+                                     batch_top_ks, batch_top_ps, batch_seeds,
                                      &sampled_tokens);
       const auto sample_end = std::chrono::steady_clock::now();
       sample_ms_total +=
           std::chrono::duration<double, std::milli>(sample_end - sample_start)
               .count();
 
+      if (DecodeMappingDebugEnabled()) {
+        log::Info("native_kernel_executor",
+                  "decode_mapping[lane]: batch_size=" + std::to_string(B) +
+                      ", batch_offset=" + std::to_string(offset));
+        for (int b = 0; b < B; ++b) {
+          if (!ConsumeDecodeMappingBudget()) {
+            break;
+          }
+          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+          const int token_id = sampled_tokens[b];
+          const std::string piece =
+              (tokenizer_ && token_id >= 0)
+                  ? tokenizer_->TokenToString(token_id)
+                  : std::string();
+          log::Info("native_kernel_executor",
+                    "decode_mapping[lane]: input_idx=" +
+                        std::to_string(entry.input_idx) + ", " +
+                        (entry.client_request_id.empty()
+                             ? std::string()
+                             : "client_request_id=" +
+                                   entry.client_request_id + ", ") +
+                        "request_id=" + std::to_string(entry.request_id) +
+                        ", sequence_id=" +
+                        std::to_string(entry.sequence_id) +
+                        ", sequence_generation=" +
+                        std::to_string(entry.sequence_generation) +
+                        ", n_past=" +
+                        std::to_string(entry.n_past) + ", sampled_token=" +
+                        std::to_string(token_id) + ", piece=" + piece);
+        }
+      }
+
       for (int b = 0; b < B; ++b) {
         const auto &entry = decode_group[offset + static_cast<size_t>(b)];
         int token_id = sampled_tokens[b];
         auto &output = result.outputs[entry.input_idx];
-        if (tokenizer_ && token_id == tokenizer_->EosTokenId()) {
+        if (tokenizer_ && tokenizer_->IsTerminalGeneratedToken(token_id)) {
           output.token = -1;
           output.piece.clear();
         } else {
           output.token = token_id;
-          output.piece = tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
-          perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+          output.piece = VisibleTokenPiece(tokenizer_.get(), token_id);
+          if (!output.piece.empty()) {
+            perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+          }
         }
         output.ok = true;
       }
@@ -1793,14 +2161,20 @@ NativeKernelExecutor::ExecuteLaneBatch(
           std::chrono::duration<double, std::milli>(sample_end - sample_start)
               .count();
       ++sampled_prefill_total;
+      LogSampleMapping("sample_mapping[lane_prefill]", idx, input.request_id,
+                       input.client_request_id, input.sequence_id,
+                       input.sequence_generation,
+                       input.n_past, token_count, token_id, tokenizer_.get());
 
-      if (tokenizer_ && token_id == tokenizer_->EosTokenId()) {
+      if (tokenizer_ && tokenizer_->IsTerminalGeneratedToken(token_id)) {
         output.token = -1;
         output.piece.clear();
       } else {
         output.token = token_id;
-        output.piece = tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
-        perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+        output.piece = VisibleTokenPiece(tokenizer_.get(), token_id);
+        if (!output.piece.empty()) {
+          perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+        }
       }
     }
 
@@ -2149,9 +2523,12 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
   // Partition inputs into decode (tokens.size()==1, request_logits) and others
   struct DecodeEntry {
     int input_idx;
+    int64_t request_id;
+    std::string client_request_id;
     int token_id;
     int n_past;
     int sequence_id;
+    uint64_t sequence_generation;
     float temperature;
     int top_k;
     float top_p;
@@ -2163,10 +2540,17 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto &input = inputs[i];
     if (input.tokens.size() == 1 && input.request_logits) {
-      decode_group.push_back({static_cast<int>(i), input.tokens[0],
-                              input.n_past, input.sequence_id,
-                              input.sampling.temperature, input.sampling.top_k,
-                              input.sampling.top_p, input.sampling.seed});
+      decode_group.push_back({static_cast<int>(i),
+                              input.request_id,
+                              input.client_request_id,
+                              input.tokens[0],
+                              input.n_past,
+                              input.sequence_id,
+                              input.sequence_generation,
+                              input.sampling.temperature,
+                              input.sampling.top_k,
+                              input.sampling.top_p,
+                              input.sampling.seed});
     } else {
       prefill_indices.push_back(static_cast<int>(i));
     }
@@ -2186,6 +2570,7 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
     std::vector<float> batch_temps(max_B);
     std::vector<int> batch_top_ks(max_B);
     std::vector<float> batch_top_ps(max_B);
+    std::vector<uint32_t> batch_seeds(max_B);
     std::vector<int> sampled_tokens;
 
     for (size_t offset = 0; offset < decode_group.size();
@@ -2203,15 +2588,13 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         batch_temps[b] = entry.temperature;
         batch_top_ks[b] = entry.top_k;
         batch_top_ps[b] = entry.top_p;
+        batch_seeds[b] = entry.seed;
       }
 
       // Record forward timing based on sample rate.
       // rate=0: never record (pure throughput). rate=N: every Nth batch.
-      bool record_timing = false;
-      if (timing_sample_rate_ > 0) {
-        ++timing_batch_counter_;
-        record_timing = (timing_batch_counter_ % timing_sample_rate_ == 0);
-      }
+      const bool record_timing =
+          ShouldRecordTimingSample(timing_sample_rate_, &timing_batch_counter_);
       if (record_timing) {
         cudaEventRecord(forward_start_, compute_stream_);
       }
@@ -2233,18 +2616,62 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       }
 
       sampler_->SampleBatch(d_logits_, B, batch_temps, batch_top_ks,
-                            batch_top_ps, &sampled_tokens);
+                            batch_top_ps, batch_seeds, &sampled_tokens);
+
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+      if (NativeLogitsDebugEnabled()) {
+        for (int b = 0; b < B; ++b) {
+          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+          LogNativeTopLogits("primary",
+                             d_logits_ + b * model_config_.vocab_size,
+                             model_config_.vocab_size,
+                             entry.request_id, entry.client_request_id,
+                             entry.sequence_id,
+                             entry.sequence_generation, entry.n_past);
+        }
+      }
+#endif
+
+      if (DecodeMappingDebugEnabled()) {
+        log::Info("native_kernel_executor",
+                  "decode_mapping[primary]: batch_size=" + std::to_string(B) +
+                      ", batch_offset=" + std::to_string(offset));
+        for (int b = 0; b < B; ++b) {
+          if (!ConsumeDecodeMappingBudget()) {
+            break;
+          }
+          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+          const int token_id = sampled_tokens[b];
+          const std::string piece =
+              (tokenizer_ && token_id >= 0)
+                  ? tokenizer_->TokenToString(token_id)
+                  : std::string();
+          log::Info("native_kernel_executor",
+                    "decode_mapping[primary]: input_idx=" +
+                        std::to_string(entry.input_idx) + ", " +
+                        (entry.client_request_id.empty()
+                             ? std::string()
+                             : "client_request_id=" +
+                                   entry.client_request_id + ", ") +
+                        "request_id=" + std::to_string(entry.request_id) +
+                        ", sequence_id=" +
+                        std::to_string(entry.sequence_id) +
+                        ", sequence_generation=" +
+                        std::to_string(entry.sequence_generation) +
+                        ", n_past=" +
+                        std::to_string(entry.n_past) + ", sampled_token=" +
+                        std::to_string(token_id) + ", piece=" + piece);
+        }
+      }
 
       // SampleBatch already synchronized the stream.
+      GlobalMetrics().RecordNativeForwardShape(/*is_decode=*/true, B);
       if (record_timing) {
         float fwd_ms = 0.0f;
         if (CheckCudaStatus(
                 cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
                 "cudaEventElapsedTime(forward,decode_batch)")) {
-          // Scale metrics by total decode count (first batch is representative)
-          int total_decode = static_cast<int>(decode_group.size());
-          GlobalMetrics().RecordNativeForwardPass(/*is_decode=*/true,
-                                                  total_decode, fwd_ms);
+          GlobalMetrics().RecordNativeForwardLatency(fwd_ms);
           perf_accum_.decode_ms.store(
               perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
               std::memory_order_relaxed);
@@ -2254,14 +2681,16 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       for (int b = 0; b < B; ++b) {
         const auto &entry = decode_group[offset + static_cast<size_t>(b)];
         int token_id = sampled_tokens[b];
-        if (tokenizer_ && token_id == tokenizer_->EosTokenId()) {
+        if (tokenizer_ && tokenizer_->IsTerminalGeneratedToken(token_id)) {
           outputs[entry.input_idx].token = -1;
           outputs[entry.input_idx].piece = "";
         } else {
           outputs[entry.input_idx].token = token_id;
           outputs[entry.input_idx].piece =
-              tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
-          perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+              VisibleTokenPiece(tokenizer_.get(), token_id);
+          if (!outputs[entry.input_idx].piece.empty()) {
+            perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+          }
         }
         outputs[entry.input_idx].ok = true;
       }
@@ -2278,9 +2707,11 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
     bool is_decode = (input.tokens.size() == 1);
     int batch_tokens = static_cast<int>(input.tokens.size());
 
+    const bool record_prefill_timing =
+        ShouldRecordTimingSample(timing_sample_rate_, &timing_batch_counter_);
+
     if (!input.request_logits) {
       NVTX_SCOPE("ForwardPass");
-      bool record_prefill_timing = (timing_sample_rate_ > 0);
       if (record_prefill_timing) {
         cudaEventRecord(forward_start_, compute_stream_);
       }
@@ -2291,12 +2722,12 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       if (record_prefill_timing) {
         cudaEventRecord(forward_stop_, compute_stream_);
         cudaEventSynchronize(forward_stop_);
+        GlobalMetrics().RecordNativeForwardShape(is_decode, batch_tokens);
         float fwd_ms = 0.0f;
         if (CheckCudaStatus(
                 cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
                 "cudaEventElapsedTime(forward,prefill_no_logits)")) {
-          GlobalMetrics().RecordNativeForwardPass(is_decode, batch_tokens,
-                                                  fwd_ms);
+          GlobalMetrics().RecordNativeForwardLatency(fwd_ms);
           perf_accum_.prefill_ms.store(
               perf_accum_.prefill_ms.load(std::memory_order_relaxed) + fwd_ms,
               std::memory_order_relaxed);
@@ -2304,6 +2735,7 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       } else {
         // No timing — just sync stream to ensure forward completes
         cudaStreamSynchronize(compute_stream_);
+        GlobalMetrics().RecordNativeForwardShape(is_decode, batch_tokens);
       }
       perf_accum_.prompt_tokens.fetch_add(batch_tokens,
                                           std::memory_order_relaxed);
@@ -2314,7 +2746,6 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
     // Forward pass
     {
       NVTX_SCOPE("ForwardPass");
-      bool record_prefill_timing = (timing_sample_rate_ > 0);
       if (record_prefill_timing) {
         cudaEventRecord(forward_start_, compute_stream_);
       }
@@ -2331,7 +2762,6 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
     // Sample
     {
       NVTX_SCOPE("Sampling");
-      bool record_prefill_timing = (timing_sample_rate_ > 0);
       if (record_prefill_timing) {
         cudaEventRecord(sampling_start_, compute_stream_);
       }
@@ -2339,18 +2769,24 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
           d_logits_, input.sampling.temperature, input.sampling.top_k,
           input.sampling.top_p, input.sampling.seed);
       // Sample() already synchronizes the stream before returning
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+      LogNativeTopLogits("primary_prefill", d_logits_, model_config_.vocab_size,
+                         input.request_id, input.client_request_id,
+                         input.sequence_id,
+                         input.sequence_generation, input.n_past);
+#endif
       if (record_prefill_timing) {
         cudaEventRecord(sampling_stop_, compute_stream_);
       }
 
       // Deferred timing: compute elapsed from already-completed events
+      GlobalMetrics().RecordNativeForwardShape(is_decode, batch_tokens);
       if (record_prefill_timing) {
         float fwd_ms = 0.0f;
         if (CheckCudaStatus(
                 cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
                 "cudaEventElapsedTime(forward,prefill_logits)")) {
-          GlobalMetrics().RecordNativeForwardPass(is_decode, batch_tokens,
-                                                  fwd_ms);
+          GlobalMetrics().RecordNativeForwardLatency(fwd_ms);
           if (is_decode) {
             perf_accum_.decode_ms.store(
                 perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
@@ -2364,21 +2800,29 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
           }
         }
         float samp_ms = 0.0f;
-        if (CheckCudaStatus(
+        if (CheckCudaStatus(cudaEventSynchronize(sampling_stop_),
+                            "cudaEventSynchronize(sampling_stop_)") &&
+            CheckCudaStatus(
                 cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_),
                 "cudaEventElapsedTime(sampling,prefill_logits)")) {
           GlobalMetrics().RecordNativeSampling(1, samp_ms);
         }
       } // end if (record_prefill_timing)
 
-      if (tokenizer_ && token_id == tokenizer_->EosTokenId()) {
+      if (tokenizer_ && tokenizer_->IsTerminalGeneratedToken(token_id)) {
         output.token = -1;
         output.piece = "";
       } else {
         output.token = token_id;
-        output.piece = tokenizer_ ? tokenizer_->TokenToString(token_id) : "";
-        perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+        output.piece = VisibleTokenPiece(tokenizer_.get(), token_id);
+        if (!output.piece.empty()) {
+          perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+        }
       }
+      LogSampleMapping("sample_mapping[primary_prefill]", idx, input.request_id,
+                       input.client_request_id, input.sequence_id,
+                       input.sequence_generation,
+                       input.n_past, batch_tokens, token_id, tokenizer_.get());
       output.ok = true;
     }
   }
@@ -2392,17 +2836,14 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
 }
 
 bool NativeKernelExecutor::SupportsAsyncUnifiedBatch() const {
-#ifdef INFERFLUX_NATIVE_KERNELS_READY
-  if (!model_loaded_ || !model_forward_) {
-    return false;
-  }
-  if (!overlap_enabled_) {
-    return false;
-  }
-  return CanRunLaneOverlap();
-#else
+  // Disable async dispatch to use the synchronous ExecuteUnifiedBatch path
+  // which supports true batching (BatchForward + SampleBatch). The async
+  // path routes every decode step through the lane dispatcher, adding
+  // per-step overhead from queue operations, condition variable signaling,
+  // and thread context switches that accumulate to a 2x slowdown.
+  // Phase overlap for mixed prefill/decode workloads is handled internally
+  // by ExecuteUnifiedBatchWithOverlap when called from the sync path.
   return false;
-#endif
 }
 
 UnifiedBatchHandle NativeKernelExecutor::SubmitUnifiedBatchAsync(
@@ -2534,6 +2975,15 @@ NativeCudaRuntime::NativePerfSnapshot NativeKernelExecutor::NativeTakePerf() {
   return snap;
 }
 
+bool NativeKernelExecutor::ShouldRecordTimingSample(int sample_rate,
+                                                    int *counter) {
+  if (sample_rate <= 0 || !counter) {
+    return false;
+  }
+  ++(*counter);
+  return (*counter % sample_rate) == 0;
+}
+
 // ==========================================================================
 // Native* method overrides (no CUDA dependency)
 // ==========================================================================
@@ -2557,9 +3007,150 @@ bool NativeKernelExecutor::NativeIsReady() const { return model_loaded_; }
 
 void NativeKernelExecutor::NativeFreeSequence(int sequence_id) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-  if (kv_cache_) {
-    kv_cache_->ClearSequenceAsync(sequence_id, compute_stream_);
+  if (!kv_cache_ || sequence_id < 0) {
+    return;
   }
+  // Sequence slots are reused by the scheduler. Ensure in-flight work on all
+  // native streams has completed before zeroing the shared KV rows so the next
+  // request never observes stale cache state from a prior occupant.
+  if (compute_stream_) {
+    CheckCudaStatus(cudaStreamSynchronize(compute_stream_),
+                    "cudaStreamSynchronize(compute_stream_,free_sequence)");
+  }
+  if (decode_stream_) {
+    CheckCudaStatus(cudaStreamSynchronize(decode_stream_),
+                    "cudaStreamSynchronize(decode_stream_,free_sequence)");
+  }
+  if (prefill_stream_) {
+    CheckCudaStatus(cudaStreamSynchronize(prefill_stream_),
+                    "cudaStreamSynchronize(prefill_stream_,free_sequence)");
+  }
+  kv_cache_->ClearSequence(sequence_id);
+#endif
+}
+
+LlamaCPUBackend::SequenceReleaseFence
+NativeKernelExecutor::NativeBeginFreeSequence(int sequence_id) {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!kv_cache_ || sequence_id < 0) {
+    return {};
+  }
+
+  PendingSequenceRelease pending;
+  pending.token = next_sequence_release_token_++;
+  pending.sequence_id = sequence_id;
+
+  auto record_event = [&](cudaStream_t stream, const char *label,
+                          cudaEvent_t *event_out) -> bool {
+    if (!stream) {
+      return true;
+    }
+    if (!CheckCudaStatus(cudaEventCreateWithFlags(event_out,
+                                                  cudaEventDisableTiming),
+                         std::string("cudaEventCreateWithFlags(") + label +
+                             ")")) {
+      return false;
+    }
+    if (!CheckCudaStatus(cudaEventRecord(*event_out, stream),
+                         std::string("cudaEventRecord(") + label + ")")) {
+      cudaEventDestroy(*event_out);
+      *event_out = nullptr;
+      return false;
+    }
+    return true;
+  };
+
+  if (!record_event(compute_stream_, "free_sequence.compute",
+                    &pending.compute_done) ||
+      !record_event(decode_stream_, "free_sequence.decode",
+                    &pending.decode_done) ||
+      !record_event(prefill_stream_, "free_sequence.prefill",
+                    &pending.prefill_done)) {
+    if (pending.compute_done) {
+      cudaEventDestroy(pending.compute_done);
+    }
+    if (pending.decode_done) {
+      cudaEventDestroy(pending.decode_done);
+    }
+    if (pending.prefill_done) {
+      cudaEventDestroy(pending.prefill_done);
+    }
+    NativeFreeSequence(sequence_id);
+    return {};
+  }
+
+  if (!pending.compute_done && !pending.decode_done && !pending.prefill_done) {
+    kv_cache_->ClearSequence(sequence_id);
+    return {};
+  }
+
+  pending_sequence_releases_.push_back(pending);
+  LlamaCPUBackend::SequenceReleaseFence fence;
+  fence.token = pending.token;
+  fence.pending = true;
+  return fence;
+#else
+  (void)sequence_id;
+  return {};
+#endif
+}
+
+bool NativeKernelExecutor::NativePollFreeSequence(
+    const LlamaCPUBackend::SequenceReleaseFence &fence) {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!fence.pending || fence.token == 0) {
+    return true;
+  }
+
+  auto ready = [&](cudaEvent_t event, const char *label) -> bool {
+    if (!event) {
+      return true;
+    }
+    cudaError_t err = cudaEventQuery(event);
+    if (err == cudaSuccess) {
+      return true;
+    }
+    if (err == cudaErrorNotReady) {
+      return false;
+    }
+    log::Warn("native_kernel_executor",
+              "cudaEventQuery failed during sequence release poll: " +
+                  std::string(label) + " err=" +
+                  std::string(cudaGetErrorString(err)));
+    cudaGetLastError();
+    return true;
+  };
+
+  auto it = std::find_if(pending_sequence_releases_.begin(),
+                         pending_sequence_releases_.end(),
+                         [&](const PendingSequenceRelease &pending) {
+                           return pending.token == fence.token;
+                         });
+  if (it == pending_sequence_releases_.end()) {
+    return true;
+  }
+
+  if (!ready(it->compute_done, "compute") ||
+      !ready(it->decode_done, "decode") ||
+      !ready(it->prefill_done, "prefill")) {
+    return false;
+  }
+
+  kv_cache_->ClearSequence(it->sequence_id);
+  if (it->compute_done) {
+    cudaEventDestroy(it->compute_done);
+  }
+  if (it->decode_done) {
+    cudaEventDestroy(it->decode_done);
+  }
+  if (it->prefill_done) {
+    cudaEventDestroy(it->prefill_done);
+  }
+  pending_sequence_releases_.erase(it);
+  return true;
+#else
+  (void)fence;
+  return true;
 #endif
 }
 
@@ -2632,6 +3223,28 @@ NativeCudaRuntime::NativeChatResult NativeKernelExecutor::NativeFormatChat(
 
 const ITokenizer *NativeKernelExecutor::NativeGetTokenizer() const {
   return tokenizer_.get();
+}
+
+int NativeKernelExecutor::NativeVocabSize() const {
+  return model_config_.vocab_size;
+}
+
+int NativeKernelExecutor::CopyLastLogitsToHost(float *host_buf, int buf_size) {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!d_logits_ || !sampler_ || model_config_.vocab_size <= 0) {
+    return 0;
+  }
+  int n = model_config_.vocab_size;
+  if (buf_size < n) {
+    return 0;
+  }
+  sampler_->CopyLogitsToHost(d_logits_, host_buf);
+  return n;
+#else
+  (void)host_buf;
+  (void)buf_size;
+  return 0;
+#endif
 }
 
 } // namespace inferflux

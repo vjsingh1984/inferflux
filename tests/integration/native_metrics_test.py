@@ -127,6 +127,92 @@ class NativeMetricsStubTests(unittest.TestCase):
         resp, body = self._get("/metrics")
         self.assertIn("inferflux_native_forward_batch_tokens_total", body)
 
+    def test_native_forward_batch_size_counters_present(self):
+        resp, body = self._get("/metrics")
+        self.assertEqual(resp.status, 200)
+        self.assertIn(
+            "# HELP inferflux_native_forward_batch_size_total", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_native_forward_batch_size_total counter", body
+        )
+        self.assertIn(
+            'inferflux_native_forward_batch_size_total{phase="prefill",bucket="1"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_forward_batch_size_total{phase="decode",bucket="5_8"}',
+            body,
+        )
+
+    def test_native_down_proj_operator_counters_present(self):
+        resp, body = self._get("/metrics")
+        self.assertEqual(resp.status, 200)
+        self.assertIn(
+            "# HELP inferflux_native_ffn_proj_operator_total", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_native_ffn_proj_operator_total counter", body
+        )
+        self.assertIn(
+            'inferflux_native_ffn_proj_operator_total{phase="prefill",operator="q8_1_group_hot_q4k"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_ffn_proj_operator_total{phase="prefill",operator="q8_1_group"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_ffn_proj_operator_total{phase="decode",operator="fallback"}',
+            body,
+        )
+        self.assertIn(
+            "# HELP inferflux_native_down_proj_operator_total", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_native_down_proj_operator_total counter", body
+        )
+        self.assertIn(
+            'inferflux_native_down_proj_operator_total{phase="prefill",operator="q8_1_gemv"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_down_proj_operator_total{phase="prefill",operator="q8_1_gemv_hot_fixed"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_down_proj_operator_total{phase="prefill",operator="q8_1_gemv_row_pair"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_down_proj_operator_total{phase="prefill",operator="q8_1_gemv_row_quad"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_down_proj_operator_total{phase="prefill",operator="packed_gemv"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_down_proj_operator_total{phase="prefill",operator="mmq"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_down_proj_operator_total{phase="decode",operator="fallback"}',
+            body,
+        )
+        self.assertIn(
+            "# HELP inferflux_native_ffn_proj_geometry_total", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_native_ffn_proj_geometry_total counter", body
+        )
+        self.assertIn(
+            "# HELP inferflux_native_down_proj_geometry_total", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_native_down_proj_geometry_total counter", body
+        )
+
     def test_native_forward_duration_histogram(self):
         """Forward pass latency histogram has correct Prometheus format."""
         resp, body = self._get("/metrics")
@@ -150,6 +236,12 @@ class NativeMetricsStubTests(unittest.TestCase):
         resp, body = self._get("/metrics")
         self.assertIn("inferflux_native_kv_active_sequences", body)
         self.assertIn("inferflux_native_kv_max_sequences", body)
+        self.assertIn("inferflux_native_kv_autotune_events_total", body)
+        self.assertIn("inferflux_native_kv_requested_max_seq", body)
+        self.assertIn("inferflux_native_kv_planned_max_seq", body)
+        self.assertIn("inferflux_native_kv_requested_bytes", body)
+        self.assertIn("inferflux_native_kv_planned_bytes", body)
+        self.assertIn("inferflux_native_kv_budget_bytes", body)
 
     def test_cuda_lane_backpressure_metrics_present(self):
         """CUDA lane reject/timeout/restart metrics are rendered."""
@@ -186,6 +278,48 @@ class NativeMetricsStubTests(unittest.TestCase):
         )
         self.assertIn("inferflux_cuda_lane_worker_restarts_total", body)
 
+    def test_scheduler_sequence_reclamation_metrics_present(self):
+        """Deferred sequence-retirement metrics are rendered."""
+        resp, body = self._get("/metrics")
+        self.assertEqual(resp.status, 200)
+        self.assertIn(
+            "# HELP inferflux_scheduler_deferred_sequence_retirements", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_scheduler_deferred_sequence_retirements gauge", body
+        )
+        self.assertRegex(
+            body,
+            r'inferflux_scheduler_deferred_sequence_retirements\{backend="[^"]+"\}\s+\d+',
+        )
+        self.assertIn(
+            "# HELP inferflux_scheduler_deferred_sequence_retirements_completed_total",
+            body,
+        )
+        self.assertIn(
+            "# TYPE inferflux_scheduler_deferred_sequence_retirements_completed_total counter",
+            body,
+        )
+        self.assertRegex(
+            body,
+            r'inferflux_scheduler_deferred_sequence_retirements_completed_total\{backend="[^"]+"\}\s+\d+',
+        )
+        self.assertIn(
+            "# HELP inferflux_scheduler_sequence_retirement_duration_ms", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_scheduler_sequence_retirement_duration_ms histogram",
+            body,
+        )
+        self.assertRegex(
+            body,
+            r'inferflux_scheduler_sequence_retirement_duration_ms_bucket\{backend="[^"]+",le="\+Inf"\}\s+\d+',
+        )
+        self.assertRegex(
+            body,
+            r'inferflux_scheduler_sequence_retirement_duration_ms_count\{backend="[^"]+"\}\s+\d+',
+        )
+
     def test_native_forward_counters_zero_in_stub(self):
         """In stub mode (no native backend), counters should be 0."""
         resp, body = self._get("/metrics")
@@ -218,6 +352,9 @@ class NativeMetricsStubTests(unittest.TestCase):
             "# HELP inferflux_native_forward_batch_tokens_total", body
         )
         self.assertIn(
+            "# HELP inferflux_native_down_proj_operator_total", body
+        )
+        self.assertIn(
             "# HELP inferflux_native_forward_duration_ms", body
         )
         self.assertIn(
@@ -228,6 +365,24 @@ class NativeMetricsStubTests(unittest.TestCase):
         )
         self.assertIn(
             "# HELP inferflux_native_kv_max_sequences", body
+        )
+        self.assertIn(
+            "# HELP inferflux_native_kv_autotune_events_total", body
+        )
+        self.assertIn(
+            "# HELP inferflux_native_kv_requested_max_seq", body
+        )
+        self.assertIn(
+            "# HELP inferflux_native_kv_planned_max_seq", body
+        )
+        self.assertIn(
+            "# HELP inferflux_native_kv_requested_bytes", body
+        )
+        self.assertIn(
+            "# HELP inferflux_native_kv_planned_bytes", body
+        )
+        self.assertIn(
+            "# HELP inferflux_native_kv_budget_bytes", body
         )
 
     def test_native_metrics_have_type_annotations(self):
@@ -240,6 +395,9 @@ class NativeMetricsStubTests(unittest.TestCase):
             "# TYPE inferflux_native_forward_batch_tokens_total counter", body
         )
         self.assertIn(
+            "# TYPE inferflux_native_down_proj_operator_total counter", body
+        )
+        self.assertIn(
             "# TYPE inferflux_native_forward_duration_ms histogram", body
         )
         self.assertIn(
@@ -250,6 +408,24 @@ class NativeMetricsStubTests(unittest.TestCase):
         )
         self.assertIn(
             "# TYPE inferflux_native_kv_max_sequences gauge", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_native_kv_autotune_events_total counter", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_native_kv_requested_max_seq gauge", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_native_kv_planned_max_seq gauge", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_native_kv_requested_bytes gauge", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_native_kv_planned_bytes gauge", body
+        )
+        self.assertIn(
+            "# TYPE inferflux_native_kv_budget_bytes gauge", body
         )
 
 

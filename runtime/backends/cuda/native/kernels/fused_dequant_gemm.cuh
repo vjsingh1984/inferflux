@@ -10,9 +10,17 @@ namespace runtime {
 namespace cuda {
 namespace native {
 
-// Maximum M the tiled GEMM kernels can handle (shared memory + register limit).
-// The adaptive dispatch threshold may be lower on GPUs with fast tensor cores.
-constexpr int kFusedGemmMaxM = 32;
+// Deprecated reference kernels:
+// These small-batch fused GEMM implementations are intentionally kept for
+// algorithm comparison and bring-up, but the current native dispatcher does not
+// launch them. `FusedQuantGemm::DispatchFused` uses the GEMV-style kernels for
+// active fused execution and falls back to cuBLAS before any large-M GEMM
+// dispatch would occur.
+
+// Maximum M for fused dequant dispatch (GEMV 2D grid has no inherent M limit,
+// but above this threshold cuBLAS with tensor cores is typically faster).
+// Matches llama.cpp's MMQ_DP4A_MAX_BATCH_SIZE=64 for dp4a-capable GPUs.
+constexpr int kFusedGemmMaxM = 64;
 
 // Tile dimensions for small-batch GEMM
 constexpr int kTileN = 8; // Output columns per thread block

@@ -34,8 +34,12 @@ void EnsureCudaQuantizationHandlersRegistered(
   registry->Register("q5_k",
                      []() { return std::make_shared<Q5_K_M_Handler>(); });
   registry->Register("q6_k", []() { return std::make_shared<Q6_K_Handler>(); });
+  registry->Register("q6_k_m",
+                     []() { return std::make_shared<Q6_K_Handler>(); });
   registry->Register("q8_0", []() { return std::make_shared<Q8_0_Handler>(); });
   registry->Register("q8_k", []() { return std::make_shared<Q8_K_Handler>(); });
+  registry->Register("q8_k_m",
+                     []() { return std::make_shared<Q8_K_Handler>(); });
 }
 #endif
 
@@ -92,8 +96,20 @@ void EnsureCpuQuantizationHandlersRegistered(
     return std::make_shared<StaticQuantizationHandler>("q6_k", 6.5625, 256,
                                                        210);
   });
+  registry->Register("q6_k_m", []() {
+    return std::make_shared<StaticQuantizationHandler>("q6_k", 6.5625, 256,
+                                                       210);
+  });
   registry->Register("q8_0", []() {
     return std::make_shared<StaticQuantizationHandler>("q8_0", 8.5, 32, 34);
+  });
+  registry->Register("q8_k", []() {
+    return std::make_shared<StaticQuantizationHandler>("q8_k", 9.125, 256,
+                                                       292);
+  });
+  registry->Register("q8_k_m", []() {
+    return std::make_shared<StaticQuantizationHandler>("q8_k", 9.125, 256,
+                                                       292);
   });
 }
 #endif
@@ -186,7 +202,7 @@ size_t BaseQuantizationHandler::GetBlockSize(const std::string &type) {
       {"q4_0", 32},  {"q4_1", 32},    {"q5_0", 32},  {"q5_1", 32},
       {"q8_0", 32},  {"q8_1", 32},    {"q2_k", 256}, {"q3_k", 256},
       {"q4_k", 256}, {"q4_k_m", 256}, {"q5_k", 256}, {"q5_k_m", 256},
-      {"q6_k", 256}, {"q8_k", 256},
+      {"q6_k", 256}, {"q6_k_m", 256}, {"q8_k", 256}, {"q8_k_m", 256},
   };
 
   auto it = block_sizes.find(type);
@@ -221,8 +237,9 @@ size_t BaseQuantizationHandler::GetQuantizedSize(size_t num_elements,
        176}, // 2*sizeof(half) + 12 + 256/2 + 256/8 = 4 + 12 + 128 + 32 = 176
       {"q5_k_m", 176},
       {"q6_k", 210}, // sizeof(half) + 256/16 + 3*256/4 = 2 + 16 + 192 = 210
-      {"q8_k", 320}, // sizeof(float) + 256 + 256/16*sizeof(int16_t) = 4 + 256 +
-                     // 32 = 292
+      {"q6_k_m", 210},
+      {"q8_k", 292},   // sizeof(float) + 256 + 256/16*sizeof(int16_t)
+      {"q8_k_m", 292}, // alias
   };
 
   auto it = block_bytes.find(type);

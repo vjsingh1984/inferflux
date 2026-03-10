@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -36,6 +37,17 @@ template <typename T>
 cudaError_t HalfToFloat(const T *input, float *output, int count,
                         cudaStream_t stream);
 
+template <typename T>
+cudaError_t QuantizeRowsSymmetric(const T *input, int8_t *output,
+                                  float *row_scales, int rows, int cols,
+                                  cudaStream_t stream);
+
+template <typename T>
+cudaError_t SiluMulQuantizeRowsSymmetric(const T *gate, const T *up,
+                                         int8_t *output, float *row_scales,
+                                         int rows, int cols,
+                                         cudaStream_t stream);
+
 /**
  * BiasAdd: output[i] += bias[i % bias_dim] for rows * bias_dim elements.
  * Used to add projection biases after GEMM (e.g., Q/K/V biases in Qwen2).
@@ -67,6 +79,15 @@ cudaError_t EmbeddingLookup(const half *table, const int *token_ids,
 
 cudaError_t HalfToFloat(const half *input, float *output, int count,
                         cudaStream_t stream);
+
+cudaError_t QuantizeRowsSymmetric(const half *input, int8_t *output,
+                                  float *row_scales, int rows, int cols,
+                                  cudaStream_t stream);
+
+cudaError_t SiluMulQuantizeRowsSymmetric(const half *gate, const half *up,
+                                         int8_t *output, float *row_scales,
+                                         int rows, int cols,
+                                         cudaStream_t stream);
 
 // ============================================================================
 // Batched kernels for multi-sequence decode

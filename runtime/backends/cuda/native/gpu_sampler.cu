@@ -145,9 +145,6 @@ __global__ void TopPMaskKernel(float *__restrict__ probs, int vocab_size,
   // Instead, scan from max prob downward using the unsorted array.
   // This is approximate but functional.
   float cumsum = 0.0f;
-  // First pass: find threshold
-  float threshold = 0.0f;
-
   // We need to iterate in sorted order. For a production kernel,
   // use CUB radix sort. Here we use a simple iterative max approach.
   // Mark visited entries by negating them temporarily.
@@ -165,7 +162,6 @@ __global__ void TopPMaskKernel(float *__restrict__ probs, int vocab_size,
     if (max_idx < 0)
       break;
     cumsum += max_val;
-    threshold = max_val;
     probs[max_idx] = -probs[max_idx]; // Mark as visited
   }
 
@@ -422,6 +418,7 @@ void GpuSampler::SampleBatch(const float *d_logits, int batch_size,
                              const std::vector<float> &temperatures,
                              const std::vector<int> &top_ks,
                              const std::vector<float> &top_ps,
+                             const std::vector<uint32_t> &seeds,
                              std::vector<int> *out_tokens) {
   NVTX_SCOPE("SampleBatch");
   out_tokens->resize(batch_size);
@@ -437,8 +434,19 @@ void GpuSampler::SampleBatch(const float *d_logits, int batch_size,
   // Fallback: per-sequence sampling (stochastic needs per-seq state)
   for (int i = 0; i < batch_size; ++i) {
     const float *logits_i = d_logits + i * vocab_size_;
-    (*out_tokens)[i] = Sample(logits_i, temperatures[i], top_ks[i], top_ps[i]);
+    const uint32_t seed =
+        i < static_cast<int>(seeds.size()) ? seeds[static_cast<size_t>(i)]
+                                           : UINT32_MAX;
+    (*out_tokens)[i] =
+        Sample(logits_i, temperatures[i], top_ks[i], top_ps[i], seed);
   }
+}
+
+void GpuSampler::CopyLogitsToHost(const float *d_logits, float *host_buf) {
+  NVTX_SCOPE("Sampler_CopyLogits");
+  cudaMemcpyAsync(host_buf, d_logits, vocab_size_ * sizeof(float),
+                  cudaMemcpyDeviceToHost, stream_);
+  cudaStreamSynchronize(stream_);
 }
 
 } // namespace inferflux

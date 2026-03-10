@@ -196,7 +196,7 @@ For `backend: cuda` requests, runtime fallback order is:
 | `runtime.scheduler.min_batch_size` | 1 | keep low for responsiveness |
 | `runtime.scheduler.batch_accumulation_ms` | 0-5 | small wait to form better batches |
 | `runtime.scheduler.policy` | `priority_age` | queue ranking policy (`priority_age`, `lpm_priority`, `throughput_balanced`) |
-| `runtime.scheduler.continuous_decode_steps` | `0` | decode burst cap per executor pass (`0` disables burst slicing) |
+| `runtime.scheduler.decode_burst_tokens` | `0` | decode burst cap per executor pass (`0` disables burst slicing) |
 | `runtime.scheduler.chunked_prefill_tokens` | `512` | max tokens submitted per prefill chunk in mixed execution |
 | `runtime.scheduler.mixed_prefill_budget_ratio` | `1.0` | fraction (`0.0-1.0`) of token budget reserved for prefill in mixed steps |
 | `runtime.scheduler.session_handles.enabled` | `false` | optional `session_id -> sequence slot` mapping layer |
@@ -208,7 +208,7 @@ Session handle contract:
 - `session_id` support is opt-in and only active when `session_handles.enabled=true`.
 - KV dtype stays server/model-load scoped (`runtime.cuda.kv_cache_dtype`), not per request/session.
 - `runtime.scheduler.policy` can be overridden with `INFERFLUX_SCHED_POLICY`.
-- Scheduler mixed-step env overrides: `INFERFLUX_SCHED_CONTINUOUS_DECODE_STEPS`, `INFERFLUX_SCHED_CHUNKED_PREFILL_TOKENS`, `INFERFLUX_SCHED_MIXED_PREFILL_BUDGET_RATIO`.
+- Scheduler mixed-step env overrides: `INFERFLUX_SCHED_DECODE_BURST_TOKENS`, `INFERFLUX_SCHED_CHUNKED_PREFILL_TOKENS`, `INFERFLUX_SCHED_MIXED_PREFILL_BUDGET_RATIO`.
 
 ### KV cache
 

@@ -1,15 +1,20 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/disaggregated/kv_channel.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "scheduler/fairness_controller.h"
+#include "scheduler/request_requeue.h"
+#define private public
 #include "scheduler/scheduler.h"
+#undef private
 #include "scheduler/single_model_router.h"
 #include "server/metrics/metrics.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -39,6 +44,56 @@ int64_t ReadBatchTokenBudgetSkipsTotal() {
   }
 }
 
+int64_t ReadDisaggTicketStageTotal(const std::string &stage) {
+  const std::string output = GlobalMetrics().RenderPrometheus();
+  const std::string key = "inferflux_disagg_kv_tickets_total{backend=\"cpu\","
+                          "stage=\"" +
+                          stage + "\"} ";
+  auto pos = output.find(key);
+  if (pos == std::string::npos) {
+    return 0;
+  }
+  pos += key.size();
+  auto line_end = output.find('\n', pos);
+  const std::string value = output.substr(
+      pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+  try {
+    return std::stoll(value);
+  } catch (const std::exception &) {
+    return 0;
+  }
+}
+
+int64_t ReadScalarMetric(const std::string &key) {
+  const std::string output = GlobalMetrics().RenderPrometheus();
+  auto pos = output.find(key);
+  if (pos == std::string::npos) {
+    return 0;
+  }
+  pos += key.size();
+  auto line_end = output.find('\n', pos);
+  const std::string value = output.substr(
+      pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+  try {
+    return std::stoll(value);
+  } catch (const std::exception &) {
+    return 0;
+  }
+}
+
+bool WaitForCondition(
+    const std::function<bool()> &predicate,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return predicate();
+}
+
 class ReadyStubBackend : public LlamaCPUBackend {
 public:
   explicit ReadyStubBackend(std::string output) : output_(std::move(output)) {}
@@ -49,6 +104,7 @@ public:
   }
 
   bool IsReady() const override { return true; }
+  bool SupportsSplitPrefillDecodeHandoff() const override { return true; }
 
   PrefillResult Prefill(const std::string &, int) override {
     PrefillResult out;
@@ -114,6 +170,31 @@ public:
 
 private:
   std::string output_;
+};
+
+class ProcessLocalSplitStubBackend final : public ReadyStubBackend {
+public:
+  explicit ProcessLocalSplitStubBackend(std::string output)
+      : ReadyStubBackend(std::move(output)) {}
+
+  bool SupportsProcessLocalSequenceTransfer() const override { return true; }
+
+  std::vector<uint8_t> SerializeSequence(int sequence_id) override {
+    ++serialize_calls_;
+    return {static_cast<uint8_t>(sequence_id & 0xff), 0x42};
+  }
+
+  bool HydrateSequence(int, const std::vector<uint8_t> &blob) override {
+    ++hydrate_calls_;
+    return !blob.empty();
+  }
+
+  int SerializeCalls() const { return serialize_calls_.load(); }
+  int HydrateCalls() const { return hydrate_calls_.load(); }
+
+private:
+  std::atomic<int> serialize_calls_{0};
+  std::atomic<int> hydrate_calls_{0};
 };
 
 class AsyncLaneStubBackend final : public ReadyStubBackend {
@@ -199,11 +280,29 @@ public:
   int FirstSubmissionTicket() const {
     return first_submission_ticket_.load(std::memory_order_relaxed);
   }
+  std::vector<int> PrefillBatchSizes() const {
+    std::lock_guard<std::mutex> lock(batch_size_mutex_);
+    return prefill_batch_sizes_;
+  }
+  std::vector<int> DecodeBatchSizes() const {
+    std::lock_guard<std::mutex> lock(batch_size_mutex_);
+    return decode_batch_sizes_;
+  }
 
 private:
   std::vector<UnifiedBatchOutput>
   BuildOutputs(const std::vector<UnifiedBatchInput> &inputs,
                UnifiedBatchLane lane) const {
+    {
+      std::lock_guard<std::mutex> lock(batch_size_mutex_);
+      if (lane == UnifiedBatchLane::kPrefill) {
+        prefill_batch_sizes_.push_back(static_cast<int>(inputs.size()));
+      } else if (lane == UnifiedBatchLane::kDecode) {
+        decode_batch_sizes_.push_back(static_cast<int>(inputs.size()));
+      } else {
+        auto_batch_sizes_.push_back(static_cast<int>(inputs.size()));
+      }
+    }
     std::vector<UnifiedBatchOutput> outputs(inputs.size());
     for (std::size_t i = 0; i < inputs.size(); ++i) {
       outputs[i].ok = true;
@@ -228,8 +327,45 @@ private:
   std::atomic<int> prefill_fallback_calls_{0};
   std::atomic<int> prefill_partial_fallback_calls_{0};
   std::atomic<int> first_submission_ticket_{0};
+  mutable std::mutex batch_size_mutex_;
+  mutable std::vector<int> prefill_batch_sizes_;
+  mutable std::vector<int> decode_batch_sizes_;
+  mutable std::vector<int> auto_batch_sizes_;
 
   static std::atomic<int> global_submission_ticket_;
+};
+
+class PromptRecordingSliceBackend final : public LlamaCPUBackend {
+public:
+  explicit PromptRecordingSliceBackend(std::vector<std::string> outputs)
+      : outputs_(std::move(outputs)) {}
+
+  bool IsReady() const override { return true; }
+
+  std::string
+  Generate(const std::string &prompt, int,
+           const std::function<bool(const std::string &, const TokenLogprob *)>
+               &,
+           const std::function<bool()> &, int,
+           std::vector<TokenLogprob> *,
+           const std::vector<std::string> &) override {
+    seen_prompts_.push_back(prompt);
+    if (next_output_ >= outputs_.size()) {
+      return {};
+    }
+    return outputs_[next_output_++];
+  }
+
+  int TokenCount(const std::string &text) const override {
+    return static_cast<int>(text.size());
+  }
+
+  const std::vector<std::string> &SeenPrompts() const { return seen_prompts_; }
+
+private:
+  std::vector<std::string> outputs_;
+  std::vector<std::string> seen_prompts_;
+  std::size_t next_output_{0};
 };
 
 std::atomic<int> AsyncLaneStubBackend::global_submission_ticket_{0};
@@ -249,6 +385,47 @@ public:
 
 private:
   std::atomic<int> free_sequence_calls_{0};
+};
+
+class NonSplitHandoffStubBackend final : public ReadyStubBackend {
+public:
+  explicit NonSplitHandoffStubBackend(std::string output)
+      : ReadyStubBackend(std::move(output)) {}
+
+  bool SupportsSplitPrefillDecodeHandoff() const override { return false; }
+};
+
+class DeferredFreeStubBackend final : public ReadyStubBackend {
+public:
+  explicit DeferredFreeStubBackend(std::string output)
+      : ReadyStubBackend(std::move(output)) {}
+
+  SequenceReleaseFence BeginFreeSequence(int sequence_id) override {
+    last_sequence_id_.store(sequence_id, std::memory_order_relaxed);
+    begin_calls_.fetch_add(1, std::memory_order_relaxed);
+    SequenceReleaseFence fence;
+    fence.token = 1;
+    fence.pending = true;
+    return fence;
+  }
+
+  bool PollFreeSequence(const SequenceReleaseFence &) override {
+    poll_calls_.fetch_add(1, std::memory_order_relaxed);
+    return ready_.load(std::memory_order_relaxed);
+  }
+
+  void SetReady(bool ready) { ready_.store(ready, std::memory_order_relaxed); }
+  int BeginCalls() const { return begin_calls_.load(std::memory_order_relaxed); }
+  int PollCalls() const { return poll_calls_.load(std::memory_order_relaxed); }
+  int LastSequenceId() const {
+    return last_sequence_id_.load(std::memory_order_relaxed);
+  }
+
+private:
+  std::atomic<bool> ready_{false};
+  std::atomic<int> begin_calls_{0};
+  std::atomic<int> poll_calls_{0};
+  std::atomic<int> last_sequence_id_{-1};
 };
 
 class RejectingKVTransport final : public disaggregated::IKVTransport {
@@ -272,6 +449,92 @@ public:
 
 private:
   std::atomic<int> enqueue_calls_{0};
+};
+
+class CapturingKVTransport final : public disaggregated::IKVTransport {
+public:
+  explicit CapturingKVTransport(bool process_local = false)
+      : process_local_(process_local) {}
+
+  bool Enqueue(disaggregated::KVPacket packet) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (packet.ticket_id > 0) {
+      ticket_stages_[packet.ticket_id] = packet.ticket_stage;
+    }
+    packets_.push_back(packet);
+    queue_.push_back(std::move(packet));
+    return true;
+  }
+
+  std::optional<disaggregated::KVPacket> TryDequeue() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (queue_.empty()) {
+      return std::nullopt;
+    }
+    auto pkt = std::move(queue_.front());
+    queue_.erase(queue_.begin());
+    if (rewrite_dequeued_request_id_) {
+      pkt.request_id = rewritten_request_id_;
+    }
+    return pkt;
+  }
+
+  std::size_t Size() const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return queue_.size();
+  }
+
+  std::size_t Capacity() const override { return 1024; }
+  bool IsProcessLocal() const override { return process_local_; }
+
+  bool UpdateTicketStage(uint64_t ticket_id,
+                         disaggregated::KVTicketStage stage) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = ticket_stages_.find(ticket_id);
+    if (it == ticket_stages_.end()) {
+      return false;
+    }
+    it->second = stage;
+    return true;
+  }
+
+  disaggregated::KVTicketStage
+  GetTicketStage(uint64_t ticket_id) const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = ticket_stages_.find(ticket_id);
+    if (it == ticket_stages_.end()) {
+      return disaggregated::KVTicketStage::kNone;
+    }
+    return it->second;
+  }
+
+  std::vector<disaggregated::KVPacket> Snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return packets_;
+  }
+
+  void RewriteDequeuedRequestId(uint64_t request_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rewrite_dequeued_request_id_ = true;
+    rewritten_request_id_ = request_id;
+  }
+
+  void InjectPacket(disaggregated::KVPacket packet) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (packet.ticket_id > 0) {
+      ticket_stages_[packet.ticket_id] = packet.ticket_stage;
+    }
+    queue_.push_back(std::move(packet));
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::vector<disaggregated::KVPacket> packets_;
+  std::vector<disaggregated::KVPacket> queue_;
+  std::unordered_map<uint64_t, disaggregated::KVTicketStage> ticket_stages_;
+  bool rewrite_dequeued_request_id_{false};
+  uint64_t rewritten_request_id_{0};
+  bool process_local_{false};
 };
 
 } // namespace
@@ -360,6 +623,145 @@ TEST_CASE("Scheduler clamps max_tokens=0 to 1", "[scheduler]") {
   REQUIRE(resp.no_backend);
 }
 
+TEST_CASE("Scheduler slot manager mirrors alloc/free lifecycle",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  Scheduler scheduler(tokenizer, device, cache, nullptr);
+
+  auto *slot_manager = scheduler.SlotManager();
+  REQUIRE(slot_manager != nullptr);
+  REQUIRE(slot_manager->GetUsedSlotCount() == 0);
+
+  uint64_t generation = 0;
+  const int slot = scheduler.AllocSeqSlot(4242, &generation);
+  REQUIRE(slot >= 0);
+  REQUIRE(generation == 1);
+  REQUIRE(slot_manager->GetUsedSlotCount() == 1);
+
+  bool found = false;
+  for (const auto &status : slot_manager->GetSlotStatus()) {
+    if (status.slot_id == slot) {
+      REQUIRE(status.request_id == 4242);
+      REQUIRE(status.generation == generation);
+      REQUIRE(status.state == scheduler::SequenceState::kPrefilling);
+      found = true;
+      break;
+    }
+  }
+  REQUIRE(found);
+
+  scheduler.FreeSeqSlot(slot, generation);
+  REQUIRE(slot_manager->GetUsedSlotCount() == 0);
+}
+
+TEST_CASE("Scheduler rejects stale sequence lease release after slot reuse",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  Scheduler scheduler(tokenizer, device, cache, nullptr);
+
+  auto *slot_manager = scheduler.SlotManager();
+  REQUIRE(slot_manager != nullptr);
+
+  uint64_t first_generation = 0;
+  const int slot = scheduler.AllocSeqSlot(6001, &first_generation);
+  REQUIRE(slot >= 0);
+  REQUIRE(first_generation == 1);
+  scheduler.FreeSeqSlot(slot, first_generation);
+
+  uint64_t second_generation = 0;
+  const int reused_slot = scheduler.AllocSeqSlot(6002, &second_generation);
+  REQUIRE(reused_slot == slot);
+  REQUIRE(second_generation > first_generation);
+  REQUIRE(slot_manager->GetUsedSlotCount() == 1);
+
+  scheduler.FreeSeqSlot(slot, first_generation);
+  REQUIRE(slot_manager->GetUsedSlotCount() == 1);
+
+  bool found = false;
+  for (const auto &status : slot_manager->GetSlotStatus()) {
+    if (status.slot_id == slot) {
+      REQUIRE(status.request_id == 6002);
+      REQUIRE(status.generation == second_generation);
+      REQUIRE(status.state == scheduler::SequenceState::kPrefilling);
+      found = true;
+      break;
+    }
+  }
+  REQUIRE(found);
+
+  scheduler.FreeSeqSlot(reused_slot, second_generation);
+  REQUIRE(slot_manager->GetUsedSlotCount() == 0);
+}
+
+TEST_CASE("Scheduler defers slot reuse until backend free fence is ready",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  Scheduler scheduler(tokenizer, device, cache, nullptr);
+
+  auto backend = std::make_shared<DeferredFreeStubBackend>("deferred");
+  auto *slot_manager = scheduler.SlotManager();
+  REQUIRE(slot_manager != nullptr);
+  GlobalMetrics().SetBackend("cpu");
+  const int64_t deferred_completed_before = ReadScalarMetric(
+      "inferflux_scheduler_deferred_sequence_retirements_completed_total{"
+      "backend=\"cpu\"} ");
+
+  uint64_t generation = 0;
+  const int slot = scheduler.AllocSeqSlot(7001, &generation);
+  REQUIRE(slot >= 0);
+  REQUIRE(generation == 1);
+
+  scheduler.FreeSeqSlot(slot, generation, backend);
+  REQUIRE(slot_manager->GetRetiringSlotCount() == 1);
+  REQUIRE(slot_manager->GetUsedSlotCount() == 0);
+  REQUIRE(slot_manager->GetFreeSlotCount() == 15);
+  REQUIRE(GlobalMetrics().GetSchedulerDeferredSequenceRetirements() == 1);
+  REQUIRE(backend->BeginCalls() == 1);
+  REQUIRE(backend->LastSequenceId() == slot);
+
+  std::vector<std::pair<int, uint64_t>> held_slots;
+  held_slots.reserve(15);
+  for (int i = 0; i < 15; ++i) {
+    uint64_t held_generation = 0;
+    const int held_slot = scheduler.AllocSeqSlot(7100 + i, &held_generation);
+    REQUIRE(held_slot >= 0);
+    REQUIRE(held_slot != slot);
+    held_slots.push_back({held_slot, held_generation});
+  }
+
+  uint64_t blocked_generation = 0;
+  REQUIRE(scheduler.AllocSeqSlot(7002, &blocked_generation) == -1);
+  REQUIRE(slot_manager->GetRetiringSlotCount() == 1);
+  REQUIRE(backend->PollCalls() >= 1);
+
+  backend->SetReady(true);
+  uint64_t reacquired_generation = 0;
+  const int reacquired_slot =
+      scheduler.AllocSeqSlot(7003, &reacquired_generation);
+  REQUIRE(reacquired_slot == slot);
+  REQUIRE(reacquired_generation > generation);
+  REQUIRE(slot_manager->GetRetiringSlotCount() == 0);
+  REQUIRE(GlobalMetrics().GetSchedulerDeferredSequenceRetirements() == 0);
+  REQUIRE(ReadScalarMetric(
+              "inferflux_scheduler_deferred_sequence_retirements_completed_"
+              "total{backend=\"cpu\"} ") ==
+          deferred_completed_before + 1);
+
+  scheduler.FreeSeqSlot(reacquired_slot, reacquired_generation);
+  for (const auto &[held_slot, held_generation] : held_slots) {
+    scheduler.FreeSeqSlot(held_slot, held_generation);
+  }
+}
+
 TEST_CASE("Scheduler prefill uses async unified prefill lane when available",
           "[scheduler]") {
   SimpleTokenizer tokenizer;
@@ -389,6 +791,153 @@ TEST_CASE("Scheduler prefill uses async unified prefill lane when available",
   REQUIRE(backend->DecodeSubmissions() > 0);
   REQUIRE(backend->PrefillFallbackCalls() == 0);
   REQUIRE(backend->PrefillPartialFallbackCalls() == 0);
+}
+
+TEST_CASE("Scheduler routes decode-ready prefill requests directly to decode",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<AsyncLaneStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "decode-ready-model";
+  info.path = "/tmp/decode-ready.gguf";
+  info.backend = "cuda";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  Scheduler scheduler(tokenizer, device, cache, router);
+
+  auto pending = std::make_shared<Scheduler::PendingRequest>();
+  pending->inference.id = 7;
+  pending->inference.model = info.id;
+  pending->inference.resolved_model = info.id;
+  pending->inference.prompt = "decode ready";
+  pending->inference.prompt_tokens = tokenizer.Encode(pending->inference.prompt);
+  pending->inference.bpe_prompt_tokens = {1, 2, 3, 4};
+  pending->inference.max_tokens = 2;
+  pending->inference.remaining_decode_tokens = 2;
+  pending->inference.phase = RequestPhase::kPrefill;
+  pending->enqueue_time = std::chrono::steady_clock::now();
+  pending->inference.enqueue_time = pending->enqueue_time;
+  pending->resolved_backend = backend;
+  pending->priority = 0;
+  pending->priority_level = 0;
+  pending->sequence = 7;
+
+  uint64_t generation = 0;
+  const int seq_id = scheduler.AllocSeqSlot(pending->inference.id, &generation);
+  REQUIRE(seq_id >= 0);
+  pending->inference.sequence_id = seq_id;
+  pending->inference.sequence_generation = generation;
+  pending->inference.n_past = 4;
+  pending->inference.first_token = 100;
+  pending->inference.first_piece = "p";
+
+  Scheduler::BatchSelection selection;
+  selection.pending.push_back(pending);
+  selection.batch.requests.push_back(&pending->inference);
+  selection.total_tokens = pending->inference.prompt_tokens.size();
+
+  auto future = pending->promise.get_future();
+  scheduler.ProcessBatch(std::move(selection));
+  auto result = future.get();
+
+  REQUIRE_FALSE(result.no_backend);
+  REQUIRE(result.completion == "pd");
+  REQUIRE(backend->PrefillSubmissions() == 0);
+  REQUIRE(backend->PrefillFallbackCalls() == 0);
+  REQUIRE(backend->PrefillPartialFallbackCalls() == 0);
+  REQUIRE(backend->DecodeSubmissions() > 0);
+}
+
+TEST_CASE("Scheduler opportunistically accumulates decode batches when "
+          "min_batch_size is one",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<AsyncLaneStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "decode-accumulate-model";
+  info.path = "/tmp/decode-accumulate.gguf";
+  info.backend = "cuda";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  Scheduler::Config scheduler_config;
+  scheduler_config.max_batch_size = 4;
+  scheduler_config.min_batch_size = 1;
+  scheduler_config.batch_accumulation_ms = 20;
+
+  DisaggregatedConfig disagg_config;
+  disagg_config.decode_pool_size = 1;
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, disagg_config, ModelSelectionOptions{},
+                      scheduler_config);
+
+  auto make_request = [&]() {
+    InferenceRequest req;
+    req.model = info.id;
+    req.prompt = "decode accumulation check";
+    req.max_tokens = 2;
+    return req;
+  };
+
+  auto first = scheduler.Generate(make_request());
+  auto second = scheduler.Generate(make_request());
+
+  auto first_resp = first.get();
+  auto second_resp = second.get();
+
+  REQUIRE_FALSE(first_resp.no_backend);
+  REQUIRE_FALSE(second_resp.no_backend);
+  REQUIRE(backend->DecodeSubmissions() > 0);
+
+  const auto decode_batch_sizes = backend->DecodeBatchSizes();
+  REQUIRE(std::any_of(decode_batch_sizes.begin(), decode_batch_sizes.end(),
+                      [](int size) { return size >= 2; }));
+}
+
+TEST_CASE("Scheduler batch selection deduplicates one pending request leaked "
+          "into both queues",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+
+  Scheduler scheduler(tokenizer, device, cache, router);
+
+  auto pending = std::make_shared<Scheduler::PendingRequest>();
+  pending->inference.id = 42;
+  pending->inference.prompt = "duplicate queue entry";
+  pending->inference.prompt_tokens = tokenizer.Encode(pending->inference.prompt);
+  pending->inference.phase = RequestPhase::kPending;
+  pending->priority = 0;
+  pending->priority_level = 0;
+  pending->sequence = 42;
+  pending->enqueue_time = std::chrono::steady_clock::now();
+
+  {
+    std::lock_guard<std::mutex> lock(scheduler.queue_mutex_);
+    scheduler.pending_prefill_.push_back(pending);
+    scheduler.pending_decode_.push_back(pending);
+    auto selection = scheduler.BuildBatchLocked();
+
+    REQUIRE(selection.pending.size() == 1);
+    REQUIRE(selection.pending.front().get() == pending.get());
+    REQUIRE(scheduler.pending_prefill_.empty());
+    REQUIRE(scheduler.pending_decode_.empty());
+  }
 }
 
 TEST_CASE("Scheduler token budget accounts decode slices, not full prompts",
@@ -501,6 +1050,71 @@ TEST_CASE("Scheduler session handles preserve sequence until lease release",
   REQUIRE(backend->FreeSequenceCalls() >= 1);
 }
 
+TEST_CASE("PrepareFairnessDecodeRequeue preserves original prompt state",
+          "[scheduler]") {
+  InferenceRequest req;
+  req.id = 42;
+  req.prompt = "seed prompt";
+  req.phase = RequestPhase::kPending;
+  req.sequence_id = 7;
+  req.sequence_generation = 3;
+  req.n_past = 11;
+  req.remaining_decode_tokens = 2;
+  req.accumulated_output = "AB";
+
+  const auto now = std::chrono::steady_clock::now();
+  PrepareFairnessDecodeRequeue(&req, now);
+
+  REQUIRE(req.prompt == "seed prompt");
+  REQUIRE(req.accumulated_output == "AB");
+  REQUIRE(req.phase == RequestPhase::kDecode);
+  REQUIRE(req.enqueue_time == now);
+  REQUIRE(req.sequence_id == 7);
+  REQUIRE(req.sequence_generation == 3);
+}
+
+TEST_CASE("Scheduler fairness requeue does not mutate prompt between slices",
+          "[scheduler]") {
+  auto backend = std::make_shared<PromptRecordingSliceBackend>(
+      std::vector<std::string>{"A", "B", "C"});
+
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      16, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+
+  ModelInfo info;
+  info.id = "fairness-prompt";
+  info.path = "/tmp/fairness-prompt.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  FairnessConfig fairness_config;
+  fairness_config.max_timeslice_tokens = 1;
+
+  Scheduler::Config scheduler_config;
+  scheduler_config.max_batch_size = 1;
+  scheduler_config.max_batch_tokens = 8;
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      fairness_config, DisaggregatedConfig{},
+                      ModelSelectionOptions{}, scheduler_config);
+
+  InferenceRequest req;
+  req.model = info.id;
+  req.prompt = "seed prompt";
+  req.max_tokens = 3;
+
+  auto result = scheduler.Generate(std::move(req)).get();
+  REQUIRE_FALSE(result.no_backend);
+  REQUIRE(result.completion == "ABC");
+  REQUIRE(backend->SeenPrompts() ==
+          std::vector<std::string>{"seed prompt", "seed prompt",
+                                   "seed prompt"});
+}
+
 TEST_CASE("Scheduler fails fast when distributed enqueue retries are exhausted",
           "[scheduler][distributed]") {
   SimpleTokenizer tokenizer;
@@ -538,6 +1152,268 @@ TEST_CASE("Scheduler fails fast when distributed enqueue retries are exhausted",
   REQUIRE(backend->FreeSequenceCalls() >= 1);
 }
 
+TEST_CASE("Scheduler stamps distributed KV packets with transport ticket ids",
+          "[scheduler][distributed]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      16, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<SessionLeaseStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "dist-ticket-model";
+  info.path = "/tmp/dist-ticket.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  auto transport = std::make_shared<CapturingKVTransport>();
+  DisaggregatedConfig disagg_config;
+  disagg_config.decode_pool_size = 1;
+  disagg_config.kv_transport = transport;
+  disagg_config.kv_enqueue_max_retries = 1;
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, disagg_config);
+
+  InferenceRequest req;
+  req.model = info.id;
+  req.prompt = "distributed ticket test";
+  req.max_tokens = 4;
+
+  auto resp = scheduler.Generate(std::move(req)).get();
+  REQUIRE_FALSE(resp.no_backend);
+
+  const auto packets = transport->Snapshot();
+  REQUIRE_FALSE(packets.empty());
+  REQUIRE(packets.front().ticket_id > 0);
+  REQUIRE(packets.front().ticket_stage ==
+          disaggregated::KVTicketStage::kEnqueued);
+  REQUIRE(transport->GetTicketStage(packets.front().ticket_id) ==
+          disaggregated::KVTicketStage::kCommitted);
+}
+
+TEST_CASE("Scheduler keeps non-split backends on local decode lane",
+          "[scheduler][distributed]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      16, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<NonSplitHandoffStubBackend>("local-safe");
+
+  ModelInfo info;
+  info.id = "local-safe-model";
+  info.path = "/tmp/local-safe.gguf";
+  info.backend = "cuda";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  auto transport = std::make_shared<CapturingKVTransport>();
+  DisaggregatedConfig disagg_config;
+  disagg_config.decode_pool_size = 1;
+  disagg_config.kv_transport = transport;
+
+  GlobalMetrics().SetBackend("cpu");
+  const int64_t enqueued_before = ReadDisaggTicketStageTotal("enqueued");
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, disagg_config);
+
+  InferenceRequest req;
+  req.model = info.id;
+  req.prompt = "split lane safety test";
+  req.max_tokens = 4;
+
+  auto resp = scheduler.Generate(std::move(req)).get();
+  REQUIRE_FALSE(resp.no_backend);
+  REQUIRE(resp.completion == "local-safe");
+  REQUIRE(transport->Snapshot().empty());
+  REQUIRE(ReadDisaggTicketStageTotal("enqueued") - enqueued_before == 0);
+}
+
+TEST_CASE("Scheduler skips KV blob serialize/hydrate for process-local native "
+          "split handoff",
+          "[scheduler][distributed]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      16, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<ProcessLocalSplitStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "process-local-split-model";
+  info.path = "/tmp/process-local-split.gguf";
+  info.backend = "cuda";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  auto transport = std::make_shared<CapturingKVTransport>(true);
+  DisaggregatedConfig disagg_config;
+  disagg_config.decode_pool_size = 1;
+  disagg_config.kv_transport = transport;
+  disagg_config.kv_enqueue_max_retries = 1;
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, disagg_config);
+
+  InferenceRequest req;
+  req.model = info.id;
+  req.prompt = "process local split handoff test";
+  req.max_tokens = 4;
+
+  auto resp = scheduler.Generate(std::move(req)).get();
+  REQUIRE_FALSE(resp.no_backend);
+  REQUIRE(resp.completion == "ok");
+
+  const auto packets = transport->Snapshot();
+  REQUIRE_FALSE(packets.empty());
+  REQUIRE(packets.front().sequence_id >= 0);
+  REQUIRE(packets.front().kv_blob.empty());
+  REQUIRE(backend->SerializeCalls() == 0);
+  REQUIRE(backend->HydrateCalls() == 0);
+}
+
+TEST_CASE("Scheduler advances distributed KV ticket to committed on dequeue",
+          "[scheduler][distributed]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      16, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<SessionLeaseStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "dist-ticket-stage-model";
+  info.path = "/tmp/dist-ticket-stage.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  auto transport = std::make_shared<CapturingKVTransport>();
+  DisaggregatedConfig disagg_config;
+  disagg_config.decode_pool_size = 1;
+  disagg_config.kv_transport = transport;
+  disagg_config.kv_enqueue_max_retries = 1;
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, disagg_config);
+
+  GlobalMetrics().SetBackend("cpu");
+  const int64_t enqueued_before = ReadDisaggTicketStageTotal("enqueued");
+  const int64_t acknowledged_before =
+      ReadDisaggTicketStageTotal("acknowledged");
+  const int64_t committed_before = ReadDisaggTicketStageTotal("committed");
+
+  InferenceRequest req;
+  req.model = info.id;
+  req.prompt = "distributed ticket stage test";
+  req.max_tokens = 4;
+
+  auto resp = scheduler.Generate(std::move(req)).get();
+  REQUIRE_FALSE(resp.no_backend);
+
+  const auto packets = transport->Snapshot();
+  REQUIRE_FALSE(packets.empty());
+  REQUIRE(transport->GetTicketStage(packets.front().ticket_id) ==
+          disaggregated::KVTicketStage::kCommitted);
+  REQUIRE(ReadDisaggTicketStageTotal("enqueued") - enqueued_before == 1);
+  REQUIRE(ReadDisaggTicketStageTotal("acknowledged") - acknowledged_before ==
+          1);
+  REQUIRE(ReadDisaggTicketStageTotal("committed") - committed_before == 1);
+}
+
+TEST_CASE("Scheduler marks unmatched distributed KV tickets as timed out",
+          "[scheduler][distributed]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      16, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<SessionLeaseStubBackend>("ok");
+  auto transport = std::make_shared<CapturingKVTransport>();
+
+  ModelInfo info;
+  info.id = "dist-ticket-timeout-model";
+  info.path = "/tmp/dist-ticket-timeout.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  DisaggregatedConfig disagg_config;
+  disagg_config.decode_pool_size = 1;
+  disagg_config.kv_transport = transport;
+  disagg_config.kv_enqueue_max_retries = 1;
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, disagg_config);
+
+  GlobalMetrics().SetBackend("cpu");
+  const int64_t enqueued_before = ReadDisaggTicketStageTotal("enqueued");
+  const int64_t acknowledged_before =
+      ReadDisaggTicketStageTotal("acknowledged");
+  const int64_t timed_out_before = ReadDisaggTicketStageTotal("timed_out");
+  transport->RewriteDequeuedRequestId(999999);
+
+  InferenceRequest req;
+  req.model = info.id;
+  req.prompt = "distributed ticket timeout test";
+  req.max_tokens = 4;
+
+  auto resp = scheduler.Generate(std::move(req)).get();
+  REQUIRE_FALSE(resp.no_backend);
+
+  const auto packets = transport->Snapshot();
+  REQUIRE_FALSE(packets.empty());
+  REQUIRE(transport->GetTicketStage(packets.front().ticket_id) ==
+          disaggregated::KVTicketStage::kTimedOut);
+  REQUIRE(ReadDisaggTicketStageTotal("enqueued") - enqueued_before == 1);
+  REQUIRE(ReadDisaggTicketStageTotal("acknowledged") - acknowledged_before ==
+          1);
+  REQUIRE(ReadDisaggTicketStageTotal("timed_out") - timed_out_before == 1);
+}
+
+TEST_CASE(
+    "Scheduler drains transport-only KV tickets without decode queue work",
+    "[scheduler][distributed]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      16, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto transport = std::make_shared<CapturingKVTransport>();
+
+  DisaggregatedConfig disagg_config;
+  disagg_config.decode_pool_size = 1;
+  disagg_config.kv_transport = transport;
+
+  Scheduler scheduler(tokenizer, device, cache, nullptr, nullptr, nullptr,
+                      FairnessConfig{}, disagg_config);
+
+  GlobalMetrics().SetBackend("cpu");
+  const int64_t acknowledged_before =
+      ReadDisaggTicketStageTotal("acknowledged");
+  const int64_t timed_out_before = ReadDisaggTicketStageTotal("timed_out");
+
+  disaggregated::KVPacket packet;
+  packet.request_id = 424242;
+  packet.ticket_id = 888;
+  packet.ticket_stage = disaggregated::KVTicketStage::kEnqueued;
+  packet.n_past = 3;
+  transport->InjectPacket(std::move(packet));
+
+  REQUIRE(WaitForCondition([&]() {
+    return transport->GetTicketStage(888) ==
+           disaggregated::KVTicketStage::kTimedOut;
+  }));
+  REQUIRE(WaitForCondition([&]() {
+    return ReadDisaggTicketStageTotal("acknowledged") - acknowledged_before ==
+               1 &&
+           ReadDisaggTicketStageTotal("timed_out") - timed_out_before == 1;
+  }));
+}
+
 TEST_CASE("FairnessController evaluation", "[fairness]") {
   FairnessConfig cfg;
   cfg.enable_preemption = true;
@@ -553,6 +1429,56 @@ TEST_CASE("FairnessController evaluation", "[fairness]") {
 
   auto decision = controller.Evaluate(batch, queue);
   REQUIRE(decision.swap);
+}
+
+TEST_CASE("Scheduler fairness preemption keeps decode requests on decode queue",
+          "[scheduler][fairness]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+
+  FairnessConfig cfg;
+  cfg.enable_preemption = true;
+  cfg.high_priority_threshold = 5;
+
+  Scheduler scheduler(tokenizer, device, cache, nullptr, nullptr, nullptr, cfg);
+
+  auto decode_pending = std::make_shared<Scheduler::PendingRequest>();
+  decode_pending->priority = 1;
+  decode_pending->inference.priority = 1;
+  decode_pending->inference.priority_level = 1;
+  decode_pending->inference.id = 101;
+  decode_pending->inference.phase = RequestPhase::kDecode;
+  decode_pending->inference.sequence_id = 6;
+  decode_pending->inference.sequence_generation = 7;
+  decode_pending->inference.n_past = 12;
+  decode_pending->inference.remaining_decode_tokens = 16;
+
+  auto high_pending = std::make_shared<Scheduler::PendingRequest>();
+  high_pending->priority = 10;
+  high_pending->inference.priority = 10;
+  high_pending->inference.priority_level = 10;
+  high_pending->inference.id = 202;
+  high_pending->inference.phase = RequestPhase::kPending;
+
+  scheduler.pending_prefill_.push_back(high_pending);
+
+  Scheduler::BatchSelection selection;
+  selection.pending.push_back(decode_pending);
+
+  scheduler.ApplyFairness(&selection);
+
+  REQUIRE(selection.pending.size() == 1);
+  REQUIRE(selection.pending[0] == high_pending);
+  REQUIRE(scheduler.pending_prefill_.empty());
+  REQUIRE(scheduler.pending_decode_.size() == 1);
+  REQUIRE(scheduler.pending_decode_[0] == decode_pending);
+  REQUIRE(decode_pending->inference.phase == RequestPhase::kDecode);
+  REQUIRE(decode_pending->inference.sequence_id == 6);
+  REQUIRE(decode_pending->inference.sequence_generation == 7);
+  REQUIRE(decode_pending->inference.n_past == 12);
+  REQUIRE(decode_pending->inference.remaining_decode_tokens == 16);
 }
 
 TEST_CASE(
@@ -820,7 +1746,7 @@ TEST_CASE("Scheduler preserves configured batch policy", "[scheduler]") {
 
   Scheduler::Config cfg;
   cfg.batch_policy = SchedulerBatchPolicy::kLpmPriority;
-  cfg.continuous_decode_steps = 3;
+  cfg.decode_burst_tokens = 3;
   cfg.chunked_prefill_tokens = 96;
   cfg.mixed_prefill_budget_ratio = 0.4;
   Scheduler scheduler(tokenizer, device, cache, nullptr, nullptr, nullptr,
@@ -828,7 +1754,7 @@ TEST_CASE("Scheduler preserves configured batch policy", "[scheduler]") {
                       ModelSelectionOptions{}, cfg);
 
   REQUIRE(scheduler.BatchPolicy() == SchedulerBatchPolicy::kLpmPriority);
-  REQUIRE(scheduler.ContinuousDecodeSteps() == 3);
+  REQUIRE(scheduler.DecodeBurstTokens() == 3);
   REQUIRE(scheduler.ChunkedPrefillTokens() == 96);
   REQUIRE(scheduler.MixedPrefillBudgetRatio() ==
           Catch::Approx(0.4).epsilon(1e-6));
@@ -841,14 +1767,14 @@ TEST_CASE("Scheduler normalizes mixed-step tuning bounds", "[scheduler]") {
       4, 1024, PagedKVCache::EvictionPolicy::kLRU);
 
   Scheduler::Config cfg;
-  cfg.continuous_decode_steps = -7;
+  cfg.decode_burst_tokens = -7;
   cfg.chunked_prefill_tokens = 0;
   cfg.mixed_prefill_budget_ratio = 2.5;
   Scheduler scheduler(tokenizer, device, cache, nullptr, nullptr, nullptr,
                       FairnessConfig{}, DisaggregatedConfig{},
                       ModelSelectionOptions{}, cfg);
 
-  REQUIRE(scheduler.ContinuousDecodeSteps() == 0);
+  REQUIRE(scheduler.DecodeBurstTokens() == 0);
   REQUIRE(scheduler.ChunkedPrefillTokens() == 1);
   REQUIRE(scheduler.MixedPrefillBudgetRatio() ==
           Catch::Approx(1.0).epsilon(1e-6));

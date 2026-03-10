@@ -1,6 +1,7 @@
 #include "runtime/backends/cuda/common/dtype_traits.cuh"
 #include "runtime/backends/cuda/native/cuda_kernels.cuh"
 #include <cmath>
+#include <cstdint>
 
 namespace inferflux {
 namespace cuda_kernel {
@@ -236,6 +237,138 @@ cudaError_t HalfToFloat(const T *input, float *output, int count,
 }
 
 // ============================================================================
+// Symmetric per-row activation quantization (templated)
+// ============================================================================
+
+template <typename T>
+__global__ void QuantizeRowsSymmetricKernel(const T *__restrict__ input,
+                                            int8_t *__restrict__ output,
+                                            float *__restrict__ row_scales,
+                                            int cols) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const T *x = input + static_cast<size_t>(row) * cols;
+  int8_t *y = output + static_cast<size_t>(row) * cols;
+
+  extern __shared__ float shared[];
+
+  float local_max = 0.0f;
+  for (int i = tid; i < cols; i += blockDim.x) {
+    const float v = DtypeTraits<T>::to_float(x[i]);
+    local_max = fmaxf(local_max, fabsf(v));
+  }
+  shared[tid] = local_max;
+  __syncthreads();
+
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      shared[tid] = fmaxf(shared[tid], shared[tid + s]);
+    }
+    __syncthreads();
+  }
+
+  const float scale = (shared[0] > 0.0f) ? shared[0] / 127.0f : 0.0f;
+  const float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+  if (tid == 0) {
+    row_scales[row] = scale;
+  }
+  __syncthreads();
+
+  for (int i = tid; i < cols; i += blockDim.x) {
+    const float scaled = DtypeTraits<T>::to_float(x[i]) * inv_scale;
+    const int q = max(-127, min(127, __float2int_rn(scaled)));
+    y[i] = static_cast<int8_t>(q);
+  }
+}
+
+template <typename T>
+cudaError_t QuantizeRowsSymmetric(const T *input, int8_t *output,
+                                  float *row_scales, int rows, int cols,
+                                  cudaStream_t stream) {
+  if (!input || !output || !row_scales || rows <= 0 || cols <= 0) {
+    return cudaErrorInvalidValue;
+  }
+
+  int threads = min(256, cols);
+  int t = 1;
+  while (t < threads) {
+    t <<= 1;
+  }
+  threads = t;
+  const int smem = threads * sizeof(float);
+  QuantizeRowsSymmetricKernel<T><<<rows, threads, smem, stream>>>(
+      input, output, row_scales, cols);
+  return cudaGetLastError();
+}
+
+template <typename T>
+__global__ void SiluMulQuantizeRowsSymmetricKernel(
+    const T *__restrict__ gate, const T *__restrict__ up,
+    int8_t *__restrict__ output, float *__restrict__ row_scales, int cols) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const T *g_row = gate + static_cast<size_t>(row) * cols;
+  const T *u_row = up + static_cast<size_t>(row) * cols;
+  int8_t *y = output + static_cast<size_t>(row) * cols;
+
+  extern __shared__ float shared[];
+
+  float local_max = 0.0f;
+  for (int i = tid; i < cols; i += blockDim.x) {
+    const float g = DtypeTraits<T>::to_float(g_row[i]);
+    const float u = DtypeTraits<T>::to_float(u_row[i]);
+    const float silu = g / (1.0f + expf(-g));
+    local_max = fmaxf(local_max, fabsf(silu * u));
+  }
+  shared[tid] = local_max;
+  __syncthreads();
+
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      shared[tid] = fmaxf(shared[tid], shared[tid + s]);
+    }
+    __syncthreads();
+  }
+
+  const float scale = (shared[0] > 0.0f) ? shared[0] / 127.0f : 0.0f;
+  const float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+  if (tid == 0) {
+    row_scales[row] = scale;
+  }
+  __syncthreads();
+
+  for (int i = tid; i < cols; i += blockDim.x) {
+    const float g = DtypeTraits<T>::to_float(g_row[i]);
+    const float u = DtypeTraits<T>::to_float(u_row[i]);
+    const float silu = g / (1.0f + expf(-g));
+    const float scaled = (silu * u) * inv_scale;
+    const int q = max(-127, min(127, __float2int_rn(scaled)));
+    y[i] = static_cast<int8_t>(q);
+  }
+}
+
+template <typename T>
+cudaError_t SiluMulQuantizeRowsSymmetric(const T *gate, const T *up,
+                                         int8_t *output, float *row_scales,
+                                         int rows, int cols,
+                                         cudaStream_t stream) {
+  if (!gate || !up || !output || !row_scales || rows <= 0 || cols <= 0) {
+    return cudaErrorInvalidValue;
+  }
+
+  int threads = min(256, cols);
+  int t = 1;
+  while (t < threads) {
+    t <<= 1;
+  }
+  threads = t;
+  const int smem = threads * sizeof(float);
+  SiluMulQuantizeRowsSymmetricKernel<T><<<rows, threads, smem, stream>>>(
+      gate, up, output, row_scales, cols);
+  return cudaGetLastError();
+}
+
+// ============================================================================
 // Bias Add (templated)
 // ============================================================================
 
@@ -300,6 +433,15 @@ template cudaError_t HalfToFloat<half>(const half *, float *, int,
                                        cudaStream_t);
 template cudaError_t HalfToFloat<__nv_bfloat16>(const __nv_bfloat16 *, float *,
                                                 int, cudaStream_t);
+template cudaError_t QuantizeRowsSymmetric<half>(const half *, int8_t *, float *,
+                                                 int, int, cudaStream_t);
+template cudaError_t QuantizeRowsSymmetric<__nv_bfloat16>(
+    const __nv_bfloat16 *, int8_t *, float *, int, int, cudaStream_t);
+template cudaError_t SiluMulQuantizeRowsSymmetric<half>(
+    const half *, const half *, int8_t *, float *, int, int, cudaStream_t);
+template cudaError_t SiluMulQuantizeRowsSymmetric<__nv_bfloat16>(
+    const __nv_bfloat16 *, const __nv_bfloat16 *, int8_t *, float *, int, int,
+    cudaStream_t);
 
 template cudaError_t BiasAdd<half>(half *, const half *, int, int,
                                    cudaStream_t);
@@ -344,6 +486,21 @@ cudaError_t EmbeddingLookup(const half *table, const int *token_ids,
 cudaError_t HalfToFloat(const half *input, float *output, int count,
                         cudaStream_t stream) {
   return HalfToFloat<half>(input, output, count, stream);
+}
+
+cudaError_t QuantizeRowsSymmetric(const half *input, int8_t *output,
+                                  float *row_scales, int rows, int cols,
+                                  cudaStream_t stream) {
+  return QuantizeRowsSymmetric<half>(input, output, row_scales, rows, cols,
+                                     stream);
+}
+
+cudaError_t SiluMulQuantizeRowsSymmetric(const half *gate, const half *up,
+                                         int8_t *output, float *row_scales,
+                                         int rows, int cols,
+                                         cudaStream_t stream) {
+  return SiluMulQuantizeRowsSymmetric<half>(gate, up, output, row_scales, rows,
+                                            cols, stream);
 }
 
 // ============================================================================

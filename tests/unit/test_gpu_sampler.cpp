@@ -82,9 +82,11 @@ TEST_CASE("GpuSampler: Batched greedy argmax", "[gpu_sampler][cuda]") {
   std::vector<float> temps(batch_size, 0.0f);
   std::vector<int> top_ks(batch_size, 0);
   std::vector<float> top_ps(batch_size, 1.0f);
+  std::vector<uint32_t> seeds(batch_size, UINT32_MAX);
   std::vector<int> out_tokens;
 
-  sampler.SampleBatch(d_logits, batch_size, temps, top_ks, top_ps, &out_tokens);
+  sampler.SampleBatch(d_logits, batch_size, temps, top_ks, top_ps, seeds,
+                      &out_tokens);
 
   REQUIRE(out_tokens.size() == 4);
   REQUIRE(out_tokens[0] == 10);
@@ -123,6 +125,58 @@ TEST_CASE("GpuSampler: Stochastic sample returns valid token",
   int token = sampler.Sample(d_logits, 1.0f, 0, 1.0f, 42);
   REQUIRE(token >= 0);
   REQUIRE(token < vocab_size);
+
+  cudaFree(d_logits);
+  cudaStreamDestroy(stream);
+}
+
+TEST_CASE("GpuSampler: Batched stochastic sampling preserves per-sequence seeds",
+          "[gpu_sampler][cuda]") {
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count == 0) {
+    SKIP("No CUDA device available");
+  }
+
+  constexpr int vocab_size = 64;
+  constexpr int batch_size = 2;
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+
+  GpuSampler batch_sampler;
+  GpuSampler single_sampler;
+  REQUIRE(batch_sampler.Initialize(vocab_size, stream));
+  REQUIRE(single_sampler.Initialize(vocab_size, stream));
+
+  std::vector<float> h_logits(batch_size * vocab_size, 0.0f);
+  for (int b = 0; b < batch_size; ++b) {
+    for (int i = 0; i < vocab_size; ++i) {
+      h_logits[b * vocab_size + i] =
+          0.01f * static_cast<float>((b + 1) * ((i % 7) - 3));
+    }
+  }
+
+  float *d_logits = nullptr;
+  cudaMalloc(&d_logits, batch_size * vocab_size * sizeof(float));
+  cudaMemcpy(d_logits, h_logits.data(), batch_size * vocab_size * sizeof(float),
+             cudaMemcpyHostToDevice);
+
+  std::vector<float> temps(batch_size, 1.0f);
+  std::vector<int> top_ks(batch_size, 0);
+  std::vector<float> top_ps(batch_size, 1.0f);
+  const std::vector<uint32_t> seeds = {123u, 98765u};
+  std::vector<int> batch_tokens;
+
+  batch_sampler.SampleBatch(d_logits, batch_size, temps, top_ks, top_ps, seeds,
+                            &batch_tokens);
+
+  REQUIRE(batch_tokens.size() == batch_size);
+  for (int i = 0; i < batch_size; ++i) {
+    const int single =
+        single_sampler.Sample(d_logits + i * vocab_size, temps[i], top_ks[i],
+                              top_ps[i], seeds[i]);
+    REQUIRE(batch_tokens[i] == single);
+  }
 
   cudaFree(d_logits);
   cudaStreamDestroy(stream);

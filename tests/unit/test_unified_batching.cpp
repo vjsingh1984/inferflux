@@ -1,7 +1,9 @@
 #include "runtime/backends/cpu/llama_backend.h"
 #include "runtime/execution/batch_executor.h"
 #include "scheduler/single_model_router.h"
+#include "server/metrics/metrics.h"
 #include <catch2/catch_amalgamated.hpp>
+#include <deque>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -125,6 +127,97 @@ public:
   bool IsReady() const override { return true; }
   int TokenCount(const std::string &) const override { return 5; }
 };
+
+class EmptyGenerateBackend : public LlamaCPUBackend {
+public:
+  bool IsReady() const override { return true; }
+
+  std::string
+  Generate(const std::string &, int,
+           const std::function<bool(const std::string &, const TokenLogprob *)>
+               &,
+           const std::function<bool()> &, int,
+           std::vector<TokenLogprob> *,
+           const std::vector<std::string> &) override {
+    return {};
+  }
+
+  int TokenCount(const std::string &text) const override {
+    return static_cast<int>(text.size());
+  }
+};
+
+class SequencedAsyncUnifiedBackend : public LlamaCPUBackend {
+public:
+  struct SequencePlan {
+    std::deque<UnifiedBatchOutput> outputs;
+  };
+
+  bool SupportsAsyncUnifiedBatch() const override { return true; }
+  bool IsReady() const override { return true; }
+  int TokenCount(const std::string &text) const override {
+    return static_cast<int>(text.size());
+  }
+
+  void SetSequencePlan(int sequence_id,
+                       std::initializer_list<UnifiedBatchOutput> outputs) {
+    plans_[sequence_id].outputs = std::deque<UnifiedBatchOutput>(outputs);
+  }
+
+  UnifiedBatchHandle
+  SubmitUnifiedBatchAsync(const std::vector<UnifiedBatchInput> &inputs,
+                          UnifiedBatchLane) override {
+    std::vector<UnifiedBatchOutput> outputs;
+    outputs.reserve(inputs.size());
+    for (const auto &input : inputs) {
+      auto it = plans_.find(input.sequence_id);
+      REQUIRE(it != plans_.end());
+      REQUIRE_FALSE(it->second.outputs.empty());
+      outputs.push_back(it->second.outputs.front());
+      it->second.outputs.pop_front();
+    }
+    const auto handle = next_handle_++;
+    pending_[handle] = std::move(outputs);
+    return handle;
+  }
+
+  bool TryCollectUnifiedBatchAsync(
+      UnifiedBatchHandle handle,
+      std::vector<UnifiedBatchOutput> *outputs) override {
+    auto it = pending_.find(handle);
+    if (it == pending_.end() || !outputs) {
+      return false;
+    }
+    *outputs = std::move(it->second);
+    pending_.erase(it);
+    return true;
+  }
+
+private:
+  std::unordered_map<int, SequencePlan> plans_;
+  std::unordered_map<UnifiedBatchHandle, std::vector<UnifiedBatchOutput>>
+      pending_;
+  UnifiedBatchHandle next_handle_{1};
+};
+
+int64_t ReadEmptyGenerationsTotal() {
+  const std::string output = GlobalMetrics().RenderPrometheus();
+  const std::string key =
+      "inferflux_empty_generations_total{backend=\"cpu\"} ";
+  auto pos = output.find(key);
+  if (pos == std::string::npos) {
+    return 0;
+  }
+  pos += key.size();
+  auto line_end = output.find('\n', pos);
+  const std::string value = output.substr(
+      pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+  try {
+    return std::stoll(value);
+  } catch (const std::exception &) {
+    return 0;
+  }
+}
 
 TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
           "[unified_batch]") {
@@ -337,7 +430,7 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     auto bounded_backend = std::make_shared<MockUnifiedBackend>();
 
     BatchExecutor::UnifiedBatchTuning tuning;
-    tuning.continuous_decode_steps = 2;
+    tuning.decode_burst_tokens = 2;
     auto tuned_executor = std::make_unique<BatchExecutor>(
         &tokenizer, device, cache, router, nullptr, tuning);
 
@@ -592,4 +685,390 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     REQUIRE(async_backend->submit_calls.front().inputs[0].tokens.size() == 3);
     REQUIRE(async_backend->submit_calls.front().inputs[1].tokens.size() == 3);
   }
+}
+
+TEST_CASE("BatchExecutor keeps async phased completions isolated per request",
+          "[unified_batch]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr);
+  auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
+
+  LlamaCPUBackend::UnifiedBatchOutput a0;
+  a0.token = 501;
+  a0.piece = "A0";
+  a0.ok = true;
+  LlamaCPUBackend::UnifiedBatchOutput a1;
+  a1.token = 502;
+  a1.piece = "A1";
+  a1.ok = true;
+  LlamaCPUBackend::UnifiedBatchOutput b1;
+  b1.token = 601;
+  b1.piece = "B1";
+  b1.ok = true;
+  backend->SetSequencePlan(101, {a0, a1});
+  backend->SetSequencePlan(202, {b1});
+
+  InferenceRequest req_prefill;
+  req_prefill.id = 1;
+  req_prefill.model = "mock";
+  req_prefill.phase = RequestPhase::kPrefill;
+  req_prefill.n_past = 0;
+  req_prefill.sequence_id = 101;
+  req_prefill.bpe_prompt_tokens = {1, 2};
+  req_prefill.max_tokens = 2;
+  req_prefill.block_table = {101};
+
+  InferenceRequest req_decode;
+  req_decode.id = 2;
+  req_decode.model = "mock";
+  req_decode.phase = RequestPhase::kDecode;
+  req_decode.n_past = 10;
+  req_decode.sequence_id = 202;
+  req_decode.first_token = 600;
+  req_decode.first_piece = "B0";
+  req_decode.max_tokens = 2;
+  req_decode.block_table = {202};
+
+  RequestBatch batch;
+  batch.requests = {&req_prefill, &req_decode};
+
+  auto results = executor->ExecuteBatch(batch, {backend, backend});
+
+  REQUIRE(results.size() == 2);
+  REQUIRE(results[0].completion == "A0A1");
+  REQUIRE(results[1].completion == "B0B1");
+  REQUIRE(req_prefill.accumulated_output == "A0A1");
+  REQUIRE(req_decode.accumulated_output == "B0B1");
+  REQUIRE(req_prefill.phase == RequestPhase::kFinished);
+  REQUIRE(req_decode.phase == RequestPhase::kFinished);
+}
+
+TEST_CASE("BatchExecutor resumes fairness-sliced seeded decode without re-emitting"
+          " first_piece",
+          "[unified_batch]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  BatchExecutor::UnifiedBatchTuning tuning;
+  tuning.decode_burst_tokens = 1;
+  auto executor = std::make_unique<BatchExecutor>(
+      &tokenizer, device, cache, router, nullptr, tuning);
+  auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
+
+  LlamaCPUBackend::UnifiedBatchOutput b1;
+  b1.token = 601;
+  b1.piece = "B1";
+  b1.ok = true;
+  LlamaCPUBackend::UnifiedBatchOutput b2;
+  b2.token = 602;
+  b2.piece = "B2";
+  b2.ok = true;
+  backend->SetSequencePlan(404, {b1, b2});
+
+  InferenceRequest req;
+  req.id = 4;
+  req.model = "mock";
+  req.phase = RequestPhase::kDecode;
+  req.n_past = 10;
+  req.sequence_id = 404;
+  req.first_token = 600;
+  req.first_piece = "B0";
+  req.max_tokens = 3;
+  req.remaining_decode_tokens = 3;
+  req.block_table = {404};
+
+  RequestBatch batch;
+  batch.requests = {&req};
+
+  auto first = executor->ExecuteBatch(batch, {backend});
+  REQUIRE(first.size() == 1);
+  REQUIRE(first[0].completion == "B0");
+  REQUIRE(req.accumulated_output == "B0");
+  REQUIRE(req.phase == RequestPhase::kPending);
+  REQUIRE(req.remaining_decode_tokens == 2);
+
+  auto second = executor->ExecuteBatch(batch, {backend});
+  REQUIRE(second.size() == 1);
+  REQUIRE(second[0].completion == "B1");
+  REQUIRE(req.accumulated_output == "B0B1");
+  REQUIRE(req.phase == RequestPhase::kPending);
+  REQUIRE(req.remaining_decode_tokens == 1);
+
+  auto third = executor->ExecuteBatch(batch, {backend});
+  REQUIRE(third.size() == 1);
+  REQUIRE(third[0].completion == "B2");
+  REQUIRE(req.accumulated_output == "B0B1B2");
+  REQUIRE(req.phase == RequestPhase::kFinished);
+  REQUIRE(req.total_completion_tokens == 3);
+}
+
+TEST_CASE("BatchExecutor resumes fairness-sliced unified prefill decode with"
+          " current token carryover",
+          "[unified_batch]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  BatchExecutor::UnifiedBatchTuning tuning;
+  tuning.decode_burst_tokens = 1;
+  auto executor = std::make_unique<BatchExecutor>(
+      &tokenizer, device, cache, router, nullptr, tuning);
+  auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
+
+  LlamaCPUBackend::UnifiedBatchOutput a0;
+  a0.token = 700;
+  a0.piece = "A0";
+  a0.ok = true;
+  LlamaCPUBackend::UnifiedBatchOutput a1;
+  a1.token = 701;
+  a1.piece = "A1";
+  a1.ok = true;
+  backend->SetSequencePlan(505, {a0, a1});
+
+  InferenceRequest req;
+  req.id = 5;
+  req.model = "mock";
+  req.phase = RequestPhase::kPrefill;
+  req.n_past = 0;
+  req.sequence_id = 505;
+  req.bpe_prompt_tokens = {1, 2};
+  req.max_tokens = 2;
+  req.remaining_decode_tokens = 2;
+  req.block_table = {505};
+
+  RequestBatch batch;
+  batch.requests = {&req};
+
+  auto first = executor->ExecuteBatch(batch, {backend});
+  REQUIRE(first.size() == 1);
+  REQUIRE(first[0].completion == "A0");
+  REQUIRE(req.accumulated_output == "A0");
+  REQUIRE(req.phase == RequestPhase::kPending);
+  REQUIRE(req.remaining_decode_tokens == 1);
+
+  auto second = executor->ExecuteBatch(batch, {backend});
+  REQUIRE(second.size() == 1);
+  REQUIRE(second[0].completion == "A1");
+  REQUIRE(req.accumulated_output == "A0A1");
+  REQUIRE(req.phase == RequestPhase::kFinished);
+  REQUIRE(req.total_completion_tokens == 2);
+}
+
+TEST_CASE("BatchExecutor keeps interleaved fairness-sliced phased requests"
+          " isolated across resumes",
+          "[unified_batch]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  BatchExecutor::UnifiedBatchTuning tuning;
+  tuning.decode_burst_tokens = 1;
+  auto executor = std::make_unique<BatchExecutor>(
+      &tokenizer, device, cache, router, nullptr, tuning);
+  auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
+
+  LlamaCPUBackend::UnifiedBatchOutput a0;
+  a0.token = 800;
+  a0.piece = "A0";
+  a0.ok = true;
+  LlamaCPUBackend::UnifiedBatchOutput a1;
+  a1.token = 801;
+  a1.piece = "A1";
+  a1.ok = true;
+  LlamaCPUBackend::UnifiedBatchOutput b1;
+  b1.token = 901;
+  b1.piece = "B1";
+  b1.ok = true;
+  LlamaCPUBackend::UnifiedBatchOutput b2;
+  b2.token = 902;
+  b2.piece = "B2";
+  b2.ok = true;
+  backend->SetSequencePlan(606, {a0, a1});
+  backend->SetSequencePlan(707, {b1, b2});
+
+  InferenceRequest req_prefill;
+  req_prefill.id = 6;
+  req_prefill.model = "mock";
+  req_prefill.phase = RequestPhase::kPrefill;
+  req_prefill.n_past = 0;
+  req_prefill.sequence_id = 606;
+  req_prefill.bpe_prompt_tokens = {1, 2};
+  req_prefill.max_tokens = 2;
+  req_prefill.remaining_decode_tokens = 2;
+  req_prefill.block_table = {606};
+
+  InferenceRequest req_decode;
+  req_decode.id = 7;
+  req_decode.model = "mock";
+  req_decode.phase = RequestPhase::kDecode;
+  req_decode.n_past = 12;
+  req_decode.sequence_id = 707;
+  req_decode.first_token = 900;
+  req_decode.first_piece = "B0";
+  req_decode.max_tokens = 3;
+  req_decode.remaining_decode_tokens = 3;
+  req_decode.block_table = {707};
+
+  RequestBatch batch;
+  batch.requests = {&req_prefill, &req_decode};
+
+  auto first = executor->ExecuteBatch(batch, {backend, backend});
+  REQUIRE(first.size() == 2);
+  REQUIRE(first[0].completion == "A0");
+  REQUIRE(first[1].completion == "B0");
+  REQUIRE(req_prefill.accumulated_output == "A0");
+  REQUIRE(req_decode.accumulated_output == "B0");
+  REQUIRE(req_prefill.phase == RequestPhase::kPending);
+  REQUIRE(req_decode.phase == RequestPhase::kPending);
+
+  auto second = executor->ExecuteBatch(batch, {backend, backend});
+  REQUIRE(second.size() == 2);
+  REQUIRE(second[0].completion == "A1");
+  REQUIRE(second[1].completion == "B1");
+  REQUIRE(req_prefill.accumulated_output == "A0A1");
+  REQUIRE(req_decode.accumulated_output == "B0B1");
+  REQUIRE(req_prefill.phase == RequestPhase::kFinished);
+  REQUIRE(req_decode.phase == RequestPhase::kPending);
+
+  auto third = executor->ExecuteBatch(batch, {backend, backend});
+  REQUIRE(third.size() == 2);
+  REQUIRE(third[1].completion == "B2");
+  REQUIRE(req_prefill.accumulated_output == "A0A1");
+  REQUIRE(req_decode.accumulated_output == "B0B1B2");
+  REQUIRE(req_prefill.phase == RequestPhase::kFinished);
+  REQUIRE(req_decode.phase == RequestPhase::kFinished);
+}
+
+TEST_CASE("BatchExecutor threads request and lease identity into unified batch"
+          " inputs",
+          "[unified_batch]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  BatchExecutor::UnifiedBatchTuning tuning;
+  tuning.decode_burst_tokens = 1;
+  auto executor = std::make_unique<BatchExecutor>(
+      &tokenizer, device, cache, router, nullptr, tuning);
+  auto backend = std::make_shared<MockAsyncUnifiedBackend>();
+
+  InferenceRequest req;
+  req.id = 77;
+  req.model = "mock";
+  req.phase = RequestPhase::kDecode;
+  req.n_past = 5;
+  req.sequence_id = 909;
+  req.sequence_generation = 12;
+  req.first_token = 808;
+  req.max_tokens = 1;
+  req.remaining_decode_tokens = 1;
+  req.block_table = {909};
+
+  RequestBatch batch;
+  batch.requests = {&req};
+
+  auto results = executor->ExecuteBatch(batch, {backend});
+  REQUIRE(results.size() == 1);
+  REQUIRE_FALSE(backend->submit_calls.empty());
+  REQUIRE(backend->submit_calls.front().inputs.size() == 1);
+  const auto &input = backend->submit_calls.front().inputs.front();
+  REQUIRE(input.request_id == 77);
+  REQUIRE(input.sequence_generation == 12);
+  REQUIRE(input.sequence_id == 909);
+}
+
+TEST_CASE(
+    "BatchExecutor ignores invisible control-token steps in async phased "
+    "generation",
+    "[unified_batch]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr);
+  auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
+
+  LlamaCPUBackend::UnifiedBatchOutput a;
+  a.token = 700;
+  a.piece = "A";
+  a.ok = true;
+  LlamaCPUBackend::UnifiedBatchOutput control;
+  control.token = 151643;
+  control.piece = "";
+  control.ok = true;
+  LlamaCPUBackend::UnifiedBatchOutput b;
+  b.token = 701;
+  b.piece = "B";
+  b.ok = true;
+  backend->SetSequencePlan(303, {a, control, b});
+
+  std::vector<std::string> streamed;
+  InferenceRequest req;
+  req.id = 3;
+  req.model = "mock";
+  req.phase = RequestPhase::kPrefill;
+  req.n_past = 0;
+  req.sequence_id = 303;
+  req.bpe_prompt_tokens = {1, 2};
+  req.max_tokens = 2;
+  req.block_table = {303};
+  req.on_token = [&](const std::string &piece, const TokenLogprob *) {
+    streamed.push_back(piece);
+  };
+
+  RequestBatch batch;
+  batch.requests = {&req};
+
+  auto results = executor->ExecuteBatch(batch, {backend});
+
+  REQUIRE(results.size() == 1);
+  REQUIRE(results[0].completion == "AB");
+  REQUIRE(results[0].completion_tokens == 2);
+  REQUIRE(req.accumulated_output == "AB");
+  REQUIRE(req.total_completion_tokens == 2);
+  REQUIRE(req.phase == RequestPhase::kFinished);
+  REQUIRE(streamed == std::vector<std::string>{"A", "B"});
+}
+
+TEST_CASE("BatchExecutor treats empty backend generation as zero-token sentinel",
+          "[unified_batch]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr);
+  auto backend = std::make_shared<EmptyGenerateBackend>();
+
+  GlobalMetrics().SetBackend("cpu");
+  const int64_t empty_before = ReadEmptyGenerationsTotal();
+
+  InferenceRequest req;
+  req.model = "mock";
+  req.prompt = "empty generation";
+  req.max_tokens = 4;
+
+  RequestBatch batch;
+  batch.requests = {&req};
+
+  auto results = executor->ExecuteBatch(batch, {backend});
+  REQUIRE(results.size() == 1);
+  REQUIRE_FALSE(results[0].no_backend);
+  REQUIRE(results[0].completion == kBackendEmptyResponseText);
+  REQUIRE(results[0].completion_tokens == 0);
+  REQUIRE(req.accumulated_output.empty());
+  REQUIRE(ReadEmptyGenerationsTotal() - empty_before == 1);
 }

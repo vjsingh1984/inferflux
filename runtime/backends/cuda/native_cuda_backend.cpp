@@ -15,6 +15,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 
 namespace inferflux {
 
@@ -40,11 +41,31 @@ bool ParseBoolEnv(const char *name, bool default_value) {
   return ParseBoolValue(raw);
 }
 
+bool IsVisibleNativePiece(std::string_view piece) { return !piece.empty(); }
+
+std::string NormalizeNativeOutputPiece(const ITokenizer *tokenizer,
+                                       int token_id,
+                                       std::string_view decoded_piece) {
+  if (token_id < 0) {
+    return {};
+  }
+  if (tokenizer && tokenizer->IsTerminalGeneratedToken(token_id)) {
+    return {};
+  }
+  if (!decoded_piece.empty()) {
+    return std::string(decoded_piece);
+  }
+  if (!tokenizer) {
+    return {};
+  }
+  return tokenizer->TokenToString(token_id);
+}
+
 } // namespace
 
 std::atomic<int> NativeCudaBackend::next_ephemeral_sequence_id_{1 << 20};
 
-NativeCudaBackend::NativeCudaBackend() = default;
+NativeCudaBackend::NativeCudaBackend() : LlamaCPUBackend(false) {}
 
 NativeCudaBackend::~NativeCudaBackend() = default;
 
@@ -131,9 +152,35 @@ bool NativeCudaBackend::NativeKernelsReady() {
     return false;
   }
 
+  const auto log_probe_failure = [](const char *stage, cudaError_t err) {
+    static bool logged = false;
+    if (logged) {
+      return;
+    }
+    logged = true;
+    log::Warn("native_cuda_backend",
+              std::string("Native CUDA readiness probe failed at ") + stage +
+                  ": " + cudaGetErrorString(err));
+  };
+
   int device_count = 0;
-  const cudaError_t err = cudaGetDeviceCount(&device_count);
+  cudaError_t err = cudaGetDeviceCount(&device_count);
+  if (err == cudaSuccess && device_count > 0) {
+    return true;
+  }
+
+  // Some hosts report a transient/runtime-init failure on the first probe even
+  // though CUDA execution is available for the process. Force a lightweight
+  // runtime init and retry once before declaring native CUDA unavailable.
+  const cudaError_t init_err = cudaFree(nullptr);
+  if (init_err != cudaSuccess && init_err != cudaErrorCudartUnloading) {
+    log_probe_failure("cudaFree(0)", init_err);
+    return false;
+  }
+
+  err = cudaGetDeviceCount(&device_count);
   if (err != cudaSuccess) {
+    log_probe_failure("cudaGetDeviceCount(retry)", err);
     return false;
   }
   return device_count > 0;
@@ -148,6 +195,7 @@ bool NativeCudaBackend::NativeKernelsReady() {
 std::vector<LlamaCPUBackend::UnifiedBatchOutput>
 NativeCudaBackend::ExecuteUnifiedBatch(
     const std::vector<UnifiedBatchInput> &inputs) {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (!runtime_) {
     return {};
   }
@@ -155,14 +203,24 @@ NativeCudaBackend::ExecuteUnifiedBatch(
 }
 
 bool NativeCudaBackend::SupportsAsyncUnifiedBatch() const {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (!runtime_) {
     return false;
   }
   return runtime_->SupportsAsyncUnifiedBatch();
 }
 
+bool NativeCudaBackend::SupportsSplitPrefillDecodeHandoff() const {
+  return runtime_ != nullptr && !fallback_mode_;
+}
+
+bool NativeCudaBackend::SupportsProcessLocalSequenceTransfer() const {
+  return runtime_ != nullptr && !fallback_mode_;
+}
+
 LlamaCPUBackend::UnifiedBatchHandle NativeCudaBackend::SubmitUnifiedBatchAsync(
     const std::vector<UnifiedBatchInput> &inputs, UnifiedBatchLane lane) {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (!runtime_) {
     return 0;
   }
@@ -171,6 +229,7 @@ LlamaCPUBackend::UnifiedBatchHandle NativeCudaBackend::SubmitUnifiedBatchAsync(
 
 bool NativeCudaBackend::TryCollectUnifiedBatchAsync(
     UnifiedBatchHandle handle, std::vector<UnifiedBatchOutput> *outputs) {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (!runtime_) {
     return false;
   }
@@ -206,18 +265,41 @@ NativeCudaBackend::PrefillPartial(const std::string &prompt, int sequence_id,
 
 void NativeCudaBackend::CopySequencePrefix(int src_seq, int dst_seq,
                                            int n_tokens) {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     runtime_->NativeCopySequencePrefix(src_seq, dst_seq, n_tokens);
   }
 }
 
 void NativeCudaBackend::FreeSequence(int sequence_id) {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     runtime_->NativeFreeSequence(sequence_id);
   }
 }
 
+LlamaCPUBackend::SequenceReleaseFence
+NativeCudaBackend::BeginFreeSequence(int sequence_id) {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
+  if (runtime_) {
+    return runtime_->NativeBeginFreeSequence(sequence_id);
+  }
+  auto backend = DelegateBackend();
+  return backend ? backend->BeginFreeSequence(sequence_id)
+                 : LlamaCPUBackend::SequenceReleaseFence{};
+}
+
+bool NativeCudaBackend::PollFreeSequence(const SequenceReleaseFence &fence) {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
+  if (runtime_) {
+    return runtime_->NativePollFreeSequence(fence);
+  }
+  auto backend = DelegateBackend();
+  return backend ? backend->PollFreeSequence(fence) : true;
+}
+
 std::vector<uint8_t> NativeCudaBackend::SerializeSequence(int sequence_id) {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     auto blob = runtime_->NativeSerializeSequence(sequence_id);
     if (!blob.empty()) {
@@ -233,6 +315,7 @@ std::vector<uint8_t> NativeCudaBackend::SerializeSequence(int sequence_id) {
 
 bool NativeCudaBackend::HydrateSequence(int dest_sequence_id,
                                         const std::vector<uint8_t> &blob) {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_ && runtime_->NativeHydrateSequence(dest_sequence_id, blob)) {
     return true;
   }
@@ -250,10 +333,8 @@ std::string NativeCudaBackend::Decode(
     const std::function<bool()> &should_stop, int logprob_top_n,
     std::vector<TokenLogprob> *out_logprobs, int first_token,
     const std::vector<std::string> &stop_seqs) {
-  const bool needs_parity_path = (logprob_top_n > 0) ||
-                                 (out_logprobs != nullptr) ||
-                                 UsesStructuredConstraintSampler();
-  if (needs_parity_path) {
+  // Delegate to parity backend only for structured output (not logprobs).
+  if (UsesStructuredConstraintSampler()) {
     auto parity_backend = EnsureParityBackend();
     if (parity_backend && parity_backend->IsReady()) {
       return parity_backend->Decode(n_past, sequence_id, max_tokens, on_chunk,
@@ -262,15 +343,13 @@ std::string NativeCudaBackend::Decode(
     }
   }
 
+  std::lock_guard<std::recursive_mutex> runtime_lock(runtime_mutex_);
+
   if (!runtime_ || sequence_id < 0 || n_past < 0 || max_tokens <= 0) {
     return {};
   }
 
-  if (logprob_top_n > 0 || out_logprobs != nullptr) {
-    log::Warn("native_cuda_backend",
-              "native decode logprobs are not implemented yet");
-  }
-
+  const bool collect_lp = (logprob_top_n > 0) || (out_logprobs != nullptr);
   const SamplingParams sampling = SnapshotSamplingParams();
   const ITokenizer *tokenizer = runtime_->NativeGetTokenizer();
   if (first_token < 0 || tokenizer == nullptr) {
@@ -280,26 +359,38 @@ std::string NativeCudaBackend::Decode(
   }
 
   std::string output;
-  int tokens_remaining = std::max(max_tokens, 1);
   int current_token = first_token;
+  int visible_tokens_generated = 0;
+  int non_emitting_steps = 0;
+  const int max_non_emitting_steps = std::max(max_tokens * 8, 32);
 
   // Emit the pre-sampled token first, matching llama.cpp decode semantics.
-  if (tokens_remaining > 0) {
-    std::string piece = tokenizer->TokenToString(current_token);
-    output += piece;
-    --tokens_remaining;
-
-    std::string emit_piece;
-    const bool stop_hit = ApplyStop(piece, output, stop_seqs, &emit_piece);
-    if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece, nullptr)) {
+  // For the first token logprobs are unavailable (logits were consumed by the
+  // prefill step that produced this token).
+  if (max_tokens > 0) {
+    if (tokenizer->IsTerminalGeneratedToken(current_token)) {
       return output;
     }
-    if (stop_hit || (should_stop && should_stop())) {
-      return output;
+    std::string piece =
+        NormalizeNativeOutputPiece(tokenizer, current_token, std::string_view{});
+    if (IsVisibleNativePiece(piece)) {
+      output += piece;
+      ++visible_tokens_generated;
+
+      std::string emit_piece;
+      const bool stop_hit = ApplyStop(piece, output, stop_seqs, &emit_piece);
+      if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece, nullptr)) {
+        return output;
+      }
+      if (stop_hit || (should_stop && should_stop())) {
+        return output;
+      }
+    } else {
+      ++non_emitting_steps;
     }
   }
 
-  while (tokens_remaining-- > 0) {
+  while (visible_tokens_generated < max_tokens) {
     if (should_stop && should_stop()) {
       break;
     }
@@ -317,12 +408,38 @@ std::string NativeCudaBackend::Decode(
 
     ++n_past;
     current_token = step.front().token;
-    output += step.front().piece;
+    if (tokenizer->IsTerminalGeneratedToken(current_token)) {
+      break;
+    }
+    std::string piece = NormalizeNativeOutputPiece(tokenizer, current_token,
+                                                   step.front().piece);
+    if (!IsVisibleNativePiece(piece)) {
+      if (++non_emitting_steps >= max_non_emitting_steps) {
+        log::Warn("native_cuda_backend",
+                  "native decode aborted after too many non-emitting tokens");
+        break;
+      }
+      continue;
+    }
+
+    non_emitting_steps = 0;
+    output += piece;
+    ++visible_tokens_generated;
+
+    // Collect logprobs from the logits that produced this token.
+    TokenLogprob tlp;
+    const TokenLogprob *tlp_ptr = nullptr;
+    if (collect_lp) {
+      tlp = CollectNativeLogprob(current_token, piece, logprob_top_n);
+      tlp_ptr = &tlp;
+      if (out_logprobs) {
+        out_logprobs->push_back(tlp);
+      }
+    }
 
     std::string emit_piece;
-    const bool stop_hit =
-        ApplyStop(step.front().piece, output, stop_seqs, &emit_piece);
-    if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece, nullptr)) {
+    const bool stop_hit = ApplyStop(piece, output, stop_seqs, &emit_piece);
+    if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece, tlp_ptr)) {
       break;
     }
     if (stop_hit) {
@@ -340,10 +457,8 @@ std::string NativeCudaBackend::Generate(
     const std::function<bool()> &should_stop, int logprob_top_n,
     std::vector<TokenLogprob> *out_logprobs,
     const std::vector<std::string> &stop_seqs) {
-  const bool needs_parity_path = (logprob_top_n > 0) ||
-                                 (out_logprobs != nullptr) ||
-                                 UsesStructuredConstraintSampler();
-  if (needs_parity_path) {
+  // Delegate to parity backend only for structured output (not logprobs).
+  if (UsesStructuredConstraintSampler()) {
     auto parity_backend = EnsureParityBackend();
     if (parity_backend && parity_backend->IsReady()) {
       return parity_backend->Generate(prompt, max_tokens, on_chunk, should_stop,
@@ -351,15 +466,13 @@ std::string NativeCudaBackend::Generate(
     }
   }
 
+  std::lock_guard<std::recursive_mutex> runtime_lock(runtime_mutex_);
+
   if (!runtime_ || max_tokens <= 0) {
     return {};
   }
 
-  if (logprob_top_n > 0 || out_logprobs != nullptr) {
-    log::Warn("native_cuda_backend",
-              "native generate logprobs are not implemented yet");
-  }
-
+  const bool collect_lp = (logprob_top_n > 0) || (out_logprobs != nullptr);
   const std::vector<int> prompt_tokens = runtime_->NativeTokenize(prompt);
   if (prompt_tokens.empty()) {
     return {};
@@ -367,6 +480,7 @@ std::string NativeCudaBackend::Generate(
 
   const int sequence_id = AcquireEphemeralSequenceId();
   const SamplingParams sampling = SnapshotSamplingParams();
+  const ITokenizer *tokenizer = runtime_->NativeGetTokenizer();
   std::string output;
 
   // Scope guard: always release the temporary sequence.
@@ -395,24 +509,45 @@ std::string NativeCudaBackend::Generate(
 
   int current_token = first_step.front().token;
   int n_past = static_cast<int>(prompt_tokens.size());
-  int tokens_remaining = std::max(max_tokens, 1);
+  int visible_tokens_generated = 0;
+  int non_emitting_steps = 0;
+  const int max_non_emitting_steps = std::max(max_tokens * 8, 32);
 
-  if (tokens_remaining > 0) {
-    output += first_step.front().piece;
-    --tokens_remaining;
-
-    std::string emit_piece;
-    const bool stop_hit =
-        ApplyStop(first_step.front().piece, output, stop_seqs, &emit_piece);
-    if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece, nullptr)) {
+  if (max_tokens > 0) {
+    if (tokenizer->IsTerminalGeneratedToken(current_token)) {
       return output;
     }
-    if (stop_hit || (should_stop && should_stop())) {
-      return output;
+    std::string piece = NormalizeNativeOutputPiece(tokenizer, current_token,
+                                                   first_step.front().piece);
+    if (IsVisibleNativePiece(piece)) {
+      output += piece;
+      ++visible_tokens_generated;
+
+      // First token: logits are available from prefill.
+      TokenLogprob tlp;
+      const TokenLogprob *tlp_ptr = nullptr;
+      if (collect_lp) {
+        tlp = CollectNativeLogprob(current_token, piece, logprob_top_n);
+        tlp_ptr = &tlp;
+        if (out_logprobs) {
+          out_logprobs->push_back(tlp);
+        }
+      }
+
+      std::string emit_piece;
+      const bool stop_hit = ApplyStop(piece, output, stop_seqs, &emit_piece);
+      if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece, tlp_ptr)) {
+        return output;
+      }
+      if (stop_hit || (should_stop && should_stop())) {
+        return output;
+      }
+    } else {
+      ++non_emitting_steps;
     }
   }
 
-  while (tokens_remaining-- > 0) {
+  while (visible_tokens_generated < max_tokens) {
     if (should_stop && should_stop()) {
       break;
     }
@@ -430,12 +565,38 @@ std::string NativeCudaBackend::Generate(
 
     ++n_past;
     current_token = step.front().token;
-    output += step.front().piece;
+    if (tokenizer->IsTerminalGeneratedToken(current_token)) {
+      break;
+    }
+    std::string piece = NormalizeNativeOutputPiece(tokenizer, current_token,
+                                                   step.front().piece);
+    if (!IsVisibleNativePiece(piece)) {
+      if (++non_emitting_steps >= max_non_emitting_steps) {
+        log::Warn("native_cuda_backend",
+                  "native generate aborted after too many non-emitting "
+                  "tokens");
+        break;
+      }
+      continue;
+    }
+
+    non_emitting_steps = 0;
+    output += piece;
+    ++visible_tokens_generated;
+
+    TokenLogprob tlp;
+    const TokenLogprob *tlp_ptr = nullptr;
+    if (collect_lp) {
+      tlp = CollectNativeLogprob(current_token, piece, logprob_top_n);
+      tlp_ptr = &tlp;
+      if (out_logprobs) {
+        out_logprobs->push_back(tlp);
+      }
+    }
 
     std::string emit_piece;
-    const bool stop_hit =
-        ApplyStop(step.front().piece, output, stop_seqs, &emit_piece);
-    if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece, nullptr)) {
+    const bool stop_hit = ApplyStop(piece, output, stop_seqs, &emit_piece);
+    if (on_chunk && !emit_piece.empty() && !on_chunk(emit_piece, tlp_ptr)) {
       break;
     }
     if (stop_hit) {
@@ -487,6 +648,7 @@ void NativeCudaBackend::TeardownSampler() {
 }
 
 LlamaCPUBackend::PerfSnapshot NativeCudaBackend::TakePerf() {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   auto backend = DelegateBackend();
   if (backend) {
     return backend->TakePerf();
@@ -507,6 +669,7 @@ LlamaCPUBackend::PerfSnapshot NativeCudaBackend::TakePerf() {
 LlamaCPUBackend::ChatTemplateResult NativeCudaBackend::FormatChatMessages(
     const std::vector<std::pair<std::string, std::string>> &messages,
     bool add_assistant_prefix) {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   // Prefer runtime's native tokenizer (LlamaTokenizer with chat templates)
   if (runtime_) {
     auto native = runtime_->NativeFormatChat(messages, add_assistant_prefix);
@@ -526,6 +689,7 @@ LlamaCPUBackend::ChatTemplateResult NativeCudaBackend::FormatChatMessages(
 }
 
 int NativeCudaBackend::TokenCount(const std::string &text) const {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     return runtime_->NativeTokenCount(text);
   }
@@ -534,6 +698,7 @@ int NativeCudaBackend::TokenCount(const std::string &text) const {
 
 std::vector<int>
 NativeCudaBackend::TokenizeForCache(const std::string &prompt) const {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     return runtime_->NativeTokenize(prompt);
   }
@@ -541,6 +706,7 @@ NativeCudaBackend::TokenizeForCache(const std::string &prompt) const {
 }
 
 bool NativeCudaBackend::IsReady() const {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     return runtime_->NativeIsReady();
   }
@@ -548,13 +714,12 @@ bool NativeCudaBackend::IsReady() const {
 }
 
 bool NativeCudaBackend::SupportsSpeculativeDecodingContract() const {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   return runtime_ && runtime_->NativeIsReady() &&
          runtime_->NativeGetTokenizer() != nullptr;
 }
 
-bool NativeCudaBackend::SupportsLogprobsContract() const {
-  return IsParityDelegateAvailable();
-}
+bool NativeCudaBackend::SupportsLogprobsContract() const { return true; }
 
 bool NativeCudaBackend::SupportsStructuredOutputContract() const {
   return IsParityDelegateAvailable();
@@ -565,6 +730,7 @@ bool NativeCudaBackend::SupportsEmbeddingsContract() const {
 }
 
 bool NativeCudaBackend::IsParityDelegateAvailable() const {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   return runtime_ && runtime_->NativeIsReady() && parity_delegate_enabled_ &&
          parity_delegate_available_;
 }
@@ -591,7 +757,7 @@ NativeCudaBackend::EnsureParityBackend() const {
     log::Warn("native_cuda_backend",
               "Failed to initialize parity delegate backend from '" +
                   parity_load_path_.string() +
-                  "'; logprobs/structured-output/embeddings remain "
+                  "'; structured-output/embeddings remain "
                   "unavailable on native provider");
     parity_delegate_available_ = false;
     return nullptr;
@@ -614,6 +780,27 @@ std::shared_ptr<LlamaCPUBackend> NativeCudaBackend::DelegateBackend() const {
 bool NativeCudaBackend::UsesStructuredConstraintSampler() const {
   std::lock_guard<std::mutex> lock(sampling_mutex_);
   return structured_constraint_sampler_active_;
+}
+
+TokenLogprob NativeCudaBackend::CollectNativeLogprob(int token_id,
+                                                     const std::string &piece,
+                                                     int top_n) {
+  const int vocab = runtime_->NativeVocabSize();
+  if (vocab <= 0) {
+    return {};
+  }
+  if (static_cast<int>(host_logits_buf_.size()) < vocab) {
+    host_logits_buf_.resize(vocab);
+  }
+  int copied = runtime_->CopyLastLogitsToHost(host_logits_buf_.data(), vocab);
+  if (copied <= 0) {
+    return {};
+  }
+  const ITokenizer *tok = runtime_->NativeGetTokenizer();
+  return ComputeLogprob(host_logits_buf_.data(), vocab, token_id, piece, top_n,
+                        [tok](int32_t id) -> std::string {
+                          return tok ? tok->TokenToString(id) : "";
+                        });
 }
 
 std::vector<float> NativeCudaBackend::EmbedForParity(const std::string &text) {

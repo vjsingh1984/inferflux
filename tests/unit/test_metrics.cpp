@@ -36,6 +36,16 @@ TEST_CASE("MetricsRegistry records errors", "[metrics]") {
           std::string::npos);
 }
 
+TEST_CASE("MetricsRegistry records empty generations", "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordEmptyGeneration();
+  registry.RecordEmptyGeneration();
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_empty_generations_total{backend=\"cpu\"} 2") !=
+          std::string::npos);
+}
+
 TEST_CASE("MetricsRegistry records speculative stats", "[metrics]") {
   inferflux::MetricsRegistry registry;
   registry.RecordSpeculative(4, 3, 6);
@@ -228,6 +238,173 @@ TEST_CASE("MetricsRegistry records decode-step loop and prefill truncation "
                   "mode=\"unified_step\"} 4") != std::string::npos);
 }
 
+TEST_CASE("MetricsRegistry records deferred sequence retirement metrics",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.SetSchedulerDeferredSequenceRetirements(2);
+  registry.RecordSchedulerDeferredSequenceRetirement(17.0);
+  registry.SetSchedulerDeferredSequenceRetirements(0);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_scheduler_deferred_sequence_retirements{"
+                      "backend=\"cpu\"} 0") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_deferred_sequence_retirements_"
+                      "completed_total{backend=\"cpu\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("# HELP inferflux_scheduler_sequence_retirement_"
+                      "duration_ms") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_sequence_retirement_duration_ms_"
+                      "count{backend=\"cpu\"} 1") != std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry records native down-proj operator selections",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordNativeForwardBatchSize("prefill", 1);
+  registry.RecordNativeForwardBatchSize("prefill", 4);
+  registry.RecordNativeForwardBatchSize("decode", 2);
+  registry.RecordNativeForwardBatchSize("decode", 7);
+  registry.RecordNativeFfnProjOperator("prefill", "q8_1_group_hot_q4k");
+  registry.RecordNativeFfnProjOperator("prefill", "q8_1_group");
+  registry.RecordNativeFfnProjOperator("decode", "packed_group");
+  registry.RecordNativeFfnProjOperator("decode", "fallback");
+  registry.RecordNativeFfnProjGeometry("prefill", "q8_1_group_hot_q4k", "q4_k",
+                                       2, 11008, 2048, 2);
+  registry.RecordNativeFfnProjGeometry("prefill", "q8_1_group", "q6_k", 12,
+                                       8192, 3072, 2);
+  registry.RecordNativeFfnProjGeometry("decode", "packed_group", "mixed", 2,
+                                       8192, 3072, 2);
+  registry.RecordNativeDownProjOperator("prefill", "q8_1_gemv");
+  registry.RecordNativeDownProjOperator("prefill", "q8_1_gemv_hot_fixed");
+  registry.RecordNativeDownProjOperator("prefill", "q8_1_gemv_row_pair");
+  registry.RecordNativeDownProjOperator("decode", "q8_1_gemv_row_quad");
+  registry.RecordNativeDownProjOperator("decode", "packed_gemv");
+  registry.RecordNativeDownProjOperator("decode", "mmq");
+  registry.RecordNativeDownProjOperator("decode", "fallback");
+  registry.RecordNativeDownProjGeometry("prefill", "q8_1_gemv", "q4_k", 12,
+                                        3072, 8192);
+  registry.RecordNativeDownProjGeometry("prefill", "q8_1_gemv_hot_fixed",
+                                        "q4_k", 1, 2048, 11008);
+  registry.RecordNativeDownProjGeometry("prefill", "q8_1_gemv_row_pair",
+                                        "q4_k", 2, 2048, 11008);
+  registry.RecordNativeDownProjGeometry("decode", "q8_1_gemv_row_quad",
+                                        "q6_k", 7, 2048, 11008);
+  registry.RecordNativeDownProjGeometry("decode", "packed_gemv", "q4_k", 1,
+                                        2048, 11008);
+  registry.RecordNativeDownProjGeometry("decode", "mmq", "q6_k", 2, 3072,
+                                        8192);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("# HELP inferflux_native_forward_batch_size_total") !=
+          std::string::npos);
+  REQUIRE(output.find("# TYPE inferflux_native_forward_batch_size_total "
+                      "counter") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_forward_batch_size_total{phase="
+                      "\"prefill\",bucket=\"1\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_forward_batch_size_total{phase="
+                      "\"prefill\",bucket=\"3_4\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_forward_batch_size_total{phase="
+                      "\"decode\",bucket=\"2\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_forward_batch_size_total{phase="
+                      "\"decode\",bucket=\"5_8\"} 1") != std::string::npos);
+  REQUIRE(output.find("# HELP inferflux_native_ffn_proj_operator_total") !=
+          std::string::npos);
+  REQUIRE(output.find("# TYPE inferflux_native_ffn_proj_operator_total "
+                      "counter") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_ffn_proj_operator_total{phase="
+                      "\"prefill\",operator=\"q8_1_group_hot_q4k\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_ffn_proj_operator_total{phase="
+                      "\"prefill\",operator=\"q8_1_group\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_ffn_proj_operator_total{phase="
+                      "\"decode\",operator=\"packed_group\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_ffn_proj_operator_total{phase="
+                      "\"decode\",operator=\"fallback\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("# HELP inferflux_native_down_proj_operator_total") !=
+          std::string::npos);
+  REQUIRE(output.find("# TYPE inferflux_native_down_proj_operator_total "
+                      "counter") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_operator_total{phase="
+                      "\"prefill\",operator=\"q8_1_gemv\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_operator_total{phase="
+                      "\"prefill\",operator=\"q8_1_gemv_hot_fixed\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_operator_total{phase="
+                      "\"prefill\",operator=\"q8_1_gemv_row_pair\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_operator_total{phase="
+                      "\"decode\",operator=\"q8_1_gemv_row_quad\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_operator_total{phase="
+                      "\"decode\",operator=\"packed_gemv\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_operator_total{phase="
+                      "\"decode\",operator=\"mmq\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_operator_total{phase="
+                      "\"decode\",operator=\"fallback\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_operator_total{phase="
+                      "\"prefill\",operator=\"mmq\"} 0") !=
+          std::string::npos);
+  REQUIRE(output.find("# HELP inferflux_native_ffn_proj_geometry_total") !=
+          std::string::npos);
+  REQUIRE(output.find("# TYPE inferflux_native_ffn_proj_geometry_total "
+                      "counter") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_ffn_proj_geometry_total{phase="
+                      "\"prefill\",operator=\"q8_1_group_hot_q4k\",quant=\"q4_k\","
+                      "m_bucket=\"2\",n=\"11008\",n_bucket=\"8193_16384\","
+                      "k=\"2048\",k_bucket=\"1025_2048\",grouped_outputs=\"2\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_ffn_proj_geometry_total{phase="
+                      "\"prefill\",operator=\"q8_1_group\",quant=\"q6_k\","
+                      "m_bucket=\"9_16\",n=\"8192\",n_bucket=\"4097_8192\","
+                      "k=\"3072\",k_bucket=\"2049_4096\",grouped_outputs=\"2\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_ffn_proj_geometry_total{phase="
+                      "\"decode\",operator=\"packed_group\",quant=\"mixed\","
+                      "m_bucket=\"2\",n=\"8192\",n_bucket=\"4097_8192\","
+                      "k=\"3072\",k_bucket=\"2049_4096\",grouped_outputs=\"2\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("# HELP inferflux_native_down_proj_geometry_total") !=
+          std::string::npos);
+  REQUIRE(output.find("# TYPE inferflux_native_down_proj_geometry_total "
+                      "counter") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_geometry_total{phase="
+                      "\"prefill\",operator=\"q8_1_gemv\",quant=\"q4_k\","
+                      "m_bucket=\"9_16\",n=\"3072\",n_bucket=\"2049_4096\","
+                      "k=\"8192\",k_bucket=\"4097_8192\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_geometry_total{phase="
+                      "\"prefill\",operator=\"q8_1_gemv_hot_fixed\",quant=\"q4_k\","
+                      "m_bucket=\"1\",n=\"2048\",n_bucket=\"1025_2048\","
+                      "k=\"11008\",k_bucket=\"8193_16384\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_geometry_total{phase="
+                      "\"prefill\",operator=\"q8_1_gemv_row_pair\",quant=\"q4_k\","
+                      "m_bucket=\"2\",n=\"2048\",n_bucket=\"1025_2048\","
+                      "k=\"11008\",k_bucket=\"8193_16384\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_geometry_total{phase="
+                      "\"decode\",operator=\"q8_1_gemv_row_quad\",quant=\"q6_k\","
+                      "m_bucket=\"5_8\",n=\"2048\",n_bucket=\"1025_2048\","
+                      "k=\"11008\",k_bucket=\"8193_16384\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_geometry_total{phase="
+                      "\"decode\",operator=\"packed_gemv\",quant=\"q4_k\","
+                      "m_bucket=\"1\",n=\"2048\",n_bucket=\"1025_2048\","
+                      "k=\"11008\",k_bucket=\"8193_16384\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_geometry_total{phase="
+                      "\"decode\",operator=\"mmq\",quant=\"q6_k\","
+                      "m_bucket=\"2\",n=\"3072\",n_bucket=\"2049_4096\","
+                      "k=\"8192\",k_bucket=\"4097_8192\"} 1") !=
+          std::string::npos);
+}
+
 TEST_CASE("MetricsRegistry records distributed KV enqueue rejection counters",
           "[metrics]") {
   inferflux::MetricsRegistry registry;
@@ -240,6 +417,83 @@ TEST_CASE("MetricsRegistry records distributed KV enqueue rejection counters",
                       "backend=\"cpu\"} 3") != std::string::npos);
   REQUIRE(output.find("inferflux_disagg_kv_enqueue_exhausted_total{"
                       "backend=\"cpu\"} 1") != std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry records distributed KV ticket lifecycle counters",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordDisaggKVTicketStage("enqueued");
+  registry.RecordDisaggKVTicketStage("enqueued");
+  registry.RecordDisaggKVTicketStage("acknowledged");
+  registry.RecordDisaggKVTicketStage("committed");
+  registry.RecordDisaggKVTicketStage("timed_out");
+  registry.RecordDisaggKVTicketStage("committed");
+  registry.RecordDisaggKVTicketStage("unknown");
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("# HELP inferflux_disagg_kv_tickets_total") !=
+          std::string::npos);
+  REQUIRE(output.find("# TYPE inferflux_disagg_kv_tickets_total counter") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_disagg_kv_tickets_total{backend=\"cpu\","
+                      "stage=\"enqueued\"} 2") != std::string::npos);
+  REQUIRE(output.find("inferflux_disagg_kv_tickets_total{backend=\"cpu\","
+                      "stage=\"acknowledged\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_disagg_kv_tickets_total{backend=\"cpu\","
+                      "stage=\"committed\"} 2") != std::string::npos);
+  REQUIRE(output.find("inferflux_disagg_kv_tickets_total{backend=\"cpu\","
+                      "stage=\"timed_out\"} 1") != std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry tracks recoverable distributed KV timeout streak",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordDisaggKVTicketStage("timed_out");
+  registry.RecordDisaggKVTicketStage("timed_out");
+  REQUIRE(registry.GetDisaggKVTimeoutStreak() == 2);
+  REQUIRE(registry.GetDisaggKVTimeoutDebt() == 2);
+
+  registry.RecordDisaggKVTicketStage("acknowledged");
+  REQUIRE(registry.GetDisaggKVTimeoutStreak() == 2);
+  REQUIRE(registry.GetDisaggKVTimeoutDebt() == 2);
+
+  registry.RecordDisaggKVTicketStage("committed");
+  REQUIRE(registry.GetDisaggKVTimeoutStreak() == 0);
+  REQUIRE(registry.GetDisaggKVTimeoutDebt() == 1);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("# HELP inferflux_disagg_kv_timeout_streak") !=
+          std::string::npos);
+  REQUIRE(output.find("# TYPE inferflux_disagg_kv_timeout_streak gauge") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_disagg_kv_timeout_streak{backend=\"cpu\"} 0") !=
+          std::string::npos);
+  REQUIRE(output.find("# HELP inferflux_disagg_kv_timeout_debt") !=
+          std::string::npos);
+  REQUIRE(output.find("# TYPE inferflux_disagg_kv_timeout_debt gauge") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_disagg_kv_timeout_debt{backend=\"cpu\"} 1") !=
+          std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry exposes distributed KV counters via getters",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordDisaggKVEnqueueRejected(false);
+  registry.RecordDisaggKVEnqueueRejected(true);
+  registry.RecordDisaggKVTicketStage("enqueued");
+  registry.RecordDisaggKVTicketStage("acknowledged");
+  registry.RecordDisaggKVTicketStage("committed");
+  registry.RecordDisaggKVTicketStage("timed_out");
+  registry.RecordDisaggKVTicketStage("committed");
+
+  REQUIRE(registry.GetDisaggKVEnqueueRejections() == 2);
+  REQUIRE(registry.GetDisaggKVEnqueueExhausted() == 1);
+  REQUIRE(registry.GetDisaggKVTicketsEnqueued() == 1);
+  REQUIRE(registry.GetDisaggKVTicketsAcknowledged() == 1);
+  REQUIRE(registry.GetDisaggKVTicketsCommitted() == 2);
+  REQUIRE(registry.GetDisaggKVTicketsTimedOut() == 1);
+  REQUIRE(registry.GetDisaggKVTimeoutDebt() == 0);
 }
 
 TEST_CASE("MetricsRegistry records per-model token counters", "[metrics]") {

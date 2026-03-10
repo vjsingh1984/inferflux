@@ -70,6 +70,10 @@ bool CheckCudaStatus(cudaError_t status, const char *component,
   return false;
 }
 
+bool ShouldRetainDequantizedTensor(const std::string &name) {
+  return name == "token_embd.weight" || name == "tok_emb.weight";
+}
+
 } // namespace
 
 //==============================================================================
@@ -369,6 +373,9 @@ bool GGUFModelLoader::ParseKeyValuePairs(FILE *file) {
   alignment_ = 32;
   model_info_ = ModelInfo{};
   tokenizer_pieces_.clear();
+  tokenizer_merges_.clear();
+  tokenizer_pre_.clear();
+  tokenizer_chat_template_.clear();
   tokenizer_eos_token_id_ = -1;
   tokenizer_bos_token_id_ = -1;
 
@@ -472,6 +479,14 @@ bool GGUFModelLoader::ParseKeyValuePairs(FILE *file) {
           return false;
         }
         tmp = v;
+        break;
+      }
+      case GGUF::ValueType::BOOL: {
+        uint8_t v = 0;
+        if (fread(&v, sizeof(v), 1, file) != 1) {
+          return false;
+        }
+        tmp = static_cast<int64_t>(v != 0);
         break;
       }
       default:
@@ -595,6 +610,32 @@ bool GGUFModelLoader::ParseKeyValuePairs(FILE *file) {
       tokenizer_bos_token_id_ = v;
       continue;
     }
+    if (key == "tokenizer.ggml.add_bos_token") {
+      int v = 0;
+      if (!read_int_value(&v)) {
+        return false;
+      }
+      tokenizer_add_bos_token_ = (v != 0);
+      continue;
+    }
+    if (key == "tokenizer.ggml.pre") {
+      if (type != GGUF::ValueType::STRING) {
+        return false;
+      }
+      if (!GGUFReader::ReadString(file, &tokenizer_pre_)) {
+        return false;
+      }
+      continue;
+    }
+    if (key == "tokenizer.chat_template") {
+      if (type != GGUF::ValueType::STRING) {
+        return false;
+      }
+      if (!GGUFReader::ReadString(file, &tokenizer_chat_template_)) {
+        return false;
+      }
+      continue;
+    }
     if (key == "tokenizer.ggml.tokens" && type == GGUF::ValueType::ARRAY) {
       uint32_t elem_type_raw = 0;
       uint64_t arr_len = 0;
@@ -624,6 +665,34 @@ bool GGUFModelLoader::ParseKeyValuePairs(FILE *file) {
       }
       model_info_.vocab_size = static_cast<int>(std::min<uint64_t>(
           arr_len, static_cast<uint64_t>(std::numeric_limits<int>::max())));
+      continue;
+    }
+    if (key == "tokenizer.ggml.merges" && type == GGUF::ValueType::ARRAY) {
+      uint32_t elem_type_raw = 0;
+      uint64_t arr_len = 0;
+      if (!ReadU32(file, &elem_type_raw) ||
+          !GGUFReader::ReadUint64(file, &arr_len)) {
+        return false;
+      }
+      if (static_cast<GGUF::ValueType>(elem_type_raw) !=
+          GGUF::ValueType::STRING) {
+        for (uint64_t idx = 0; idx < arr_len; ++idx) {
+          if (!GGUFReader::SkipValue(
+                  file, static_cast<GGUF::ValueType>(elem_type_raw))) {
+            return false;
+          }
+        }
+        continue;
+      }
+      tokenizer_merges_.reserve(static_cast<size_t>(std::min<uint64_t>(
+          arr_len, static_cast<uint64_t>(std::numeric_limits<size_t>::max()))));
+      for (uint64_t idx = 0; idx < arr_len; ++idx) {
+        std::string merge;
+        if (!GGUFReader::ReadString(file, &merge)) {
+          return false;
+        }
+        tokenizer_merges_.push_back(std::move(merge));
+      }
       continue;
     }
 
@@ -981,12 +1050,11 @@ DequantizedCachePolicy GGUFModelLoader::GetDequantizedCachePolicy() const {
 void GGUFModelLoader::ClearDequantizedCache() {
   for (auto &[name, tensor] : tensors_) {
     if (tensor.dequantized_gpu) {
-      // Only free dequantized caches for quantized tensors (large projection
-      // weights). Non-quantized tensors (embeddings, norms, LM head) produce
-      // small F32→FP16 conversions that should persist — freeing them causes a
-      // use-after-free when the forward pass accesses these weights via cached
-      // pointers in QuantizedWeightMap.
-      if (tensor.info.is_quantized()) {
+      // Only free request/batch scoped dequantized caches for projection-like
+      // quantized tensors. Quantized token embeddings must stay resident even
+      // in memory-first modes because every request reuses them and the native
+      // path still reads them through the dequantized gather path.
+      if (tensor.info.is_quantized() && !ShouldRetainDequantizedTensor(name)) {
         CheckCudaStatus(cudaFree(tensor.dequantized_gpu), "gguf_loader",
                         "cudaFree(tensor.dequantized_gpu:" + name + ")");
         tensor.dequantized_gpu = nullptr;

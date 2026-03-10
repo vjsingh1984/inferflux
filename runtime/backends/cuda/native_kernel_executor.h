@@ -171,11 +171,8 @@ public:
 
   // NativeCudaRuntime interface
   std::string Name() const override { return "native_cuda"; }
-  bool IsFallback() const override { return false; } // We use native kernels!
-  const std::string &FallbackReason() const override {
-    static const std::string no_reason;
-    return no_reason;
-  }
+  bool IsFallback() const override { return fallback_mode_; }
+  const std::string &FallbackReason() const override { return fallback_reason_; }
 
   /**
    * Load model from safetensors
@@ -206,11 +203,19 @@ public:
   // Native perf
   NativePerfSnapshot NativeTakePerf() override;
 
+  // Timing helper: 0 disables event timing, N>0 records every Nth native work
+  // item (decode batch or prefill request). Exposed for contract tests.
+  static bool ShouldRecordTimingSample(int sample_rate, int *counter);
+
   // Native* overrides — provide tokenization/readiness without llama.cpp
   std::vector<int> NativeTokenize(const std::string &prompt) const override;
   int NativeTokenCount(const std::string &text) const override;
   bool NativeIsReady() const override;
   void NativeFreeSequence(int sequence_id) override;
+  LlamaCPUBackend::SequenceReleaseFence
+  NativeBeginFreeSequence(int sequence_id) override;
+  bool NativePollFreeSequence(
+      const LlamaCPUBackend::SequenceReleaseFence &fence) override;
   void NativeCopySequencePrefix(int src_seq, int dst_seq,
                                 int n_tokens) override;
   std::vector<uint8_t> NativeSerializeSequence(int sequence_id) const override;
@@ -220,6 +225,8 @@ public:
       const std::vector<std::pair<std::string, std::string>> &messages,
       bool add_assistant_prefix = true) const override;
   const ITokenizer *NativeGetTokenizer() const override;
+  int CopyLastLogitsToHost(float *host_buf, int buf_size) override;
+  int NativeVocabSize() const override;
 
   // Native-specific functionality
   bool HasFlashAttention2() const { return has_flash_attention_2_; }
@@ -235,6 +242,8 @@ private:
   runtime::cuda::native::ModelInfo model_info_;
   std::filesystem::path loaded_model_path_;
   bool model_loaded_{false};
+  bool fallback_mode_{false};
+  std::string fallback_reason_;
 
   // CUDA state
   int device_id_{0};
@@ -319,6 +328,16 @@ private:
   float *d_prefill_logits_{nullptr};
   UnifiedBatchLaneDispatcher lane_dispatcher_;
   std::mutex lane_dispatcher_mutex_;
+
+  struct PendingSequenceRelease {
+    uint64_t token{0};
+    int sequence_id{-1};
+    cudaEvent_t compute_done{nullptr};
+    cudaEvent_t decode_done{nullptr};
+    cudaEvent_t prefill_done{nullptr};
+  };
+  std::vector<PendingSequenceRelease> pending_sequence_releases_;
+  uint64_t next_sequence_release_token_{1};
 #endif
 
   // Performance timing via cudaEvents
@@ -330,7 +349,7 @@ private:
 
   // Timing sample rate: 0 = disabled, N>0 = record every Nth batch.
   // Controlled by INFERFLUX_NATIVE_TIMING_SAMPLE_RATE env var.
-  int timing_sample_rate_{1};
+  int timing_sample_rate_{0};
   int timing_batch_counter_{0};
 
   struct NativePerfAccumulator {

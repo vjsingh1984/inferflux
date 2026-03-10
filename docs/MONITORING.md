@@ -20,8 +20,15 @@ flowchart LR
 | Errors | `inferflux_errors_total` |
 | Queue depth | `inferflux_scheduler_queue_depth`, `inferflux_prefill_queue_depth`, `inferflux_decode_queue_depth` |
 | Batch quality | `inferflux_batch_size_max`, `inferflux_scheduler_batch_token_budget_skips_total`, `inferflux_scheduler_iterations_total{phase=...}` |
+| Sequence reclamation | `inferflux_scheduler_deferred_sequence_retirements`, `inferflux_scheduler_deferred_sequence_retirements_completed_total`, `inferflux_scheduler_sequence_retirement_duration_ms*` |
 | CUDA overlap | `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_overlap_events_total` |
 | Native path activity | `inferflux_native_forward_passes_total{phase=...}` |
+| Native forward batch distribution | `inferflux_native_forward_batch_size_total{phase=...,bucket=...}` |
+| Native FFN projection mix | `inferflux_native_ffn_proj_operator_total{phase=...,operator=...}` |
+| Native FFN geometry | `inferflux_native_ffn_proj_geometry_total{phase=...,operator=...,quant=...,m_bucket=...,n=...,k=...,grouped_outputs=...}` |
+| Native down-proj operator mix | `inferflux_native_down_proj_operator_total{phase=...,operator=...}` |
+| Native down-proj geometry | `inferflux_native_down_proj_geometry_total{phase=...,operator=...,quant=...,m_bucket=...,n=...,k=...}` |
+| Native GEMV dispatch | `inferflux_native_ffn_proj_operator_total{operator=...}` — confirms Q8_1 vs packed vs fallback for FFN gate/up. `inferflux_native_down_proj_operator_total{operator=...}` — confirms generic `q8_1_gemv`, experimental `q8_1_gemv_hot_fixed`, row-pair/row-quad, MMQ, or fallback for down proj |
 | Native KV planning | `inferflux_native_kv_active_sequences`, `inferflux_native_kv_max_sequences`, `inferflux_native_kv_autotune_events_total`, `inferflux_native_kv_requested_max_seq`, `inferflux_native_kv_planned_max_seq`, `inferflux_native_kv_budget_bytes` |
 | Distributed KV health | `inferflux_disagg_kv_tickets_total{stage=...}`, `inferflux_disagg_kv_timeout_streak`, `inferflux_disagg_kv_timeout_debt` |
 | Cache reuse | `inferflux_prefix_hits_total`, `inferflux_prefix_partial_hits_total`, `inferflux_prefix_matched_tokens_total`, `inferflux_kv_prefix_reuse_total` |
@@ -41,6 +48,7 @@ curl -s http://127.0.0.1:8080/metrics | head -160
 | Increase throughput | `runtime.scheduler.max_batch_size` | `runtime.scheduler.batch_accumulation_ms` | `inferflux_batch_size_max` rises without error spikes |
 | Improve mixed workloads | `runtime.cuda.phase_overlap.enabled` | `runtime.scheduler.mixed_prefill_budget_ratio` | overlap events and mixed scheduler iterations rise |
 | Improve memory economy | native dequant policy + KV budget knobs | session/prefix reuse patterns | native KV plan shrinks to budget without request failures |
+| Validate deferred slot reuse | backend release fences | scheduler slot reuse | retirement gauge drains and retirement duration stays bounded |
 | Improve cache reuse | prefix warm path + KV pages | scheduler policy | prefix/kv reuse counters rise |
 | Validate provider intent | backend exposure policy | strict-native mode | `/v1/models` shows expected provider/fallback fields |
 
@@ -52,10 +60,54 @@ Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 |---|---|---|
 | Selected provider | `/v1/models` or `inferctl models --json` | `provider=llama_cpp` with `fallback=true` means native is not serving the request path |
 | Native execution | `inferflux_native_forward_passes_total{phase=...}` | Zero deltas mean native forward is not active |
+| Native decode batch shape | `inferflux_native_forward_batch_size_total{phase="decode",bucket=...}` | If decode stays mostly in `bucket="1"`, scheduler/kernel work is still effectively single-row |
+| Native FFN gate+up path | `inferflux_native_ffn_proj_operator_total{phase=...,operator=...}` | Confirms whether the live FFN projection hot path is experimental small-batch `q8_1_group_hot_q4k`, generic `q8_1_group`, packed, or fallback. `q8_1_group_hot_q4k` should stay at zero unless explicitly re-enabled for experiments; if it is zero, the generic path no longer dispatches the fixed-block kernel accidentally. |
+| Native FFN gate+up geometry | `inferflux_native_ffn_proj_geometry_total{phase=...,operator=...,quant=...,m_bucket=...,n=...,k=...,grouped_outputs=...}` | Identifies the actual grouped gate/up GEMV envelope before changing kernels or thresholds |
+| Native down-proj operator | `inferflux_native_down_proj_operator_total{phase=...,operator=...}` | Confirms whether native `down_proj` is actually using generic `q8_1_gemv`, experimental `q8_1_gemv_hot_fixed`, row-pair/row-quad `Q8_1`, packed, `mmq`, or fallback |
+| Native down-proj geometry | `inferflux_native_down_proj_geometry_total{phase=...,operator=...,quant=...,m_bucket=...,n=...,k=...}` | Identifies the actual down-proj GEMV envelope before changing kernels or thresholds |
+| Native operator selection logs | `INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION=1` | Emits `operator_select[...]` lines with chosen operator plus `M/N/K` geometry; use only for short debug runs |
+| Native vs llama decode parity | `INFERFLUX_DEBUG_LOGITS=1`, `INFERFLUX_DEBUG_TOKEN_TRACE=1`, then `python3 scripts/compare_decode_traces.py native.log llama.log --json` | Reports the first divergent `client_request_id / n_past / top-token` step when stable client tags are present, falling back to scheduler `request_id` only when no caller tag was logged |
+| Phased fairness resume | `inferflux_empty_generations_total` plus unified-batch regression tests | Empty generations should not spike after a fairness-slice change; resumed phased requests must carry only the next feed token |
+| Slot/request identity debugging | `INFERFLUX_DEBUG_SEQUENCE_SLOTS=1` and `INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING=1` | Logs must include `request_id` plus `sequence_generation`; slot id alone is not enough once leases are reused |
+| Compatibility-path EOG parity | local GGUF tokenizer/backend regression tests | `cuda_llama_cpp` should stop on GGUF end-of-generation tokens, not just model EOS |
+| Batched decode active | `INFERFLUX_ENABLE_BATCHED_DECODE=1` + batch buckets in `bucket="2"` or higher | When enabled, B>1 decode uses BatchedRoPE/KvAppend/FlashDecodeMultiSeq instead of per-sequence loop. Opt-in until compute-sanitizer validates stability. |
+| Q8_1 activation path | startup log shows `using Q8_1 grouped triple GEMV` or `using Q8_1 pre-quantized GEMV` | Confirms pre-quantized Q8_1 activations are active (highest throughput path). Disable with `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` for A/B testing. |
 | Overlap activity | `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_overlap_events_total` | Non-zero deltas confirm mixed-workload lane activity |
 | Native KV sizing | `inferflux_native_kv_requested_max_seq`, `inferflux_native_kv_planned_max_seq`, `inferflux_native_kv_budget_bytes` | Planned values below requested show KV auto-tune is protecting VRAM |
 | Readiness on decode/disagg nodes | `/readyz` | Ready requires weights loaded, full decode-worker health, and timeout streak/debt below threshold |
 | Fail-closed admission | generation `503` with `error=distributed_kv_transport_degraded` | optional protection when degraded transport should stop new generation work immediately |
+
+Benchmark-only experiment:
+- `INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH=<n>`
+  Lowers the native `down_proj` MMQ promotion threshold for controlled experiments.
+  Validate with `inferflux_native_down_proj_operator_total` before trusting throughput movement.
+- `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED=1`
+  Enables the exact-shape fixed-block `down_proj` kernel for the observed `M=1,N=2048,K=11008` decode envelope. Keep it off for normal runs until the full concurrent benchmark reaches the same exact-match bar as the generic path.
+
+Benchmark harness knobs:
+- `INFERFLUX_BENCH_ENABLE_BATCHED_DECODE=<0|1>`
+- `INFERFLUX_BENCH_MIN_BATCH_SIZE=<n>`
+- `INFERFLUX_BENCH_BATCH_ACCUMULATION_MS=<ms>`
+- `INFERFLUX_BENCH_DECODE_BURST_TOKENS=<n>`
+- `INFERFLUX_BENCH_NATIVE_TIMING_SAMPLE_RATE=<n>`
+  `0` disables native CUDA event timing; `N>0` records every `N`th native work item across both decode batches and prefill requests.
+  The harness default for `INFERFLUX_BENCH_ENABLE_BATCHED_DECODE` is `1`, because otherwise the benchmark measures the native per-sequence decode fallback and systematically understates throughput. The server runtime default is still separate and remains opt-in until the broader batched-decode stability gate is closed.
+  The harness default for `INFERFLUX_BENCH_DECODE_BURST_TOKENS` is `0`; use `>1` only for explicit throughput experiments because native exact-match parity is not closed there yet.
+- `INFERFLUX_BENCH_DEBUG_SEQUENCE_SLOTS=1`
+- `INFERFLUX_BENCH_DEBUG_UNIFIED_ASSEMBLY=1`
+- `INFERFLUX_BENCH_NATIVE_DEBUG_DECODE_MAPPING=1`
+- `INFERFLUX_BENCH_NATIVE_DEBUG_OPERATOR_SELECTION=1`
+  Passes the corresponding debug knobs through `scripts/run_gguf_comparison_benchmark.sh` so the artifact directory contains slot, decode-mapping, assembly, and operator-selection traces.
+
+Logging control:
+- `INFERFLUX_LOG_LEVEL=warning` or `error`
+  Suppresses native `INFO`-level kernel/path logs during throughput runs.
+
+Measured starting point, not a global default:
+- On RTX 4000 Ada with `qwen2.5-3b-instruct-q4_k_m.gguf`, a short `concurrency=4` probe improved native throughput when moving from `min_batch_size=1,batch_accumulation_ms=2` to `min_batch_size=2,batch_accumulation_ms=6`.
+- Raising the window further to `10ms` increased `decode` multi-row buckets slightly but reduced net throughput.
+- Raising `decode_burst_tokens` from the harness-safe default `0` to `8` improved native throughput only modestly on the same probe but regressed exact match from `8/10` to `6/10`, so treat `>1` as experiment-only until native batched decode parity is proven.
+- Use the native forward batch-size and geometry metrics to validate that a tuning change improved the actual live decode envelope before changing defaults.
 
 ## 5) Throughput Gate Contract
 
@@ -117,6 +169,7 @@ nsys profile -t cuda,nvtx -o /tmp/inferflux_profile \
 ## 9) Related Docs
 
 - [Architecture](Architecture.md)
+- [GEMV_KERNEL_ARCHITECTURE](GEMV_KERNEL_ARCHITECTURE.md)
 - [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 - [Troubleshooting](Troubleshooting.md)
 - [ARCHIVE_INDEX](ARCHIVE_INDEX.md)

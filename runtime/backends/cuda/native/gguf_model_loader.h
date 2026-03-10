@@ -100,8 +100,16 @@ public:
   const std::vector<std::string> &TokenizerPieces() const {
     return tokenizer_pieces_;
   }
+  const std::vector<std::string> &TokenizerMerges() const {
+    return tokenizer_merges_;
+  }
+  const std::string &TokenizerPreTokenizer() const { return tokenizer_pre_; }
+  const std::string &TokenizerChatTemplate() const {
+    return tokenizer_chat_template_;
+  }
   int TokenizerEosTokenId() const { return tokenizer_eos_token_id_; }
   int TokenizerBosTokenId() const { return tokenizer_bos_token_id_; }
+  bool TokenizerAddBosToken() const { return tokenizer_add_bos_token_; }
 
   /**
    * @brief Get GGUF to internal tensor name mapping
@@ -141,8 +149,12 @@ private:
   size_t alignment_{32};
   size_t data_section_offset_{0};
   std::vector<std::string> tokenizer_pieces_;
+  std::vector<std::string> tokenizer_merges_;
+  std::string tokenizer_pre_;
+  std::string tokenizer_chat_template_;
   int tokenizer_eos_token_id_{-1};
   int tokenizer_bos_token_id_{-1};
+  bool tokenizer_add_bos_token_{true};
 
   // Tensors (keyed by GGUF name)
   std::unordered_map<std::string, GGUFTensorData> tensors_;

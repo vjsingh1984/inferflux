@@ -8,6 +8,7 @@
 #endif
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -133,6 +134,7 @@ public:
   QuantizedWeightInfo GetRawLayerGateProj(int layer) const;
   QuantizedWeightInfo GetRawLayerUpProj(int layer) const;
   QuantizedWeightInfo GetRawLayerDownProj(int layer) const;
+  MmqWeightInfo GetMmqLayerDownProj(int layer) const;
   QuantizedWeightInfo GetRawLmHead() const;
 
   /**
@@ -180,6 +182,7 @@ private:
     mutable const half *gate_proj{nullptr};
     mutable const half *up_proj{nullptr};
     mutable const half *down_proj{nullptr};
+    mutable MmqWeightInfo down_proj_mmq{};
     // Biases
     mutable const half *q_proj_bias{nullptr};
     mutable const half *k_proj_bias{nullptr};
@@ -222,6 +225,7 @@ private:
   // Scratch buffer for on-demand projection dequantization
   mutable half *scratch_buffer_{nullptr};
   mutable size_t scratch_buffer_elements_{0};
+  mutable std::mutex mmq_cache_mu_;
   bool allow_fused_quantized_matmul_{true};
 
   // Global weight accessors

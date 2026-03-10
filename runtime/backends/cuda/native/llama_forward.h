@@ -1,8 +1,83 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/model_forward.h"
+#include <algorithm>
+#include <array>
+
+#include <cstdint>
 
 namespace inferflux {
+
+inline int PackedActivationWidth(int hidden_size, int intermediate_size) {
+  return std::max(hidden_size, intermediate_size);
+}
+
+inline bool ShouldUseDecodeGraph(bool graph_enabled, bool graph_disabled,
+                                 bool phase_timing_enabled,
+                                 bool capture_safe = true) {
+  return graph_enabled && !graph_disabled && !phase_timing_enabled &&
+         capture_safe;
+}
+
+template <size_t GroupSize> struct SharedActivationGroupingChoice {
+  int grouped_count{0};
+  std::array<int, GroupSize> indices{};
+};
+
+template <size_t GroupSize>
+inline SharedActivationGroupingChoice<GroupSize> SelectSharedActivationGrouping(
+    const std::array<int, GroupSize> &quant_types,
+    const std::array<int, GroupSize> &output_cols,
+    const std::array<bool, GroupSize> &pair_ready,
+    const std::array<bool, GroupSize> &triple_ready) {
+  SharedActivationGroupingChoice<GroupSize> choice;
+  choice.indices.fill(-1);
+
+  if constexpr (GroupSize == 2) {
+    if (quant_types[0] == quant_types[1] && pair_ready[0] && pair_ready[1]) {
+      choice.grouped_count = 2;
+      choice.indices[0] = 0;
+      choice.indices[1] = 1;
+    }
+    return choice;
+  }
+
+  if constexpr (GroupSize == 3) {
+    if (quant_types[0] == quant_types[1] && quant_types[1] == quant_types[2] &&
+        triple_ready[0] && triple_ready[1] && triple_ready[2]) {
+      choice.grouped_count = 3;
+      choice.indices[0] = 0;
+      choice.indices[1] = 1;
+      choice.indices[2] = 2;
+      return choice;
+    }
+
+    int best_i = -1;
+    int best_j = -1;
+    int best_cols = -1;
+    for (size_t i = 0; i < GroupSize; ++i) {
+      for (size_t j = i + 1; j < GroupSize; ++j) {
+        if (quant_types[i] != quant_types[j] || !pair_ready[i] ||
+            !pair_ready[j]) {
+          continue;
+        }
+        const int cols = output_cols[i] + output_cols[j];
+        if (cols > best_cols) {
+          best_cols = cols;
+          best_i = static_cast<int>(i);
+          best_j = static_cast<int>(j);
+        }
+      }
+    }
+    if (best_i >= 0) {
+      choice.grouped_count = 2;
+      choice.indices[0] = best_i;
+      choice.indices[1] = best_j;
+    }
+  }
+
+  return choice;
+}
 
 /**
  * LlamaForwardTyped<T>: Llama/Qwen decoder-only transformer forward pass.
@@ -68,6 +143,9 @@ private:
   T *d_ffn_gate_{nullptr};
   T *d_ffn_up_{nullptr};
   T *d_ffn_down_{nullptr};
+  int8_t *d_packed_activation_{nullptr};
+  float *d_packed_activation_scales_{nullptr};
+  void *d_act_q8_1_{nullptr}; // Pre-quantized Q8_1 activation buffer
   int *d_token_ids_{nullptr};
   T *d_logits_typed_{nullptr};
 

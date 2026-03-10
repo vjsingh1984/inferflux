@@ -141,9 +141,23 @@ void SignalHandler(int) { g_running = false; }
 
 int main(int argc, char **argv) {
   // Structured JSON logging: set before any log output.
+  const bool log_format_from_env = std::getenv("INFERFLUX_LOG_FORMAT") != nullptr;
   if (const char *fmt = std::getenv("INFERFLUX_LOG_FORMAT")) {
     std::string s = fmt;
     inferflux::log::SetJsonMode(s == "json" || s == "JSON");
+  }
+  std::string configured_log_level = "info";
+  bool log_level_from_env = false;
+  if (const char *level = std::getenv("INFERFLUX_LOG_LEVEL")) {
+    inferflux::log::Level parsed_level;
+    if (inferflux::log::ParseLevel(level, &parsed_level)) {
+      inferflux::log::SetLevel(parsed_level);
+      configured_log_level = level;
+      log_level_from_env = true;
+    } else {
+      std::cerr << "[WARN] server: Ignoring invalid INFERFLUX_LOG_LEVEL | "
+                << level << "\n";
+    }
   }
 
   // §P1e: Initialize distributed parallel environment.
@@ -493,9 +507,9 @@ int main(int argc, char **argv) {
             scheduler_config.batch_accumulation_ms =
                 std::max(0, scheduler_node["batch_accumulation_ms"].as<int>());
           }
-          if (scheduler_node["continuous_decode_steps"]) {
-            scheduler_config.continuous_decode_steps = std::max(
-                0, scheduler_node["continuous_decode_steps"].as<int>());
+          if (scheduler_node["decode_burst_tokens"]) {
+            scheduler_config.decode_burst_tokens = std::max(
+                0, scheduler_node["decode_burst_tokens"].as<int>());
           }
           if (scheduler_node["chunked_prefill_tokens"]) {
             scheduler_config.chunked_prefill_tokens =
@@ -582,8 +596,17 @@ int main(int argc, char **argv) {
       }
 
       // Logging config
-      if (config["logging"] && config["logging"]["audit_log"]) {
-        audit_log_path = config["logging"]["audit_log"].as<std::string>();
+      if (config["logging"]) {
+        if (config["logging"]["audit_log"]) {
+          audit_log_path = config["logging"]["audit_log"].as<std::string>();
+        }
+        if (!log_format_from_env && config["logging"]["format"]) {
+          const auto format = config["logging"]["format"].as<std::string>();
+          inferflux::log::SetJsonMode(format == "json" || format == "JSON");
+        }
+        if (config["logging"]["level"]) {
+          configured_log_level = config["logging"]["level"].as<std::string>();
+        }
       }
 
       // TLS config
@@ -654,6 +677,15 @@ int main(int argc, char **argv) {
   }
   if (const char *env_audit = std::getenv("INFERFLUX_AUDIT_LOG")) {
     audit_log_path = env_audit;
+  }
+  if (!log_level_from_env) {
+    inferflux::log::Level parsed_level;
+    if (inferflux::log::ParseLevel(configured_log_level, &parsed_level)) {
+      inferflux::log::SetLevel(parsed_level);
+    } else {
+      inferflux::log::Warn("server", "Ignoring invalid logging.level setting",
+                           configured_log_level);
+    }
   }
   if (const char *env_blk = std::getenv("INFERFLUX_GUARDRAIL_BLOCKLIST")) {
     std::stringstream ss(env_blk);
@@ -881,12 +913,12 @@ int main(int argc, char **argv) {
       scheduler_config.batch_accumulation_ms = static_cast<int>(accumulation);
     }
   }
-  if (const char *env_continuous_decode_steps =
-          std::getenv("INFERFLUX_SCHED_CONTINUOUS_DECODE_STEPS")) {
+  if (const char *env_decode_burst_tokens =
+          std::getenv("INFERFLUX_SCHED_DECODE_BURST_TOKENS")) {
     try {
-      int v = std::stoi(env_continuous_decode_steps);
+      int v = std::stoi(env_decode_burst_tokens);
       if (v >= 0) {
-        scheduler_config.continuous_decode_steps = v;
+        scheduler_config.decode_burst_tokens = v;
       }
     } catch (...) {
     }
@@ -1070,8 +1102,8 @@ int main(int argc, char **argv) {
           std::to_string(scheduler_config.batch_accumulation_ms) + ", policy=" +
           inferflux::SchedulerBatchPolicyToString(
               scheduler_config.batch_policy) +
-          ", continuous_decode_steps=" +
-          std::to_string(scheduler_config.continuous_decode_steps) +
+          ", decode_burst_tokens=" +
+          std::to_string(scheduler_config.decode_burst_tokens) +
           ", chunked_prefill_tokens=" +
           std::to_string(scheduler_config.chunked_prefill_tokens) +
           ", mixed_prefill_budget_ratio=" +

@@ -25,6 +25,27 @@ TEST_CASE("Native metrics record forward passes", "[native_batch]") {
           std::string::npos);
 }
 
+TEST_CASE("Native metrics record forward shape without timing", "[native_batch]") {
+  inferflux::MetricsRegistry registry;
+
+  registry.RecordNativeForwardShape(/*is_decode=*/true, /*batch_size=*/2);
+  registry.RecordNativeForwardShape(/*is_decode=*/false, /*batch_size=*/12);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_native_forward_passes_total{phase=\"decode\"} "
+                      "1") != std::string::npos);
+  REQUIRE(output.find(
+              "inferflux_native_forward_passes_total{phase=\"prefill\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_forward_batch_tokens_total 14") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_forward_batch_size_total{phase="
+                      "\"decode\",bucket=\"2\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_forward_batch_size_total{phase="
+                      "\"prefill\",bucket=\"9_16\"} 1") !=
+          std::string::npos);
+}
+
 TEST_CASE("Native metrics record sampling", "[native_batch]") {
   inferflux::MetricsRegistry registry;
 
@@ -45,6 +66,50 @@ TEST_CASE("Native KV cache occupancy gauges", "[native_batch]") {
   REQUIRE(output.find("inferflux_native_kv_active_sequences 5") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_native_kv_max_sequences 32") !=
+          std::string::npos);
+}
+
+TEST_CASE("Native KV auto-tune metrics record reduced plan", "[native_batch]") {
+  inferflux::MetricsRegistry registry;
+
+  registry.RecordNativeKvAutoTunePlan(/*requested_max_seq=*/4096,
+                                      /*planned_max_seq=*/1024,
+                                      /*requested_bytes=*/4294967296ULL,
+                                      /*planned_bytes=*/1073741824ULL,
+                                      /*budget_bytes=*/1073741824ULL);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_native_kv_autotune_events_total 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_kv_requested_max_seq 4096") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_kv_planned_max_seq 1024") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_kv_requested_bytes 4294967296") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_kv_planned_bytes 1073741824") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_kv_budget_bytes 1073741824") !=
+          std::string::npos);
+}
+
+TEST_CASE("Native KV auto-tune metrics keep event counter stable when plan is "
+          "unchanged",
+          "[native_batch]") {
+  inferflux::MetricsRegistry registry;
+
+  registry.RecordNativeKvAutoTunePlan(/*requested_max_seq=*/2048,
+                                      /*planned_max_seq=*/2048,
+                                      /*requested_bytes=*/536870912ULL,
+                                      /*planned_bytes=*/536870912ULL,
+                                      /*budget_bytes=*/1073741824ULL);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_native_kv_autotune_events_total 0") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_kv_requested_max_seq 2048") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_kv_planned_max_seq 2048") !=
           std::string::npos);
 }
 

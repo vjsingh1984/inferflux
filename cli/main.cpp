@@ -127,6 +127,58 @@ bool ParsePrometheusMetricValue(const std::string &metrics_body,
   return false;
 }
 
+bool ParsePrometheusLabeledMetricValue(
+    const std::string &metrics_body, const std::string &metric_name,
+    const std::vector<std::pair<std::string, std::string>> &labels,
+    double *value_out) {
+  if (!value_out || metric_name.empty()) {
+    return false;
+  }
+  std::stringstream ss(metrics_body);
+  std::string line;
+  while (std::getline(ss, line)) {
+    line = Trim(line);
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+    if (line.rfind(metric_name, 0) != 0) {
+      continue;
+    }
+    if (line.size() <= metric_name.size() || line[metric_name.size()] != '{') {
+      continue;
+    }
+    const std::size_t labels_end = line.find('}', metric_name.size() + 1);
+    if (labels_end == std::string::npos) {
+      continue;
+    }
+    const std::string label_blob = line.substr(
+        metric_name.size() + 1, labels_end - metric_name.size() - 1);
+    bool labels_match = true;
+    for (const auto &[key, value] : labels) {
+      const std::string needle = key + "=\"" + value + "\"";
+      if (label_blob.find(needle) == std::string::npos) {
+        labels_match = false;
+        break;
+      }
+    }
+    if (!labels_match) {
+      continue;
+    }
+    const std::size_t sep = line.find_last_of(" \t");
+    if (sep == std::string::npos || sep + 1 >= line.size()) {
+      continue;
+    }
+    const std::string value_str = Trim(line.substr(sep + 1));
+    try {
+      *value_out = std::stod(value_str);
+      return true;
+    } catch (...) {
+      continue;
+    }
+  }
+  return false;
+}
+
 int PrintJsonResponseAndReturn(const inferflux::HttpResponse &resp,
                                const std::string &auth_command_hint = "") {
   if (resp.status == 401 || resp.status == 403) {
@@ -350,6 +402,118 @@ void PrintAdminModelsTable(const json &payload) {
   }
 }
 
+std::string JsonValueToText(const json &value) {
+  if (value.is_null()) {
+    return "n/a";
+  }
+  if (value.is_boolean()) {
+    return value.get<bool>() ? "yes" : "no";
+  }
+  if (value.is_string()) {
+    return value.get<std::string>();
+  }
+  return value.dump();
+}
+
+std::string JsonThresholdPair(const json &value, const json &threshold) {
+  if (value.is_null() && threshold.is_null()) {
+    return "n/a";
+  }
+  if (threshold.is_null()) {
+    return JsonValueToText(value);
+  }
+  return JsonValueToText(value) + " / " + JsonValueToText(threshold);
+}
+
+void PrintAdminPoolsSectionHeader(const std::string &title) {
+  std::cout << title << "\n" << std::string(title.size(), '-') << "\n";
+}
+
+void PrintAdminPoolsRow(const std::string &label, const std::string &value) {
+  constexpr int kLabelW = 27;
+  std::cout << std::left << std::setw(kLabelW) << label << value << "\n";
+}
+
+void PrintAdminPoolsTable(const json &payload) {
+  if (!payload.is_object() || !payload.contains("pool_health") ||
+      !payload.contains("scheduler") || !payload.contains("distributed_kv")) {
+    std::cout << payload.dump() << std::endl;
+    return;
+  }
+
+  const json &pool = payload["pool_health"];
+  const json &scheduler = payload["scheduler"];
+  const json &disagg = payload["distributed_kv"];
+
+  PrintAdminPoolsSectionHeader("POOL HEALTH");
+  PrintAdminPoolsRow("Ready", JsonValueToText(pool.value("ready", false)));
+  PrintAdminPoolsRow("HTTP status",
+                     JsonValueToText(pool.value("http_status", json(nullptr))));
+  PrintAdminPoolsRow("Role",
+                     JsonValueToText(pool.value("role", json(nullptr))));
+  PrintAdminPoolsRow("Reason",
+                     JsonValueToText(pool.value("reason", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Model loaded",
+      JsonValueToText(pool.value("model_loaded", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Decode pool warm",
+      JsonValueToText(pool.value("decode_pool_warm", json(nullptr))));
+  PrintAdminPoolsRow("Transport degraded",
+                     JsonValueToText(pool.value("disagg_transport_degraded",
+                                                json(nullptr))));
+  PrintAdminPoolsRow(
+      "Timeout debt",
+      JsonThresholdPair(pool.value("disagg_timeout_debt", json(nullptr)),
+                        pool.value("disagg_timeout_debt_threshold",
+                                   json(nullptr))));
+  PrintAdminPoolsRow(
+      "Timeout streak",
+      JsonThresholdPair(pool.value("disagg_timeout_streak", json(nullptr)),
+                        pool.value("disagg_timeout_streak_threshold",
+                                   json(nullptr))));
+
+  std::cout << "\n";
+  PrintAdminPoolsSectionHeader("SCHEDULER");
+  PrintAdminPoolsRow(
+      "Queue depth",
+      JsonValueToText(scheduler.value("queue_depth", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Prefill queue depth",
+      JsonValueToText(scheduler.value("prefill_queue_depth", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Decode queue depth",
+      JsonValueToText(scheduler.value("decode_queue_depth", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Batch limit size",
+      JsonValueToText(scheduler.value("batch_limit_size", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Batch limit tokens",
+      JsonValueToText(scheduler.value("batch_limit_tokens", json(nullptr))));
+
+  std::cout << "\n";
+  PrintAdminPoolsSectionHeader("DISTRIBUTED KV");
+  PrintAdminPoolsRow("Enqueue rejections",
+                     JsonValueToText(disagg.value("enqueue_rejections_total",
+                                                  json(nullptr))));
+  PrintAdminPoolsRow("Enqueue exhausted",
+                     JsonValueToText(disagg.value("enqueue_exhausted_total",
+                                                  json(nullptr))));
+  PrintAdminPoolsRow("Tickets enqueued",
+                     JsonValueToText(disagg.value("tickets_enqueued_total",
+                                                  json(nullptr))));
+  PrintAdminPoolsRow(
+      "Tickets acknowledged",
+      JsonValueToText(disagg.value("tickets_acknowledged_total",
+                                   json(nullptr))));
+  PrintAdminPoolsRow("Tickets committed",
+                     JsonValueToText(disagg.value("tickets_committed_total",
+                                                  json(nullptr))));
+  PrintAdminPoolsRow("Tickets timed out",
+                     JsonValueToText(disagg.value("tickets_timed_out_total",
+                                                  json(nullptr))));
+}
+
 void PrintUsage() {
   std::cout
       << "Usage:\n"
@@ -398,7 +562,8 @@ void PrintUsage() {
          "                         [--fallback-scope any_compatible|"
          "same_path_only]]\n"
          "                        [--host ... --port ... --api-key KEY]\n"
-      << "  inferctl admin pools --get [--host ... --port ... --api-key KEY]\n"
+      << "  inferctl admin pools --get [--json|--table] [--host ... --port "
+         "... --api-key KEY]\n"
       << "  inferctl admin models --list | --load PATH [--backend TYPE] [--id "
          "NAME] [--default] [--json]\n"
          "                       | --unload ID | --set-default ID [--host ... "
@@ -1631,14 +1796,51 @@ int main(int argc, char **argv) {
       }
       if (target == "pools") {
         bool get = false;
+        bool output_json = false;
+        bool output_table = false;
         for (int i = 3; i < argc; ++i) {
           std::string arg = argv[i];
           if (arg == "--get") {
             get = true;
+          } else if (arg == "--json") {
+            output_json = true;
+          } else if (arg == "--table") {
+            output_table = true;
           }
         }
         if (!get) {
           std::cerr << "inferctl admin pools: --get is required" << std::endl;
+          return 1;
+        }
+        if (output_json && output_table) {
+          std::cerr << "inferctl admin pools: choose at most one of --json, "
+                       "--table"
+                    << std::endl;
+          return 1;
+        }
+        const bool render_table = output_table;
+
+        auto pools_resp =
+            client.Get(BuildUrl(host, port, "/v1/admin/pools"), headers);
+        if (pools_resp.status == 401 || pools_resp.status == 403) {
+          std::cerr << "inferctl admin pools --get: authentication required "
+                       "(set --api-key or INFERCTL_API_KEY)\n";
+          return 1;
+        }
+        if (IsHttpSuccess(pools_resp.status)) {
+          if (render_table) {
+            try {
+              PrintAdminPoolsTable(json::parse(pools_resp.body));
+            } catch (const json::exception &) {
+              std::cout << pools_resp.body << std::endl;
+            }
+          } else {
+            std::cout << pools_resp.body << std::endl;
+          }
+          return 0;
+        }
+        if (pools_resp.status != 404) {
+          std::cout << pools_resp.body << std::endl;
           return 1;
         }
 
@@ -1684,6 +1886,21 @@ int main(int argc, char **argv) {
           }
           return json(value);
         };
+        auto labeled_metric_or_null =
+            [&](const std::string &name,
+                const std::vector<std::pair<std::string, std::string>> &labels)
+            -> json {
+          double value = 0.0;
+          if (!ParsePrometheusLabeledMetricValue(metrics_resp.body, name, labels,
+                                                &value)) {
+            return json(nullptr);
+          }
+          double rounded = std::round(value);
+          if (std::fabs(value - rounded) < 1e-9) {
+            return json(static_cast<int64_t>(rounded));
+          }
+          return json(value);
+        };
 
         json scheduler_metrics{
             {"queue_depth", metric_or_null("inferflux_scheduler_queue_depth")},
@@ -1696,6 +1913,24 @@ int main(int argc, char **argv) {
             {"batch_limit_tokens",
              metric_or_null("inferflux_scheduler_batch_limit_tokens")},
         };
+        json distributed_kv{
+            {"enqueue_rejections_total",
+             metric_or_null("inferflux_disagg_kv_enqueue_rejections_total")},
+            {"enqueue_exhausted_total",
+             metric_or_null("inferflux_disagg_kv_enqueue_exhausted_total")},
+            {"tickets_enqueued_total",
+             labeled_metric_or_null("inferflux_disagg_kv_tickets_total",
+                                    {{"stage", "enqueued"}})},
+            {"tickets_acknowledged_total",
+             labeled_metric_or_null("inferflux_disagg_kv_tickets_total",
+                                    {{"stage", "acknowledged"}})},
+            {"tickets_committed_total",
+             labeled_metric_or_null("inferflux_disagg_kv_tickets_total",
+                                    {{"stage", "committed"}})},
+            {"tickets_timed_out_total",
+             labeled_metric_or_null("inferflux_disagg_kv_tickets_total",
+                                    {{"stage", "timed_out"}})},
+        };
 
         json payload{
             {"status", "ok"},
@@ -1703,10 +1938,37 @@ int main(int argc, char **argv) {
              {{"ready", ready_payload.value("status", "") == "ready"},
               {"http_status", ready_resp.status},
               {"role", ready_payload.value("role", "unknown")},
-              {"reason", ready_payload.value("reason", "")}}},
+              {"reason", ready_payload.value("reason", "")},
+              {"model_loaded",
+               ready_payload.value("model_loaded", false)},
+              {"decode_pool_warm",
+               ready_payload.value("decode_pool_warm", false)},
+              {"disagg_transport_degraded",
+               ready_payload.value("disagg_transport_degraded", false)},
+              {"disagg_timeout_debt",
+               ready_payload.contains("disagg_timeout_debt")
+                   ? ready_payload["disagg_timeout_debt"]
+                   : metric_or_null("inferflux_disagg_kv_timeout_debt")},
+              {"disagg_timeout_debt_threshold",
+               ready_payload.contains("disagg_timeout_debt_threshold")
+                   ? ready_payload["disagg_timeout_debt_threshold"]
+                   : json(nullptr)},
+              {"disagg_timeout_streak",
+               ready_payload.contains("disagg_timeout_streak")
+                   ? ready_payload["disagg_timeout_streak"]
+                   : json(nullptr)},
+              {"disagg_timeout_streak_threshold",
+               ready_payload.contains("disagg_timeout_streak_threshold")
+                   ? ready_payload["disagg_timeout_streak_threshold"]
+                   : json(nullptr)}}},
             {"scheduler", scheduler_metrics},
+            {"distributed_kv", distributed_kv},
         };
-        std::cout << payload.dump() << std::endl;
+        if (render_table) {
+          PrintAdminPoolsTable(payload);
+        } else {
+          std::cout << payload.dump() << std::endl;
+        }
         return 0;
       }
       if (target == "models") {

@@ -197,6 +197,9 @@ TEST_CASE("GGUF Integration: Handler registry", "[gguf][integration]") {
     REQUIRE(registry.IsRegistered("q5_k_m"));
     REQUIRE(registry.IsRegistered("q5_k"));
     REQUIRE(registry.IsRegistered("q6_k"));
+    REQUIRE(registry.IsRegistered("q6_k_m"));
+    REQUIRE(registry.IsRegistered("q8_k"));
+    REQUIRE(registry.IsRegistered("q8_k_m"));
   }
 
   SECTION("Implemented quantizations registered") {
@@ -244,6 +247,15 @@ TEST_CASE("GGUF Integration: Handler creation and basic functionality",
     REQUIRE(handler->GetDequantizedSize(210) == 512);
   }
 
+  SECTION("Create and validate Q6_K_M alias handler") {
+    auto handler = registry.Create("q6_k_m");
+    REQUIRE(handler != nullptr);
+
+    REQUIRE(handler->GetType() == "q6_k");
+    REQUIRE(handler->GetBitsPerValue() == Catch::Approx(6.5625));
+    REQUIRE(handler->GetDequantizedSize(210) == 512);
+  }
+
   SECTION("Create and validate Q8_0 handler") {
     auto handler = registry.Create("q8_0");
     REQUIRE(handler != nullptr);
@@ -253,6 +265,20 @@ TEST_CASE("GGUF Integration: Handler creation and basic functionality",
 
     // 34 bytes (Q8_0) → 64 bytes (FP16)
     REQUIRE(handler->GetDequantizedSize(34) == 64);
+  }
+
+  SECTION("Create and validate Q8_K and Q8_K_M alias handlers") {
+    auto handler_q8_k = registry.Create("q8_k");
+    REQUIRE(handler_q8_k != nullptr);
+    REQUIRE(handler_q8_k->GetType() == "q8_k");
+    REQUIRE(handler_q8_k->GetBitsPerValue() == Catch::Approx(9.125));
+    REQUIRE(handler_q8_k->GetDequantizedSize(292) == 512);
+
+    auto handler_q8_k_m = registry.Create("q8_k_m");
+    REQUIRE(handler_q8_k_m != nullptr);
+    REQUIRE(handler_q8_k_m->GetType() == "q8_k");
+    REQUIRE(handler_q8_k_m->GetBitsPerValue() == Catch::Approx(9.125));
+    REQUIRE(handler_q8_k_m->GetDequantizedSize(292) == 512);
   }
 
   SECTION("Handler creation for unknown type returns nullptr") {
@@ -497,6 +523,64 @@ TEST_CASE("GGUF Integration: Type string conversions", "[gguf][integration]") {
     REQUIRE(GetQuantizationType(GGUF::TensorType::F16) == ""); // Not quantized
     REQUIRE(GetQuantizationType(GGUF::TensorType::F32) == ""); // Not quantized
   }
+}
+
+TEST_CASE("GGUF Integration: F16 accessor returns direct GPU pointer without "
+          "dequant cache",
+          "[gguf][integration][f16_contract]") {
+#ifdef INFERFLUX_HAS_CUDA
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping F16 GGUF accessor contract.");
+    return;
+  }
+
+  cudaStream_t stream = nullptr;
+  REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) ==
+          cudaSuccess);
+
+  GGUFModelLoader loader;
+  const std::string gguf_name = "blk.0.attn_q.weight";
+  const std::string internal_name = "model.layers.0.self_attn.q_proj.weight";
+  const std::vector<uint64_t> shape = {64, 64};
+  const size_t f16_bytes = shape[0] * shape[1] * sizeof(half);
+
+  GGUFTensorData tensor;
+  tensor.info.name = gguf_name;
+  tensor.info.shape = shape;
+  tensor.info.type = GGUF::TensorType::F16;
+  tensor.info.offset = 0;
+  tensor.info.byte_size = f16_bytes;
+  tensor.cpu_data.assign(f16_bytes, 0U);
+
+  REQUIRE(cudaMalloc(&loader.d_quantized_buffer_, f16_bytes) == cudaSuccess);
+  loader.quantized_buffer_size_ = f16_bytes;
+  REQUIRE(cudaMemset(loader.d_quantized_buffer_, 0, f16_bytes) == cudaSuccess);
+
+  tensor.gpu_data = loader.d_quantized_buffer_;
+  tensor.gpu_offset = 0;
+  loader.tensors_.emplace(gguf_name, std::move(tensor));
+  loader.gguf_to_internal_name_map_[gguf_name] = internal_name;
+  loader.internal_to_gguf_name_map_[internal_name] = gguf_name;
+
+  auto accessor = loader.GetWeightAccessor(internal_name);
+  REQUIRE(accessor != nullptr);
+  REQUIRE_FALSE(accessor->IsQuantized());
+
+  const void *raw_ptr = accessor->GetGpuWeights(stream);
+  half *f16_ptr = accessor->GetDequantizedGpuWeights(stream);
+  REQUIRE(raw_ptr != nullptr);
+  REQUIRE(reinterpret_cast<const void *>(f16_ptr) == raw_ptr);
+
+  const auto *tensor_after = loader.GetTensorByGGUFName(gguf_name);
+  REQUIRE(tensor_after != nullptr);
+  REQUIRE(tensor_after->dequantized_gpu == nullptr);
+
+  loader.FreeGPUMemory();
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+#else
+  SUCCEED("Built without CUDA; skipping F16 GGUF accessor contract.");
+#endif
 }
 
 //==============================================================================

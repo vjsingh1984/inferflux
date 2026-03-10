@@ -84,7 +84,7 @@ runtime:
     min_batch_size: 1               # Minimum batch size before flushing
     batch_accumulation_ms: 5        # Wait time to accumulate larger batches
     policy: priority_age            # queue policy: priority_age | lpm_priority | throughput_balanced
-    continuous_decode_steps: 0      # 0 = disabled; >0 enforces decode bursts before requeue
+    decode_burst_tokens: 0      # 0 = disabled; >0 enforces decode bursts before requeue
     chunked_prefill_tokens: 512     # Max tokens per prefill chunk in mixed execution
     mixed_prefill_budget_ratio: 1.0 # Fraction (0.0-1.0) of backend token budget reserved for prefill
     session_handles:

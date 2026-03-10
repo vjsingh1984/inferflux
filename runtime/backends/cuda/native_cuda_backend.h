@@ -33,6 +33,8 @@ public:
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override;
 
   bool SupportsAsyncUnifiedBatch() const override;
+  bool SupportsSplitPrefillDecodeHandoff() const override;
+  bool SupportsProcessLocalSequenceTransfer() const override;
   UnifiedBatchHandle SubmitUnifiedBatchAsync(
       const std::vector<UnifiedBatchInput> &inputs,
       UnifiedBatchLane lane = UnifiedBatchLane::kAuto) override;
@@ -45,6 +47,8 @@ public:
                                int n_past_start) override;
   void CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) override;
   void FreeSequence(int sequence_id) override;
+  SequenceReleaseFence BeginFreeSequence(int sequence_id) override;
+  bool PollFreeSequence(const SequenceReleaseFence &fence) override;
   std::vector<uint8_t> SerializeSequence(int sequence_id) override;
   bool HydrateSequence(int dest_sequence_id,
                        const std::vector<uint8_t> &blob) override;
@@ -109,12 +113,19 @@ private:
   std::string runtime_kind_{"native_cuda"};
   bool fallback_mode_{true};
   std::string fallback_reason_;
+  mutable std::recursive_mutex runtime_mutex_;
   mutable std::mutex parity_backend_mutex_;
   mutable std::mutex sampling_mutex_;
   SamplingParams active_sampling_{};
   bool sampling_active_{false};
   bool structured_constraint_sampler_active_{false};
   static std::atomic<int> next_ephemeral_sequence_id_;
+
+  // Host-side logits buffer for native logprob computation.
+  // Lazy-allocated on first logprob request.
+  std::vector<float> host_logits_buf_;
+  TokenLogprob CollectNativeLogprob(int token_id, const std::string &piece,
+                                    int top_n);
 };
 
 } // namespace inferflux

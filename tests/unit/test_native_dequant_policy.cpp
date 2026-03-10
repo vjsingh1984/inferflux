@@ -53,7 +53,7 @@ private:
 
 } // namespace
 
-TEST_CASE("NativeKernelExecutor dequant policy parser keeps none as default",
+TEST_CASE("NativeKernelExecutor dequant policy parser uses none as default",
           "[native_forward][dequant_policy]") {
   NativeKernelExecutor executor;
 
@@ -85,11 +85,12 @@ TEST_CASE("NativeKernelExecutor dequant policy parser accepts none batch model",
         runtime::cuda::native::DequantizedCachePolicy::kModelLifetime);
 }
 
-TEST_CASE("NativeKernelExecutor releases dequant cache for none and batch on "
-          "GGUF loaders",
+TEST_CASE("NativeKernelExecutor releases dequant cache for non-model policies "
+          "on GGUF loaders",
           "[native_forward][dequant_policy]") {
   NativeKernelExecutor executor;
 
+  // kNone: request-boundary cleanup clears dequantized cache
   auto *none_loader = new MockDequantPolicyLoader("gguf");
   executor.model_loader_.reset(none_loader);
   executor.dequantized_cache_policy_ =
@@ -97,6 +98,7 @@ TEST_CASE("NativeKernelExecutor releases dequant cache for none and batch on "
   executor.ReleaseBatchScopedDequantizedCache();
   CHECK(none_loader->clear_calls() == 1);
 
+  // kBatchLifetime: clear between batches
   auto *batch_loader = new MockDequantPolicyLoader("gguf");
   executor.model_loader_.reset(batch_loader);
   executor.dequantized_cache_policy_ =

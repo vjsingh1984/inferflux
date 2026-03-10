@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -34,6 +35,9 @@ struct SamplingParams {
 };
 
 // InferenceResult surfaced by the scheduler and BatchExecutor to HTTP handlers.
+inline constexpr std::string_view kBackendEmptyResponseText =
+    "[backend returned empty response]";
+
 struct InferenceResult {
   std::string model_id;
   std::string completion;
@@ -49,6 +53,15 @@ struct InferenceResult {
     int reused_tokens{0};
   } speculative;
 };
+
+inline bool IsBackendEmptyResponse(std::string_view text) {
+  return text == kBackendEmptyResponseText;
+}
+
+inline bool IsBackendEmptyResponse(const InferenceResult &result) {
+  return !result.no_backend && result.completion_tokens == 0 &&
+         IsBackendEmptyResponse(result.completion);
+}
 
 // Phase of an inference request in the continuous batching pipeline.
 enum class RequestPhase {
@@ -70,6 +83,7 @@ struct InferenceRequest {
   // Optional upper-layer session handle (feature-flagged server behavior).
   // Empty keeps default stateless OpenAI-compatible semantics.
   std::string session_id;
+  std::string client_request_id; // Stable caller-provided trace/debug tag.
   bool session_lease_acquired{false};
   std::string prompt;
   int max_tokens{256};
@@ -93,6 +107,8 @@ struct InferenceRequest {
   // Generate().
   int n_past{-1}; // KV position after prefill; -1 = use legacy Generate() path.
   int sequence_id{-1}; // KV cache sequence slot; -1 = unassigned.
+  uint64_t sequence_generation{
+      0}; // Generation-stamped lease identity for sequence_id.
   // BPE token count from Prefill() (= pr.n_past at prefill time).  Stored
   // separately because n_past is updated by each Decode() step and by fairness
   // slice rewrites, so by donation time it no longer reflects the prompt

@@ -6,6 +6,8 @@
 #include <llama.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -79,6 +81,7 @@ namespace inferflux {
 namespace {
 std::mutex g_llama_init_mutex;
 int g_llama_init_refcount = 0;
+using BackendStateLock = std::lock_guard<std::recursive_mutex>;
 
 bool SizeToInt32(std::size_t value, int32_t *out) {
   if (!out) {
@@ -89,6 +92,137 @@ bool SizeToInt32(std::size_t value, int32_t *out) {
   }
   *out = static_cast<int32_t>(value);
   return true;
+}
+
+bool TokenTraceDebugEnabled() {
+  static const bool enabled =
+      std::getenv("INFERFLUX_DEBUG_TOKEN_TRACE") != nullptr;
+  return enabled;
+}
+
+bool ConsumeTokenTraceBudget() {
+  static const int initial_budget = [] {
+    int parsed = 128;
+    if (const char *env = std::getenv("INFERFLUX_DEBUG_TOKEN_TRACE_LIMIT")) {
+      char *end = nullptr;
+      const long value = std::strtol(env, &end, 10);
+      if (end != env && *end == '\0' && value > 0 &&
+          value <= static_cast<long>(std::numeric_limits<int>::max())) {
+        parsed = static_cast<int>(value);
+      }
+    }
+    return parsed;
+  }();
+  static std::atomic<int> remaining(initial_budget);
+  int current = remaining.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (remaining.compare_exchange_weak(current, current - 1,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool LogitsDebugEnabled() {
+  static const bool enabled = std::getenv("INFERFLUX_DEBUG_LOGITS") != nullptr;
+  return enabled;
+}
+
+bool ConsumeLogitsDebugBudget() {
+  static const int initial_budget = [] {
+    int parsed = 64;
+    if (const char *env = std::getenv("INFERFLUX_DEBUG_LOGITS_LIMIT")) {
+      char *end = nullptr;
+      const long value = std::strtol(env, &end, 10);
+      if (end != env && *end == '\0' && value > 0 &&
+          value <= static_cast<long>(std::numeric_limits<int>::max())) {
+        parsed = static_cast<int>(value);
+      }
+    }
+    return parsed;
+  }();
+  static std::atomic<int> remaining(initial_budget);
+  int current = remaining.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (remaining.compare_exchange_weak(current, current - 1,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void LogTokenTrace(std::string_view stage, int64_t request_id, int sequence_id,
+                   std::string_view client_request_id,
+                   uint64_t sequence_generation, int n_past, int token_id,
+                   const std::string &piece) {
+  if (!TokenTraceDebugEnabled() || !ConsumeTokenTraceBudget()) {
+    return;
+  }
+  const std::string client_prefix =
+      client_request_id.empty()
+          ? std::string()
+          : "client_request_id=" + std::string(client_request_id) + ", ";
+  log::Info("llama_backend",
+            "token_trace[" + std::string(stage) + "]: " + client_prefix +
+                "request_id=" +
+                std::to_string(request_id) + ", sequence_id=" +
+                std::to_string(sequence_id) + ", sequence_generation=" +
+                std::to_string(sequence_generation) + ", n_past=" +
+                std::to_string(n_past) + ", sampled_token=" +
+                std::to_string(token_id) + ", piece=" + piece);
+}
+
+void LogTopLogits(std::string_view stage, const float *logits, int vocab_size,
+                  int64_t request_id, std::string_view client_request_id,
+                  int sequence_id,
+                  uint64_t sequence_generation, int n_past) {
+  if (!LogitsDebugEnabled() || !ConsumeLogitsDebugBudget() || !logits ||
+      vocab_size <= 0) {
+    return;
+  }
+  constexpr std::size_t kTopK = 5;
+  std::array<std::pair<float, int>, kTopK> top{};
+  for (auto &entry : top) {
+    entry = {std::numeric_limits<float>::lowest(), -1};
+  }
+  for (int i = 0; i < vocab_size; ++i) {
+    const float value = logits[i];
+    for (std::size_t slot = 0; slot < kTopK; ++slot) {
+      if (value > top[slot].first) {
+        for (std::size_t shift = kTopK - 1; shift > slot; --shift) {
+          top[shift] = top[shift - 1];
+        }
+        top[slot] = {value, i};
+        break;
+      }
+    }
+  }
+  std::string payload;
+  for (std::size_t i = 0; i < kTopK; ++i) {
+    if (top[i].second < 0) {
+      continue;
+    }
+    if (!payload.empty()) {
+      payload += " ";
+    }
+    payload += "[" + std::to_string(top[i].second) + "]=" +
+               std::to_string(top[i].first);
+  }
+  const std::string client_prefix =
+      client_request_id.empty()
+          ? std::string()
+          : "client_request_id=" + std::string(client_request_id) + ", ";
+  log::Info("llama_backend",
+            "debug_logits[" + std::string(stage) + "]: " + client_prefix +
+                "request_id=" +
+                std::to_string(request_id) + ", sequence_id=" +
+                std::to_string(sequence_id) + ", sequence_generation=" +
+                std::to_string(sequence_generation) + ", n_past=" +
+                std::to_string(n_past) + " top-5: " + payload);
 }
 
 void LlamaBackendAcquire() {
@@ -106,7 +240,14 @@ void LlamaBackendRelease() {
 }
 } // namespace
 
-LlamaCPUBackend::LlamaCPUBackend() { LlamaBackendAcquire(); }
+LlamaCPUBackend::LlamaCPUBackend() : LlamaCPUBackend(true) {}
+
+LlamaCPUBackend::LlamaCPUBackend(bool acquire_backend)
+    : llama_backend_acquired_(acquire_backend) {
+  if (llama_backend_acquired_) {
+    LlamaBackendAcquire();
+  }
+}
 
 LlamaCPUBackend::~LlamaCPUBackend() {
   TeardownSamplerImpl();
@@ -129,11 +270,14 @@ LlamaCPUBackend::~LlamaCPUBackend() {
     model_ = nullptr;
   }
   vocab_ = nullptr;
-  LlamaBackendRelease();
+  if (llama_backend_acquired_) {
+    LlamaBackendRelease();
+  }
 }
 
 bool LlamaCPUBackend::LoadModel(const std::filesystem::path &model_path,
                                 const LlamaBackendConfig &config) {
+  BackendStateLock lock(backend_state_mutex_);
   test_ready_ = false;
   if (!std::filesystem::exists(model_path)) {
     log::Error("llama_backend",
@@ -247,6 +391,7 @@ std::vector<int> LlamaCPUBackend::Tokenize(const std::string &prompt,
 void LlamaCPUBackend::SetupSampler(const std::string &grammar,
                                    const std::string &root,
                                    const SamplingParams &sp) {
+  BackendStateLock lock(backend_state_mutex_);
   TeardownSampler();
   if (!vocab_) {
     return;
@@ -310,7 +455,10 @@ void LlamaCPUBackend::SetupSampler(const std::string &grammar,
   active_sampler_ = chain;
 }
 
-void LlamaCPUBackend::TeardownSampler() { TeardownSamplerImpl(); }
+void LlamaCPUBackend::TeardownSampler() {
+  BackendStateLock lock(backend_state_mutex_);
+  TeardownSamplerImpl();
+}
 
 void LlamaCPUBackend::TeardownSamplerImpl() {
   if (active_sampler_) {
@@ -346,6 +494,13 @@ std::string LlamaCPUBackend::TokenToString(int token) const {
   return buf;
 }
 
+bool LlamaCPUBackend::IsTerminalGeneratedToken(int token) const {
+  if (token < 0 || !vocab_) {
+    return token < 0;
+  }
+  return llama_vocab_is_eog(vocab_, static_cast<llama_token>(token));
+}
+
 std::string LlamaCPUBackend::Generate(
     const std::string &prompt, int max_tokens,
     const std::function<bool(const std::string &, const TokenLogprob *)>
@@ -353,6 +508,7 @@ std::string LlamaCPUBackend::Generate(
     const std::function<bool()> &should_stop, int logprob_top_n,
     std::vector<TokenLogprob> *out_logprobs,
     const std::vector<std::string> &stop_seqs) {
+  BackendStateLock lock(backend_state_mutex_);
   log::Debug("llama_backend",
              "Generate() called: prompt_len=" + std::to_string(prompt.size()) +
                  ", max_tokens=" + std::to_string(max_tokens));
@@ -442,7 +598,6 @@ std::string LlamaCPUBackend::Generate(
                 std::to_string(prefill_per_token_ms) + "ms/token)");
 
   std::string output;
-  llama_token eos = llama_vocab_eos(vocab_);
   int tokens_remaining = std::max(max_tokens, 1);
 
   log::Debug("llama_backend", "Starting generation loop: max_tokens=" +
@@ -464,7 +619,7 @@ std::string LlamaCPUBackend::Generate(
         std::chrono::duration<float, std::milli>(sample_end - sample_start)
             .count();
 
-    if (token == eos) {
+    if (IsTerminalGeneratedToken(token)) {
       log::Debug("llama_backend", "EOS token received at position " +
                                       std::to_string(generated_count));
       break;
@@ -574,6 +729,7 @@ std::string LlamaCPUBackend::Generate(
 }
 
 bool LlamaCPUBackend::LoadMmproj(const std::filesystem::path &mmproj_path) {
+  BackendStateLock lock(backend_state_mutex_);
 #ifdef INFERFLUX_HAS_MTMD
   if (!model_) {
     log::Error("llama_backend", "LoadMmproj: text model must be loaded first");
@@ -614,6 +770,7 @@ std::string LlamaCPUBackend::GenerateWithImages(
         &on_chunk,
     const std::function<bool()> &should_stop,
     const std::vector<std::string> &stop_seqs) {
+  BackendStateLock lock(backend_state_mutex_);
 #ifdef INFERFLUX_HAS_MTMD
   if (!IsReady() || !vision_ready_ || !mtmd_ctx_ || images.empty()) {
     return Generate(prompt, max_tokens, on_chunk, should_stop, 0, nullptr,
@@ -684,14 +841,13 @@ std::string LlamaCPUBackend::GenerateWithImages(
   llama_batch batch = llama_batch_init(batch_cap, 0, 1);
 
   std::string output;
-  llama_token eos = llama_vocab_eos(vocab_);
   int tokens_remaining = std::max(max_tokens, 1);
 
   while (tokens_remaining-- > 0) {
     if (should_stop && should_stop())
       break;
     int token = llama_sampler_sample(active_sampler_, context_, -1);
-    if (token == eos)
+    if (IsTerminalGeneratedToken(token))
       break;
     std::string piece = TokenToString(token);
     output += piece;
@@ -722,6 +878,7 @@ std::string LlamaCPUBackend::GenerateWithImages(
 
 LlamaCPUBackend::PrefillResult
 LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
+  BackendStateLock lock(backend_state_mutex_);
   if (!context_ || !vocab_) {
     return {};
   }
@@ -762,17 +919,20 @@ LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
   PrefillResult result;
   result.n_past = static_cast<int>(prompt_tokens.size());
   result.ok = true;
-  llama_token eos = llama_vocab_eos(vocab_);
   {
     const float *logits = llama_get_logits(context_);
     int first_tok = -1;
     if (logits) {
+      LogTopLogits("prefill", logits, n_vocab_, -1, "", sequence_id, 0,
+                   static_cast<int>(prompt_tokens.size()) - 1);
       auto max_it = std::max_element(logits, logits + n_vocab_);
       first_tok = static_cast<int>(std::distance(logits, max_it));
     }
-    if (first_tok >= 0 && first_tok != eos) {
+    if (!IsTerminalGeneratedToken(first_tok)) {
       result.first_token = first_tok;
       result.first_piece = TokenToString(first_tok);
+      LogTokenTrace("prefill", -1, sequence_id, "", 0, result.n_past, first_tok,
+                    result.first_piece);
     }
   }
   llama_batch_free(batch);
@@ -781,6 +941,7 @@ LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
 
 void LlamaCPUBackend::CopySequencePrefix(int src_seq, int dst_seq,
                                          int n_tokens) {
+  BackendStateLock lock(backend_state_mutex_);
   if (!context_)
     return;
   // Clear dst slot first so no stale KV cells survive from a previous request.
@@ -805,6 +966,7 @@ void LlamaCPUBackend::CopySequencePrefix(int src_seq, int dst_seq,
 LlamaCPUBackend::PrefillResult
 LlamaCPUBackend::PrefillPartial(const std::string &prompt, int sequence_id,
                                 int n_past_start) {
+  BackendStateLock lock(backend_state_mutex_);
   if (!context_ || !vocab_)
     return {};
   auto prompt_tokens = Tokenize(prompt, /*add_bos=*/true);
@@ -841,17 +1003,20 @@ LlamaCPUBackend::PrefillPartial(const std::string &prompt, int sequence_id,
   PrefillResult result;
   result.n_past = n_total;
   result.ok = true;
-  llama_token eos = llama_vocab_eos(vocab_);
   {
     const float *logits = llama_get_logits(context_);
     int first_tok = -1;
     if (logits) {
+      LogTopLogits("prefill_partial", logits, n_vocab_, -1, "", sequence_id, 0,
+                   n_total - 1);
       auto max_it = std::max_element(logits, logits + n_vocab_);
       first_tok = static_cast<int>(std::distance(logits, max_it));
     }
-    if (first_tok >= 0 && first_tok != eos) {
+    if (!IsTerminalGeneratedToken(first_tok)) {
       result.first_token = first_tok;
       result.first_piece = TokenToString(first_tok);
+      LogTokenTrace("prefill_partial", -1, sequence_id, "", 0, result.n_past,
+                    first_tok, result.first_piece);
     }
   }
   llama_batch_free(batch);
@@ -865,6 +1030,7 @@ std::string LlamaCPUBackend::Decode(
     const std::function<bool()> &should_stop, int logprob_top_n,
     std::vector<TokenLogprob> *out_logprobs, int first_token,
     const std::vector<std::string> &stop_seqs) {
+  BackendStateLock lock(backend_state_mutex_);
   if (!context_ || !vocab_ || n_past < 0) {
     return {};
   }
@@ -873,13 +1039,15 @@ std::string LlamaCPUBackend::Decode(
   llama_pos position = static_cast<llama_pos>(n_past);
 
   std::string output;
-  llama_token eos = llama_vocab_eos(vocab_);
   int tokens_remaining = std::max(max_tokens, 1);
 
   // If a first token was pre-sampled by Prefill() (to avoid the logit-buffer
   // race in multi-sequence prefill), emit and feed it before the loop.
-  if (first_token >= 0 && first_token != eos && tokens_remaining > 0) {
+  if (!IsTerminalGeneratedToken(first_token) && tokens_remaining > 0) {
     std::string piece = TokenToString(first_token);
+    LogTokenTrace("decode_seed", -1, sequence_id, "", 0,
+                  static_cast<int>(position),
+                  first_token, piece);
     if (out_logprobs) {
       out_logprobs->push_back(
           CollectLogprob(first_token, piece, logprob_top_n));
@@ -917,10 +1085,15 @@ std::string LlamaCPUBackend::Decode(
   while (tokens_remaining-- > 0) {
     if (should_stop && should_stop())
       break;
+    LogTopLogits("decode", llama_get_logits(context_), n_vocab_, -1, "",
+                 sequence_id, 0, static_cast<int>(position) - 1);
     int token = llama_sampler_sample(active_sampler_, context_, -1);
-    if (token == eos)
+    if (IsTerminalGeneratedToken(token))
       break;
     std::string piece = TokenToString(token);
+    LogTokenTrace("decode", -1, sequence_id, "", 0,
+                  static_cast<int>(position),
+                  token, piece);
     if (out_logprobs) {
       out_logprobs->push_back(CollectLogprob(token, piece, logprob_top_n));
     }
@@ -981,6 +1154,7 @@ std::string LlamaCPUBackend::Decode(
 
 std::vector<LlamaCPUBackend::BatchDecodeOutput>
 LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
+  BackendStateLock lock(backend_state_mutex_);
   if (!context_ || !vocab_ || inputs.empty()) {
     return {};
   }
@@ -1016,7 +1190,6 @@ LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
   }
   llama_batch_free(batch);
 
-  llama_token eos = llama_vocab_eos(vocab_);
   std::vector<BatchDecodeOutput> results(static_cast<std::size_t>(n));
   for (int i = 0; i < n; ++i) {
     inputs[i].n_past++; // advance position for the next step
@@ -1025,13 +1198,18 @@ LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
       results[static_cast<std::size_t>(i)].token = -1;
       continue;
     }
+    LogTopLogits("batch_decode", logits, n_vocab_, -1, "",
+                 inputs[i].sequence_id, 0, inputs[i].n_past - 1);
     auto max_it = std::max_element(logits, logits + n_vocab_);
     int tok = static_cast<int>(std::distance(logits, max_it));
-    if (tok == eos) {
+    if (IsTerminalGeneratedToken(tok)) {
       results[static_cast<std::size_t>(i)].token = -1;
     } else {
       results[static_cast<std::size_t>(i)].token = tok;
       results[static_cast<std::size_t>(i)].piece = TokenToString(tok);
+      LogTokenTrace("batch_decode", -1, inputs[i].sequence_id, "", 0,
+                    inputs[i].n_past,
+                    tok, results[static_cast<std::size_t>(i)].piece);
     }
   }
   return results;
@@ -1070,6 +1248,7 @@ bool LlamaCPUBackend::TryCollectUnifiedBatchAsync(
 std::vector<LlamaCPUBackend::UnifiedBatchOutput>
 LlamaCPUBackend::ExecuteUnifiedBatch(
     const std::vector<UnifiedBatchInput> &inputs) {
+  BackendStateLock lock(backend_state_mutex_);
   log::Debug("llama_backend", "ExecuteUnifiedBatch called with " +
                                   std::to_string(inputs.size()) + " inputs");
 
@@ -1164,7 +1343,6 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
 
   llama_batch_free(batch);
 
-  llama_token eos = llama_vocab_eos(vocab_);
   for (std::size_t i = 0; i < inputs.size(); ++i) {
     if (logit_indices[i] >= 0) {
       const auto &inp = inputs[i];
@@ -1175,29 +1353,48 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
       SetupSampler("", "", inp.sampling);
 
       if (active_sampler_) {
+        const float *logits = llama_get_logits_ith(context_, logit_indices[i]);
+        LogTopLogits("unified_batch", logits, n_vocab_, inp.request_id,
+                     inp.client_request_id,
+                     inp.sequence_id, inp.sequence_generation,
+                     inp.n_past + static_cast<int>(inp.tokens.size()) - 1);
         int tok =
             llama_sampler_sample(active_sampler_, context_, logit_indices[i]);
         llama_sampler_accept(active_sampler_, tok);
 
         results[i].ok = true;
-        if (tok == eos) {
+        if (IsTerminalGeneratedToken(tok)) {
           results[i].token = -1;
         } else {
           results[i].token = tok;
           results[i].piece = TokenToString(tok);
+          LogTokenTrace("unified_batch", inp.request_id, inp.sequence_id,
+                        inp.client_request_id,
+                        inp.sequence_generation,
+                        inp.n_past + static_cast<int>(inp.tokens.size()), tok,
+                        results[i].piece);
         }
       } else {
         // Fallback to greedy if SetupSampler failed.
         const float *logits = llama_get_logits_ith(context_, logit_indices[i]);
         if (logits) {
+          LogTopLogits("unified_batch_fallback", logits, n_vocab_,
+                       inp.request_id, inp.client_request_id, inp.sequence_id,
+                       inp.sequence_generation,
+                       inp.n_past + static_cast<int>(inp.tokens.size()) - 1);
           auto max_it = std::max_element(logits, logits + n_vocab_);
           int tok = static_cast<int>(std::distance(logits, max_it));
           results[i].ok = true;
-          if (tok == eos) {
+          if (IsTerminalGeneratedToken(tok)) {
             results[i].token = -1;
           } else {
             results[i].token = tok;
             results[i].piece = TokenToString(tok);
+            LogTokenTrace("unified_batch_fallback", inp.request_id,
+                          inp.sequence_id, inp.client_request_id,
+                          inp.sequence_generation,
+                          inp.n_past + static_cast<int>(inp.tokens.size()), tok,
+                          results[i].piece);
           }
         }
       }
@@ -1214,13 +1411,27 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
 }
 
 void LlamaCPUBackend::FreeSequence(int sequence_id) {
+  BackendStateLock lock(backend_state_mutex_);
   if (!context_)
     return;
   llama_memory_seq_rm(llama_get_memory(context_),
                       static_cast<llama_seq_id>(sequence_id), -1, -1);
 }
 
+LlamaCPUBackend::SequenceReleaseFence
+LlamaCPUBackend::BeginFreeSequence(int sequence_id) {
+  FreeSequence(sequence_id);
+  (void)sequence_id;
+  return {};
+}
+
+bool LlamaCPUBackend::PollFreeSequence(const SequenceReleaseFence &fence) {
+  (void)fence;
+  return true;
+}
+
 std::vector<uint8_t> LlamaCPUBackend::SerializeSequence(int sequence_id) {
+  BackendStateLock lock(backend_state_mutex_);
   if (!context_)
     return {};
   std::size_t size = llama_state_seq_get_size(
@@ -1238,6 +1449,7 @@ std::vector<uint8_t> LlamaCPUBackend::SerializeSequence(int sequence_id) {
 
 bool LlamaCPUBackend::HydrateSequence(int dest_sequence_id,
                                       const std::vector<uint8_t> &blob) {
+  BackendStateLock lock(backend_state_mutex_);
   if (!context_ || blob.empty())
     return false;
   std::size_t read =
@@ -1271,6 +1483,7 @@ int LlamaCPUBackend::ActiveExperts() const {
 }
 
 LlamaCPUBackend::PerfSnapshot LlamaCPUBackend::TakePerf() {
+  BackendStateLock lock(backend_state_mutex_);
   auto snap = last_perf_;
   last_perf_ = {};
   return snap;
@@ -1368,6 +1581,7 @@ int LlamaCPUBackend::EmbedDims() const {
 }
 
 std::vector<float> LlamaCPUBackend::Embed(const std::string &text) {
+  BackendStateLock lock(backend_state_mutex_);
   if (!EnsureEmbedCtx())
     return {};
   if (!vocab_)

@@ -21,6 +21,21 @@ struct QuantizedWeightInfo {
 };
 
 /**
+ * Tile-major quantized layout for MMQ-style kernels.
+ *
+ * Unlike QuantizedWeightInfo, this points at a transformed layout optimized
+ * for multi-output tiled execution rather than the original GGUF row-major
+ * tensor blocks.
+ */
+struct MmqWeightInfo {
+  const void *data{nullptr};
+  int quant_type{-1};
+  int rows{0};      // Logical output rows / columns in the destination matrix
+  int cols{0};      // Logical K dimension
+  int tile_cols{0}; // Number of output rows packed per layout tile
+};
+
+/**
  * WeightMapTyped<T>: typed GPU pointer accessors for safetensors model weights.
  *
  * Wraps SafetensorsLoader to provide const T* accessors organized by
@@ -71,6 +86,7 @@ public:
   virtual QuantizedWeightInfo LayerDownProjRaw(int /*layer*/) const {
     return {};
   }
+  virtual MmqWeightInfo LayerDownProjMmq(int /*layer*/) const { return {}; }
   virtual QuantizedWeightInfo LmHeadRaw() const { return {}; }
   virtual bool HasQuantizedWeights() const { return false; }
   // Strategy-driven policy switch used by native CUDA forward kernels to

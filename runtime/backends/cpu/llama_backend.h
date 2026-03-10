@@ -49,8 +49,8 @@ struct LlamaBackendConfig {
   // `auto` keeps current behavior (match inference dtype).
   std::string native_kv_cache_dtype{"auto"};
   // Dequantized GGUF weight cache lifecycle in native CUDA runtime:
-  // none (memory-first default) | batch (batch-boundary cleanup) |
-  // model (maximum reuse, highest VRAM).
+  // none (no caching) | batch (batch-boundary cleanup) |
+  // model (persist for model lifetime; highest VRAM use).
   std::string native_dequantized_cache_policy{"none"};
   // When true, quantized GGUF model-load fails unless fused dequant-tile GEMM
   // strategy is selected for this GPU/runtime capability set.
@@ -146,6 +146,9 @@ public:
     std::vector<int> tokens;
     bool request_logits{true}; // true to sample a token after this step
     SamplingParams sampling;   // Per-request sampling parameters (§P1b)
+    int64_t request_id{-1};
+    std::string client_request_id;
+    uint64_t sequence_generation{0};
   };
   struct UnifiedBatchOutput {
     int token{-1};
@@ -162,6 +165,11 @@ public:
   };
   using UnifiedBatchHandle = uint64_t;
 #endif // INFERFLUX_USE_COMMON_BACKEND_TYPES
+
+  struct SequenceReleaseFence {
+    uint64_t token{0};
+    bool pending{false};
+  };
 
   // Execute a mixed batch of prefill and decode sequences.
   // Returns results for all inputs where request_logits=true.
@@ -199,6 +207,12 @@ public:
   // batch step. Used by scheduler/executor-side chunking guards.
   virtual int UnifiedBatchTokenCapacity() const;
 #endif
+  // Whether the backend can safely split prefill/decode ownership across
+  // separate scheduler lanes while sharing sequence state.
+  virtual bool SupportsSplitPrefillDecodeHandoff() const { return false; }
+  // Whether process-local split handoff can keep the same sequence slot
+  // instead of serializing/hydrating sequence state through the KV transport.
+  virtual bool SupportsProcessLocalSequenceTransfer() const { return false; }
 
   // Evaluate all prompt tokens for sequence_id and populate the KV cache.
   virtual PrefillResult Prefill(const std::string &prompt, int sequence_id);
@@ -231,6 +245,8 @@ public:
 
   // Release KV cache slots for the given sequence_id.
   virtual void FreeSequence(int sequence_id);
+  virtual SequenceReleaseFence BeginFreeSequence(int sequence_id);
+  virtual bool PollFreeSequence(const SequenceReleaseFence &fence);
 
   // Serialize the KV cache state for sequence_id to a byte buffer.
   virtual std::vector<uint8_t> SerializeSequence(int sequence_id);
@@ -299,6 +315,7 @@ public:
       bool add_assistant_prefix = true);
 
   virtual int TokenCount(const std::string &text) const;
+  bool IsTerminalGeneratedToken(int token) const;
   void ForceReadyForTests() { test_ready_ = true; }
 
   std::vector<float> Embed(const std::string &text);
@@ -320,9 +337,14 @@ public:
 #endif
 
 protected:
+  explicit LlamaCPUBackend(bool acquire_backend);
   struct llama_sampler *active_sampler_{nullptr};
   std::shared_ptr<EPDispatch> ep_dispatch_;
   int tp_rank_{0};
+  // llama.cpp exposes one mutable context and one active sampler per backend
+  // instance; callers must serialize access until the backend provides explicit
+  // multi-context ownership.
+  mutable std::recursive_mutex backend_state_mutex_;
 
 private:
   void TeardownSamplerImpl();
@@ -338,6 +360,7 @@ private:
   int32_t n_vocab_{0};
   LlamaBackendConfig config_;
   bool test_ready_{false};
+  bool llama_backend_acquired_{false};
   PerfSnapshot last_perf_{};
   llama_context *embed_ctx_{nullptr};
   bool EnsureEmbedCtx();

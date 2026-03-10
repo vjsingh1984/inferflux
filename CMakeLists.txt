@@ -25,7 +25,8 @@ option(ENABLE_CPU "Enable CPU runtime" ON)
 option(ENABLE_MTMD "Enable multimodal (vision) support via libmtmd" OFF)
 option(INFERFLUX_USE_COMMON_BACKEND_TYPES "Use common backend types from runtime/backends/common (Phase 2 migration)" OFF)
 option(INFERFLUX_CUDA_DEVICE_LTO "Enable CUDA device LTO profile (requires custom lto gencode)" OFF)
-option(INFERFLUX_CUDA_USE_FAST_MATH "Enable --use_fast_math for CUDA kernels (precision tradeoff)" OFF)
+option(INFERFLUX_CUDA_USE_FAST_MATH "Enable --use_fast_math for CUDA kernels (default ON, matches llama.cpp)" ON)
+option(INFERFLUX_CUDA_NATIVE_ARCH "Compile CUDA kernels for local GPU only (faster builds, better codegen)" OFF)
 
 if(INFERFLUX_USE_COMMON_BACKEND_TYPES)
   add_compile_definitions(INFERFLUX_USE_COMMON_BACKEND_TYPES)
@@ -82,6 +83,8 @@ add_library(inferflux_core
   model/tokenizer/simple_tokenizer.cpp
   model/tokenizer/simple_tokenizer.h
   model/tokenizer.h
+  model/gguf_tokenizer.cpp
+  model/gguf_tokenizer.h
   model/llama_tokenizer.cpp
   model/llama_tokenizer.h
   model/hf_tokenizer.cpp
@@ -162,9 +165,29 @@ find_package(CUDAToolkit QUIET)
 
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   message(STATUS "CUDA toolkit found: enabling CUDA build path")
+  if(INFERFLUX_CUDA_NATIVE_ARCH)
+    # Keep the cache aligned with the requested mode so reconfigured dev builds
+    # do not retain an old numeric architecture list and still pass -arch=native
+    # through to nvcc, which falls back to a generic target on some hosts.
+    set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures" FORCE)
+    message(STATUS "CUDA native arch: probing local GPU architecture")
+  elseif(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING "CUDA architectures" FORCE)
+  endif()
   enable_language(CUDA)
-  if(NOT CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90")
+  if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
+    if(DEFINED CMAKE_CUDA_ARCHITECTURES_NATIVE AND
+       CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES
+         "^[0-9]+(a|f)?(-real|-virtual)?(;[0-9]+(a|f)?(-real|-virtual)?)*$")
+      set(CMAKE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" CACHE STRING
+          "CUDA architectures" FORCE)
+      message(STATUS "CUDA native arch resolved to ${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING
+          "CUDA architectures" FORCE)
+      message(WARNING
+        "Failed to resolve native CUDA architecture; falling back to standard multi-arch build")
+    endif()
   endif()
   set(LLAMA_CUDA ON CACHE BOOL "" FORCE)
   target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_CUDA=1)
@@ -184,6 +207,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   )
   target_include_directories(inferflux_cuda_kernels PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -451,6 +475,7 @@ add_executable(inferflux_tests
   tests/unit/test_guardrail.cpp
   tests/unit/test_audit_logger.cpp
   tests/unit/test_metrics.cpp
+  tests/unit/test_http_server.cpp
   tests/unit/test_scheduler.cpp
   tests/unit/test_session_handle_manager.cpp
   tests/unit/test_sequence_slot_manager.cpp
@@ -487,15 +512,19 @@ add_executable(inferflux_tests
   tests/unit/test_backend_interface.cpp
   tests/unit/test_native_forward.cpp
   tests/unit/test_native_dequant_policy.cpp
+  tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
   tests/unit/test_dtype_traits.cpp
   tests/unit/test_gpu_kv_cache.cpp
   tests/unit/test_gpu_sampler.cpp
   tests/unit/test_native_batching.cpp
+  tests/unit/test_batched_decode.cpp
   tests/unit/test_startup_advisor.cpp
+  tests/unit/test_gguf_tokenizer.cpp
   tests/unit/test_gguf_parsing.cpp
   tests/unit/test_gguf_model_loader.cpp
   tests/unit/test_quantized_weight_map.cpp
+  tests/unit/test_quantized_weight_map_scratch.cpp
   tests/unit/test_strategy_registry.cpp
   tests/integration/test_gguf_quantization.cpp
   tests/integration/test_http_generation_admission.cpp
@@ -534,6 +563,8 @@ add_test(NAME FlashAttnTests COMMAND inferflux_tests "[flash_attn]")
 set_tests_properties(FlashAttnTests PROPERTIES LABELS flash_attn)
 add_test(NAME ShmTransportTests COMMAND inferflux_tests "[shm_transport]")
 set_tests_properties(ShmTransportTests PROPERTIES LABELS shm_transport)
+add_test(NAME HttpServerTests COMMAND inferflux_tests "[http_server]")
+set_tests_properties(HttpServerTests PROPERTIES LABELS http_server)
 add_test(NAME HttpGenerationAdmissionIntegrationTests
          COMMAND inferflux_tests "[http_server][integration][admission]")
 set_tests_properties(HttpGenerationAdmissionIntegrationTests PROPERTIES
@@ -726,6 +757,13 @@ if(Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 30)
 
+  add_test(
+    NAME IntegrationBackendIdentityContract
+    COMMAND ${Python3_EXECUTABLE} tests/integration/backend_identity_contract_test.py)
+  set_tests_properties(IntegrationBackendIdentityContract PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
   # Stub-mode integration tests — run without a model; always enabled.
   add_test(NAME StubIntegration
            COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py)
@@ -834,6 +872,15 @@ if(Python3_Interpreter_FOUND)
     ENVIRONMENT
       "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${CMAKE_BINARY_DIR}/inferctl")
 
+  add_test(
+    NAME IntegrationCLIAdminPoolsContract
+    COMMAND ${Python3_EXECUTABLE}
+            tests/integration/inferctl_admin_pools_contract_test.py)
+  set_tests_properties(IntegrationCLIAdminPoolsContract PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30
+    ENVIRONMENT "INFERCTL_BIN=${CMAKE_BINARY_DIR}/inferctl")
+
   # Native CUDA backend metrics contract (stub-mode: verifies metric names + format).
   add_test(NAME IntegrationNativeMetrics
            COMMAND ${Python3_EXECUTABLE} tests/integration/native_metrics_test.py)
@@ -841,6 +888,34 @@ if(Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60
     ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
+
+  add_test(NAME IntegrationNativePhaseTimingParser
+           COMMAND ${Python3_EXECUTABLE}
+                   tests/integration/native_phase_timing_parser_test.py)
+  set_tests_properties(IntegrationNativePhaseTimingParser PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
+  add_test(NAME IntegrationBenchmarkResponseClassifier
+           COMMAND ${Python3_EXECUTABLE}
+                   tests/integration/benchmark_response_classifier_test.py)
+  set_tests_properties(IntegrationBenchmarkResponseClassifier PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
+  add_test(NAME IntegrationBenchmarkHarnessDefaults
+           COMMAND ${Python3_EXECUTABLE}
+                   tests/integration/benchmark_harness_defaults_test.py)
+  set_tests_properties(IntegrationBenchmarkHarnessDefaults PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
+  add_test(NAME IntegrationDecodeTraceParity
+           COMMAND ${Python3_EXECUTABLE}
+                   tests/integration/decode_trace_parity_test.py)
+  set_tests_properties(IntegrationDecodeTraceParity PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
 
   add_test(NAME SSECancel
            COMMAND ${Python3_EXECUTABLE} tests/integration/sse_cancel_test.py)

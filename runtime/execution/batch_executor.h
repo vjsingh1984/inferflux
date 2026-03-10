@@ -18,7 +18,7 @@ class BatchExecutor {
 public:
   struct UnifiedBatchTuning {
     // 0 disables scheduler-level decode slicing in executor loops.
-    int continuous_decode_steps{0};
+    int decode_burst_tokens{0};
     // Upper bound on per-request prefill chunk tokens in mixed execution.
     int chunked_prefill_tokens{512};
     // Fraction of backend token capacity reserved for prefill work in

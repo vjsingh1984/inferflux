@@ -40,6 +40,18 @@ public:
              uint32_t seed = UINT32_MAX);
 
   /**
+   * Copy last-position logits from device to a host buffer.
+   * The caller must provide a buffer of at least vocab_size floats.
+   * This must be called after Sample() / SampleBatch() and before the next
+   * forward pass overwrites the logits buffer.
+   *
+   * @param d_logits  [vocab_size] FP32 logits on device (same pointer passed
+   *                  to Sample)
+   * @param host_buf  [vocab_size] FP32 host destination
+   */
+  void CopyLogitsToHost(const float *d_logits, float *host_buf);
+
+  /**
    * Sample tokens from batched logits.
    *
    * @param d_logits      [batch_size * vocab_size] FP32 logits on device
@@ -53,6 +65,7 @@ public:
                    const std::vector<float> &temperatures,
                    const std::vector<int> &top_ks,
                    const std::vector<float> &top_ps,
+                   const std::vector<uint32_t> &seeds,
                    std::vector<int> *out_tokens);
 
 private:

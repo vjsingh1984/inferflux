@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace inferflux {
@@ -32,6 +33,7 @@ public:
   // Counters (existing).
   void RecordSuccess(int prompt_tokens, int completion_tokens);
   void RecordError();
+  void RecordEmptyGeneration();
   void RecordSpeculative(std::size_t total_chunks, std::size_t accepted_chunks,
                          std::size_t reused_tokens);
   void RecordBatch(std::size_t request_count, std::size_t token_count);
@@ -116,6 +118,31 @@ public:
   // ShmKVTransport.
   void RecordKVTransfer(double transfer_ms);
   void RecordDisaggKVEnqueueRejected(bool retries_exhausted);
+  void RecordDisaggKVTicketStage(std::string_view stage);
+  uint64_t GetDisaggKVEnqueueRejections() const {
+    return disagg_kv_enqueue_rejections_.load(std::memory_order_relaxed);
+  }
+  uint64_t GetDisaggKVEnqueueExhausted() const {
+    return disagg_kv_enqueue_exhausted_.load(std::memory_order_relaxed);
+  }
+  uint64_t GetDisaggKVTicketsEnqueued() const {
+    return disagg_kv_tickets_enqueued_.load(std::memory_order_relaxed);
+  }
+  uint64_t GetDisaggKVTicketsAcknowledged() const {
+    return disagg_kv_tickets_acknowledged_.load(std::memory_order_relaxed);
+  }
+  uint64_t GetDisaggKVTicketsCommitted() const {
+    return disagg_kv_tickets_committed_.load(std::memory_order_relaxed);
+  }
+  uint64_t GetDisaggKVTicketsTimedOut() const {
+    return disagg_kv_tickets_timed_out_.load(std::memory_order_relaxed);
+  }
+  uint64_t GetDisaggKVTimeoutDebt() const {
+    return disagg_kv_timeout_debt_.load(std::memory_order_relaxed);
+  }
+  uint64_t GetDisaggKVTimeoutStreak() const {
+    return disagg_kv_timeout_streak_.load(std::memory_order_relaxed);
+  }
 
   // GGML-native perf counters (from llama_perf_context). Exposes ground-truth
   // kernel timings that subprocess wrappers cannot surface.
@@ -138,6 +165,8 @@ public:
   void SetPrefillQueueDepth(int depth);
   void SetDecodeQueueDepth(int depth);
   void SetSchedulerBatchLimits(int max_batch_size, int max_batch_tokens);
+  void SetSchedulerDeferredSequenceRetirements(int depth);
+  void RecordSchedulerDeferredSequenceRetirement(double lag_ms);
   void RecordCudaLaneSubmission(bool decode_lane);
   void RecordCudaLaneCompletion(bool decode_lane);
   void RecordCudaLaneExecutionStart(bool decode_lane);
@@ -158,11 +187,47 @@ public:
                                        const std::string &to_kernel);
 
   // Native CUDA backend metrics
+  void RecordNativeForwardShape(bool is_decode, int batch_size);
+  void RecordNativeForwardLatency(double forward_ms);
   void RecordNativeForwardPass(bool is_decode, int batch_size,
                                double forward_ms);
   void RecordNativeSampling(int batch_size, double sampling_ms);
   void RecordNativeBatchDecode(int batch_size, double total_ms);
+  void RecordNativeForwardBatchSize(std::string_view phase, int batch_size);
+  void RecordNativeFfnProjOperator(std::string_view phase,
+                                   std::string_view op);
+  void RecordNativeFfnProjGeometry(std::string_view phase,
+                                   std::string_view op,
+                                   std::string_view quant, int batch_size, int n,
+                                   int k, int grouped_outputs);
+  void RecordNativeDownProjOperator(std::string_view phase,
+                                    std::string_view op);
+  void RecordNativeDownProjGeometry(std::string_view phase,
+                                    std::string_view op,
+                                    std::string_view quant, int batch_size,
+                                    int n, int k);
+  void RecordNativeKvAutoTunePlan(int requested_max_seq, int planned_max_seq,
+                                  std::size_t requested_bytes,
+                                  std::size_t planned_bytes,
+                                  std::size_t budget_bytes);
   void SetNativeKvCacheOccupancy(int active_sequences, int max_sequences);
+  int GetQueueDepth() const { return queue_depth_.load(std::memory_order_relaxed); }
+  int GetPrefillQueueDepth() const {
+    return prefill_queue_depth_.load(std::memory_order_relaxed);
+  }
+  int GetDecodeQueueDepth() const {
+    return decode_queue_depth_.load(std::memory_order_relaxed);
+  }
+  int GetSchedulerBatchLimitSize() const {
+    return scheduler_batch_limit_size_.load(std::memory_order_relaxed);
+  }
+  int GetSchedulerBatchLimitTokens() const {
+    return scheduler_batch_limit_tokens_.load(std::memory_order_relaxed);
+  }
+  int GetSchedulerDeferredSequenceRetirements() const {
+    return scheduler_deferred_sequence_retirements_.load(
+        std::memory_order_relaxed);
+  }
 
   // Snapshot of prefix-cache metrics for the /v1/admin/cache endpoint.
   struct CacheMetrics {
@@ -184,6 +249,7 @@ private:
   // Counters.
   std::atomic<uint64_t> total_requests_{0};
   std::atomic<uint64_t> total_errors_{0};
+  std::atomic<uint64_t> total_empty_generations_{0};
   std::atomic<uint64_t> total_prompt_tokens_{0};
   std::atomic<uint64_t> total_completion_tokens_{0};
   std::atomic<uint64_t> speculative_chunks_total_{0};
@@ -242,12 +308,19 @@ private:
   LatencyHistogram request_latency_;
   LatencyHistogram queue_latency_;
   LatencyHistogram batch_exec_latency_;
+  LatencyHistogram scheduler_sequence_retirement_latency_;
   LatencyHistogram prefill_latency_; // OBS-2: prefill phase
   LatencyHistogram decode_latency_;  // OBS-2: decode phase
   LatencyHistogram
       kv_transfer_latency_; // §2.5 item 12: prefill→decode KV hand-off
   std::atomic<uint64_t> disagg_kv_enqueue_rejections_{0};
   std::atomic<uint64_t> disagg_kv_enqueue_exhausted_{0};
+  std::atomic<uint64_t> disagg_kv_tickets_enqueued_{0};
+  std::atomic<uint64_t> disagg_kv_tickets_acknowledged_{0};
+  std::atomic<uint64_t> disagg_kv_tickets_committed_{0};
+  std::atomic<uint64_t> disagg_kv_tickets_timed_out_{0};
+  std::atomic<uint64_t> disagg_kv_timeout_debt_{0};
+  std::atomic<uint64_t> disagg_kv_timeout_streak_{0};
   LatencyHistogram llama_prefill_latency_; // GGML-native prompt eval latency
   LatencyHistogram llama_decode_latency_;  // GGML-native token gen latency
   std::atomic<uint64_t> llama_prompt_tokens_{0};
@@ -260,6 +333,8 @@ private:
   std::atomic<int> decode_queue_depth_{0};
   std::atomic<int> scheduler_batch_limit_size_{0};
   std::atomic<int> scheduler_batch_limit_tokens_{0};
+  std::atomic<int> scheduler_deferred_sequence_retirements_{0};
+  std::atomic<uint64_t> scheduler_deferred_sequence_retirements_completed_{0};
   std::atomic<uint64_t> cuda_decode_lane_submissions_{0};
   std::atomic<uint64_t> cuda_prefill_lane_submissions_{0};
   std::atomic<uint64_t> cuda_decode_lane_completions_{0};
@@ -299,8 +374,24 @@ private:
   std::atomic<uint64_t> native_forward_batch_tokens_total_{0};
   LatencyHistogram native_forward_latency_;
   LatencyHistogram native_sampling_latency_;
+  mutable std::mutex native_forward_batch_size_mutex_;
+  std::unordered_map<std::string, uint64_t> native_forward_batch_size_counts_;
+  mutable std::mutex native_ffn_proj_operator_mutex_;
+  std::unordered_map<std::string, uint64_t> native_ffn_proj_operator_counts_;
+  mutable std::mutex native_ffn_proj_geometry_mutex_;
+  std::unordered_map<std::string, uint64_t> native_ffn_proj_geometry_counts_;
+  mutable std::mutex native_down_proj_operator_mutex_;
+  std::unordered_map<std::string, uint64_t> native_down_proj_operator_counts_;
+  mutable std::mutex native_down_proj_geometry_mutex_;
+  std::unordered_map<std::string, uint64_t> native_down_proj_geometry_counts_;
   std::atomic<int> native_kv_active_sequences_{0};
   std::atomic<int> native_kv_max_sequences_{0};
+  std::atomic<uint64_t> native_kv_autotune_events_total_{0};
+  std::atomic<int> native_kv_requested_max_seq_{0};
+  std::atomic<int> native_kv_planned_max_seq_{0};
+  std::atomic<uint64_t> native_kv_requested_bytes_{0};
+  std::atomic<uint64_t> native_kv_planned_bytes_{0};
+  std::atomic<uint64_t> native_kv_budget_bytes_{0};
 
   struct ModelStats {
     std::string backend;

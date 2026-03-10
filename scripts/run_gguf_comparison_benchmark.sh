@@ -6,9 +6,10 @@
 # llama.cpp CUDA and native CUDA backends using an existing GGUF model.
 #
 # Usage:
-#   ./scripts/run_gguf_comparison_benchmark.sh
-#   MODEL_PATH=models/other.gguf ./scripts/run_gguf_comparison_benchmark.sh
-#   NUM_REQUESTS=20 MAX_TOKENS=64 ./scripts/run_gguf_comparison_benchmark.sh
+#   ./scripts/run_gguf_comparison_benchmark.sh [model.gguf]
+#   ./scripts/run_gguf_comparison_benchmark.sh models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+#   ./scripts/run_gguf_comparison_benchmark.sh   # uses default model
+#   NUM_REQUESTS=20 MAX_TOKENS=64 ./scripts/run_gguf_comparison_benchmark.sh models/foo.gguf
 #
 
 set -euo pipefail
@@ -20,15 +21,42 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Configuration (override via env)
-MODEL_PATH="${MODEL_PATH:-models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf}"
+# First positional argument overrides MODEL_PATH, env var is second priority
+DEFAULT_MODEL="models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf"
+MODEL_PATH="${1:-${MODEL_PATH:-$DEFAULT_MODEL}}"
 BUILD_DIR="${BUILD_DIR:-./build-cuda}"
 OUTPUT_DIR="${OUTPUT_DIR:-./gguf_benchmark_results}"
 NUM_REQUESTS="${NUM_REQUESTS:-10}"
 MAX_TOKENS="${MAX_TOKENS:-32}"
 CONCURRENCY="${CONCURRENCY:-4}"
+ENDPOINT_MODE="${INFERFLUX_BENCH_ENDPOINT_MODE:-completion}"
+NATIVE_PHASE_TIMING="${INFERFLUX_BENCH_NATIVE_PHASE_TIMING:-0}"
+NATIVE_TIMING_SAMPLE_RATE="${INFERFLUX_BENCH_NATIVE_TIMING_SAMPLE_RATE:-0}"
 API_KEY="${API_KEY:-dev-key-123}"
 QUANTIZE_TO="${QUANTIZE_TO:-}"  # Set to e.g. "q4_k_m" to convert safetensors → GGUF
+PREFILL_POOL_SIZE="${INFERFLUX_BENCH_PREFILL_POOL_SIZE:-1}"
+DECODE_POOL_SIZE="${INFERFLUX_BENCH_DECODE_POOL_SIZE:-1}"
+KV_CHANNEL_CAPACITY="${INFERFLUX_BENCH_KV_CHANNEL_CAPACITY:-64}"
+KV_ENQUEUE_MAX_RETRIES="${INFERFLUX_BENCH_KV_ENQUEUE_MAX_RETRIES:-3}"
+BATCH_ACCUMULATION_MS="${INFERFLUX_BENCH_BATCH_ACCUMULATION_MS:-2}"
+MIN_BATCH_SIZE="${INFERFLUX_BENCH_MIN_BATCH_SIZE:-1}"
+ENABLE_BATCHED_DECODE="${INFERFLUX_BENCH_ENABLE_BATCHED_DECODE:-1}"
+# Keep the benchmark on the stateless/native-safe decode policy by default.
+# Higher values can improve throughput modestly, but they still regress native
+# exact-match parity on the current Qwen 3B GGUF benchmark envelope.
+DECODE_BURST_TOKENS="${INFERFLUX_BENCH_DECODE_BURST_TOKENS:-0}"
+BENCH_LOG_LEVEL="${INFERFLUX_BENCH_LOG_LEVEL:-warning}"
+DEBUG_SEQUENCE_SLOTS="${INFERFLUX_BENCH_DEBUG_SEQUENCE_SLOTS:-0}"
+DEBUG_UNIFIED_ASSEMBLY="${INFERFLUX_BENCH_DEBUG_UNIFIED_ASSEMBLY:-0}"
+DEBUG_UNIFIED_ASSEMBLY_LIMIT="${INFERFLUX_BENCH_DEBUG_UNIFIED_ASSEMBLY_LIMIT:-200}"
+DEBUG_DECODE_MAPPING="${INFERFLUX_BENCH_NATIVE_DEBUG_DECODE_MAPPING:-0}"
+DEBUG_DECODE_MAPPING_LIMIT="${INFERFLUX_BENCH_NATIVE_DEBUG_DECODE_MAPPING_LIMIT:-64}"
+DEBUG_OPERATOR_SELECTION="${INFERFLUX_BENCH_NATIVE_DEBUG_OPERATOR_SELECTION:-0}"
+DEBUG_OPERATOR_SELECTION_LIMIT="${INFERFLUX_BENCH_NATIVE_DEBUG_OPERATOR_SELECTION_LIMIT:-64}"
+DEBUG_LOGITS="${INFERFLUX_BENCH_DEBUG_LOGITS:-0}"
+DEBUG_LOGITS_LIMIT="${INFERFLUX_BENCH_DEBUG_LOGITS_LIMIT:-64}"
+DEBUG_TOKEN_TRACE="${INFERFLUX_BENCH_DEBUG_TOKEN_TRACE:-0}"
+DEBUG_TOKEN_TRACE_LIMIT="${INFERFLUX_BENCH_DEBUG_TOKEN_TRACE_LIMIT:-128}"
 PORT_LLAMA=18090
 PORT_NATIVE=18091
 
@@ -37,19 +65,264 @@ LLAMA_CONVERT="external/llama.cpp/convert_hf_to_gguf.py"
 LLAMA_QUANTIZE="external/llama.cpp/build/bin/llama-quantize"
 
 # Prompts (deterministic, temperature=0)
-PROMPTS=(
-    "Explain what a hash table is in two sentences."
-    "Write a Python function that returns the nth Fibonacci number."
-    "What is the capital of France? Answer in one word."
-    "Translate hello world to Spanish."
-    "List three prime numbers greater than 10."
-)
+if [ -n "${INFERFLUX_BENCH_SINGLE_PROMPT:-}" ]; then
+    PROMPTS=("$INFERFLUX_BENCH_SINGLE_PROMPT")
+else
+    PROMPTS=(
+        "Explain what a hash table is in two sentences."
+        "Write a Python function that returns the nth Fibonacci number."
+        "What is the capital of France? Answer in one word."
+        "Translate hello world to Spanish."
+        "List three prime numbers greater than 10."
+    )
+fi
 
 log()      { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $1"; }
 log_ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
 log_err()  { echo -e "${RED}[ERR]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 header()   { echo -e "\n${BOLD}$1${NC}"; echo "$(printf '=%.0s' $(seq 1 ${#1}))"; }
+
+if [ "$DECODE_BURST_TOKENS" -gt 1 ]; then
+    log_warn "decode_burst_tokens=$DECODE_BURST_TOKENS is experimental for native accuracy; use 0 or 1 for parity-sensitive runs"
+fi
+
+capture_native_operator_metrics() {
+    local port=$1 backend=$2
+    local metrics_file="$OUTPUT_DIR/metrics_${backend}.txt"
+    local summary_file="$OUTPUT_DIR/native_operator_summary_${backend}.json"
+
+    if [ "$backend" != "cuda_native" ]; then
+        return 0
+    fi
+
+    if ! curl -sf -H "Authorization: Bearer $API_KEY" \
+        "http://127.0.0.1:$port/metrics" > "$metrics_file" 2>/dev/null; then
+        log_warn "  Failed to scrape native metrics for operator summary"
+        return 0
+    fi
+
+    python3 - "$metrics_file" "$summary_file" <<'PYEOF'
+import json, re, sys
+
+metrics_path, out_path = sys.argv[1], sys.argv[2]
+pattern = re.compile(
+    r'^inferflux_native_down_proj_operator_total\{phase="([^"]+)",operator="([^"]+)"\}\s+(\d+)$'
+)
+summary = {}
+with open(metrics_path) as f:
+    for raw in f:
+        line = raw.strip()
+        m = pattern.match(line)
+        if not m:
+            continue
+        phase, op, count = m.group(1), m.group(2), int(m.group(3))
+        summary.setdefault(phase, {})[op] = count
+
+with open(out_path, "w") as f:
+    json.dump(summary, f, indent=2, sort_keys=True)
+
+prefill = summary.get("prefill", {})
+decode = summary.get("decode", {})
+print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ("q8_1_gemv", "q8_1_gemv_hot_fixed", "q8_1_gemv_row_pair", "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback")))
+print("decode=" + ",".join(f"{k}:{decode.get(k, 0)}" for k in ("q8_1_gemv", "q8_1_gemv_hot_fixed", "q8_1_gemv_row_pair", "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback")))
+PYEOF
+}
+
+capture_native_ffn_proj_metrics() {
+    local port=$1 backend=$2
+    local metrics_file="$OUTPUT_DIR/metrics_${backend}.txt"
+    local summary_file="$OUTPUT_DIR/native_ffn_proj_summary_${backend}.json"
+
+    if [ "$backend" != "cuda_native" ] || [ ! -f "$metrics_file" ]; then
+        return 0
+    fi
+
+    python3 - "$metrics_file" "$summary_file" <<'PYEOF'
+import json, re, sys
+
+metrics_path, out_path = sys.argv[1], sys.argv[2]
+pattern = re.compile(
+    r'^inferflux_native_ffn_proj_operator_total\{phase="([^"]+)",operator="([^"]+)"\}\s+(\d+)$'
+)
+summary = {}
+with open(metrics_path) as f:
+    for raw in f:
+        line = raw.strip()
+        m = pattern.match(line)
+        if not m:
+            continue
+        phase, op, count = m.group(1), m.group(2), int(m.group(3))
+        summary.setdefault(phase, {})[op] = count
+
+with open(out_path, "w") as f:
+    json.dump(summary, f, indent=2, sort_keys=True)
+
+prefill = summary.get("prefill", {})
+decode = summary.get("decode", {})
+print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ("q8_1_group_hot_q4k", "q8_1_group", "packed_group", "fallback")))
+print("decode=" + ",".join(f"{k}:{decode.get(k, 0)}" for k in ("q8_1_group_hot_q4k", "q8_1_group", "packed_group", "fallback")))
+PYEOF
+}
+
+capture_native_batch_metrics() {
+    local port=$1 backend=$2
+    local metrics_file="$OUTPUT_DIR/metrics_${backend}.txt"
+    local summary_file="$OUTPUT_DIR/native_batch_summary_${backend}.json"
+
+    if [ "$backend" != "cuda_native" ] || [ ! -f "$metrics_file" ]; then
+        return 0
+    fi
+
+    python3 - "$metrics_file" "$summary_file" <<'PYEOF'
+import json, re, sys
+
+metrics_path, out_path = sys.argv[1], sys.argv[2]
+pattern = re.compile(
+    r'^inferflux_native_forward_batch_size_total\{phase="([^"]+)",bucket="([^"]+)"\}\s+(\d+)$'
+)
+summary = {}
+with open(metrics_path) as f:
+    for raw in f:
+        line = raw.strip()
+        m = pattern.match(line)
+        if not m:
+            continue
+        phase, bucket, count = m.group(1), m.group(2), int(m.group(3))
+        summary.setdefault(phase, {})[bucket] = count
+
+with open(out_path, "w") as f:
+    json.dump(summary, f, indent=2, sort_keys=True)
+
+order = ("1", "2", "3_4", "5_8", "9_16", "17_plus")
+for phase in ("prefill", "decode"):
+    phase_summary = summary.get(phase, {})
+    print(phase + "=" + ",".join(f"{k}:{phase_summary.get(k, 0)}" for k in order))
+PYEOF
+}
+
+capture_native_ffn_geometry_metrics() {
+    local backend=$1
+    local metrics_file="$OUTPUT_DIR/metrics_${backend}.txt"
+    local summary_file="$OUTPUT_DIR/native_ffn_geometry_summary_${backend}.json"
+
+    if [ "$backend" != "cuda_native" ] || [ ! -f "$metrics_file" ]; then
+        return 0
+    fi
+
+    python3 - "$metrics_file" "$summary_file" <<'PYEOF'
+import json, re, sys
+
+metrics_path, out_path = sys.argv[1], sys.argv[2]
+pattern = re.compile(
+    r'^inferflux_native_ffn_proj_geometry_total\{phase="([^"]+)",operator="([^"]+)",quant="([^"]+)",m_bucket="([^"]+)",n="([^"]+)",n_bucket="([^"]+)",k="([^"]+)",k_bucket="([^"]+)",grouped_outputs="([^"]+)"\}\s+(\d+)$'
+)
+entries = []
+with open(metrics_path) as f:
+    for raw in f:
+        line = raw.strip()
+        m = pattern.match(line)
+        if not m:
+            continue
+        phase, op, quant, m_bucket, n, n_bucket, k, k_bucket, grouped, count = m.groups()
+        count = int(count)
+        entries.append({
+            "phase": phase,
+            "operator": op,
+            "quant": quant,
+            "m_bucket": m_bucket,
+            "n": n,
+            "n_bucket": n_bucket,
+            "k": k,
+            "k_bucket": k_bucket,
+            "grouped_outputs": grouped,
+            "count": count,
+        })
+
+entries.sort(key=lambda item: (-item["count"], item["phase"], item["operator"], item["quant"], item["m_bucket"]))
+with open(out_path, "w") as f:
+    json.dump(entries, f, indent=2, sort_keys=True)
+
+for entry in entries[:8]:
+    print(f'{entry["phase"]}:{entry["operator"]}:{entry["quant"]}:m={entry["m_bucket"]}:n={entry["n"]}:k={entry["k"]}:g={entry["grouped_outputs"]}:{entry["count"]}')
+PYEOF
+}
+
+capture_native_downproj_geometry_metrics() {
+    local backend=$1
+    local metrics_file="$OUTPUT_DIR/metrics_${backend}.txt"
+    local summary_file="$OUTPUT_DIR/native_downproj_geometry_summary_${backend}.json"
+
+    if [ "$backend" != "cuda_native" ] || [ ! -f "$metrics_file" ]; then
+        return 0
+    fi
+
+    python3 - "$metrics_file" "$summary_file" <<'PYEOF'
+import json, re, sys
+
+metrics_path, out_path = sys.argv[1], sys.argv[2]
+pattern = re.compile(
+    r'^inferflux_native_down_proj_geometry_total\{phase="([^"]+)",operator="([^"]+)",quant="([^"]+)",m_bucket="([^"]+)",n="([^"]+)",n_bucket="([^"]+)",k="([^"]+)",k_bucket="([^"]+)"\}\s+(\d+)$'
+)
+entries = []
+with open(metrics_path) as f:
+    for raw in f:
+        line = raw.strip()
+        m = pattern.match(line)
+        if not m:
+            continue
+        phase, op, quant, m_bucket, n, n_bucket, k, k_bucket, count = m.groups()
+        count = int(count)
+        entries.append({
+            "phase": phase,
+            "operator": op,
+            "quant": quant,
+            "m_bucket": m_bucket,
+            "n": n,
+            "n_bucket": n_bucket,
+            "k": k,
+            "k_bucket": k_bucket,
+            "count": count,
+        })
+
+entries.sort(key=lambda item: (-item["count"], item["phase"], item["operator"], item["quant"], item["m_bucket"]))
+with open(out_path, "w") as f:
+    json.dump(entries, f, indent=2, sort_keys=True)
+
+for entry in entries[:8]:
+    print(f'{entry["phase"]}:{entry["operator"]}:{entry["quant"]}:m={entry["m_bucket"]}:n={entry["n"]}:k={entry["k"]}:{entry["count"]}')
+PYEOF
+}
+
+assert_backend_identity() {
+    local backend=$1 port=$2 log_file=$3
+    if [ "$backend" != "cuda_native" ]; then
+        return 0
+    fi
+
+    python3 scripts/check_backend_identity.py \
+        --base-url "http://127.0.0.1:$port" \
+        --model-id "bench-model" \
+        --expected-provider "native" \
+        --expected-backend "cuda" \
+        --api-key "$API_KEY" \
+        --log-file "$log_file" \
+        --forbid-log-pattern '^ggml_cuda_init:' \
+        --forbid-log-pattern '^llama_model_load_from_file_impl:' \
+        --forbid-log-pattern '^llama_model_loader:' \
+        --forbid-log-pattern '^create_tensor:' \
+        --forbid-log-pattern 'Initialized native parity delegate backend'
+}
+
+reset_backend_artifacts() {
+    local backend=$1
+    rm -rf "$OUTPUT_DIR/responses_${backend}"
+    rm -f "$OUTPUT_DIR/stats_${backend}.json" \
+          "$OUTPUT_DIR/mem_trace_${backend}.txt" \
+          "$OUTPUT_DIR/server_${backend}.log" \
+          "$OUTPUT_DIR/config_${backend}.yaml" \
+          "$OUTPUT_DIR/${backend}.pid"
+}
 
 # ============================================================================
 # GPU memory measurement (real nvidia-smi)
@@ -101,8 +374,14 @@ runtime:
   scheduler:
     max_batch_size: 32
     max_batch_tokens: 16384
-    min_batch_size: 1
-    batch_accumulation_ms: 2
+    min_batch_size: $MIN_BATCH_SIZE
+    batch_accumulation_ms: $BATCH_ACCUMULATION_MS
+    decode_burst_tokens: $DECODE_BURST_TOKENS
+  disaggregated:
+    prefill_pool_size: $PREFILL_POOL_SIZE
+    decode_pool_size: $DECODE_POOL_SIZE
+    kv_channel_capacity: $KV_CHANNEL_CAPACITY
+    kv_enqueue_max_retries: $KV_ENQUEUE_MAX_RETRIES
   paged_kv:
     cpu_pages: 4096
     eviction: lru
@@ -117,7 +396,7 @@ guardrails:
   blocklist: []
 
 logging:
-  level: warning
+  level: $BENCH_LOG_LEVEL
   format: text
 EOF
 }
@@ -136,8 +415,25 @@ start_server() {
     local kv_seq=${INFERFLUX_NATIVE_KV_MAX_SEQ:-2048}
 
     INFERFLUX_PORT_OVERRIDE=$port INFERCTL_API_KEY=$API_KEY \
+        INFERFLUX_LOG_LEVEL=$BENCH_LOG_LEVEL \
+        INFERFLUX_ENABLE_BATCHED_DECODE=$ENABLE_BATCHED_DECODE \
+        INFERFLUX_DEBUG_SEQUENCE_SLOTS=$DEBUG_SEQUENCE_SLOTS \
+        INFERFLUX_DEBUG_UNIFIED_ASSEMBLY=$DEBUG_UNIFIED_ASSEMBLY \
+        INFERFLUX_DEBUG_UNIFIED_ASSEMBLY_LIMIT=$DEBUG_UNIFIED_ASSEMBLY_LIMIT \
+        INFERFLUX_DEBUG_LOGITS=$DEBUG_LOGITS \
+        INFERFLUX_DEBUG_LOGITS_LIMIT=$DEBUG_LOGITS_LIMIT \
+        INFERFLUX_DEBUG_TOKEN_TRACE=$DEBUG_TOKEN_TRACE \
+        INFERFLUX_DEBUG_TOKEN_TRACE_LIMIT=$DEBUG_TOKEN_TRACE_LIMIT \
+        INFERFLUX_NATIVE_TIMING_SAMPLE_RATE=$([ "$backend" = "cuda_native" ] && echo "$NATIVE_TIMING_SAMPLE_RATE" || echo "0") \
+        INFERFLUX_NATIVE_PHASE_TIMING=$([ "$backend" = "cuda_native" ] && echo "$NATIVE_PHASE_TIMING" || echo "0") \
+        INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING=$([ "$backend" = "cuda_native" ] && echo "$DEBUG_DECODE_MAPPING" || echo "0") \
+        INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING_LIMIT=$([ "$backend" = "cuda_native" ] && echo "$DEBUG_DECODE_MAPPING_LIMIT" || echo "64") \
+        INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION=$([ "$backend" = "cuda_native" ] && echo "$DEBUG_OPERATOR_SELECTION" || echo "0") \
+        INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION_LIMIT=$([ "$backend" = "cuda_native" ] && echo "$DEBUG_OPERATOR_SELECTION_LIMIT" || echo "64") \
         INFERFLUX_NATIVE_KV_MAX_BATCH=$kv_batch \
         INFERFLUX_NATIVE_KV_MAX_SEQ=$kv_seq \
+        INFERFLUX_NATIVE_CUDA_STRICT=$([ "$backend" = "cuda_native" ] && echo "1" || echo "0") \
+        INFERFLUX_NATIVE_DISABLE_PARITY_DELEGATE=$([ "$backend" = "cuda_native" ] && echo "1" || echo "0") \
         "$BUILD_DIR/inferfluxd" --config "$config_file" \
         > "$log_file" 2>&1 &
     local pid=$!
@@ -153,6 +449,12 @@ start_server() {
         fi
         if curl -sf -H "Authorization: Bearer $API_KEY" \
             "http://127.0.0.1:$port/livez" >/dev/null 2>&1; then
+            if ! assert_backend_identity "$backend" "$port" "$log_file"; then
+                log_err "$backend failed backend identity contract. Last log lines:"
+                tail -40 "$log_file"
+                kill "$pid" 2>/dev/null || true
+                return 1
+            fi
             log_ok "$backend ready (PID $pid)"
             return 0
         fi
@@ -184,19 +486,36 @@ stop_server() {
 # Request runner
 # ============================================================================
 send_request() {
-    local port=$1 prompt=$2 max_tokens=$3 output_file=$4
+    local port=$1 prompt=$2 max_tokens=$3 output_file=$4 request_tag=${5:-}
+
+    mkdir -p "$(dirname "$output_file")"
 
     local start_ns=$(date +%s%N)
+    local prompt_json
+    prompt_json=$(printf '%s' "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
 
     local response
-    response=$(curl -sf -X POST "http://127.0.0.1:$port/v1/chat/completions" \
-        -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $API_KEY" \
-        -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":$(printf '%s' "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}],\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
-        --max-time 120 2>/dev/null) || {
-        echo "ERROR" > "$output_file"
-        return 1
-    }
+    if [ "$ENDPOINT_MODE" = "chat" ]; then
+        response=$(curl -sf -X POST "http://127.0.0.1:$port/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "x-inferflux-client-request-id: $request_tag" \
+            -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":$prompt_json}],\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
+            --max-time 120 2>/dev/null) || {
+            echo "ERROR" > "$output_file"
+            return 1
+        }
+    else
+        response=$(curl -sf -X POST "http://127.0.0.1:$port/v1/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "x-inferflux-client-request-id: $request_tag" \
+            -d "{\"model\":\"default\",\"prompt\":$prompt_json,\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
+            --max-time 120 2>/dev/null) || {
+            echo "ERROR" > "$output_file"
+            return 1
+        }
+    fi
 
     local end_ns=$(date +%s%N)
     local latency_ms=$(( (end_ns - start_ns) / 1000000 ))
@@ -205,9 +524,10 @@ send_request() {
     text=$(echo "$response" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-text = d.get('choices', [{}])[0].get('message', {}).get('content', '')
+choice = d.get('choices', [{}])[0]
+text = choice.get('message', {}).get('content', '') or choice.get('text', '')
 tokens = d.get('usage', {}).get('completion_tokens', 0)
-print(json.dumps({'text': text.strip(), 'tokens': tokens, 'latency_ms': $latency_ms}))
+print(json.dumps({'client_request_id': '$request_tag', 'text': text.strip(), 'tokens': tokens, 'latency_ms': $latency_ms}))
 " 2>/dev/null) || {
         echo "PARSE_ERROR" > "$output_file"
         return 1
@@ -225,7 +545,7 @@ run_benchmark() {
     log "  Warmup..."
     for i in 0 1; do
         local prompt="${PROMPTS[$((i % ${#PROMPTS[@]}))]}"
-        send_request "$port" "$prompt" "$MAX_TOKENS" "/dev/null" || true
+        send_request "$port" "$prompt" "$MAX_TOKENS" "/dev/null" "warmup-$i" || true
     done
 
     # Measure GPU memory after warmup (model loaded)
@@ -253,8 +573,9 @@ run_benchmark() {
     for i in $(seq 0 $((NUM_REQUESTS - 1))); do
         local prompt="${PROMPTS[$((i % ${#PROMPTS[@]}))]}"
         local outfile="$results_dir/req_${i}.json"
+        local request_tag="bench-$i"
 
-        send_request "$port" "$prompt" "$MAX_TOKENS" "$outfile" &
+        send_request "$port" "$prompt" "$MAX_TOKENS" "$outfile" "$request_tag" &
         pids+=($!)
 
         # Enforce concurrency limit
@@ -285,12 +606,18 @@ run_benchmark() {
     local total_tokens=0
     local total_latency=0
     local success_count=0
+    local classified_failures=0
     local latencies=""
 
     for f in "$results_dir"/req_*.json; do
         [ -f "$f" ] || continue
         local content=$(cat "$f")
         if [ "$content" = "ERROR" ] || [ "$content" = "PARSE_ERROR" ]; then
+            continue
+        fi
+
+        if ! python3 scripts/classify_benchmark_response.py "$f" >/dev/null 2>&1; then
+            classified_failures=$((classified_failures + 1))
             continue
         fi
 
@@ -332,13 +659,73 @@ run_benchmark() {
     "total_tokens": $total_tokens,
     "total_time_ms": $total_ms,
     "success_count": $success_count,
+    "classified_failures": $classified_failures,
     "total_requests": $NUM_REQUESTS,
     "gpu_mem_loaded_mb": $mem_loaded,
     "gpu_mem_peak_mb": ${mem_peak:-0}
 }
 EOF
 
-    log_ok "  $backend: $success_count/$NUM_REQUESTS OK, ${tok_per_sec} tok/s, avg ${avg_latency}ms, mem ${mem_loaded}→${mem_peak} MB"
+    local classified_note=""
+    if [ $classified_failures -gt 0 ]; then
+        classified_note=", rejected=$classified_failures"
+    fi
+    log_ok "  $backend: $success_count/$NUM_REQUESTS OK${classified_note}, ${tok_per_sec} tok/s, avg ${avg_latency}ms, mem ${mem_loaded}→${mem_peak} MB"
+
+    if [ "$backend" = "cuda_native" ] && [ "$NATIVE_PHASE_TIMING" != "0" ]; then
+        local phase_json="$OUTPUT_DIR/native_phase_timing_${backend}.json"
+        if python3 scripts/parse_native_phase_timing.py "$OUTPUT_DIR/server_${backend}.log" --json > "$phase_json" 2>/dev/null; then
+            log "  Native phase timing summary:"
+            python3 scripts/parse_native_phase_timing.py "$OUTPUT_DIR/server_${backend}.log" 2>/dev/null | sed 's/^/    /'
+        else
+            log_warn "  Native phase timing enabled but no timing lines were parsed"
+        fi
+    fi
+
+    if [ "$backend" = "cuda_native" ]; then
+        local op_summary
+        op_summary=$(capture_native_operator_metrics "$port" "$backend" 2>/dev/null || true)
+        if [ -n "${op_summary:-}" ]; then
+            log "  Native down-proj operator summary:"
+            printf '%s\n' "$op_summary" | sed 's/^/    /'
+        fi
+        local ffn_summary
+        ffn_summary=$(capture_native_ffn_proj_metrics "$port" "$backend" 2>/dev/null || true)
+        if [ -n "${ffn_summary:-}" ]; then
+            log "  Native FFN projection summary:"
+            printf '%s\n' "$ffn_summary" | sed 's/^/    /'
+        fi
+        local batch_summary
+        batch_summary=$(capture_native_batch_metrics "$port" "$backend" 2>/dev/null || true)
+        if [ -n "${batch_summary:-}" ]; then
+            log "  Native forward batch-size summary:"
+            printf '%s\n' "$batch_summary" | sed 's/^/    /'
+        fi
+        local ffn_geom_summary
+        ffn_geom_summary=$(capture_native_ffn_geometry_metrics "$backend" 2>/dev/null || true)
+        if [ -n "${ffn_geom_summary:-}" ]; then
+            log "  Native FFN geometry summary:"
+            printf '%s\n' "$ffn_geom_summary" | sed 's/^/    /'
+        fi
+        local down_geom_summary
+        down_geom_summary=$(capture_native_downproj_geometry_metrics "$backend" 2>/dev/null || true)
+        if [ -n "${down_geom_summary:-}" ]; then
+            log "  Native down-proj geometry summary:"
+            printf '%s\n' "$down_geom_summary" | sed 's/^/    /'
+        fi
+    fi
+
+    local pidfile="$OUTPUT_DIR/${backend}.pid"
+    if [ $success_count -lt $NUM_REQUESTS ]; then
+        if [ -f "$pidfile" ]; then
+            local pid
+            pid=$(cat "$pidfile")
+            if ! kill -0 "$pid" 2>/dev/null; then
+                log_err "  $backend exited during benchmark"
+            fi
+        fi
+        return 1
+    fi
 }
 
 # ============================================================================
@@ -572,7 +959,18 @@ convert_safetensors_to_gguf() {
 main() {
     header "GGUF Backend Comparison Benchmark"
     echo "  All measurements are REAL — no simulated or expected values."
+    echo "  Scheduler tuning: min_batch_size=$MIN_BATCH_SIZE, batch_accumulation_ms=$BATCH_ACCUMULATION_MS, decode_burst_tokens=$DECODE_BURST_TOKENS, batched_decode=$ENABLE_BATCHED_DECODE"
+    if [ -n "${INFERFLUX_BENCH_SINGLE_PROMPT:-}" ]; then
+        echo "  Single prompt mode: ${INFERFLUX_BENCH_SINGLE_PROMPT}"
+    fi
+    if [ "$DEBUG_SEQUENCE_SLOTS" != "0" ] || [ "$DEBUG_UNIFIED_ASSEMBLY" != "0" ] || \
+       [ "$DEBUG_DECODE_MAPPING" != "0" ] || [ "$DEBUG_OPERATOR_SELECTION" != "0" ] || \
+       [ "$DEBUG_LOGITS" != "0" ] || [ "$DEBUG_TOKEN_TRACE" != "0" ]; then
+        echo "  Debug knobs: sequence_slots=$DEBUG_SEQUENCE_SLOTS, unified_assembly=$DEBUG_UNIFIED_ASSEMBLY/$DEBUG_UNIFIED_ASSEMBLY_LIMIT, decode_mapping=$DEBUG_DECODE_MAPPING/$DEBUG_DECODE_MAPPING_LIMIT, operator_selection=$DEBUG_OPERATOR_SELECTION/$DEBUG_OPERATOR_SELECTION_LIMIT, logits=$DEBUG_LOGITS/$DEBUG_LOGITS_LIMIT, token_trace=$DEBUG_TOKEN_TRACE/$DEBUG_TOKEN_TRACE_LIMIT"
+    fi
     echo ""
+
+    mkdir -p "$OUTPUT_DIR"
 
     # Handle safetensors → GGUF conversion
     if [ -d "$MODEL_PATH" ] || [[ "$MODEL_PATH" == *.safetensors ]] || [ -n "$QUANTIZE_TO" ]; then
@@ -618,11 +1016,23 @@ main() {
         fi
     fi
     if $needs_build; then
+        local build_log="$OUTPUT_DIR/build_$(date +%Y%m%d_%H%M%S).log"
         log "Building $BUILD_DIR/inferfluxd (CUDA enabled)..."
-        cmake -S . -B "$BUILD_DIR" -DENABLE_CUDA=ON >/dev/null 2>&1 || {
+        cmake -S . -B "$BUILD_DIR" \
+            -DENABLE_CUDA=ON \
+            -DINFERFLUX_CUDA_NATIVE_ARCH=ON >/dev/null 2>&1 || {
             log_err "cmake configure failed"; exit 1; }
-        cmake --build "$BUILD_DIR" -j"$(nproc)" 2>&1 | tail -5 || {
-            log_err "cmake build failed"; exit 1; }
+        if ! cmake --build "$BUILD_DIR" -j"$(nproc)" >"$build_log" 2>&1; then
+            log_err "cmake build failed; last 50 lines:"
+            tail -50 "$build_log"
+            exit 1
+        fi
+        local warning_count=0
+        warning_count=$(grep -Ec '(^|[^[:alnum:]_])(warning|error):' "$build_log" || true)
+        if [ "$warning_count" -gt 0 ]; then
+            log_warn "Build emitted ${warning_count} compiler diagnostics; see $build_log"
+            grep -E 'warning:|error:' "$build_log" | tail -10 || true
+        fi
         log "Build complete: $BUILD_DIR/inferfluxd"
     fi
     if [ ! -f "$BUILD_DIR/inferfluxd" ]; then
@@ -635,26 +1045,29 @@ main() {
         exit 1
     fi
 
-    mkdir -p "$OUTPUT_DIR"
-
     local mem_baseline=$(gpu_mem_mb)
     log "GPU baseline memory: ${mem_baseline} MB"
     log "GPU: $(gpu_name), $(gpu_mem_total_mb) MB"
 
     # Benchmark each backend
+    local failed_backends=()
     for backend in cuda_native cuda_llama_cpp; do
         local port=$PORT_LLAMA
         [ "$backend" = "cuda_native" ] && port=$PORT_NATIVE
 
         echo ""
         header "Benchmarking: $backend"
+        reset_backend_artifacts "$backend"
 
         if ! start_server "$backend" "$port"; then
             log_err "Failed to start $backend — skipping"
+            failed_backends+=("$backend")
             continue
         fi
 
-        run_benchmark "$backend" "$port"
+        if ! run_benchmark "$backend" "$port"; then
+            failed_backends+=("$backend")
+        fi
         stop_server "$backend"
 
         # Let GPU memory settle
@@ -687,7 +1100,12 @@ outf = '$OUTPUT_DIR/comparison_$(date +%Y%m%d_%H%M%S).json'
 with open(outf, 'w') as f:
     json.dump(combined, f, indent=2)
 print(f'Results saved to: {outf}')
-"
+    "
+
+    if [ ${#failed_backends[@]} -gt 0 ]; then
+        log_err "Benchmark incomplete: failed backends: ${failed_backends[*]}"
+        return 1
+    fi
 
     log_ok "Benchmark complete!"
 }

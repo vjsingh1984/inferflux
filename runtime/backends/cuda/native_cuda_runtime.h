@@ -76,6 +76,19 @@ public:
     }
   }
 
+  virtual LlamaCPUBackend::SequenceReleaseFence
+  NativeBeginFreeSequence(int sequence_id) {
+    NativeFreeSequence(sequence_id);
+    (void)sequence_id;
+    return {};
+  }
+
+  virtual bool NativePollFreeSequence(
+      const LlamaCPUBackend::SequenceReleaseFence &fence) {
+    (void)fence;
+    return true;
+  }
+
   virtual void NativeCopySequencePrefix(int src_seq, int dst_seq,
                                         int n_tokens) {
     auto backend = BackendHandle();
@@ -108,6 +121,18 @@ public:
   }
 
   virtual const ITokenizer *NativeGetTokenizer() const { return nullptr; }
+
+  /// Copy the last-position logits (vocab_size floats) from device to host.
+  /// Must be called after ExecuteUnifiedBatch() and before the next call.
+  /// Returns the number of floats written (vocab_size), or 0 on failure.
+  virtual int CopyLastLogitsToHost(float *host_buf, int buf_size) {
+    (void)host_buf;
+    (void)buf_size;
+    return 0;
+  }
+
+  /// Returns the vocabulary size (number of logits per position).
+  virtual int NativeVocabSize() const { return 0; }
 };
 
 std::unique_ptr<NativeCudaRuntime> CreateNativeCudaRuntime();
