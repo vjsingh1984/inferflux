@@ -1,6 +1,8 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/model_loader.h"
+#include "runtime/backends/cuda/native/native_bootstrap_config.h"
+#include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/strategy_registry.h"
 #include "runtime/backends/cuda/native_cuda_runtime.h"
 #include "runtime/execution/unified_batch_lane_dispatcher.h"
@@ -262,7 +264,7 @@ private:
   InferenceDtype inference_dtype_{InferenceDtype::kFP16};
   runtime::cuda::native::KvPrecision kv_precision_{
       runtime::cuda::native::KvPrecision::kFp16};
-  std::string kv_precision_hint_{"auto"};
+  NativeBootstrapConfig bootstrap_config_{};
   runtime::cuda::native::DequantizedCachePolicy dequantized_cache_policy_{
       runtime::cuda::native::DequantizedCachePolicy::kNone};
   std::string dequantized_cache_policy_hint_{"none"};
@@ -348,9 +350,10 @@ private:
   cudaEvent_t sampling_stop_{nullptr};
 
   // Timing sample rate: 0 = disabled, N>0 = record every Nth batch.
-  // Controlled by INFERFLUX_NATIVE_TIMING_SAMPLE_RATE env var.
+  // Loaded through NativeExecutionPolicy during model initialization.
   int timing_sample_rate_{0};
   int timing_batch_counter_{0};
+  NativeExecutionPolicy execution_policy_{};
 
   struct NativePerfAccumulator {
     std::atomic<double> prefill_ms{0.0};

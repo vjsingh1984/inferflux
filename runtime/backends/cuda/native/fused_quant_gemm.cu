@@ -10,7 +10,6 @@
 #include "server/logging/logger.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cmath>
@@ -24,6 +23,36 @@ namespace inferflux {
 using namespace runtime::cuda::native;
 
 namespace {
+
+thread_local const NativeExecutionPolicy *g_execution_policy_override = nullptr;
+
+const NativeExecutionPolicy &
+ResolveExecutionPolicy(const NativeExecutionPolicy *policy) {
+  if (policy) {
+    return *policy;
+  }
+  if (g_execution_policy_override) {
+    return *g_execution_policy_override;
+  }
+  static thread_local NativeExecutionPolicy env_policy;
+  env_policy = NativeExecutionPolicy::FromEnv();
+  return env_policy;
+}
+
+class ScopedExecutionPolicyOverride {
+public:
+  explicit ScopedExecutionPolicyOverride(const NativeExecutionPolicy *policy)
+      : prev_(g_execution_policy_override) {
+    if (policy) {
+      g_execution_policy_override = policy;
+    }
+  }
+
+  ~ScopedExecutionPolicyOverride() { g_execution_policy_override = prev_; }
+
+private:
+  const NativeExecutionPolicy *prev_{nullptr};
+};
 
 // ============================================================================
 // GPU-adaptive threshold computation
@@ -130,17 +159,7 @@ float BitsPerWeight(GGUF::TensorType qtype) {
 }
 
 bool ExperimentalQ8_1TripleRowPairEnabled() {
-  const char *raw = std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_TRIPLE_ROWPAIR");
-  if (!raw) {
-    return false;
-  }
-  std::string lowered(raw);
-  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-                 [](unsigned char ch) {
-                   return static_cast<char>(std::tolower(ch));
-                 });
-  return lowered == "1" || lowered == "true" || lowered == "yes" ||
-         lowered == "on";
+  return ResolveExecutionPolicy(nullptr).enable_experimental_q81_triple_rowpair;
 }
 
 // Compute the adaptive M threshold for a given quant type.
@@ -404,52 +423,26 @@ int ClampThreshold(int threshold) {
 }
 
 bool OperatorSelectionDebugEnabled() {
-  static const bool enabled = []() {
-    const char *value =
-        std::getenv("INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION");
-    if (!value) {
-      return false;
-    }
-    std::string normalized(value);
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                   [](unsigned char c) {
-                     return static_cast<char>(std::tolower(c));
-                   });
-    return normalized != "0" && normalized != "false" &&
-           normalized != "off" && normalized != "no";
-  }();
-  return enabled;
+  return ResolveExecutionPolicy(nullptr).debug_operator_selection;
 }
 
 int OperatorSelectionDebugLimit() {
-  static const int limit = []() {
-    const char *value =
-        std::getenv("INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION_LIMIT");
-    if (!value || *value == '\0') {
-      return 64;
-    }
-    char *end = nullptr;
-    const long parsed = std::strtol(value, &end, 10);
-    if (end == value || *end != '\0' || parsed <= 0 ||
-        parsed > static_cast<long>(std::numeric_limits<int>::max())) {
-      return 64;
-    }
-    return static_cast<int>(parsed);
-  }();
-  return limit;
+  return ResolveExecutionPolicy(nullptr).debug_operator_selection_limit;
 }
 
 bool ConsumeOperatorSelectionBudget() {
-  static std::atomic<int> budget{OperatorSelectionDebugLimit()};
-  int current = budget.load(std::memory_order_relaxed);
-  while (current > 0) {
-    if (budget.compare_exchange_weak(current, current - 1,
-                                     std::memory_order_relaxed,
-                                     std::memory_order_relaxed)) {
-      return true;
-    }
+  static thread_local int last_limit = -1;
+  static thread_local int budget = 0;
+  const int limit = OperatorSelectionDebugLimit();
+  if (limit != last_limit) {
+    last_limit = limit;
+    budget = limit;
   }
-  return false;
+  if (budget <= 0) {
+    return false;
+  }
+  --budget;
+  return true;
 }
 
 std::string QuantTypeToString(int quant_type) {
@@ -502,34 +495,17 @@ bool ShouldUseSpecializedQ8_1DownProjHotPathImpl(
   const bool hot_quant =
       quant_type == static_cast<int>(GGUF::TensorType::Q4_K) ||
       quant_type == static_cast<int>(GGUF::TensorType::Q6_K);
-  const char *value =
-      std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED");
-  if (!value) {
+  if (!ResolveExecutionPolicy(nullptr)
+           .enable_experimental_q81_downproj_hot_fixed) {
     return false;
   }
-  std::string normalized(value);
-  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                 [](unsigned char c) {
-                   return static_cast<char>(std::tolower(c));
-                 });
-  const bool enabled = normalized != "0" && normalized != "false" &&
-                       normalized != "off" && normalized != "no";
-  return enabled && hot_quant && geometry.grouped_outputs == 1 &&
+  return hot_quant && geometry.grouped_outputs == 1 &&
          geometry.M == 1 && geometry.N == kDownProjHotPathN &&
          geometry.K == kDownProjHotPathK;
 }
 
 bool ExperimentalQ8_1GroupedHotQ4KEnabled() {
-  const char *value =
-      std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K");
-  if (!value) {
-    return false;
-  }
-  std::string normalized(value);
-  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return normalized != "0" && normalized != "false" &&
-         normalized != "off" && normalized != "no";
+  return ResolveExecutionPolicy(nullptr).enable_experimental_q81_grouped_hot_q4k;
 }
 
 const DispatchEntry &GetDispatchEntry(GGUF::TensorType qtype) {
@@ -773,36 +749,11 @@ bool ValidatePackedProjectionSpecs(
 }
 
 bool DownProjMmqEnabled() {
-  const char *raw = std::getenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ");
-  if (!raw) {
-    return false;
-  }
-  std::string lowered(raw);
-  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-                 [](unsigned char ch) {
-                   return static_cast<char>(std::tolower(ch));
-                 });
-  return lowered == "1" || lowered == "true" || lowered == "yes" ||
-         lowered == "on";
+  return ResolveExecutionPolicy(nullptr).enable_downproj_mmq;
 }
 
 int GetDownProjMmqThresholdOverride() {
-  const char *raw = std::getenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH");
-  if (!raw || !*raw) {
-    return -1;
-  }
-  char *end = nullptr;
-  long parsed = std::strtol(raw, &end, 10);
-  if (end == raw || (end && *end != '\0')) {
-    return -1;
-  }
-  if (parsed < 1) {
-    return 1;
-  }
-  if (parsed > 64) {
-    return 64;
-  }
-  return static_cast<int>(parsed);
+  return ResolveExecutionPolicy(nullptr).downproj_mmq_min_batch_override;
 }
 
 int GetDownProjMmqThreshold(int quant_type, int M, int N, int K) {
@@ -1175,17 +1126,24 @@ bool FusedQuantGemm::SupportsDownProjMmq(int quant_type) {
   return GetDownProjMmqDispatchEntry(qtype).fn != nullptr;
 }
 
-bool FusedQuantGemm::IsDownProjMmqEnabled() { return DownProjMmqEnabled(); }
+bool FusedQuantGemm::IsDownProjMmqEnabled(
+    const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
+  return DownProjMmqEnabled();
+}
 
 bool FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(
-    int quant_type, const FusedDispatchGeometry &geometry) {
+    int quant_type, const FusedDispatchGeometry &geometry,
+    const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
   return ExperimentalQ8_1GroupedHotQ4KEnabled() &&
          ShouldUseSpecializedQ8_1GroupedFastPathImpl(quant_type, geometry);
 }
 
 FusedQuantGemm::FfnProjOperator FusedQuantGemm::SelectFfnProjOperator(
     int quant_type0, int quant_type1, const FusedDispatchGeometry &geometry,
-    bool allow_q81, bool allow_packed) {
+    bool allow_q81, bool allow_packed, const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
   FfnProjOperator selected = FusedQuantGemm::FfnProjOperator::kFallback;
   if (geometry.M <= 0 || geometry.N <= 0 || geometry.K <= 0 ||
       geometry.grouped_outputs != 2) {
@@ -1262,7 +1220,8 @@ const char *FusedQuantGemm::FfnProjOperatorName(
 
 FusedQuantGemm::DownProjOperator FusedQuantGemm::SelectDownProjOperator(
     int quant_type, const FusedDispatchGeometry &geometry, bool allow_q81,
-    bool allow_packed, bool allow_mmq) {
+    bool allow_packed, bool allow_mmq, const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
   DownProjOperator selected = FusedQuantGemm::DownProjOperator::kFallback;
   if (geometry.M <= 0 || geometry.N <= 0 || geometry.K <= 0) {
     LogOperatorSelection("down_proj", DownProjOperatorName(selected), geometry,
@@ -1365,20 +1324,13 @@ const char *FusedQuantGemm::DownProjOperatorName(
 
 bool FusedQuantGemm::Gemv(const QuantizedWeightInfo &weight,
                           const half *activation, half *output, int M, int N,
-                          int K, cudaStream_t stream) {
+                          int K, cudaStream_t stream,
+                          const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
   if (!weight.data || weight.quant_type < 0)
     return false;
 
-  // Allow disabling fused kernels for debugging (forces cuBLAS fallback)
-  static const bool disabled = [] {
-    const char *env = std::getenv("INFERFLUX_DISABLE_FUSED_GEMV");
-    bool d = env && (std::string(env) == "1" || std::string(env) == "true");
-    if (d)
-      log::Warn("fused_quant_gemm",
-                "Fused dequant-GEMV DISABLED by INFERFLUX_DISABLE_FUSED_GEMV");
-    return d;
-  }();
-  if (disabled)
+  if (ResolveExecutionPolicy(policy).disable_fused_gemv)
     return false;
 
   auto qtype = static_cast<GGUF::TensorType>(weight.quant_type);
@@ -1412,17 +1364,14 @@ bool FusedQuantGemm::Gemv(const QuantizedWeightInfo &weight,
 bool FusedQuantGemm::GemvPacked(const QuantizedWeightInfo &weight,
                                 const PackedActivationInfo &activation,
                                 half *output, int M, int N, int K,
-                                cudaStream_t stream) {
+                                cudaStream_t stream,
+                                const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
   if (!weight.data || weight.quant_type < 0 || !activation.data ||
       !activation.row_scales) {
     return false;
   }
-
-  static const bool disabled = [] {
-    const char *env = std::getenv("INFERFLUX_DISABLE_FUSED_GEMV");
-    return env && (std::string(env) == "1" || std::string(env) == "true");
-  }();
-  if (disabled) {
+  if (ResolveExecutionPolicy(policy).disable_fused_gemv) {
     return false;
   }
 
@@ -1522,16 +1471,12 @@ bool FusedQuantGemm::GemvPackedTriple(
 bool FusedQuantGemm::RmsNormGemv(const QuantizedWeightInfo &weight,
                                  const half *residual, const half *norm_weight,
                                  half *output, int M, int N, int K,
-                                 float rms_norm_eps, cudaStream_t stream) {
+                                 float rms_norm_eps, cudaStream_t stream,
+                                 const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
   if (!weight.data || weight.quant_type < 0)
     return false;
-
-  // Respect the global disable flag
-  static const bool disabled = [] {
-    const char *env = std::getenv("INFERFLUX_DISABLE_FUSED_GEMV");
-    return env && (std::string(env) == "1" || std::string(env) == "true");
-  }();
-  if (disabled)
+  if (ResolveExecutionPolicy(policy).disable_fused_gemv)
     return false;
 
   auto qtype = static_cast<GGUF::TensorType>(weight.quant_type);
@@ -2142,7 +2087,9 @@ void FusedQuantGemm::DestroyDownProjMmqLayout(const MmqWeightInfo &layout) {
 
 bool FusedQuantGemm::DownProjMmq(const MmqWeightInfo &weight,
                                  const void *act_q8_1, half *output, int M,
-                                 int N, int K, cudaStream_t stream) {
+                                 int N, int K, cudaStream_t stream,
+                                 const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
   if (!DownProjMmqEnabled() || !weight.data || !act_q8_1 || !output || M <= 0 ||
       N <= 0 || K <= 0 || N != weight.rows || K != weight.cols ||
       weight.tile_cols <= 0 || !SupportsDownProjMmq(weight.quant_type)) {
@@ -2192,16 +2139,13 @@ bool FusedQuantGemm::DownProjMmq(const MmqWeightInfo &weight,
 }
 
 bool FusedQuantGemm::GemvQ8_1(const QuantizedWeightInfo &weight,
-                                const void *act_q8_1, half *output, int M,
-                                int N, int K, cudaStream_t stream) {
+                              const void *act_q8_1, half *output, int M, int N,
+                              int K, cudaStream_t stream,
+                              const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
   if (!weight.data || weight.quant_type < 0 || !act_q8_1)
     return false;
-
-  static const bool disabled = [] {
-    const char *env = std::getenv("INFERFLUX_DISABLE_FUSED_GEMV");
-    return env && (std::string(env) == "1" || std::string(env) == "true");
-  }();
-  if (disabled)
+  if (ResolveExecutionPolicy(policy).disable_fused_gemv)
     return false;
 
   auto qtype = static_cast<GGUF::TensorType>(weight.quant_type);
@@ -2261,7 +2205,9 @@ bool FusedQuantGemm::GemvQ8_1(const QuantizedWeightInfo &weight,
 
 bool FusedQuantGemm::GemvQ8_1Pair(
     const std::array<PackedProjectionSpec, 2> &projections,
-    const void *act_q8_1, int M, int K, cudaStream_t stream) {
+    const void *act_q8_1, int M, int K, cudaStream_t stream,
+    const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
   if (!act_q8_1 || M <= 0 || K <= 0)
     return false;
 
@@ -2329,7 +2275,9 @@ bool FusedQuantGemm::GemvQ8_1Pair(
 
 bool FusedQuantGemm::GemvQ8_1Triple(
     const std::array<PackedProjectionSpec, 3> &projections,
-    const void *act_q8_1, int M, int K, cudaStream_t stream) {
+    const void *act_q8_1, int M, int K, cudaStream_t stream,
+    const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
   if (!act_q8_1 || M <= 0 || K <= 0)
     return false;
 
