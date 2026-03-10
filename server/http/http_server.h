@@ -79,6 +79,61 @@ struct HttpRequestMetadata {
   std::string trace_id;
 };
 
+struct HttpGenerationRequestEnvelopeInput {
+  std::string prompt;
+  std::string model{"unknown"};
+  int max_tokens{256};
+  int priority{0};
+  bool stream{false};
+  bool json_mode{false};
+  bool has_response_format{false};
+  std::string response_format_type;
+  std::string response_format_schema;
+  std::string response_format_grammar;
+  std::string response_format_root{"root"};
+  bool collect_logprobs{false};
+  int logprob_top_n{0};
+  SamplingParams sampling{};
+  std::vector<std::string> stop;
+  bool has_images{false};
+  std::vector<DecodedImage> images;
+};
+
+inline InferenceRequest BuildGenerationRequestEnvelope(
+    const HttpGenerationRequestEnvelopeInput &input,
+    const HttpRequestMetadata &metadata) {
+  InferenceRequest request;
+  request.prompt = input.prompt;
+  if (input.max_tokens > 0) {
+    request.max_tokens = input.max_tokens;
+  }
+  request.model = input.model;
+  request.priority = input.priority;
+  request.session_id = metadata.session_id;
+  request.client_request_id = metadata.client_request_id;
+  request.trace_id = metadata.trace_id;
+  request.stream = input.stream;
+  request.json_mode = input.json_mode;
+  if (input.has_response_format) {
+    request.has_response_format = true;
+    request.response_format_type = input.response_format_type;
+    request.response_format_schema = input.response_format_schema;
+    request.response_format_grammar = input.response_format_grammar;
+    request.response_format_root = input.response_format_root;
+  }
+  if (input.collect_logprobs) {
+    request.collect_logprobs = true;
+    request.logprob_top_n = input.logprob_top_n;
+  }
+  request.sampling = input.sampling;
+  request.stop = input.stop;
+  if (input.has_images) {
+    request.has_images = true;
+    request.images = input.images;
+  }
+  return request;
+}
+
 // Test-visible metadata normalization helper. Payload-provided values take
 // precedence over headers; trace_id is derived from an incoming traceparent
 // header when present and valid.

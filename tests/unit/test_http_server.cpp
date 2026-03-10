@@ -150,6 +150,82 @@ TEST_CASE("ResolveHttpRequestMetadataForTest falls back to headers and rejects "
   REQUIRE(metadata.trace_id.empty());
 }
 
+TEST_CASE("BuildGenerationRequestEnvelope projects prompt, sampling, and "
+          "metadata into InferenceRequest",
+          "[http_server]") {
+  HttpGenerationRequestEnvelopeInput input;
+  input.prompt = "hello";
+  input.model = "qwen";
+  input.max_tokens = 32;
+  input.priority = 10;
+  input.stream = true;
+  input.json_mode = true;
+  input.has_response_format = true;
+  input.response_format_type = "json_object";
+  input.response_format_schema = "{\"type\":\"object\"}";
+  input.response_format_grammar = "root ::= \"{}\"";
+  input.response_format_root = "root";
+  input.collect_logprobs = true;
+  input.logprob_top_n = 3;
+  input.sampling.temperature = 0.2f;
+  input.sampling.top_p = 0.95f;
+  input.sampling.top_k = 40;
+  input.sampling.seed = 7;
+  input.stop = {"\n\n"};
+
+  HttpRequestMetadata metadata;
+  metadata.session_id = "sess-1";
+  metadata.client_request_id = "bench-7";
+  metadata.trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+  const InferenceRequest request =
+      BuildGenerationRequestEnvelope(input, metadata);
+
+  REQUIRE(request.prompt == "hello");
+  REQUIRE(request.model == "qwen");
+  REQUIRE(request.max_tokens == 32);
+  REQUIRE(request.priority == 10);
+  REQUIRE(request.stream);
+  REQUIRE(request.json_mode);
+  REQUIRE(request.has_response_format);
+  REQUIRE(request.response_format_type == "json_object");
+  REQUIRE(request.response_format_schema == "{\"type\":\"object\"}");
+  REQUIRE(request.response_format_grammar == "root ::= \"{}\"");
+  REQUIRE(request.response_format_root == "root");
+  REQUIRE(request.collect_logprobs);
+  REQUIRE(request.logprob_top_n == 3);
+  REQUIRE(request.sampling.temperature == Catch::Approx(0.2f));
+  REQUIRE(request.sampling.top_p == Catch::Approx(0.95f));
+  REQUIRE(request.sampling.top_k == 40);
+  REQUIRE(request.sampling.seed == 7);
+  REQUIRE(request.stop == std::vector<std::string>{"\n\n"});
+  REQUIRE(request.session_id == "sess-1");
+  REQUIRE(request.client_request_id == "bench-7");
+  REQUIRE(request.trace_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+}
+
+TEST_CASE("BuildGenerationRequestEnvelope keeps multimodal payload attached",
+          "[http_server]") {
+  HttpGenerationRequestEnvelopeInput input;
+  input.prompt = "describe";
+  input.has_images = true;
+  DecodedImage image;
+  image.raw_bytes = {0, 1, 2, 3, 4, 5};
+  image.source_uri = "data:image/png;base64,AAAA";
+  image.image_id = "img-1";
+  input.images.push_back(image);
+
+  const InferenceRequest request =
+      BuildGenerationRequestEnvelope(input, HttpRequestMetadata{});
+
+  REQUIRE(request.has_images);
+  REQUIRE(request.images.size() == 1);
+  REQUIRE(request.images.front().raw_bytes ==
+          std::vector<uint8_t>{0, 1, 2, 3, 4, 5});
+  REQUIRE(request.images.front().source_uri == "data:image/png;base64,AAAA");
+  REQUIRE(request.images.front().image_id == "img-1");
+}
+
 TEST_CASE("HttpServer ready status reports healthy distributed decode pool",
           "[http_server]") {
   SimpleTokenizer tokenizer;

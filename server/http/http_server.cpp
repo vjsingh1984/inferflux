@@ -211,6 +211,10 @@ struct CompletionRequestPayload {
   int best_of{1};
 };
 
+std::string FlattenMessages(const std::vector<ChatMessage> &messages);
+std::string BuildToolSystemPrompt(const std::vector<Tool> &tools,
+                                  const std::string &forced_function_name);
+
 HttpRequestMetadata ResolveHttpRequestMetadata(
     const CompletionRequestPayload &payload, const std::string &headers) {
   HttpRequestMetadata metadata;
@@ -230,14 +234,98 @@ HttpRequestMetadata ResolveHttpRequestMetadata(
   return metadata;
 }
 
-void ApplyHttpRequestMetadata(const HttpRequestMetadata &metadata,
-                              InferenceRequest *request) {
-  if (!request) {
-    return;
+struct ResolvedGenerationPrompt {
+  std::string prompt;
+};
+
+HttpGenerationRequestEnvelopeInput BuildGenerationRequestEnvelopeInput(
+    CompletionRequestPayload &payload, std::string prompt, int priority) {
+  HttpGenerationRequestEnvelopeInput input;
+  input.prompt = std::move(prompt);
+  input.model = payload.model;
+  input.priority = priority;
+  input.max_tokens = payload.max_tokens;
+  input.stream = payload.stream;
+  input.json_mode = payload.json_mode;
+  if (payload.has_response_format) {
+    input.has_response_format = true;
+    input.response_format_type = payload.response_format_type;
+    input.response_format_schema = payload.response_format_schema;
+    input.response_format_grammar = payload.response_format_grammar;
+    input.response_format_root = payload.response_format_root;
   }
-  request->session_id = metadata.session_id;
-  request->client_request_id = metadata.client_request_id;
-  request->trace_id = metadata.trace_id;
+  if (payload.logprobs) {
+    input.collect_logprobs = true;
+    input.logprob_top_n = payload.top_logprobs;
+  }
+  input.sampling = {payload.temperature,
+                    payload.top_p,
+                    payload.top_k,
+                    payload.min_p,
+                    payload.frequency_penalty,
+                    payload.presence_penalty,
+                    payload.repetition_penalty,
+                    /*penalty_last_n=*/64,
+                    payload.seed,
+                    payload.logit_bias};
+  input.stop = payload.stop;
+  if (payload.has_images) {
+    input.has_images = true;
+    input.images = std::move(payload.images);
+  }
+  return input;
+}
+
+ResolvedGenerationPrompt ResolveGenerationPrompt(
+    const CompletionRequestPayload &payload, bool use_tools, Scheduler *scheduler,
+    const std::function<void(const std::string &)> &log_tool_event) {
+  ResolvedGenerationPrompt result;
+
+  if (payload.prompt.empty() && !payload.messages.empty() && scheduler) {
+    auto *router = scheduler->Router();
+    if (router) {
+      auto *info = router->Resolve(payload.model);
+      if (info) {
+        auto backend = router->GetBackend(info->id);
+        if (backend && backend->IsReady()) {
+          std::vector<std::pair<std::string, std::string>> msgs;
+          if (use_tools && !payload.tools.empty()) {
+            msgs.push_back({"system", BuildToolSystemPrompt(
+                                          payload.tools,
+                                          payload.tool_choice_function)});
+          }
+          for (const auto &message : payload.messages) {
+            if (!message.role.empty() || !message.content.empty()) {
+              msgs.push_back({message.role, message.content});
+            }
+          }
+          auto tmpl = backend->FormatChatMessages(
+              msgs, /*add_assistant_prefix=*/true);
+          if (tmpl.valid) {
+            result.prompt = tmpl.prompt;
+            if (log_tool_event) {
+              log_tool_event("native_template=true msgs=" +
+                             std::to_string(msgs.size()));
+            }
+            return result;
+          }
+        }
+      }
+    }
+  }
+
+  if (!payload.prompt.empty()) {
+    result.prompt = payload.prompt;
+  } else if (!payload.messages.empty()) {
+    result.prompt = FlattenMessages(payload.messages);
+  }
+  if (use_tools && !payload.tools.empty()) {
+    std::string tool_prefix =
+        BuildToolSystemPrompt(payload.tools, payload.tool_choice_function);
+    result.prompt =
+        result.prompt.empty() ? tool_prefix : tool_prefix + "\n" + result.prompt;
+  }
+  return result;
 }
 
 json BuildCapabilitiesJson(const BackendCapabilities &capabilities) {
@@ -2602,54 +2690,6 @@ void HttpServer::HandleClient(ClientSession &session) {
     const HttpRequestMetadata request_metadata =
         ResolveHttpRequestMetadata(parsed, headers);
 
-    InferenceRequest req;
-    // Note: req.prompt is set below after the tool/template block which
-    // handles both the messages chat path and the direct prompt path.
-    if (parsed.max_tokens > 0) {
-      req.max_tokens = parsed.max_tokens;
-    }
-    req.model = parsed.model;
-    ApplyHttpRequestMetadata(request_metadata, &req);
-    req.json_mode = parsed.json_mode;
-    if (parsed.has_response_format) {
-      req.has_response_format = true;
-      req.response_format_type = parsed.response_format_type;
-      req.response_format_schema = parsed.response_format_schema;
-      req.response_format_grammar = parsed.response_format_grammar;
-      req.response_format_root = parsed.response_format_root;
-    }
-    req.stream = parsed.stream;
-    if (parsed.logprobs) {
-      req.collect_logprobs = true;
-      // top_logprobs=0 means selected-token logprob only (no alternatives).
-      // CollectLogprob skips the O(V log V) partial-sort when top_n==0.
-      req.logprob_top_n = parsed.top_logprobs; // 0-20, already clamped above
-    }
-
-    // Sampling parameters (temperature, top_p, top_k, etc.).
-    req.sampling = {parsed.temperature,
-                    parsed.top_p,
-                    parsed.top_k,
-                    parsed.min_p,
-                    parsed.frequency_penalty,
-                    parsed.presence_penalty,
-                    parsed.repetition_penalty,
-                    /*penalty_last_n=*/64,
-                    parsed.seed,
-                    parsed.logit_bias};
-
-    // Stop sequences.
-    req.stop = parsed.stop;
-
-    // §2.2: attach decoded images (populated when messages contain image_url
-    // parts).
-    if (parsed.has_images) {
-      req.has_images = true;
-      req.images = std::move(parsed.images);
-      GlobalMetrics().RecordImagePreprocess(static_cast<int>(req.images.size()),
-                                            0.0);
-    }
-
     // §2.3: tool schema injection + model-native chat template formatting.
     bool use_tools = (parsed.has_tool_schema || !parsed.tools.empty()) &&
                      parsed.tool_choice != "none";
@@ -2663,65 +2703,17 @@ void HttpServer::HandleClient(ClientSession &session) {
                    " choice=" + parsed.tool_choice);
     }
 
-    // §2.3 model-native chat template path.
-    // When a real model is loaded and the request came as a chat messages
-    // array, format the conversation using the model's built-in template
-    // (llama_chat_apply_template).  Tool definitions are injected as the first
-    // system message so the model-specific role tokens wrap them correctly.
-    // When no model is available (stub mode) or the template is unsupported, we
-    // fall back to FlattenMessages + BuildToolSystemPrompt (existing
-    // behaviour).
-    bool use_native_template = false;
-    if (parsed.prompt.empty() && !parsed.messages.empty()) {
-      auto *router = scheduler_->Router();
-      if (router) {
-        auto *info = router->Resolve(parsed.model);
-        if (info) {
-          auto backend = router->GetBackend(info->id);
-          if (backend && backend->IsReady()) {
-            // Build message list: prepend tool schema as system message if
-            // needed.
-            std::vector<std::pair<std::string, std::string>> msgs;
-            if (use_tools && !parsed.tools.empty()) {
-              msgs.push_back(
-                  {"system", BuildToolSystemPrompt(
-                                 parsed.tools, parsed.tool_choice_function)});
-            }
-            for (const auto &m : parsed.messages) {
-              if (!m.role.empty() || !m.content.empty()) {
-                msgs.push_back({m.role, m.content});
-              }
-            }
-            auto tmpl = backend->FormatChatMessages(
-                msgs, /*add_assistant_prefix=*/true);
-            if (tmpl.valid) {
-              req.prompt = tmpl.prompt;
-              use_native_template = true;
-              LogToolEvent("native_template=true msgs=" +
-                           std::to_string(msgs.size()));
-            }
-          }
-        }
-      }
+    auto prompt_result = ResolveGenerationPrompt(parsed, use_tools, scheduler_,
+                                                 LogToolEvent);
+    InferenceRequest req = BuildGenerationRequestEnvelope(
+        BuildGenerationRequestEnvelopeInput(
+            parsed, std::move(prompt_result.prompt),
+            static_cast<int>(auth_ctx.scopes.count("admin") ? 10 : 0)),
+        request_metadata);
+    if (req.has_images) {
+      GlobalMetrics().RecordImagePreprocess(static_cast<int>(req.images.size()),
+                                            0.0);
     }
-
-    if (!use_native_template) {
-      // Fallback: flat concatenation + preamble injection (stub / unsupported
-      // template models).
-      if (!parsed.prompt.empty()) {
-        req.prompt = parsed.prompt;
-      } else if (!parsed.messages.empty()) {
-        req.prompt = FlattenMessages(parsed.messages);
-      }
-      if (use_tools && !parsed.tools.empty()) {
-        std::string tool_prefix =
-            BuildToolSystemPrompt(parsed.tools, parsed.tool_choice_function);
-        req.prompt =
-            req.prompt.empty() ? tool_prefix : tool_prefix + "\n" + req.prompt;
-      }
-    }
-
-    req.priority = static_cast<int>(auth_ctx.scopes.count("admin") ? 10 : 0);
     if (req.prompt.empty()) {
       auto payload =
           BuildResponse(BuildErrorBody("prompt or messages are required"), 400,
