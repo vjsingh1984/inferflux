@@ -154,28 +154,48 @@ TEST_CASE("NativeExecutionPolicy loads hot-path policy from env",
           "[native_forward]") {
   ScopedEnvVar enable_batched("INFERFLUX_ENABLE_BATCHED_DECODE", "1");
   ScopedEnvVar disable_graph("INFERFLUX_DISABLE_CUDA_GRAPH", "1");
+  ScopedEnvVar phase_timing("INFERFLUX_NATIVE_PHASE_TIMING", "1");
   ScopedEnvVar force_cublas("INFERFLUX_FORCE_CUBLAS", "1");
   ScopedEnvVar disable_packed("INFERFLUX_DISABLE_PREPACKED_ACTIVATIONS", "1");
   ScopedEnvVar disable_q81("INFERFLUX_DISABLE_Q8_1_ACTIVATIONS", "1");
   ScopedEnvVar disable_fused("INFERFLUX_DISABLE_FUSED_GEMV", "1");
+  ScopedEnvVar debug_decode_mapping("INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING",
+                                    "1");
+  ScopedEnvVar debug_decode_mapping_limit(
+      "INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING_LIMIT", "21");
+  ScopedEnvVar debug_logits("INFERFLUX_DEBUG_LOGITS", "1");
+  ScopedEnvVar debug_logits_limit("INFERFLUX_DEBUG_LOGITS_LIMIT", "13");
+  ScopedEnvVar require_fused("INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL", "1");
+  ScopedEnvVar dequant_policy("INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY",
+                              "batch");
   ScopedEnvVar grouped_hot("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K",
                            "1");
   ScopedEnvVar downproj_hot(
       "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1");
   ScopedEnvVar enable_mmq("INFERFLUX_ENABLE_DOWNPROJ_MMQ", "1");
   ScopedEnvVar mmq_min_batch("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", "7");
+  ScopedEnvVar timing_sample_rate("INFERFLUX_NATIVE_TIMING_SAMPLE_RATE", "9");
 
   const auto policy = NativeExecutionPolicy::FromEnv();
   REQUIRE(policy.enable_batched_decode);
   REQUIRE(policy.disable_cuda_graph);
+  REQUIRE(policy.phase_timing_enabled);
   REQUIRE(policy.force_cublas);
   REQUIRE(policy.disable_prepacked_activations);
   REQUIRE(policy.disable_q81_activations);
   REQUIRE(policy.disable_fused_gemv);
+  REQUIRE(policy.debug_decode_mapping);
+  REQUIRE(policy.debug_decode_mapping_limit == 21);
+  REQUIRE(policy.debug_logits);
+  REQUIRE(policy.debug_logits_limit == 13);
   REQUIRE(policy.enable_experimental_q81_grouped_hot_q4k);
   REQUIRE(policy.enable_experimental_q81_downproj_hot_fixed);
   REQUIRE(policy.enable_downproj_mmq);
   REQUIRE(policy.downproj_mmq_min_batch_override == 7);
+  REQUIRE(policy.timing_sample_rate == 9);
+  REQUIRE(policy.require_fused_quantized_matmul_override);
+  REQUIRE(policy.require_fused_quantized_matmul);
+  REQUIRE(policy.dequantized_cache_policy_override == "batch");
 }
 
 TEST_CASE("NativeKernelExecutor: ExecuteUnifiedBatch returns empty when no "

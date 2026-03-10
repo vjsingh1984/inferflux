@@ -16,8 +16,16 @@ struct NativeExecutionPolicy {
   bool disable_prepacked_activations{false};
   bool disable_q81_activations{false};
   bool disable_fused_gemv{false};
+  bool debug_decode_mapping{false};
+  int debug_decode_mapping_limit{32};
+  bool debug_logits{false};
+  int debug_logits_limit{64};
   bool debug_operator_selection{false};
   int debug_operator_selection_limit{64};
+  int timing_sample_rate{0};
+  bool require_fused_quantized_matmul_override{false};
+  bool require_fused_quantized_matmul{false};
+  std::string dequantized_cache_policy_override;
   bool enable_experimental_q81_triple_rowpair{false};
   bool enable_experimental_q81_downproj_hot_fixed{false};
   bool enable_experimental_q81_grouped_hot_q4k{false};
@@ -31,7 +39,7 @@ struct NativeExecutionPolicy {
     policy.disable_cuda_graph =
         ParseBoolEnv("INFERFLUX_DISABLE_CUDA_GRAPH", false);
     policy.phase_timing_enabled =
-        std::getenv("INFERFLUX_NATIVE_PHASE_TIMING") != nullptr;
+        ParseBoolEnv("INFERFLUX_NATIVE_PHASE_TIMING", false);
     policy.force_cublas = ParseBoolEnv("INFERFLUX_FORCE_CUBLAS", false);
     policy.disable_prepacked_activations =
         ParseBoolEnv("INFERFLUX_DISABLE_PREPACKED_ACTIVATIONS", false);
@@ -39,11 +47,32 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_DISABLE_Q8_1_ACTIVATIONS", false);
     policy.disable_fused_gemv =
         ParseBoolEnv("INFERFLUX_DISABLE_FUSED_GEMV", false);
+    policy.debug_decode_mapping =
+        ParseBoolEnv("INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING", false);
+    policy.debug_decode_mapping_limit =
+        ParseIntEnv("INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING_LIMIT", 32, 1,
+                    std::numeric_limits<int>::max());
+    policy.debug_logits = ParseBoolEnv("INFERFLUX_DEBUG_LOGITS", false);
+    policy.debug_logits_limit =
+        ParseIntEnv("INFERFLUX_DEBUG_LOGITS_LIMIT", 64, 1,
+                    std::numeric_limits<int>::max());
     policy.debug_operator_selection =
         ParseBoolEnv("INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION", false);
     policy.debug_operator_selection_limit =
         ParseIntEnv("INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION_LIMIT", 64, 1,
                     std::numeric_limits<int>::max());
+    policy.timing_sample_rate =
+        ParseIntEnv("INFERFLUX_NATIVE_TIMING_SAMPLE_RATE", 0, 0,
+                    std::numeric_limits<int>::max());
+    if (std::getenv("INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL")) {
+      policy.require_fused_quantized_matmul_override = true;
+      policy.require_fused_quantized_matmul =
+          ParseBoolEnv("INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL", false);
+    }
+    if (const char *dequant_override =
+            std::getenv("INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY")) {
+      policy.dequantized_cache_policy_override = dequant_override;
+    }
     policy.enable_experimental_q81_triple_rowpair = ParseBoolEnv(
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_TRIPLE_ROWPAIR", false);
     policy.enable_experimental_q81_downproj_hot_fixed = ParseBoolEnv(

@@ -149,70 +149,52 @@ bool ParseBoolSetting(const char *raw, bool fallback) {
   return inferflux::ParseBool(raw);
 }
 
-bool DecodeMappingDebugEnabled() {
-  static const bool enabled =
-      std::getenv("INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING") != nullptr;
-  return enabled;
+bool DecodeMappingDebugEnabled(
+    const inferflux::NativeExecutionPolicy &policy) {
+  return policy.debug_decode_mapping;
 }
 
-bool ConsumeDecodeMappingBudget() {
-  static const int initial_budget = [] {
-    int parsed = 32;
-    if (const char *env =
-            std::getenv("INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING_LIMIT")) {
-      int value = 0;
-      if (ParsePositiveIntSetting(env, &value)) {
-        parsed = value;
-      }
-    }
-    return parsed;
-  }();
-  static std::atomic<int> remaining(initial_budget);
-  int current = remaining.load(std::memory_order_relaxed);
-  while (current > 0) {
-    if (remaining.compare_exchange_weak(current, current - 1,
-                                        std::memory_order_relaxed,
-                                        std::memory_order_relaxed)) {
-      return true;
-    }
+bool ConsumeDecodeMappingBudget(
+    const inferflux::NativeExecutionPolicy &policy) {
+  static thread_local int last_limit = -1;
+  static thread_local int remaining = 0;
+  if (policy.debug_decode_mapping_limit != last_limit) {
+    last_limit = policy.debug_decode_mapping_limit;
+    remaining = policy.debug_decode_mapping_limit;
   }
-  return false;
-}
-
-bool NativeLogitsDebugEnabled() {
-  static const bool enabled = std::getenv("INFERFLUX_DEBUG_LOGITS") != nullptr;
-  return enabled;
-}
-
-bool ConsumeNativeLogitsBudget() {
-  static const int initial_budget = [] {
-    int parsed = 64;
-    if (const char *env = std::getenv("INFERFLUX_DEBUG_LOGITS_LIMIT")) {
-      int value = 0;
-      if (ParsePositiveIntSetting(env, &value)) {
-        parsed = value;
-      }
-    }
-    return parsed;
-  }();
-  static std::atomic<int> remaining(initial_budget);
-  int current = remaining.load(std::memory_order_relaxed);
-  while (current > 0) {
-    if (remaining.compare_exchange_weak(current, current - 1,
-                                        std::memory_order_relaxed,
-                                        std::memory_order_relaxed)) {
-      return true;
-    }
+  if (remaining <= 0) {
+    return false;
   }
-  return false;
+  --remaining;
+  return true;
+}
+
+bool NativeLogitsDebugEnabled(const inferflux::NativeExecutionPolicy &policy) {
+  return policy.debug_logits;
+}
+
+bool ConsumeNativeLogitsBudget(
+    const inferflux::NativeExecutionPolicy &policy) {
+  static thread_local int last_limit = -1;
+  static thread_local int remaining = 0;
+  if (policy.debug_logits_limit != last_limit) {
+    last_limit = policy.debug_logits_limit;
+    remaining = policy.debug_logits_limit;
+  }
+  if (remaining <= 0) {
+    return false;
+  }
+  --remaining;
+  return true;
 }
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
 void LogNativeTopLogits(std::string_view stage, const float *d_logits_row,
                         int vocab_size, int64_t request_id,
                         std::string_view client_request_id, int sequence_id,
-                        uint64_t sequence_generation, int n_past) {
-  if (!NativeLogitsDebugEnabled() || !ConsumeNativeLogitsBudget() ||
+                        uint64_t sequence_generation, int n_past,
+                        const inferflux::NativeExecutionPolicy &policy) {
+  if (!NativeLogitsDebugEnabled(policy) || !ConsumeNativeLogitsBudget(policy) ||
       !d_logits_row || vocab_size <= 0) {
     return;
   }
@@ -263,8 +245,10 @@ void LogSampleMapping(std::string_view stage, int input_idx, int64_t request_id,
                       std::string_view client_request_id, int sequence_id,
                       uint64_t sequence_generation, int n_past, int token_count,
                       int token_id,
-                      const inferflux::ITokenizer *tokenizer) {
-  if (!DecodeMappingDebugEnabled() || !ConsumeDecodeMappingBudget()) {
+                      const inferflux::ITokenizer *tokenizer,
+                      const inferflux::NativeExecutionPolicy &policy) {
+  if (!DecodeMappingDebugEnabled(policy) ||
+      !ConsumeDecodeMappingBudget(policy)) {
     return;
   }
   const std::string piece =
@@ -1717,18 +1701,13 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     }
   }
 
-  // 9. Read timing sample-rate from environment.
-  //    0 or negative → disable event recording entirely (max throughput).
-  //    N > 0         → record events every Nth batch (default 0 = disabled).
-  {
-    const char *env = std::getenv("INFERFLUX_NATIVE_TIMING_SAMPLE_RATE");
-    if (env) {
-      timing_sample_rate_ = std::atoi(env);
-      log::Info("native_kernel_executor",
-                "Timing sample rate: " + std::to_string(timing_sample_rate_) +
-                    (timing_sample_rate_ <= 0 ? " (disabled)" : ""));
-    }
-  }
+  // 9. Read timing sample-rate from NativeExecutionPolicy.
+  //    0 → disable event recording entirely (max throughput).
+  //    N > 0 → record events every Nth batch.
+  timing_sample_rate_ = execution_policy_.timing_sample_rate;
+  log::Info("native_kernel_executor",
+            "Timing sample rate: " + std::to_string(timing_sample_rate_) +
+                (timing_sample_rate_ <= 0 ? " (disabled)" : ""));
 
   // Create cudaEvent pairs for forward/sampling timing
   if (timing_sample_rate_ > 0) {
@@ -1797,20 +1776,19 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   dequantized_cache_policy_hint_ = config.native_dequantized_cache_policy;
   require_fused_quantized_matmul_ =
       config.native_require_fused_quantized_matmul;
+  execution_policy_ = NativeExecutionPolicy::FromEnv();
   quantized_matmul_mode_ =
       runtime::cuda::native::MatmulExecutionMode::kFusedDequantTileGemm;
   quantized_matmul_strategy_id_ = "matmul.fused.dequant_tile_gemm.v1";
-  if (const char *env_require_fused =
-          std::getenv("INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL")) {
+  if (execution_policy_.require_fused_quantized_matmul_override) {
     require_fused_quantized_matmul_ =
-        ParseBoolSetting(env_require_fused, require_fused_quantized_matmul_);
+        execution_policy_.require_fused_quantized_matmul;
   }
-  if (const char *env_dequant_policy =
-          std::getenv("INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY")) {
-    dequantized_cache_policy_hint_ = env_dequant_policy;
+  if (!execution_policy_.dequantized_cache_policy_override.empty()) {
+    dequantized_cache_policy_hint_ =
+        execution_policy_.dequantized_cache_policy_override;
   }
   ConfigureDequantizedCachePolicy(dequantized_cache_policy_hint_);
-  execution_policy_ = NativeExecutionPolicy::FromEnv();
   log::Info(
       "native_kernel_executor",
       "Phase overlap: " +
@@ -2082,12 +2060,12 @@ NativeKernelExecutor::ExecuteLaneBatch(
           std::chrono::duration<double, std::milli>(sample_end - sample_start)
               .count();
 
-      if (DecodeMappingDebugEnabled()) {
+      if (DecodeMappingDebugEnabled(execution_policy_)) {
         log::Info("native_kernel_executor",
                   "decode_mapping[lane]: batch_size=" + std::to_string(B) +
                       ", batch_offset=" + std::to_string(offset));
         for (int b = 0; b < B; ++b) {
-          if (!ConsumeDecodeMappingBudget()) {
+          if (!ConsumeDecodeMappingBudget(execution_policy_)) {
             break;
           }
           const auto &entry = decode_group[offset + static_cast<size_t>(b)];
@@ -2171,7 +2149,8 @@ NativeKernelExecutor::ExecuteLaneBatch(
       LogSampleMapping("sample_mapping[lane_prefill]", idx, input.request_id,
                        input.client_request_id, input.sequence_id,
                        input.sequence_generation,
-                       input.n_past, token_count, token_id, tokenizer_.get());
+                       input.n_past, token_count, token_id, tokenizer_.get(),
+                       execution_policy_);
 
       if (tokenizer_ && tokenizer_->IsTerminalGeneratedToken(token_id)) {
         output.token = -1;
@@ -2626,25 +2605,25 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
                             batch_top_ps, batch_seeds, &sampled_tokens);
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-      if (NativeLogitsDebugEnabled()) {
+      if (NativeLogitsDebugEnabled(execution_policy_)) {
         for (int b = 0; b < B; ++b) {
           const auto &entry = decode_group[offset + static_cast<size_t>(b)];
           LogNativeTopLogits("primary",
                              d_logits_ + b * model_config_.vocab_size,
                              model_config_.vocab_size,
                              entry.request_id, entry.client_request_id,
-                             entry.sequence_id,
-                             entry.sequence_generation, entry.n_past);
+                             entry.sequence_id, entry.sequence_generation,
+                             entry.n_past, execution_policy_);
         }
       }
 #endif
 
-      if (DecodeMappingDebugEnabled()) {
+      if (DecodeMappingDebugEnabled(execution_policy_)) {
         log::Info("native_kernel_executor",
                   "decode_mapping[primary]: batch_size=" + std::to_string(B) +
                       ", batch_offset=" + std::to_string(offset));
         for (int b = 0; b < B; ++b) {
-          if (!ConsumeDecodeMappingBudget()) {
+          if (!ConsumeDecodeMappingBudget(execution_policy_)) {
             break;
           }
           const auto &entry = decode_group[offset + static_cast<size_t>(b)];
@@ -2777,10 +2756,11 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
           input.sampling.top_p, input.sampling.seed);
       // Sample() already synchronizes the stream before returning
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-      LogNativeTopLogits("primary_prefill", d_logits_, model_config_.vocab_size,
-                         input.request_id, input.client_request_id,
-                         input.sequence_id,
-                         input.sequence_generation, input.n_past);
+      LogNativeTopLogits("primary_prefill", d_logits_,
+                         model_config_.vocab_size, input.request_id,
+                         input.client_request_id, input.sequence_id,
+                         input.sequence_generation, input.n_past,
+                         execution_policy_);
 #endif
       if (record_prefill_timing) {
         cudaEventRecord(sampling_stop_, compute_stream_);
@@ -2829,7 +2809,8 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       LogSampleMapping("sample_mapping[primary_prefill]", idx, input.request_id,
                        input.client_request_id, input.sequence_id,
                        input.sequence_generation,
-                       input.n_past, batch_tokens, token_id, tokenizer_.get());
+                       input.n_past, batch_tokens, token_id, tokenizer_.get(),
+                       execution_policy_);
       output.ok = true;
     }
   }

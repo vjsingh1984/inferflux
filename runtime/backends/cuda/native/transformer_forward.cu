@@ -45,6 +45,9 @@ std::string ProjectionGroupQuantLabel(const QuantizedWeightInfo &first,
   return "mixed";
 }
 
+const NativeExecutionPolicy &
+ResolveForwardPolicy(const NativeExecutionPolicy *policy);
+
 // Phase timing: sync-based per-phase breakdown when
 // INFERFLUX_NATIVE_PHASE_TIMING=1 Serializes GPU pipeline — for
 // debugging/profiling only, not production.
@@ -101,9 +104,9 @@ struct PhaseTiming {
 // Debug: dump top-K logits to stderr when INFERFLUX_DEBUG_LOGITS=1
 void DebugDumpLogits(const float *d_logits, int vocab_size,
                      const std::vector<int> &token_ids, int n_past,
-                     cudaStream_t stream) {
-  static const bool enabled = std::getenv("INFERFLUX_DEBUG_LOGITS") != nullptr;
-  if (!enabled)
+                     cudaStream_t stream,
+                     const NativeExecutionPolicy *policy = nullptr) {
+  if (!ResolveForwardPolicy(policy).debug_logits)
     return;
   constexpr int TOP_N = 10;
   std::vector<float> h_logits(vocab_size);
@@ -141,9 +144,9 @@ void DebugDumpLogits(const float *d_logits, int vocab_size,
 
 // Debug: dump hidden state stats
 void DebugDumpHidden(const char *label, const void *d_data, int count,
-                     cudaStream_t stream) {
-  static const bool enabled = std::getenv("INFERFLUX_DEBUG_LOGITS") != nullptr;
-  if (!enabled)
+                     cudaStream_t stream,
+                     const NativeExecutionPolicy *policy = nullptr) {
+  if (!ResolveForwardPolicy(policy).debug_logits)
     return;
   // Read as half, convert to float
   std::vector<half> h_data(count);
@@ -1159,7 +1162,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
   }
 
   DebugDumpHidden("after_embedding", d_hidden_, seq_len * hidden_size_,
-                  stream_);
+                  stream_, &execution_policy_);
 
   // Step 3: Copy to residual stream
   err = cudaMemcpyAsync(d_residual_, d_hidden_,
@@ -1332,9 +1335,11 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
     if (layer == 0) {
       DebugDumpHidden("layer0_after_q_proj", d_q_,
-                      seq_len * num_heads_ * head_dim_, stream_);
+                      seq_len * num_heads_ * head_dim_, stream_,
+                      &execution_policy_);
       DebugDumpHidden("layer0_after_k_proj", d_k_new_,
-                      seq_len * num_kv_heads_ * head_dim_, stream_);
+                      seq_len * num_kv_heads_ * head_dim_, stream_,
+                      &execution_policy_);
     }
 
     // 4e: RoPE in-place
@@ -1740,7 +1745,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       return false;
     }
 
-    DebugDumpLogits(d_logits, vocab_size_, token_ids, n_past, stream_);
+    DebugDumpLogits(d_logits, vocab_size_, token_ids, n_past, stream_,
+                    &execution_policy_);
     pt.lm_head_ms += pt.Mark();
   }
 

@@ -349,7 +349,7 @@ private:
   cudaEvent_t sampling_stop_{nullptr};
 
   // Timing sample rate: 0 = disabled, N>0 = record every Nth batch.
-  // Controlled by INFERFLUX_NATIVE_TIMING_SAMPLE_RATE env var.
+  // Loaded through NativeExecutionPolicy during model initialization.
   int timing_sample_rate_{0};
   int timing_batch_counter_{0};
   NativeExecutionPolicy execution_policy_{};
