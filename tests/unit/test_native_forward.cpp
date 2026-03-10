@@ -5095,6 +5095,29 @@ TEST_CASE("NativeLinearExecutor: FFN helper falls back from Q8_1 to packed "
   REQUIRE(summary.actual_op == FusedQuantGemm::FfnProjOperator::kPackedGroup);
 }
 
+TEST_CASE("NativeLinearExecutor: normalized projection helper computes norm "
+          "once before dense fallback",
+          "[native_forward]") {
+  std::vector<std::string> calls;
+  bool norm_computed = false;
+
+  const bool ok = ExecuteNativeNormalizedProjectionStage(
+      [&]() { return false; }, &norm_computed,
+      [&]() {
+        calls.emplace_back("norm");
+        return true;
+      },
+      [&]() { return false; },
+      [&]() {
+        calls.emplace_back("dense");
+        return true;
+      });
+
+  REQUIRE(ok);
+  REQUIRE(norm_computed);
+  REQUIRE(calls == std::vector<std::string>{"norm", "dense"});
+}
+
 TEST_CASE("NativeLinearExecutor: grouped projection helper uses packed path "
           "before generic fallback",
           "[native_forward]") {

@@ -21,6 +21,30 @@ struct NativeGroupedProjectionSummary {
   bool used_packed{false};
 };
 
+template <typename TryFusedRmsNormFn, typename EnsureNormFn,
+          typename TryFusedGemvFn, typename DenseFallbackFn>
+bool ExecuteNativeNormalizedProjectionStage(
+    TryFusedRmsNormFn &&try_fused_rmsnorm_gemv, bool *norm_computed,
+    EnsureNormFn &&ensure_norm, TryFusedGemvFn &&try_fused_gemv,
+    DenseFallbackFn &&run_dense_fallback) {
+  if (std::forward<TryFusedRmsNormFn>(try_fused_rmsnorm_gemv)()) {
+    return true;
+  }
+
+  if (!*norm_computed) {
+    if (!std::forward<EnsureNormFn>(ensure_norm)()) {
+      return false;
+    }
+    *norm_computed = true;
+  }
+
+  if (std::forward<TryFusedGemvFn>(try_fused_gemv)()) {
+    return true;
+  }
+
+  return std::forward<DenseFallbackFn>(run_dense_fallback)();
+}
+
 template <typename TryQ81Fn, typename TryPackedFn, typename FallbackFn>
 bool ExecuteNativeGroupedProjectionStage(TryQ81Fn &&try_q81_group,
                                          TryPackedFn &&try_packed_group,
