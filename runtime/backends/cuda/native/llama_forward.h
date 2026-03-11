@@ -171,17 +171,11 @@ private:
   int *h_batch_seq_ids_{nullptr};
   int *h_batch_kv_lens_{nullptr};
 
-  // Bulk KV pointer arrays for all layers (eliminates per-layer H2D copies)
-  void **d_all_append_ptrs_meta_{nullptr}; // [2 * num_layers * max_batch_size]
-  void **d_all_k_append_ptrs_{nullptr};    // T** view
-  void **d_all_v_append_ptrs_{nullptr};    // T** view
+  // Bulk KV read pointer arrays for all layers (CUDA graph capture)
   const void
       **d_all_read_ptrs_meta_{nullptr};   // [2 * num_layers * max_batch_size]
   const void **d_all_k_read_ptrs_{nullptr}; // const T** view
   const void **d_all_v_read_ptrs_{nullptr}; // const T** view
-  void **h_all_append_ptrs_meta_{nullptr};
-  void **h_all_k_append_ptrs_{nullptr};
-  void **h_all_v_append_ptrs_{nullptr};
   const void **h_all_read_ptrs_meta_{nullptr};
   const void **h_all_k_read_ptrs_{nullptr};
   const void **h_all_v_read_ptrs_{nullptr};

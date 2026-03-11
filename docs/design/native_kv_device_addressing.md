@@ -68,6 +68,15 @@ Implementation:
    - `dst = base + n_past * kv_dim`
 3. Delete the append host slab and its H2D upload.
 
+Status:
+
+- implemented
+- `BatchedKvAppendStrided(...)` now derives append addresses on device from
+  `kv_buffer + seq_id/stride + layer/stride + n_past`
+- native `BatchForward()` no longer builds or uploads append pointer slabs
+- CUDA tests cover both the isolated strided append kernel and the synthetic
+  batched decode pipeline
+
 Why first:
 
 - append path is simpler than FlashDecode
@@ -116,6 +125,26 @@ Before rollout:
 3. Profiling:
    - steady-state native `cudaMemcpyAsync` count drops again
    - no new steady-state `cudaMalloc/cudaFree`
+
+## Current Evidence
+
+Phase A correctness is now covered by:
+
+1. `./build-cuda/inferflux_tests "[batched_decode]"`
+2. the new `BatchedKvAppendStrided` parity test in
+   [test_batched_decode.cpp](/home/vsingh/code/inferflux/tests/unit/test_batched_decode.cpp)
+
+Short end-to-end benchmark after transplanting Phase A onto the source branch:
+
+- native: `104.2 tok/s`
+- `cuda_llama_cpp`: `127.8 tok/s`
+- exact match: `7/8`
+
+That means Phase A is a correctness/architecture cleanup first. It removes one
+class of host-built metadata and keeps the path graph-safe, but it does not yet
+prove a throughput win by itself. The next required proof step is steady-state
+profiling on this branch, then Phase B or deeper device-side KV address
+derivation if the copy-path delta is still material.
 
 ## Success Metric
 

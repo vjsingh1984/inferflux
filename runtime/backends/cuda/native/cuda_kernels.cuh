@@ -114,6 +114,21 @@ cudaError_t BatchedKvAppend(const T *k_new, const T *v_new, T **d_k_dst,
                             T **d_v_dst, int batch_size, int kv_dim,
                             cudaStream_t stream);
 
+/**
+ * BatchedKvAppendStrided: Scatter-copy K/V for B sequences into a regular KV
+ * cache layout derived on device.
+ * k_new/v_new layout: [B, kv_dim]
+ * kv_buffer layout: [max_batch][num_layers][2][max_seq_len][kv_dim]
+ * d_seq_ids/d_n_past: [B] sequence IDs and append positions on device.
+ */
+template <typename T>
+cudaError_t BatchedKvAppendStrided(const T *k_new, const T *v_new,
+                                   T *kv_buffer, const int *d_seq_ids,
+                                   const int *d_n_past, int layer,
+                                   int batch_size, int kv_dim,
+                                   size_t slot_stride, size_t layer_stride,
+                                   size_t kv_stride, cudaStream_t stream);
+
 // ============================================================================
 // Embedding extraction kernels
 // ============================================================================

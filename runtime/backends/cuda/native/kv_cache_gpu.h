@@ -66,6 +66,12 @@ public:
   void GetBatchKVPtrs(int layer, const int *seq_ids, int batch_size,
                       const T **h_k_ptrs, const T **h_v_ptrs) const;
 
+  T *Buffer() const { return buffer_; }
+  size_t SlotStride() const { return slot_stride_; }
+  size_t LayerStride() const { return layer_stride_; }
+  size_t KvStride() const { return kv_stride_; }
+  int KvDim() const { return kv_dim_; }
+
   void ClearSequence(int seq_id) override;
   void ClearSequenceAsync(int seq_id, cudaStream_t stream) override;
   bool CopySequencePrefix(int src_seq, int dst_seq, int n_tokens,

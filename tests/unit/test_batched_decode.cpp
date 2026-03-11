@@ -230,6 +230,57 @@ TEST_CASE("BatchedKvAppend scatters to correct destinations",
   cudaFree(d_v);
 }
 
+TEST_CASE("BatchedKvAppendStrided matches KV cache layout addressing",
+          "[batched_decode][cuda]") {
+  constexpr int num_layers = 2;
+  constexpr int num_kv_heads = 2;
+  constexpr int head_dim = 64;
+  constexpr int max_seq_len = 128;
+  constexpr int max_batch = 4;
+  constexpr int B = 4;
+  constexpr int layer = 1;
+  constexpr int kv_dim = num_kv_heads * head_dim;
+
+  KvCacheGpuTyped<half> cache;
+  REQUIRE(cache.Allocate(num_layers, num_kv_heads, head_dim, max_seq_len,
+                         max_batch));
+
+  std::vector<int> h_seq_ids = {0, 3, 1, 2};
+  std::vector<int> h_n_past = {0, 5, 7, 1};
+  auto h_k = MakeRandom(B * kv_dim, 0.45f);
+  auto h_v = MakeRandom(B * kv_dim, 0.25f);
+
+  half *d_k = ToDevice(h_k);
+  half *d_v = ToDevice(h_v);
+  int *d_seq_ids = ToDevice(h_seq_ids);
+  int *d_n_past = ToDevice(h_n_past);
+
+  cudaError_t err = cuda_kernel::BatchedKvAppendStrided<half>(
+      d_k, d_v, cache.Buffer(), d_seq_ids, d_n_past, layer, B, cache.KvDim(),
+      cache.SlotStride(), cache.LayerStride(), cache.KvStride(), nullptr);
+  REQUIRE(err == cudaSuccess);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  std::vector<half *> h_k_ptrs(B), h_v_ptrs(B);
+  cache.GetBatchAppendPtrs(layer, h_seq_ids.data(), h_n_past.data(), B,
+                           h_k_ptrs.data(), h_v_ptrs.data());
+  for (int b = 0; b < B; ++b) {
+    auto k_out = FromDevice(h_k_ptrs[b], kv_dim);
+    auto v_out = FromDevice(h_v_ptrs[b], kv_dim);
+    for (int d = 0; d < kv_dim; ++d) {
+      CHECK(__half2float(k_out[d]) ==
+            Catch::Approx(__half2float(h_k[b * kv_dim + d])).margin(1e-4f));
+      CHECK(__half2float(v_out[d]) ==
+            Catch::Approx(__half2float(h_v[b * kv_dim + d])).margin(1e-4f));
+    }
+  }
+
+  cudaFree(d_k);
+  cudaFree(d_v);
+  cudaFree(d_seq_ids);
+  cudaFree(d_n_past);
+}
+
 // ============================================================================
 // FlashDecodeMultiSeq: isolated test with synthetic data
 // ============================================================================
@@ -410,6 +461,7 @@ TEST_CASE("Batched decode pipeline runs without CUDA errors",
   half *d_v_new = AllocDevice<half>(B * kv_dim);
   half *d_attn_out = AllocDevice<half>(B * num_heads * head_dim);
   int *d_n_past = ToDevice(h_n_past);
+  int *d_seq_ids = ToDevice(h_seq_ids);
   int *d_kv_lens = nullptr;
   {
     std::vector<int> h_kv_lens(B);
@@ -444,32 +496,17 @@ TEST_CASE("Batched decode pipeline runs without CUDA errors",
     REQUIRE(err == cudaSuccess);
   }
 
-  // Step 2: BatchedKvAppend
+  // Step 2: BatchedKvAppendStrided
   {
-    // Compute append destination pointers
-    std::vector<half *> h_k_ap(B), h_v_ap(B);
-    cache.GetBatchAppendPtrs(0, h_seq_ids.data(), h_n_past.data(), B,
-                              h_k_ap.data(), h_v_ap.data());
-
-    half **d_k_ap = nullptr;
-    half **d_v_ap = nullptr;
-    REQUIRE(cudaMalloc(&d_k_ap, B * sizeof(half *)) == cudaSuccess);
-    REQUIRE(cudaMalloc(&d_v_ap, B * sizeof(half *)) == cudaSuccess);
-    REQUIRE(cudaMemcpy(d_k_ap, h_k_ap.data(), B * sizeof(half *),
-                       cudaMemcpyHostToDevice) == cudaSuccess);
-    REQUIRE(cudaMemcpy(d_v_ap, h_v_ap.data(), B * sizeof(half *),
-                       cudaMemcpyHostToDevice) == cudaSuccess);
-
-    cudaError_t err = cuda_kernel::BatchedKvAppend<half>(
-        d_k_new, d_v_new, d_k_ap, d_v_ap, B, kv_dim, nullptr);
-    INFO("BatchedKvAppend launch: " << cudaGetErrorString(err));
+    cudaError_t err = cuda_kernel::BatchedKvAppendStrided<half>(
+        d_k_new, d_v_new, cache.Buffer(), d_seq_ids, d_n_past, 0, B,
+        cache.KvDim(), cache.SlotStride(), cache.LayerStride(),
+        cache.KvStride(), nullptr);
+    INFO("BatchedKvAppendStrided launch: " << cudaGetErrorString(err));
     REQUIRE(err == cudaSuccess);
     err = cudaDeviceSynchronize();
-    INFO("BatchedKvAppend sync: " << cudaGetErrorString(err));
+    INFO("BatchedKvAppendStrided sync: " << cudaGetErrorString(err));
     REQUIRE(err == cudaSuccess);
-
-    cudaFree(d_k_ap);
-    cudaFree(d_v_ap);
   }
 
   // Step 3: FlashDecodeMultiSeq
@@ -517,6 +554,7 @@ TEST_CASE("Batched decode pipeline runs without CUDA errors",
   cudaFree(d_v_new);
   cudaFree(d_attn_out);
   cudaFree(d_n_past);
+  cudaFree(d_seq_ids);
   cudaFree(d_kv_lens);
 }
 

@@ -876,14 +876,8 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
                            &h_batch_n_past_, &h_batch_seq_ids_,
                            &h_batch_kv_lens_);
 
-  // Bulk KV pointer arrays for all layers (CUDA graph capture)
+  // Bulk KV read pointer arrays for all layers (CUDA graph capture)
   size_t kv_ptr_total = static_cast<size_t>(num_layers_) * bsz;
-  err = cudaMalloc(&d_all_append_ptrs_meta_, kv_ptr_total * 2 * sizeof(T *));
-  if (err != cudaSuccess)
-    return false;
-  device_workspace_bytes_ += kv_ptr_total * 2 * sizeof(T *);
-  AssignPointerPairViews(d_all_append_ptrs_meta_, kv_ptr_total,
-                         &d_all_k_append_ptrs_, &d_all_v_append_ptrs_);
   err = cudaMalloc(reinterpret_cast<void **>(&d_all_read_ptrs_meta_),
                    kv_ptr_total * 2 * sizeof(T *));
   if (err != cudaSuccess)
@@ -891,11 +885,6 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   device_workspace_bytes_ += kv_ptr_total * 2 * sizeof(T *);
   AssignPointerPairViews(d_all_read_ptrs_meta_, kv_ptr_total, &d_all_k_read_ptrs_,
                          &d_all_v_read_ptrs_);
-  if (!AllocatePinnedHostBuffer(&h_all_append_ptrs_meta_, kv_ptr_total * 2))
-    return false;
-  host_workspace_bytes_ += kv_ptr_total * 2 * sizeof(T *);
-  AssignPointerPairViews(h_all_append_ptrs_meta_, kv_ptr_total,
-                         &h_all_k_append_ptrs_, &h_all_v_append_ptrs_);
   if (!AllocatePinnedHostBuffer(&h_all_read_ptrs_meta_, kv_ptr_total * 2))
     return false;
   host_workspace_bytes_ += kv_ptr_total * 2 * sizeof(T *);
@@ -964,15 +953,9 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
       *ptr = nullptr;
     }
   };
-  free_void(reinterpret_cast<void **>(&d_all_append_ptrs_meta_));
-  d_all_k_append_ptrs_ = nullptr;
-  d_all_v_append_ptrs_ = nullptr;
   free_void(reinterpret_cast<void **>(&d_all_read_ptrs_meta_));
   d_all_k_read_ptrs_ = nullptr;
   d_all_v_read_ptrs_ = nullptr;
-  FreePinnedHostBuffer(&h_all_append_ptrs_meta_);
-  h_all_k_append_ptrs_ = nullptr;
-  h_all_v_append_ptrs_ = nullptr;
   FreePinnedHostBuffer(&h_all_read_ptrs_meta_);
   h_all_k_read_ptrs_ = nullptr;
   h_all_v_read_ptrs_ = nullptr;
@@ -1756,22 +1739,16 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
     return false;
   }
 
-  // ===== Phase 2: Bulk KV pointer pre-computation for all layers =====
-  // Replaces num_layers * 4 per-layer H2D copies with two fixed-address slab
-  // uploads: append pointers and read pointers.
+  // ===== Phase 2: Bulk KV read pointer pre-computation for all layers =====
+  // FlashDecode still consumes fixed-address read pointer slabs for graph-safe
+  // replay. KV append addresses are now derived on device from the regular KV
+  // layout, so only the read slab is built and uploaded here.
   auto *typed_cache =
       static_cast<KvCacheGpuTyped<T> *>(static_cast<IKvCacheGpu *>(kv_cache_));
   {
     const size_t layer_stride = static_cast<size_t>(max_batch_size_);
     const size_t total_slots = static_cast<size_t>(num_layers_) * layer_stride;
     for (int l = 0; l < num_layers_; l++) {
-      typed_cache->GetBatchAppendPtrs(l, h_batch_seq_ids_, h_batch_n_past_, B,
-                                      reinterpret_cast<T **>(
-                                          h_all_k_append_ptrs_ +
-                                          static_cast<size_t>(l) * layer_stride),
-                                      reinterpret_cast<T **>(
-                                          h_all_v_append_ptrs_ +
-                                          static_cast<size_t>(l) * layer_stride));
       typed_cache->GetBatchKVPtrs(
           l, h_batch_seq_ids_, B,
           reinterpret_cast<const T **>(
@@ -1780,12 +1757,6 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
               h_all_v_read_ptrs_ + static_cast<size_t>(l) * layer_stride));
     }
     const size_t ptr_bytes = total_slots * 2 * sizeof(T *);
-    err = cudaMemcpyAsync(d_all_append_ptrs_meta_, h_all_append_ptrs_meta_,
-                          ptr_bytes, cudaMemcpyHostToDevice, stream_);
-    if (err != cudaSuccess) {
-      log::Error("llama_forward", "BatchForward: append pointer upload failed");
-      return false;
-    }
     err = cudaMemcpyAsync(reinterpret_cast<void *>(d_all_read_ptrs_meta_),
                           reinterpret_cast<const void *>(h_all_read_ptrs_meta_),
                           ptr_bytes, cudaMemcpyHostToDevice, stream_);
@@ -2062,21 +2033,18 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       }
       pt.rope_ms += pt.Mark();
 
-      // KV append: index into pre-computed bulk pointer arrays
+      // KV append: derive K/V destinations on device from the regular KV
+      // layout using the already-uploaded seq_id and n_past metadata.
       {
         NVTX_SCOPE("KV_Append");
-        T **k_ap = reinterpret_cast<T **>(d_all_k_append_ptrs_ +
-                                          static_cast<size_t>(layer) *
-                                              max_batch_size_);
-        T **v_ap = reinterpret_cast<T **>(d_all_v_append_ptrs_ +
-                                          static_cast<size_t>(layer) *
-                                              max_batch_size_);
-        int kv_dim = num_kv_heads_ * head_dim_;
-        err = cuda_kernel::BatchedKvAppend<T>(d_k_new_, d_v_new_, k_ap, v_ap,
-                                              B, kv_dim, stream_);
+        err = cuda_kernel::BatchedKvAppendStrided<T>(
+            d_k_new_, d_v_new_, typed_cache->Buffer(), d_batch_seq_ids_,
+            d_batch_n_past_, layer, B, typed_cache->KvDim(),
+            typed_cache->SlotStride(), typed_cache->LayerStride(),
+            typed_cache->KvStride(), stream_);
         if (err != cudaSuccess) {
           log::Error("llama_forward",
-                     "BatchedKvAppend launch failed: " +
+                     "BatchedKvAppendStrided launch failed: " +
                          std::string(cudaGetErrorString(err)));
           return false;
         }

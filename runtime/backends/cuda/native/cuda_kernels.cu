@@ -630,6 +630,56 @@ BatchedKvAppend<__nv_bfloat16>(const __nv_bfloat16 *, const __nv_bfloat16 *,
                                 __nv_bfloat16 **, __nv_bfloat16 **, int, int,
                                 cudaStream_t);
 
+template <typename T>
+__global__ void BatchedKvAppendStridedKernel(
+    const T *__restrict__ k_new, const T *__restrict__ v_new,
+    T *__restrict__ kv_buffer, const int *__restrict__ d_seq_ids,
+    const int *__restrict__ d_n_past, int layer, int batch_size, int kv_dim,
+    size_t slot_stride, size_t layer_stride, size_t kv_stride) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch_size * kv_dim;
+  if (idx >= total) {
+    return;
+  }
+
+  const int b = idx / kv_dim;
+  const int d = idx % kv_dim;
+  const size_t layer_offset = static_cast<size_t>(layer) * layer_stride;
+  const size_t seq_offset = static_cast<size_t>(d_seq_ids[b]) * slot_stride;
+  const size_t token_offset =
+      static_cast<size_t>(d_n_past[b]) * kv_dim + static_cast<size_t>(d);
+  const size_t k_offset = seq_offset + layer_offset + token_offset;
+  const size_t v_offset = seq_offset + layer_offset + kv_stride + token_offset;
+
+  kv_buffer[k_offset] = k_new[idx];
+  kv_buffer[v_offset] = v_new[idx];
+}
+
+template <typename T>
+cudaError_t BatchedKvAppendStrided(const T *k_new, const T *v_new,
+                                   T *kv_buffer, const int *d_seq_ids,
+                                   const int *d_n_past, int layer,
+                                   int batch_size, int kv_dim,
+                                   size_t slot_stride, size_t layer_stride,
+                                   size_t kv_stride, cudaStream_t stream) {
+  const int total = batch_size * kv_dim;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  BatchedKvAppendStridedKernel<T>
+      <<<blocks, threads, 0, stream>>>(k_new, v_new, kv_buffer, d_seq_ids,
+                                       d_n_past, layer, batch_size, kv_dim,
+                                       slot_stride, layer_stride, kv_stride);
+  return cudaGetLastError();
+}
+
+template cudaError_t BatchedKvAppendStrided<half>(
+    const half *, const half *, half *, const int *, const int *, int, int,
+    int, size_t, size_t, size_t, cudaStream_t);
+template cudaError_t BatchedKvAppendStrided<__nv_bfloat16>(
+    const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *,
+    const int *, const int *, int, int, int, size_t, size_t, size_t,
+    cudaStream_t);
+
 // ============================================================================
 // Mean-pooling kernel for embedding extraction
 // ============================================================================
