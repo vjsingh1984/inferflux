@@ -1,5 +1,6 @@
 #include "scheduler/scheduler.h"
 
+#include "runtime/backends/backend_utils.h"
 #include "runtime/execution/batch_executor.h"
 #include "runtime/execution/parallel_context.h"
 #include "runtime/structured_output/structured_output_adapter.h"
@@ -196,6 +197,14 @@ void ResetSequenceLease(InferenceRequest *inference) {
   inference->sequence_generation = 0;
 }
 
+int ResidentSequenceTokenCount(const InferenceRequest &inference) {
+  int token_count = std::max(0, inference.n_past);
+  token_count = std::max(token_count, inference.prompt_bpe_tokens);
+  token_count =
+      std::max(token_count, static_cast<int>(inference.bpe_prompt_tokens.size()));
+  return token_count;
+}
+
 bool WaitForUnifiedBatchAsync(
     LlamaCPUBackend *backend, LlamaCPUBackend::UnifiedBatchHandle handle,
     std::vector<LlamaCPUBackend::UnifiedBatchOutput> *outputs,
@@ -296,6 +305,162 @@ bool ExecutePhasedPrefillStep(LlamaCPUBackend *backend,
   return true;
 }
 
+bool HasValidUnifiedStepState(const InferenceRequest &req) {
+  if (req.n_past < 0 || req.sequence_id < 0) {
+    return false;
+  }
+  if (req.first_token >= 0) {
+    return true;
+  }
+  if (req.exec_initialized) {
+    return true;
+  }
+  if (req.n_past == 0 && !req.bpe_prompt_tokens.empty()) {
+    return true;
+  }
+  return req.n_past > 0 && !req.bpe_prompt_tokens.empty() &&
+         req.prefill_offset > 0 &&
+         req.prefill_offset < static_cast<int>(req.bpe_prompt_tokens.size());
+}
+
+bool HasBoundDecodeBackend(
+    const InferenceRequest &req,
+    const std::shared_ptr<LlamaCPUBackend> &resolved_backend) {
+  return resolved_backend && req.phase == RequestPhase::kDecode &&
+         HasValidUnifiedStepState(req);
+}
+
+std::string ResolveResultModelId(const InferenceRequest &req) {
+  return req.resolved_model.empty() ? req.model : req.resolved_model;
+}
+
+void ResetUnifiedStepState(InferenceRequest *req) {
+  if (!req) {
+    return;
+  }
+  req->exec_initialized = false;
+  req->exec_active = true;
+  req->exec_tokens_generated = 0;
+  req->exec_decode_limit = 0;
+  req->exec_current_token = -1;
+  req->exec_slice_active = false;
+  req->exec_in_prefill = false;
+  req->exec_result = InferenceResult{};
+}
+
+void PrimeUnifiedDecodeStepState(InferenceRequest *req) {
+  if (!req || req->exec_initialized) {
+    return;
+  }
+
+  ResetUnifiedStepState(req);
+  req->exec_initialized = true;
+  req->exec_result.model_id = ResolveResultModelId(*req);
+  req->exec_result.prompt_tokens = static_cast<int>(req->prompt_tokens.size());
+  req->exec_result.completion = req->accumulated_output;
+
+  const int prior_completion_tokens = std::max(0, req->total_completion_tokens);
+  int remaining_decode_tokens = req->remaining_decode_tokens;
+  if (remaining_decode_tokens < 0) {
+    remaining_decode_tokens =
+        std::max(0, req->max_tokens - prior_completion_tokens);
+  }
+  req->exec_tokens_generated = prior_completion_tokens;
+  req->exec_decode_limit = prior_completion_tokens + remaining_decode_tokens;
+  req->exec_slice_active = true;
+
+  if (req->n_past >= 0 && req->first_token >= 0) {
+    req->exec_current_token = req->first_token;
+    const std::string piece = req->first_piece;
+    req->first_piece.clear();
+
+    bool stop_hit = false;
+    if (!piece.empty()) {
+      req->exec_tokens_generated++;
+      req->exec_result.completion += piece;
+      std::string emit_piece;
+      stop_hit = ApplyStop(piece, req->exec_result.completion, req->stop,
+                           &emit_piece);
+      if (req->on_token && !emit_piece.empty()) {
+        GlobalMetrics().RecordStreamTokens(1);
+        req->on_token(emit_piece, nullptr);
+      }
+    }
+
+    if (stop_hit || (req->cancellation_flag && req->cancellation_flag->load()) ||
+        req->exec_tokens_generated >= req->exec_decode_limit) {
+      req->exec_active = false;
+    }
+  } else if (req->n_past == 0 && !req->bpe_prompt_tokens.empty()) {
+    req->exec_in_prefill = true;
+  } else if (req->n_past > 0 && !req->bpe_prompt_tokens.empty() &&
+             req->prefill_offset > 0 &&
+             req->prefill_offset <
+                 static_cast<int>(req->bpe_prompt_tokens.size())) {
+    req->n_past = req->prefill_offset;
+    req->exec_in_prefill = true;
+  } else {
+    req->exec_active = false;
+    req->exec_result.completion = "[batch state error]";
+  }
+
+  req->accumulated_output = req->exec_result.completion;
+  req->total_completion_tokens = req->exec_tokens_generated;
+  req->remaining_decode_tokens =
+      std::max(0, req->exec_decode_limit - req->exec_tokens_generated);
+}
+
+bool ShouldContinueUnifiedDecodeStep(const InferenceRequest &req) {
+  if (!req.exec_initialized || !req.exec_active) {
+    return false;
+  }
+  if (req.exec_in_prefill) {
+    return true;
+  }
+  return req.exec_tokens_generated < req.exec_decode_limit;
+}
+
+void SyncUnifiedDecodeStepProgress(InferenceRequest *req) {
+  if (!req || !req->exec_initialized) {
+    return;
+  }
+  req->accumulated_output = req->exec_result.completion;
+  req->total_completion_tokens = req->exec_tokens_generated;
+  req->remaining_decode_tokens =
+      std::max(0, req->exec_decode_limit - req->exec_tokens_generated);
+  if (ShouldContinueUnifiedDecodeStep(*req)) {
+    req->first_token = req->exec_current_token;
+    req->first_piece.clear();
+  }
+}
+
+void FinalizeUnifiedDecodeStepResult(InferenceRequest *req,
+                                     InferenceResult *result) {
+  if (!req || !result) {
+    return;
+  }
+
+  SyncUnifiedDecodeStepProgress(req);
+  result->model_id = ResolveResultModelId(*req);
+  result->completion = req->accumulated_output;
+  result->completion_tokens = req->total_completion_tokens;
+  result->prompt_tokens =
+      req->reported_prompt_tokens >= 0
+          ? req->reported_prompt_tokens
+          : static_cast<int>(req->prompt_tokens.size());
+  if (result->completion.empty() && !result->no_backend) {
+    result->completion = std::string(kBackendEmptyResponseText);
+    GlobalMetrics().RecordEmptyGeneration();
+  }
+
+  req->service_tokens = req->total_completion_tokens;
+  req->phase = RequestPhase::kFinished;
+  req->fairness_yielded = false;
+  req->timeslice_tokens = 0;
+  req->last_timeslice_tokens = 0;
+  ResetUnifiedStepState(req);
+}
+
 Scheduler::Config NormalizeSchedulerConfig(const Scheduler::Config &raw) {
   Scheduler::Config normalized = raw;
   if (normalized.max_batch_size <= 0) {
@@ -390,6 +555,7 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
 
   GlobalMetrics().SetSchedulerBatchLimits(config_.max_batch_size,
                                           config_.max_batch_tokens);
+  RefreshNativeKvMemoryMetrics();
 }
 
 Scheduler::~Scheduler() {
@@ -417,6 +583,7 @@ Scheduler::~Scheduler() {
       ReleaseSessionState(state, nullptr);
     }
   }
+  RefreshNativeKvMemoryMetrics();
 }
 
 void Scheduler::StartDecodeWorkers() {
@@ -445,6 +612,75 @@ int Scheduler::QueueDepth() const {
 
 int Scheduler::LiveDecodeWorkers() const {
   return live_decode_workers_.load(std::memory_order_relaxed);
+}
+
+void Scheduler::SyncSequenceSlotProgress(
+    const InferenceRequest &request) const {
+  if (!slot_manager_ || request.sequence_id < 0) {
+    return;
+  }
+  slot_manager_->UpdateTokenCount(request.sequence_id,
+                                  ResidentSequenceTokenCount(request));
+}
+
+void Scheduler::RefreshNativeKvMemoryMetrics() const {
+  if (!slot_manager_) {
+    GlobalMetrics().SetNativeKvMemoryBytes(/*total_bytes=*/0,
+                                           /*active_bytes=*/0,
+                                           /*prefix_retained_bytes=*/0,
+                                           /*free_bytes=*/0,
+                                           /*active_sequences=*/0,
+                                           /*prefix_retained_sequences=*/0,
+                                           /*free_sequences=*/0,
+                                           /*max_sequences=*/0);
+    return;
+  }
+
+  const uint64_t total_bytes = GlobalMetrics().GetNativeKvPlannedBytes();
+  const int max_sequences = GlobalMetrics().GetNativeKvMaxSequences();
+  if (total_bytes == 0 || max_sequences <= 0) {
+    GlobalMetrics().SetNativeKvMemoryBytes(/*total_bytes=*/0,
+                                           /*active_bytes=*/0,
+                                           /*prefix_retained_bytes=*/0,
+                                           /*free_bytes=*/0,
+                                           /*active_sequences=*/0,
+                                           /*prefix_retained_sequences=*/0,
+                                           /*free_sequences=*/0,
+                                           /*max_sequences=*/0);
+    return;
+  }
+
+  int active_sequences = 0;
+  int prefix_retained_sequences = 0;
+  for (const auto &slot : slot_manager_->GetSlotStatus()) {
+    if (slot.state == scheduler::SequenceState::kPrefilling ||
+        slot.state == scheduler::SequenceState::kDecoding) {
+      ++active_sequences;
+    } else if (slot.state == scheduler::SequenceState::kCompleted) {
+      ++prefix_retained_sequences;
+    }
+  }
+  active_sequences = std::min(active_sequences, max_sequences);
+  prefix_retained_sequences =
+      std::min(prefix_retained_sequences, max_sequences - active_sequences);
+  const int free_sequences =
+      std::max(0, max_sequences - active_sequences - prefix_retained_sequences);
+
+  const uint64_t bytes_per_sequence =
+      total_bytes / static_cast<uint64_t>(std::max(1, max_sequences));
+  const uint64_t active_bytes =
+      bytes_per_sequence * static_cast<uint64_t>(active_sequences);
+  const uint64_t prefix_retained_bytes =
+      bytes_per_sequence * static_cast<uint64_t>(prefix_retained_sequences);
+  const uint64_t free_bytes =
+      total_bytes >= active_bytes + prefix_retained_bytes
+          ? total_bytes - active_bytes - prefix_retained_bytes
+          : 0;
+
+  GlobalMetrics().SetNativeKvMemoryBytes(
+      total_bytes, active_bytes, prefix_retained_bytes, free_bytes,
+      active_sequences, prefix_retained_sequences, free_sequences,
+      max_sequences);
 }
 
 void Scheduler::UpdateModelSelectionOptions(
@@ -479,8 +715,10 @@ void Scheduler::DecodeWorkerLoop() {
     ~LiveGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
   } live_guard{live_decode_workers_};
 
+  std::vector<std::shared_ptr<PendingRequest>> batch;
+  std::shared_ptr<LlamaCPUBackend> sticky_step_backend;
+
   while (true) {
-    std::vector<std::shared_ptr<PendingRequest>> batch;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
       constexpr auto kDisaggTransportPollInterval =
@@ -494,10 +732,14 @@ void Scheduler::DecodeWorkerLoop() {
                disagg_config_.kv_transport->Size() > 0;
       };
       auto has_work = [&] {
-        return stop_ || !pending_decode_.empty() || has_transport_work();
+        return stop_ || !batch.empty() || !pending_decode_.empty() ||
+               has_transport_work();
       };
       auto has_min_decode_batch = [&] {
         if (stop_) {
+          return true;
+        }
+        if (!batch.empty()) {
           return true;
         }
         return pending_decode_.size() >= accumulation_target;
@@ -505,10 +747,11 @@ void Scheduler::DecodeWorkerLoop() {
 
       if (config_.batch_accumulation_ms > 0) {
         if (disagg_config_.kv_transport) {
-          while (!stop_ && pending_decode_.empty() && !has_transport_work()) {
+          while (!stop_ && batch.empty() && pending_decode_.empty() &&
+                 !has_transport_work()) {
             queue_cv_.wait_for(lock, kDisaggTransportPollInterval);
           }
-          if (!stop_ && !pending_decode_.empty()) {
+          if (!stop_ && batch.empty() && !pending_decode_.empty()) {
             const auto deadline =
                 std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(config_.batch_accumulation_ms);
@@ -527,7 +770,7 @@ void Scheduler::DecodeWorkerLoop() {
           }
         } else {
           queue_cv_.wait(lock, has_work);
-          if (!stop_ && !pending_decode_.empty()) {
+          if (!stop_ && batch.empty() && !pending_decode_.empty()) {
             const auto deadline =
                 std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(config_.batch_accumulation_ms);
@@ -540,25 +783,44 @@ void Scheduler::DecodeWorkerLoop() {
           }
         }
       } else if (disagg_config_.kv_transport) {
-        while (!stop_ && pending_decode_.empty() && !has_transport_work()) {
+        while (!stop_ && batch.empty() && pending_decode_.empty() &&
+               !has_transport_work()) {
           queue_cv_.wait_for(lock, kDisaggTransportPollInterval);
         }
       } else {
         queue_cv_.wait(lock, has_work);
       }
 
-      if (stop_ && pending_decode_.empty() && !has_transport_work())
+      if (stop_ && batch.empty() && pending_decode_.empty() &&
+          !has_transport_work()) {
         break;
+      }
 
-      // Drain up to kMaxBatchSize requests from the decode queue.
-      std::size_t n =
-          std::min(pending_decode_.size(),
-                   static_cast<std::size_t>(config_.max_batch_size));
-      batch.assign(pending_decode_.begin(),
-                   pending_decode_.begin() + static_cast<std::ptrdiff_t>(n));
-      pending_decode_.erase(pending_decode_.begin(),
-                            pending_decode_.begin() +
-                                static_cast<std::ptrdiff_t>(n));
+      const std::size_t max_batch_size =
+          static_cast<std::size_t>(config_.max_batch_size);
+      if (batch.empty()) {
+        std::size_t n = std::min(pending_decode_.size(), max_batch_size);
+        batch.assign(pending_decode_.begin(),
+                     pending_decode_.begin() + static_cast<std::ptrdiff_t>(n));
+        pending_decode_.erase(pending_decode_.begin(),
+                              pending_decode_.begin() +
+                                  static_cast<std::ptrdiff_t>(n));
+      } else if (batch.size() < max_batch_size && sticky_step_backend) {
+        while (batch.size() < max_batch_size && !pending_decode_.empty()) {
+          auto &next = pending_decode_.front();
+          if (!next || !next->resolved_backend ||
+              next->resolved_backend.get() != sticky_step_backend.get() ||
+              !HasValidUnifiedStepState(next->inference) ||
+              next->inference.response_constraint.has_grammar ||
+              next->inference.collect_logprobs ||
+              next->inference.has_response_format ||
+              !next->inference.response_format_supported) {
+            break;
+          }
+          batch.push_back(next);
+          pending_decode_.erase(pending_decode_.begin());
+        }
+      }
       UpdateQueueDepthLocked();
     }
 
@@ -648,6 +910,8 @@ void Scheduler::DecodeWorkerLoop() {
     if (batch.empty())
       continue;
 
+    GlobalMetrics().RecordDecodeWorkerBatchSize(batch.size());
+
     std::size_t decode_tokens = 0;
     for (const auto &pending : batch) {
       int slice_tokens = pending->inference.timeslice_tokens;
@@ -666,6 +930,104 @@ void Scheduler::DecodeWorkerLoop() {
     GlobalMetrics().RecordSchedulerPolicyIteration(
         SchedulerBatchPolicyToString(config_.batch_policy),
         /*prefill_requests=*/0, /*decode_requests=*/batch.size());
+
+    auto resolve_direct_step_backend =
+        [&]() -> std::shared_ptr<LlamaCPUBackend> {
+      if (config_.decode_burst_tokens != 0) {
+        return nullptr;
+      }
+      std::shared_ptr<LlamaCPUBackend> direct_backend;
+      for (const auto &pending : batch) {
+        if (!pending) {
+          return nullptr;
+        }
+        const auto &inference = pending->inference;
+        const auto &backend = pending->resolved_backend;
+        if (!HasBoundDecodeBackend(inference, backend) || !backend ||
+            !backend->IsReady() || !inference.response_format_supported ||
+            inference.response_constraint.has_grammar ||
+            inference.collect_logprobs || inference.has_response_format) {
+          return nullptr;
+        }
+        if (sticky_step_backend &&
+            backend.get() != sticky_step_backend.get()) {
+          return nullptr;
+        }
+        if (!direct_backend) {
+          direct_backend = backend;
+        } else if (direct_backend.get() != backend.get()) {
+          return nullptr;
+        }
+      }
+      return direct_backend;
+    };
+
+    if (auto direct_step_backend = resolve_direct_step_backend()) {
+      GlobalMetrics().RecordDecodeWorkerExecutionPath("direct_stepwise");
+
+      RequestBatch step_batch;
+      step_batch.batch_id =
+          next_batch_id_.fetch_add(1, std::memory_order_relaxed);
+      step_batch.requests.reserve(batch.size());
+
+      for (auto &pending : batch) {
+        auto *inference = &pending->inference;
+        if (slot_manager_ && inference->sequence_id >= 0) {
+          slot_manager_->MarkProcessing(inference->sequence_id);
+        }
+        PrimeUnifiedDecodeStepState(inference);
+        if (ShouldContinueUnifiedDecodeStep(*inference)) {
+          step_batch.requests.push_back(inference);
+        } else {
+          SyncUnifiedDecodeStepProgress(inference);
+          SyncSequenceSlotProgress(*inference);
+        }
+      }
+
+      if (!step_batch.empty()) {
+        executor_->ExecuteUnifiedBatchStep(step_batch, direct_step_backend);
+      }
+
+      std::vector<std::shared_ptr<PendingRequest>> active_requeue;
+      active_requeue.reserve(batch.size());
+      for (auto &pending : batch) {
+        auto *inference = &pending->inference;
+        InferenceResult result;
+        SyncUnifiedDecodeStepProgress(inference);
+        SyncSequenceSlotProgress(*inference);
+        if (ShouldContinueUnifiedDecodeStep(*inference)) {
+          LogSequenceSlotEvent("decode_step_requeue", *inference,
+                               "decode_worker");
+          active_requeue.push_back(pending);
+          continue;
+        }
+
+        FinalizeUnifiedDecodeStepResult(inference, &result);
+        {
+          std::lock_guard<std::mutex> lock(queue_mutex_);
+          if (inference->session_lease_acquired &&
+              RequestUsesSessionHandle(*inference)) {
+            FinalizeSessionLease(pending.get(), !result.no_backend);
+          } else if (inference->sequence_id >= 0) {
+            if (cache_) {
+              cache_->ReleaseBlocksRef(inference->block_table);
+            }
+            inference->block_table.clear();
+            FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
+                        pending->resolved_backend);
+            ResetSequenceLease(inference);
+          }
+        }
+        pending->promise.set_value(std::move(result));
+      }
+
+      batch = std::move(active_requeue);
+      sticky_step_backend =
+          batch.empty() ? nullptr : std::move(direct_step_backend);
+      continue;
+    }
+
+    GlobalMetrics().RecordDecodeWorkerExecutionPath("general");
 
     ResolveBackends(batch);
 
@@ -747,35 +1109,93 @@ void Scheduler::DecodeWorkerLoop() {
     if (exec_pending.empty())
       continue;
 
-    auto responses = executor_->ExecuteBatch(exec_batch, overrides);
-    std::vector<std::shared_ptr<PendingRequest>> requeue;
-    requeue.reserve(exec_pending.size());
+    bool use_stepwise_decode = config_.decode_burst_tokens == 0;
+    std::shared_ptr<LlamaCPUBackend> step_backend;
+    if (use_stepwise_decode) {
+      for (std::size_t i = 0; i < exec_pending.size(); ++i) {
+        auto *inference = &exec_pending[i]->inference;
+        const auto &backend = overrides[i];
+        if (!backend || !backend->IsReady() ||
+            !HasValidUnifiedStepState(*inference) ||
+            inference->response_constraint.has_grammar ||
+            inference->collect_logprobs || inference->has_response_format) {
+          use_stepwise_decode = false;
+          break;
+        }
+        if (!step_backend) {
+          step_backend = backend;
+        } else if (step_backend.get() != backend.get()) {
+          use_stepwise_decode = false;
+          break;
+        }
+      }
+    }
+
+    std::vector<InferenceResult> responses;
+    if (use_stepwise_decode) {
+      RequestBatch step_batch;
+      step_batch.batch_id = exec_batch.batch_id;
+      step_batch.requests.reserve(exec_pending.size());
+      for (auto &pending : exec_pending) {
+        auto *inference = &pending->inference;
+        PrimeUnifiedDecodeStepState(inference);
+        if (ShouldContinueUnifiedDecodeStep(*inference)) {
+          step_batch.requests.push_back(inference);
+        } else {
+          SyncUnifiedDecodeStepProgress(inference);
+          SyncSequenceSlotProgress(*inference);
+        }
+      }
+      if (!step_batch.empty()) {
+        executor_->ExecuteUnifiedBatchStep(step_batch, step_backend);
+      }
+      for (auto &pending : exec_pending) {
+        SyncUnifiedDecodeStepProgress(&pending->inference);
+        SyncSequenceSlotProgress(pending->inference);
+      }
+    } else {
+      responses = executor_->ExecuteBatch(exec_batch, overrides);
+    }
+
+    std::vector<std::shared_ptr<PendingRequest>> active_requeue;
+    active_requeue.reserve(exec_pending.size());
+    std::vector<std::shared_ptr<PendingRequest>> queue_requeue;
+    queue_requeue.reserve(exec_pending.size());
 
     for (std::size_t i = 0; i < exec_pending.size(); ++i) {
       auto &pending = exec_pending[i];
       auto *inference = &pending->inference;
       InferenceResult result;
-      if (i < responses.size()) {
+      if (!use_stepwise_decode && i < responses.size()) {
         result = std::move(responses[i]);
+        SyncSequenceSlotProgress(*inference);
       }
 
-      if (inference->fairness_yielded) {
+      if (use_stepwise_decode) {
+        if (ShouldContinueUnifiedDecodeStep(*inference)) {
+          LogSequenceSlotEvent("decode_step_requeue", *inference,
+                               "decode_worker");
+          active_requeue.push_back(pending);
+          continue;
+        }
+        FinalizeUnifiedDecodeStepResult(inference, &result);
+      } else if (inference->fairness_yielded) {
         auto now = std::chrono::steady_clock::now();
         pending->enqueue_time = now;
         PrepareFairnessDecodeRequeue(inference, now);
         LogSequenceSlotEvent("fairness_requeue", *inference,
                              "decode_worker");
-        requeue.push_back(pending);
+        queue_requeue.push_back(pending);
         continue;
       }
 
-      if (!inference->accumulated_output.empty()) {
+      if (!use_stepwise_decode && !inference->accumulated_output.empty()) {
         result.completion = inference->accumulated_output;
         if (inference->total_completion_tokens > 0) {
           result.completion_tokens = inference->total_completion_tokens;
         }
       }
-      if (inference->reported_prompt_tokens >= 0) {
+      if (!use_stepwise_decode && inference->reported_prompt_tokens >= 0) {
         result.prompt_tokens = inference->reported_prompt_tokens;
       }
 
@@ -798,19 +1218,33 @@ void Scheduler::DecodeWorkerLoop() {
           ResetSequenceLease(inference);
         }
       }
-      inference->phase = RequestPhase::kFinished;
+      if (!use_stepwise_decode) {
+        inference->phase = RequestPhase::kFinished;
+      }
       pending->promise.set_value(std::move(result));
     }
 
-    if (!requeue.empty()) {
+    batch = std::move(active_requeue);
+    if (batch.empty()) {
+      sticky_step_backend.reset();
+    }
+
+    if (!queue_requeue.empty()) {
       {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        for (auto &pending : requeue) {
+        for (auto &pending : queue_requeue) {
           pending_decode_.push_back(pending);
         }
         UpdateQueueDepthLocked();
       }
       queue_cv_.notify_all();
+    }
+
+    if (!use_stepwise_decode) {
+      batch.clear();
+      sticky_step_backend.reset();
+    } else {
+      sticky_step_backend = batch.empty() ? nullptr : step_backend;
     }
   }
 }
@@ -830,6 +1264,7 @@ std::future<InferenceResult> Scheduler::Generate(InferenceRequest request) {
   }
   pending->inference.remaining_decode_tokens = pending->inference.max_tokens;
   pending->inference.accumulated_output.clear();
+  ResetUnifiedStepState(&pending->inference);
   if (pending->inference.prompt_tokens.empty()) {
     pending->inference.prompt_tokens =
         tokenizer_.Encode(pending->inference.prompt);
@@ -1310,6 +1745,25 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         bool queued_via_unified_prefill = false;
 
         if (can_admit) {
+          if (reused_session_state && slot_manager_ && seq_generation != 0) {
+            const bool restored = slot_manager_->RestoreLease(
+                {seq_id, seq_generation, static_cast<int64_t>(pending->sequence)},
+                static_cast<int64_t>(pending->sequence), seq_id,
+                std::max(matched_tokens,
+                         static_cast<int>(inf.bpe_prompt_tokens.size())));
+            if (!restored) {
+              log::Warn("scheduler",
+                        "Failed to restore retained sequence lease for slot " +
+                            std::to_string(seq_id) + " gen=" +
+                            std::to_string(seq_generation));
+              can_admit = false;
+            } else {
+              RefreshNativeKvMemoryMetrics();
+            }
+          }
+        }
+
+        if (can_admit) {
           if (cache_) {
             // Prefix cache warm blocks need a scheduler ref. Session-owned
             // warm blocks already have a dedicated lease-owned ref.
@@ -1362,6 +1816,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
             inf.sequence_generation = seq_generation;
             inf.first_token = -1;
             inf.first_piece.clear();
+            SyncSequenceSlotProgress(inf);
             if (copied_prefix && prefill_start > 0) {
               GlobalMetrics().RecordKVPrefixReuse(prefill_start);
             }
@@ -1417,6 +1872,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               inf.sequence_generation = seq_generation;
               inf.first_token = pr.first_token;
               inf.first_piece = pr.first_piece;
+              SyncSequenceSlotProgress(inf);
             } else {
               // Prefill failed: release only the NEW blocks (warm blocks belong
               // to the cache).
@@ -1894,11 +2350,13 @@ int Scheduler::AllocSeqSlot(int64_t request_id, uint64_t *generation_out) {
   LogSequenceSlotEvent("acquire", request_id, lease->slot_id, lease->generation,
                        RequestPhase::kPrefill, /*n_past=*/0,
                        /*remaining_decode_tokens=*/-1);
+  RefreshNativeKvMemoryMetrics();
   return lease->slot_id;
 }
 
 void Scheduler::PollDeferredSequenceRetirements() {
   std::lock_guard<std::mutex> lock(deferred_sequence_retirements_mutex_);
+  bool changed = false;
   auto it = deferred_sequence_retirements_.begin();
   while (it != deferred_sequence_retirements_.end()) {
     const bool ready = !it->backend || it->backend->PollFreeSequence(it->fence);
@@ -1921,9 +2379,13 @@ void Scheduler::PollDeferredSequenceRetirements() {
                             .count();
     GlobalMetrics().RecordSchedulerDeferredSequenceRetirement(lag_ms);
     it = deferred_sequence_retirements_.erase(it);
+    changed = true;
   }
   GlobalMetrics().SetSchedulerDeferredSequenceRetirements(
       static_cast<int>(deferred_sequence_retirements_.size()));
+  if (changed) {
+    RefreshNativeKvMemoryMetrics();
+  }
 }
 
 void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
@@ -1944,6 +2406,7 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
     LogSequenceSlotEvent("release_legacy", /*request_id=*/-1, slot, generation,
                          RequestPhase::kFinished, /*n_past=*/-1,
                          /*remaining_decode_tokens=*/-1);
+    RefreshNativeKvMemoryMetrics();
     return;
   }
 
@@ -1971,6 +2434,7 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
         GlobalMetrics().SetSchedulerDeferredSequenceRetirements(
             static_cast<int>(deferred_sequence_retirements_.size()));
       }
+      RefreshNativeKvMemoryMetrics();
       return;
     }
   } else if (!backend && generation != 0) {
@@ -1985,6 +2449,7 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
                            RequestPhase::kFinished, /*n_past=*/-1,
                            /*remaining_decode_tokens=*/-1);
     }
+    RefreshNativeKvMemoryMetrics();
     return;
   }
 
@@ -2000,12 +2465,14 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
                            RequestPhase::kFinished, /*n_past=*/-1,
                            /*remaining_decode_tokens=*/-1);
     }
+    RefreshNativeKvMemoryMetrics();
     return;
   }
   slot_manager_->ReleaseSlot(slot);
   LogSequenceSlotEvent("release_legacy", /*request_id=*/-1, slot, generation,
                        RequestPhase::kFinished, /*n_past=*/-1,
                        /*remaining_decode_tokens=*/-1);
+  RefreshNativeKvMemoryMetrics();
 }
 
 void Scheduler::ReleaseSessionState(
@@ -2037,6 +2504,20 @@ void Scheduler::FinalizeSessionLease(PendingRequest *pending,
 
   if (commit_state && inference.sequence_id >= 0) {
     LogSequenceSlotEvent("session_commit", inference, inference.session_id);
+    if (slot_manager_ && inference.sequence_generation != 0) {
+      const bool marked_completed = slot_manager_->MarkCompleted(
+          {inference.sequence_id, inference.sequence_generation,
+           static_cast<int64_t>(inference.id)},
+          ResidentSequenceTokenCount(inference));
+      if (!marked_completed) {
+        log::Warn("scheduler",
+                  "Failed to mark retained native sequence slot completed for "
+                  "session " +
+                      inference.session_id + " slot=" +
+                      std::to_string(inference.sequence_id) + " gen=" +
+                      std::to_string(inference.sequence_generation));
+      }
+    }
     scheduler::SessionHandleState state;
     state.model_id = inference.resolved_model.empty()
                          ? inference.model
@@ -2049,6 +2530,7 @@ void Scheduler::FinalizeSessionLease(PendingRequest *pending,
     inference.block_table.clear();
     ResetSequenceLease(&inference);
     inference.session_lease_acquired = false;
+    RefreshNativeKvMemoryMetrics();
     return;
   }
 
@@ -2113,6 +2595,9 @@ void Scheduler::ResolveBackends(
     const std::vector<std::shared_ptr<PendingRequest>> &batch) {
   if (!router_) {
     for (auto &pending : batch) {
+      if (HasBoundDecodeBackend(pending->inference, pending->resolved_backend)) {
+        continue;
+      }
       pending->resolved_backend.reset();
       pending->inference.resolved_model.clear();
       pending->inference.response_format_supported = true;
@@ -2122,6 +2607,9 @@ void Scheduler::ResolveBackends(
   }
   ModelSelectionOptions selection_options = ModelSelectionOptionsSnapshot();
   for (auto &pending : batch) {
+    if (HasBoundDecodeBackend(pending->inference, pending->resolved_backend)) {
+      continue;
+    }
     pending->resolved_backend.reset();
     pending->inference.resolved_model.clear();
     pending->inference.response_format_supported = true;

@@ -28,6 +28,23 @@ namespace inferflux {
 
 namespace {
 
+template <typename T> bool AllocatePinnedHostBuffer(T **ptr, size_t count) {
+  void *storage = nullptr;
+  if (cudaMallocHost(&storage, count * sizeof(T)) != cudaSuccess) {
+    return false;
+  }
+  *ptr = static_cast<T *>(storage);
+  return true;
+}
+
+template <typename T> void FreePinnedHostBuffer(T **ptr) {
+  if (!ptr || !*ptr) {
+    return;
+  }
+  cudaFreeHost(const_cast<void *>(reinterpret_cast<const void *>(*ptr)));
+  *ptr = nullptr;
+}
+
 // Phase timing: sync-based per-phase breakdown when
 // INFERFLUX_NATIVE_PHASE_TIMING=1 Serializes GPU pipeline — for
 // debugging/profiling only, not production.
@@ -747,8 +764,13 @@ template <typename T> LlamaForwardTyped<T>::~LlamaForwardTyped() {
 }
 
 template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
-  auto alloc = [](T **ptr, size_t count) -> bool {
+  device_workspace_bytes_ = 0;
+  host_workspace_bytes_ = 0;
+  auto alloc = [&](T **ptr, size_t count) -> bool {
     cudaError_t err = cudaMalloc(ptr, count * sizeof(T));
+    if (err == cudaSuccess) {
+      device_workspace_bytes_ += count * sizeof(T);
+    }
     return err == cudaSuccess;
   };
   cudaError_t err;
@@ -783,9 +805,11 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   err = cudaMalloc(&d_packed_activation_, rows * packed_width * sizeof(int8_t));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += rows * packed_width * sizeof(int8_t);
   err = cudaMalloc(&d_packed_activation_scales_, rows * sizeof(float));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += rows * sizeof(float);
   // Pre-quantized Q8_1 activation buffer: ceil(max_dim/32) blocks per row
   {
     const int max_dim = std::max(hidden_size_, intermediate_size_);
@@ -795,6 +819,7 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
     err = cudaMalloc(&d_act_q8_1_, rows * blocks_per_row * q8_1_block_size);
     if (err != cudaSuccess)
       return false;
+    device_workspace_bytes_ += rows * blocks_per_row * q8_1_block_size;
   }
   // Logits buffer sized for batched decode: [max_batch_size, vocab_size]
   if (!alloc(&d_logits_typed_,
@@ -804,47 +829,83 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   err = cudaMalloc(&d_token_ids_, rows * sizeof(int));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += rows * sizeof(int);
 
   // Batch metadata buffers for batched decode
   size_t bsz = static_cast<size_t>(max_batch_size_);
   err = cudaMalloc(&d_batch_n_past_, bsz * sizeof(int));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += bsz * sizeof(int);
   err = cudaMalloc(&d_batch_seq_ids_, bsz * sizeof(int));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += bsz * sizeof(int);
   err = cudaMalloc(&d_batch_kv_lens_, bsz * sizeof(int));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += bsz * sizeof(int);
+  if (!AllocatePinnedHostBuffer(&h_batch_token_ids_, bsz))
+    return false;
+  host_workspace_bytes_ += bsz * sizeof(int);
+  if (!AllocatePinnedHostBuffer(&h_batch_n_past_, bsz))
+    return false;
+  host_workspace_bytes_ += bsz * sizeof(int);
+  if (!AllocatePinnedHostBuffer(&h_batch_seq_ids_, bsz))
+    return false;
+  host_workspace_bytes_ += bsz * sizeof(int);
+  if (!AllocatePinnedHostBuffer(&h_batch_kv_lens_, bsz))
+    return false;
+  host_workspace_bytes_ += bsz * sizeof(int);
 
   // Device pointer arrays for batched KV append and attention
   err = cudaMalloc(&d_k_ptrs_, bsz * sizeof(T *));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += bsz * sizeof(T *);
   err = cudaMalloc(&d_v_ptrs_, bsz * sizeof(T *));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += bsz * sizeof(T *);
   err = cudaMalloc(&d_k_append_ptrs_, bsz * sizeof(T *));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += bsz * sizeof(T *);
   err = cudaMalloc(&d_v_append_ptrs_, bsz * sizeof(T *));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += bsz * sizeof(T *);
 
   // Bulk KV pointer arrays for all layers (CUDA graph capture)
   size_t kv_ptr_total = static_cast<size_t>(num_layers_) * bsz;
   err = cudaMalloc(&d_all_k_append_ptrs_, kv_ptr_total * sizeof(T *));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += kv_ptr_total * sizeof(T *);
   err = cudaMalloc(&d_all_v_append_ptrs_, kv_ptr_total * sizeof(T *));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += kv_ptr_total * sizeof(T *);
   err = cudaMalloc(&d_all_k_read_ptrs_, kv_ptr_total * sizeof(T *));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += kv_ptr_total * sizeof(T *);
   err = cudaMalloc(&d_all_v_read_ptrs_, kv_ptr_total * sizeof(T *));
   if (err != cudaSuccess)
     return false;
+  device_workspace_bytes_ += kv_ptr_total * sizeof(T *);
+  if (!AllocatePinnedHostBuffer(&h_all_k_append_ptrs_, kv_ptr_total))
+    return false;
+  host_workspace_bytes_ += kv_ptr_total * sizeof(T *);
+  if (!AllocatePinnedHostBuffer(&h_all_v_append_ptrs_, kv_ptr_total))
+    return false;
+  host_workspace_bytes_ += kv_ptr_total * sizeof(T *);
+  if (!AllocatePinnedHostBuffer(&h_all_k_read_ptrs_, kv_ptr_total))
+    return false;
+  host_workspace_bytes_ += kv_ptr_total * sizeof(T *);
+  if (!AllocatePinnedHostBuffer(&h_all_v_read_ptrs_, kv_ptr_total))
+    return false;
+  host_workspace_bytes_ += kv_ptr_total * sizeof(T *);
 
   return true;
 }
@@ -895,6 +956,10 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
   free_int(&d_batch_n_past_);
   free_int(&d_batch_seq_ids_);
   free_int(&d_batch_kv_lens_);
+  FreePinnedHostBuffer(&h_batch_token_ids_);
+  FreePinnedHostBuffer(&h_batch_n_past_);
+  FreePinnedHostBuffer(&h_batch_seq_ids_);
+  FreePinnedHostBuffer(&h_batch_kv_lens_);
 
   auto free_void = [](void **ptr) {
     if (*ptr) {
@@ -910,6 +975,10 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
   free_void(&d_all_v_append_ptrs_);
   free_void(&d_all_k_read_ptrs_);
   free_void(&d_all_v_read_ptrs_);
+  FreePinnedHostBuffer(&h_all_k_append_ptrs_);
+  FreePinnedHostBuffer(&h_all_v_append_ptrs_);
+  FreePinnedHostBuffer(&h_all_k_read_ptrs_);
+  FreePinnedHostBuffer(&h_all_v_read_ptrs_);
 
   if (decode_graph_exec_) {
     cudaGraphExecDestroy(decode_graph_exec_);
@@ -919,6 +988,8 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
     cudaGraphDestroy(decode_graph_);
     decode_graph_ = nullptr;
   }
+  device_workspace_bytes_ = 0;
+  host_workspace_bytes_ = 0;
 }
 
 template <typename T>
@@ -1655,6 +1726,11 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   }
 
   int B = batch_size;
+  if (B > max_batch_size_) {
+    log::Error("llama_forward",
+               "BatchForward: batch size exceeds preallocated staging buffers");
+    return false;
+  }
   const bool allow_fused_quantized_matmul =
       !weights_ || weights_->AllowFusedQuantizedMatmul();
   ScopedFusedMatmulPolicy fused_policy(allow_fused_quantized_matmul);
@@ -1663,22 +1739,36 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   // ===== Phase 1: Upload metadata to fixed device addresses =====
   // All H2D copies happen BEFORE any graph-captured region so that
   // graph replay reads updated data from the same device addresses.
-  err = cudaMemcpyAsync(d_token_ids_, token_ids.data(), B * sizeof(int),
+  std::copy_n(token_ids.data(), B, h_batch_token_ids_);
+  std::copy_n(n_past.data(), B, h_batch_n_past_);
+  std::copy_n(sequence_ids.data(), B, h_batch_seq_ids_);
+  for (int b = 0; b < B; ++b) {
+    h_batch_kv_lens_[b] = h_batch_n_past_[b] + 1;
+  }
+
+  err = cudaMemcpyAsync(d_token_ids_, h_batch_token_ids_, B * sizeof(int),
                         cudaMemcpyHostToDevice, stream_);
   if (err != cudaSuccess) {
     log::Error("llama_forward", "BatchForward: token upload failed");
     return false;
   }
-  cudaMemcpyAsync(d_batch_n_past_, n_past.data(), B * sizeof(int),
-                  cudaMemcpyHostToDevice, stream_);
-  cudaMemcpyAsync(d_batch_seq_ids_, sequence_ids.data(), B * sizeof(int),
-                  cudaMemcpyHostToDevice, stream_);
-  {
-    std::vector<int> h_kv_lens(B);
-    for (int b = 0; b < B; ++b)
-      h_kv_lens[b] = n_past[b] + 1;
-    cudaMemcpyAsync(d_batch_kv_lens_, h_kv_lens.data(), B * sizeof(int),
-                    cudaMemcpyHostToDevice, stream_);
+  err = cudaMemcpyAsync(d_batch_n_past_, h_batch_n_past_, B * sizeof(int),
+                        cudaMemcpyHostToDevice, stream_);
+  if (err != cudaSuccess) {
+    log::Error("llama_forward", "BatchForward: n_past upload failed");
+    return false;
+  }
+  err = cudaMemcpyAsync(d_batch_seq_ids_, h_batch_seq_ids_, B * sizeof(int),
+                        cudaMemcpyHostToDevice, stream_);
+  if (err != cudaSuccess) {
+    log::Error("llama_forward", "BatchForward: sequence id upload failed");
+    return false;
+  }
+  err = cudaMemcpyAsync(d_batch_kv_lens_, h_batch_kv_lens_, B * sizeof(int),
+                        cudaMemcpyHostToDevice, stream_);
+  if (err != cudaSuccess) {
+    log::Error("llama_forward", "BatchForward: KV length upload failed");
+    return false;
   }
 
   // ===== Phase 2: Bulk KV pointer pre-computation for all layers =====
@@ -1687,23 +1777,43 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       static_cast<KvCacheGpuTyped<T> *>(static_cast<IKvCacheGpu *>(kv_cache_));
   {
     size_t total = static_cast<size_t>(num_layers_) * B;
-    std::vector<T *> h_k_ap(total), h_v_ap(total);
-    std::vector<const T *> h_k_rd(total), h_v_rd(total);
     for (int l = 0; l < num_layers_; l++) {
-      typed_cache->GetBatchAppendPtrs(l, sequence_ids.data(), n_past.data(), B,
-                                      &h_k_ap[l * B], &h_v_ap[l * B]);
-      typed_cache->GetBatchKVPtrs(l, sequence_ids.data(), B, &h_k_rd[l * B],
-                                  &h_v_rd[l * B]);
+      typed_cache->GetBatchAppendPtrs(l, h_batch_seq_ids_, h_batch_n_past_, B,
+                                      &h_all_k_append_ptrs_[l * B],
+                                      &h_all_v_append_ptrs_[l * B]);
+      typed_cache->GetBatchKVPtrs(l, h_batch_seq_ids_, B,
+                                  &h_all_k_read_ptrs_[l * B],
+                                  &h_all_v_read_ptrs_[l * B]);
     }
     size_t ptr_bytes = total * sizeof(T *);
-    cudaMemcpyAsync(d_all_k_append_ptrs_, h_k_ap.data(), ptr_bytes,
-                    cudaMemcpyHostToDevice, stream_);
-    cudaMemcpyAsync(d_all_v_append_ptrs_, h_v_ap.data(), ptr_bytes,
-                    cudaMemcpyHostToDevice, stream_);
-    cudaMemcpyAsync(d_all_k_read_ptrs_, h_k_rd.data(), ptr_bytes,
-                    cudaMemcpyHostToDevice, stream_);
-    cudaMemcpyAsync(d_all_v_read_ptrs_, h_v_rd.data(), ptr_bytes,
-                    cudaMemcpyHostToDevice, stream_);
+    err = cudaMemcpyAsync(d_all_k_append_ptrs_, h_all_k_append_ptrs_, ptr_bytes,
+                          cudaMemcpyHostToDevice, stream_);
+    if (err != cudaSuccess) {
+      log::Error("llama_forward",
+                 "BatchForward: KV append pointer upload failed");
+      return false;
+    }
+    err = cudaMemcpyAsync(d_all_v_append_ptrs_, h_all_v_append_ptrs_, ptr_bytes,
+                          cudaMemcpyHostToDevice, stream_);
+    if (err != cudaSuccess) {
+      log::Error("llama_forward",
+                 "BatchForward: value append pointer upload failed");
+      return false;
+    }
+    err = cudaMemcpyAsync(d_all_k_read_ptrs_, h_all_k_read_ptrs_, ptr_bytes,
+                          cudaMemcpyHostToDevice, stream_);
+    if (err != cudaSuccess) {
+      log::Error("llama_forward",
+                 "BatchForward: KV read pointer upload failed");
+      return false;
+    }
+    err = cudaMemcpyAsync(d_all_v_read_ptrs_, h_all_v_read_ptrs_, ptr_bytes,
+                          cudaMemcpyHostToDevice, stream_);
+    if (err != cudaSuccess) {
+      log::Error("llama_forward",
+                 "BatchForward: value read pointer upload failed");
+      return false;
+    }
   }
 
   // ===== Phase 3: CUDA graph replay or capture =====

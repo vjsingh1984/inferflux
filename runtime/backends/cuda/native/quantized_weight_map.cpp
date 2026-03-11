@@ -13,10 +13,7 @@ QuantizedWeightMap::~QuantizedWeightMap() {
     FusedQuantGemm::DestroyDownProjMmqLayout(lw.down_proj_mmq);
     lw.down_proj_mmq = {};
   }
-  if (scratch_buffer_) {
-    cudaFree(scratch_buffer_);
-    scratch_buffer_ = nullptr;
-  }
+  ReleaseScratchBuffer();
 #endif
 }
 
@@ -32,6 +29,7 @@ bool QuantizedWeightMap::Build(IModelLoader *loader, const ModelInfo &config,
   num_layers_ = config.num_hidden_layers;
   is_quantized_ = loader->IsQuantized();
   quantization_type_ = loader->GetQuantizationType();
+  scratch_high_water_bytes_ = 0;
 
   log::Info("quantized_weight_map",
             "Building weight map: layers=" + std::to_string(num_layers_) +
@@ -203,6 +201,8 @@ const half *QuantizedWeightMap::DequantizeToScratch(
                   std::to_string(scratch_buffer_elements_ * sizeof(half) /
                                  1024 / 1024) +
                   " MiB (cuBLAS fallback triggered)");
+    scratch_high_water_bytes_ =
+        std::max(scratch_high_water_bytes_, ScratchReservedBytes());
   }
 
   // Get the quantization handler and dequantize directly into scratch
@@ -485,6 +485,34 @@ void QuantizedWeightMap::ClearCache() {
       lm_head_ = nullptr;
     }
   }
+}
+
+std::size_t QuantizedWeightMap::ScratchReservedBytes() const {
+#ifdef INFERFLUX_HAS_CUDA
+  if (!scratch_buffer_ || scratch_buffer_elements_ == 0) {
+    return 0;
+  }
+  return scratch_buffer_elements_ * sizeof(half);
+#else
+  return 0;
+#endif
+}
+
+std::size_t QuantizedWeightMap::ScratchInUseBytes() const {
+  return ScratchReservedBytes();
+}
+
+void QuantizedWeightMap::ReleaseScratchBuffer() {
+#ifdef INFERFLUX_HAS_CUDA
+  if (!scratch_buffer_) {
+    return;
+  }
+  if (cudaFree(scratch_buffer_) != cudaSuccess) {
+    log::Warn("quantized_weight_map", "Failed to release scratch buffer");
+    return;
+  }
+  scratch_buffer_ = nullptr;
+#endif
 }
 
 } // namespace inferflux

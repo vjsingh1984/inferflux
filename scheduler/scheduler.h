@@ -115,6 +115,7 @@ public:
   }
   ModelRouter *Router() const { return router_.get(); }
   RadixPrefixCache *PrefixCache() const { return prefix_cache_.get(); }
+  PagedKVCache *Cache() const { return cache_.get(); }
 
   // Sequence slot allocator for §2.5 phased prefill/decode.
   // Slots are borrowed during Prefill() and returned after full request
@@ -165,6 +166,8 @@ private:
   bool BackendUsesSplitDecodeWorkers(
       const std::shared_ptr<LlamaCPUBackend> &backend) const;
   void PollDeferredSequenceRetirements();
+  void RefreshNativeKvMemoryMetrics() const;
+  void SyncSequenceSlotProgress(const InferenceRequest &request) const;
 
   struct DeferredSequenceRetirement {
     std::shared_ptr<LlamaCPUBackend> backend;

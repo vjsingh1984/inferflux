@@ -153,6 +153,12 @@ public:
    */
   void ClearCache();
 
+  std::size_t ScratchReservedBytes() const;
+  std::size_t ScratchInUseBytes() const;
+  std::size_t ScratchHighWaterBytes() const { return scratch_high_water_bytes_; }
+  bool HasScratchBuffer() const { return scratch_buffer_ != nullptr; }
+  void ReleaseScratchBuffer();
+
 private:
   /**
    * @brief Get tensor name for a layer component
@@ -225,6 +231,7 @@ private:
   // Scratch buffer for on-demand projection dequantization
   mutable half *scratch_buffer_{nullptr};
   mutable size_t scratch_buffer_elements_{0};
+  mutable size_t scratch_high_water_bytes_{0};
   mutable std::mutex mmq_cache_mu_;
   bool allow_fused_quantized_matmul_{true};
 

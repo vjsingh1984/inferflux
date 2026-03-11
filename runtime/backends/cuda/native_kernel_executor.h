@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/model_loader.h"
+#include "runtime/backends/cuda/native/model_memory_ledger.h"
 #include "runtime/backends/cuda/native/native_bootstrap_config.h"
 #include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/strategy_registry.h"
@@ -231,6 +232,9 @@ public:
   int NativeVocabSize() const override;
   std::vector<float> NativeEmbed(const std::string &text) override;
   int NativeEmbedDims() const override;
+  const runtime::cuda::native::ModelMemoryLedger &MemoryLedger() const {
+    return memory_ledger_;
+  }
 
   // Native-specific functionality
   bool HasFlashAttention2() const { return has_flash_attention_2_; }
@@ -275,6 +279,9 @@ private:
       runtime::cuda::native::MatmulExecutionMode::kFusedDequantTileGemm};
   std::string quantized_matmul_strategy_id_{
       "matmul.fused.dequant_tile_gemm.v1"};
+  runtime::cuda::native::ModelMemoryLedger memory_ledger_;
+  int active_max_batch_{0};
+  int active_max_seq_{0};
 
   // Native kernel pipeline components (only available with CUDA)
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
@@ -373,6 +380,7 @@ private:
   // Internal helpers
   bool InitializeCUDA();
   bool InitializeNativePipeline();
+  void RefreshMemoryLedger();
   void FreeDeviceMemory();
   bool RunNativeInference(const std::vector<UnifiedBatchInput> &inputs,
                           std::vector<UnifiedBatchOutput> *outputs);

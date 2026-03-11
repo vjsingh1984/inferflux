@@ -829,6 +829,9 @@ NativeKernelExecutor::~NativeKernelExecutor() {
 #endif
   tokenizer_.reset();
   loader_.reset();
+  memory_ledger_.Clear();
+  active_max_batch_ = 0;
+  active_max_seq_ = 0;
 #ifdef INFERFLUX_HAS_CUDA
   FreeDeviceMemory();
   if (compute_stream_) {
@@ -941,6 +944,151 @@ void NativeKernelExecutor::FreeDeviceMemory() {
   // GPU memory is managed by SafetensorsLoader and native components
 }
 
+void NativeKernelExecutor::RefreshMemoryLedger() {
+  memory_ledger_.Clear();
+  if (!loaded_model_path_.empty()) {
+    memory_ledger_.SetModelLabel(loaded_model_path_.filename().string());
+  }
+
+  const std::size_t weights_bytes =
+      model_loader_ ? model_loader_->GetGPUSize()
+                    : (loader_ ? loader_->GetGPUSize() : 0);
+  if (weights_bytes > 0) {
+    memory_ledger_.UpsertItem(
+        model_loader_ ? "weights.loader" : "weights.safetensors",
+        runtime::cuda::native::MemoryDomain::kWeights,
+        runtime::cuda::native::MemoryLifetime::kModel, weights_bytes,
+        weights_bytes);
+  }
+
+  auto record_qwm_scratch = [&](const char *label, const QuantizedWeightMap *map) {
+    if (!map) {
+      return;
+    }
+    const std::size_t reserved_bytes = map->ScratchReservedBytes();
+    const std::size_t in_use_bytes = map->ScratchInUseBytes();
+    const std::size_t high_water_bytes = map->ScratchHighWaterBytes();
+    const std::size_t evictable_bytes = reserved_bytes;
+    if (reserved_bytes == 0 && high_water_bytes == 0) {
+      return;
+    }
+    memory_ledger_.UpsertItem(
+        label, runtime::cuda::native::MemoryDomain::kBatchEphemeral,
+        runtime::cuda::native::MemoryLifetime::kBatch, reserved_bytes,
+        in_use_bytes, high_water_bytes, evictable_bytes);
+  };
+
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (kv_cache_) {
+    const std::size_t kv_bytes = kv_cache_->GetMemoryUsage();
+    memory_ledger_.UpsertItem("kv_cache.primary",
+                              runtime::cuda::native::MemoryDomain::kKvCache,
+                              runtime::cuda::native::MemoryLifetime::kPool,
+                              kv_bytes, kv_bytes);
+  }
+
+  auto record_forward = [&](const char *device_label, const char *host_label,
+                            const ModelForward *forward) {
+    if (!forward) {
+      return;
+    }
+    const std::size_t device_bytes = forward->DeviceWorkspaceBytes();
+    if (device_bytes > 0) {
+      memory_ledger_.UpsertItem(
+          device_label, runtime::cuda::native::MemoryDomain::kWorkspaceDevice,
+          runtime::cuda::native::MemoryLifetime::kModel, device_bytes,
+          device_bytes);
+    }
+    const std::size_t host_bytes = forward->HostWorkspaceBytes();
+    if (host_bytes > 0) {
+      memory_ledger_.UpsertItem(
+          host_label,
+          runtime::cuda::native::MemoryDomain::kWorkspaceHostPinned,
+          runtime::cuda::native::MemoryLifetime::kModel, host_bytes,
+          host_bytes);
+    }
+  };
+  auto record_sampler = [&](const char *label, const GpuSampler *sampler) {
+    if (!sampler) {
+      return;
+    }
+    const std::size_t device_bytes = sampler->DeviceWorkspaceBytes();
+    if (device_bytes > 0) {
+      memory_ledger_.UpsertItem(
+          label, runtime::cuda::native::MemoryDomain::kWorkspaceDevice,
+          runtime::cuda::native::MemoryLifetime::kModel, device_bytes,
+          device_bytes);
+    }
+  };
+
+  record_forward("workspace.forward.primary", "workspace.forward.primary.host",
+                 model_forward_.get());
+  record_sampler("workspace.sampler.primary", sampler_.get());
+  record_qwm_scratch("batch_ephemeral.quantized_scratch.primary",
+                     quantized_weight_map_.get());
+
+  if (d_logits_ && active_max_batch_ > 0 && model_config_.vocab_size > 0) {
+    const std::size_t logits_bytes =
+        static_cast<std::size_t>(active_max_batch_) *
+        static_cast<std::size_t>(model_config_.vocab_size) * sizeof(float);
+    memory_ledger_.UpsertItem(
+        "workspace.logits.primary",
+        runtime::cuda::native::MemoryDomain::kWorkspaceDevice,
+        runtime::cuda::native::MemoryLifetime::kModel, logits_bytes,
+        logits_bytes);
+  }
+
+  if (lane_overlap_ready_ && active_max_batch_ > 0 &&
+      model_config_.vocab_size > 0) {
+    const std::size_t lane_logits_bytes =
+        static_cast<std::size_t>(active_max_batch_) *
+        static_cast<std::size_t>(model_config_.vocab_size) * sizeof(float);
+    record_forward("workspace.forward.decode", "workspace.forward.decode.host",
+                   decode_lane_forward_.get());
+    record_forward("workspace.forward.prefill",
+                   "workspace.forward.prefill.host",
+                   prefill_lane_forward_.get());
+    record_sampler("workspace.sampler.decode", decode_lane_sampler_.get());
+    record_sampler("workspace.sampler.prefill", prefill_lane_sampler_.get());
+    record_qwm_scratch("batch_ephemeral.quantized_scratch.decode",
+                       decode_lane_quantized_weight_map_.get());
+    record_qwm_scratch("batch_ephemeral.quantized_scratch.prefill",
+                       prefill_lane_quantized_weight_map_.get());
+    if (d_decode_logits_) {
+      memory_ledger_.UpsertItem(
+          "workspace.logits.decode",
+          runtime::cuda::native::MemoryDomain::kWorkspaceDevice,
+          runtime::cuda::native::MemoryLifetime::kModel, lane_logits_bytes,
+          lane_logits_bytes);
+    }
+    if (d_prefill_logits_) {
+      memory_ledger_.UpsertItem(
+          "workspace.logits.prefill",
+          runtime::cuda::native::MemoryDomain::kWorkspaceDevice,
+          runtime::cuda::native::MemoryLifetime::kModel, lane_logits_bytes,
+          lane_logits_bytes);
+    }
+  }
+#endif
+
+  MetricsRegistry::MemoryUsageMetrics total;
+  total.reserved_bytes = memory_ledger_.TotalReservedBytes();
+  total.in_use_bytes = memory_ledger_.TotalInUseBytes();
+  total.high_water_bytes = memory_ledger_.TotalHighWaterBytes();
+  total.evictable_bytes = memory_ledger_.TotalEvictableBytes();
+  std::unordered_map<std::string, MetricsRegistry::MemoryUsageMetrics> domains;
+  for (const auto &summary : memory_ledger_.AggregateByDomain()) {
+    MetricsRegistry::MemoryUsageMetrics usage;
+    usage.reserved_bytes = summary.usage.reserved_bytes;
+    usage.in_use_bytes = summary.usage.in_use_bytes;
+    usage.high_water_bytes = summary.usage.high_water_bytes;
+    usage.evictable_bytes = summary.usage.evictable_bytes;
+    domains.emplace(runtime::cuda::native::ToString(summary.domain), usage);
+  }
+  GlobalMetrics().SetNativeModelMemorySnapshot(memory_ledger_.ModelLabel(),
+                                               total, std::move(domains));
+}
+
 bool NativeKernelExecutor::ConfigureDequantizedCachePolicy(
     const std::string &raw_policy) {
   std::string policy = ToLowerAscii(raw_policy);
@@ -992,15 +1140,19 @@ void NativeKernelExecutor::ReleaseBatchScopedDequantizedCache() {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (quantized_weight_map_) {
     quantized_weight_map_->ClearCache();
+    quantized_weight_map_->ReleaseScratchBuffer();
   }
   if (decode_lane_quantized_weight_map_) {
     decode_lane_quantized_weight_map_->ClearCache();
+    decode_lane_quantized_weight_map_->ReleaseScratchBuffer();
   }
   if (prefill_lane_quantized_weight_map_) {
     prefill_lane_quantized_weight_map_->ClearCache();
+    prefill_lane_quantized_weight_map_->ReleaseScratchBuffer();
   }
 #endif
   model_loader_->ClearDequantizedCache();
+  RefreshMemoryLedger();
 }
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
@@ -1385,6 +1537,8 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
       kv_plan.planned_bytes, kv_plan.budget_bytes);
   max_batch = kv_plan.max_batch;
   max_seq = kv_plan.max_seq;
+  active_max_batch_ = max_batch;
+  active_max_seq_ = max_seq;
 
   if (kv_plan.auto_tuned_seq) {
     log::Info(
@@ -1675,6 +1829,9 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
               "single-lane execution");
   }
 
+  RefreshMemoryLedger();
+  log::Info("native_kernel_executor", memory_ledger_.Describe());
+
   log::Info("native_kernel_executor",
             "Native inference pipeline initialized successfully");
   return true;
@@ -1692,6 +1849,9 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   log::Info("native_kernel_executor",
             "Loading native CUDA model from: " + model_path.string());
   loaded_model_path_ = model_path;
+  memory_ledger_.Clear();
+  active_max_batch_ = 0;
+  active_max_seq_ = 0;
   fallback_mode_ = false;
   fallback_reason_.clear();
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
@@ -2180,6 +2340,7 @@ NativeKernelExecutor::ExecuteLaneBatchForAsync(
   }
 
   result = ExecuteLaneBatch(inputs, lane_resources);
+  RefreshMemoryLedger();
   ReleaseBatchScopedDequantizedCache();
   return result;
 }
@@ -2429,7 +2590,9 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
 
   // Check for mixed workload and use overlap path if enabled
   if (allow_overlap && HasMixedWorkload(inputs)) {
-    return ExecuteUnifiedBatchWithOverlap(inputs);
+    auto outputs = ExecuteUnifiedBatchWithOverlap(inputs);
+    RefreshMemoryLedger();
+    return outputs;
   }
 
   std::unique_lock<std::mutex> shared_pipeline_lock(shared_pipeline_mutex_,
@@ -2751,6 +2914,7 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
     }
   }
 
+  RefreshMemoryLedger();
   return outputs;
 #else
   log::Warn("native_kernel_executor",

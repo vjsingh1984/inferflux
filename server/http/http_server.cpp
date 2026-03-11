@@ -2340,11 +2340,33 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
     auto *cache = scheduler_ ? scheduler_->PrefixCache() : nullptr;
+    auto *paged_kv = scheduler_ ? scheduler_->Cache() : nullptr;
     auto cm = GlobalMetrics().GetCacheMetrics();
+    const auto native_model_memory =
+        metrics_ ? metrics_->GetNativeModelMemorySnapshot()
+                 : MetricsRegistry::NativeModelMemorySnapshot{};
+    const auto native_kv_memory =
+        metrics_ ? metrics_->GetNativeKvMemorySnapshot()
+                 : MetricsRegistry::NativeKvMemorySnapshot{};
+    const auto paged_kv_usage =
+        paged_kv ? paged_kv->GetUsageSnapshot() : PagedKVCache::UsageSnapshot{};
+    const auto prefix_memory =
+        cache ? cache->MemorySnapshot() : RadixPrefixMemorySnapshot{};
     double hit_rate = (cm.hits + cm.misses) > 0
                           ? static_cast<double>(cm.hits) /
                                 static_cast<double>(cm.hits + cm.misses)
                           : 0.0;
+    json memory_domains = json::object();
+    for (const auto &entry : native_model_memory.domains) {
+      memory_domains[entry.first] = {
+          {"reserved_bytes", static_cast<int64_t>(entry.second.reserved_bytes)},
+          {"in_use_bytes", static_cast<int64_t>(entry.second.in_use_bytes)},
+          {"high_water_bytes",
+           static_cast<int64_t>(entry.second.high_water_bytes)},
+          {"evictable_bytes",
+           static_cast<int64_t>(entry.second.evictable_bytes)},
+      };
+    }
     json payload{
         {"size", cache ? static_cast<int64_t>(cache->Size()) : 0},
         {"capacity", cache ? static_cast<int64_t>(cache->Capacity()) : 0},
@@ -2355,6 +2377,53 @@ void HttpServer::HandleClient(ClientSession &session) {
         {"matched_tokens", static_cast<int64_t>(cm.matched_tokens)},
         {"kv_reuse_count", static_cast<int64_t>(cm.kv_reuse_count)},
         {"kv_reuse_tokens", static_cast<int64_t>(cm.kv_reuse_tokens)},
+        {"memory",
+         {{"native_model",
+           {{"model", native_model_memory.model_label},
+            {"reserved_bytes",
+             static_cast<int64_t>(native_model_memory.total.reserved_bytes)},
+            {"in_use_bytes",
+             static_cast<int64_t>(native_model_memory.total.in_use_bytes)},
+            {"high_water_bytes",
+             static_cast<int64_t>(native_model_memory.total.high_water_bytes)},
+            {"evictable_bytes",
+             static_cast<int64_t>(native_model_memory.total.evictable_bytes)},
+            {"domains", std::move(memory_domains)}}},
+          {"native_kv",
+           {{"total_bytes",
+             static_cast<int64_t>(native_kv_memory.total_bytes)},
+            {"active_bytes",
+             static_cast<int64_t>(native_kv_memory.active_bytes)},
+            {"prefix_retained_bytes",
+             static_cast<int64_t>(native_kv_memory.prefix_retained_bytes)},
+            {"free_bytes",
+             static_cast<int64_t>(native_kv_memory.free_bytes)},
+            {"active_sequences", native_kv_memory.active_sequences},
+            {"prefix_retained_sequences",
+             native_kv_memory.prefix_retained_sequences},
+            {"free_sequences", native_kv_memory.free_sequences},
+            {"max_sequences", native_kv_memory.max_sequences}}},
+          {"paged_kv",
+           {{"total_blocks",
+             static_cast<int64_t>(paged_kv_usage.total_blocks)},
+            {"used_blocks",
+             static_cast<int64_t>(paged_kv_usage.used_blocks)},
+            {"free_blocks",
+             static_cast<int64_t>(paged_kv_usage.free_blocks)},
+            {"page_size_bytes",
+             static_cast<int64_t>(paged_kv_usage.page_size_bytes)},
+            {"total_bytes",
+             static_cast<int64_t>(paged_kv_usage.total_bytes())},
+            {"used_bytes",
+             static_cast<int64_t>(paged_kv_usage.used_bytes())},
+            {"free_bytes",
+             static_cast<int64_t>(paged_kv_usage.free_bytes())},
+            {"prefix_retained_blocks",
+             static_cast<int64_t>(prefix_memory.unique_retained_blocks)},
+            {"prefix_retained_bytes",
+             static_cast<int64_t>(prefix_memory.retained_bytes)},
+            {"prefix_live_sequences",
+             static_cast<int64_t>(prefix_memory.live_sequences)}}}}}
     };
     SendAll(session, BuildResponse(payload.dump()));
     return;

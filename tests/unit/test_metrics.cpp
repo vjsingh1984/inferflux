@@ -238,6 +238,33 @@ TEST_CASE("MetricsRegistry records decode-step loop and prefill truncation "
                   "mode=\"unified_step\"} 4") != std::string::npos);
 }
 
+TEST_CASE("MetricsRegistry records decode worker batch-size counters",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordDecodeWorkerBatchSize(4);
+  registry.RecordDecodeWorkerBatchSize(1);
+  registry.RecordDecodeWorkerBatchSize(4);
+  registry.RecordDecodeWorkerExecutionPath("direct_stepwise");
+  registry.RecordDecodeWorkerExecutionPath("general");
+  registry.RecordDecodeWorkerExecutionPath("direct_stepwise");
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("# HELP inferflux_scheduler_decode_worker_batch_size_total") !=
+          std::string::npos);
+  REQUIRE(output.find("# TYPE inferflux_scheduler_decode_worker_batch_size_total "
+                      "counter") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_decode_worker_batch_size_total{"
+                      "bucket=\"1\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_decode_worker_batch_size_total{"
+                      "bucket=\"4\"} 2") != std::string::npos);
+  REQUIRE(output.find("# HELP inferflux_scheduler_decode_worker_execution_path_total") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_decode_worker_execution_path_total{"
+                      "path=\"direct_stepwise\"} 2") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_decode_worker_execution_path_total{"
+                      "path=\"general\"} 1") != std::string::npos);
+}
+
 TEST_CASE("MetricsRegistry records deferred sequence retirement metrics",
           "[metrics]") {
   inferflux::MetricsRegistry registry;
@@ -696,4 +723,54 @@ TEST_CASE(
   REQUIRE(output.find("inferflux_cuda_attention_kernel_switches_total{"
                       "from_kernel=\"standard\",to_kernel=\"fa2\"} 1") !=
           std::string::npos);
+}
+
+TEST_CASE("MetricsRegistry exports native memory accounting snapshots",
+          "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  inferflux::MetricsRegistry::MemoryUsageMetrics total{};
+  total.reserved_bytes = 4096;
+  total.in_use_bytes = 2048;
+  total.high_water_bytes = 4096;
+  total.evictable_bytes = 512;
+  registry.SetNativeModelMemorySnapshot(
+      "qwen2.5-3b",
+      total,
+      {{"kv_cache", {1024, 1024, 1024, 0}},
+       {"batch_ephemeral", {0, 0, 512, 0}}});
+
+  registry.SetNativeKvMemoryBytes(/*total_bytes=*/2048,
+                                  /*active_bytes=*/1024,
+                                  /*prefix_retained_bytes=*/512,
+                                  /*free_bytes=*/512,
+                                  /*active_sequences=*/2,
+                                  /*prefix_retained_sequences=*/1,
+                                  /*free_sequences=*/1,
+                                  /*max_sequences=*/4);
+
+  const auto model_snapshot = registry.GetNativeModelMemorySnapshot();
+  REQUIRE(model_snapshot.model_label == "qwen2.5-3b");
+  REQUIRE(model_snapshot.total.reserved_bytes == 4096);
+  REQUIRE(model_snapshot.domains.at("kv_cache").reserved_bytes == 1024);
+
+  const auto kv_snapshot = registry.GetNativeKvMemorySnapshot();
+  REQUIRE(kv_snapshot.total_bytes == 2048);
+  REQUIRE(kv_snapshot.active_bytes == 1024);
+  REQUIRE(kv_snapshot.prefix_retained_bytes == 512);
+  REQUIRE(kv_snapshot.free_sequences == 1);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_native_kv_memory_total_bytes 2048") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_kv_memory_prefix_retained_bytes 512") !=
+          std::string::npos);
+  REQUIRE(output.find(
+              "inferflux_native_kv_memory_sequences{state=\"prefix_retained\"} "
+              "1") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_model_memory_reserved_bytes{scope="
+                      "\"domain\",model=\"qwen2.5-3b\",domain=\"kv_cache\"} "
+                      "1024") != std::string::npos);
+  REQUIRE(output.find("inferflux_native_model_memory_high_water_bytes{scope="
+                      "\"domain\",model=\"qwen2.5-3b\",domain="
+                      "\"batch_ephemeral\"} 512") != std::string::npos);
 }

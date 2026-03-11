@@ -671,6 +671,18 @@ void MetricsRegistry::RecordPrefillChunkTruncation(
   scheduler_prefill_chunk_truncated_tokens_[mode_label] += truncated_tokens;
 }
 
+void MetricsRegistry::RecordDecodeWorkerBatchSize(std::size_t batch_size) {
+  const std::string key = std::to_string(batch_size);
+  std::lock_guard<std::mutex> lock(scheduler_decode_worker_batch_size_mutex_);
+  scheduler_decode_worker_batch_size_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordDecodeWorkerExecutionPath(std::string_view path) {
+  const std::string key = path.empty() ? "unknown" : std::string(path);
+  std::lock_guard<std::mutex> lock(scheduler_decode_worker_batch_size_mutex_);
+  scheduler_decode_worker_execution_path_counts_[key] += 1;
+}
+
 void MetricsRegistry::RecordNativeForwardShape(bool is_decode, int batch_size) {
   if (is_decode) {
     native_forward_decode_total_.fetch_add(1, std::memory_order_relaxed);
@@ -872,6 +884,63 @@ MetricsRegistry::CacheMetrics MetricsRegistry::GetCacheMetrics() const {
   cm.kv_reuse_count = kv_prefix_reuse_count_.load(std::memory_order_relaxed);
   cm.kv_reuse_tokens = kv_prefix_reuse_tokens_.load(std::memory_order_relaxed);
   return cm;
+}
+
+void MetricsRegistry::SetNativeModelMemorySnapshot(
+    std::string model_label, MemoryUsageMetrics total,
+    std::unordered_map<std::string, MemoryUsageMetrics> domains) {
+  std::lock_guard<std::mutex> lock(native_model_memory_mutex_);
+  native_model_memory_snapshot_.model_label = std::move(model_label);
+  native_model_memory_snapshot_.total = total;
+  native_model_memory_snapshot_.domains = std::move(domains);
+}
+
+MetricsRegistry::NativeModelMemorySnapshot
+MetricsRegistry::GetNativeModelMemorySnapshot() const {
+  std::lock_guard<std::mutex> lock(native_model_memory_mutex_);
+  return native_model_memory_snapshot_;
+}
+
+void MetricsRegistry::SetNativeKvMemoryBytes(
+    uint64_t total_bytes, uint64_t active_bytes, uint64_t prefix_retained_bytes,
+    uint64_t free_bytes, int active_sequences, int prefix_retained_sequences,
+    int free_sequences, int max_sequences) {
+  native_kv_memory_total_bytes_.store(total_bytes, std::memory_order_relaxed);
+  native_kv_memory_active_bytes_.store(active_bytes, std::memory_order_relaxed);
+  native_kv_memory_prefix_retained_bytes_.store(prefix_retained_bytes,
+                                                std::memory_order_relaxed);
+  native_kv_memory_free_bytes_.store(free_bytes, std::memory_order_relaxed);
+  native_kv_memory_active_sequences_.store(std::max(0, active_sequences),
+                                           std::memory_order_relaxed);
+  native_kv_memory_prefix_retained_sequences_.store(
+      std::max(0, prefix_retained_sequences), std::memory_order_relaxed);
+  native_kv_memory_free_sequences_.store(std::max(0, free_sequences),
+                                         std::memory_order_relaxed);
+  native_kv_max_sequences_.store(std::max(0, max_sequences),
+                                 std::memory_order_relaxed);
+}
+
+MetricsRegistry::NativeKvMemorySnapshot
+MetricsRegistry::GetNativeKvMemorySnapshot() const {
+  NativeKvMemorySnapshot snapshot;
+  snapshot.total_bytes =
+      native_kv_memory_total_bytes_.load(std::memory_order_relaxed);
+  snapshot.active_bytes =
+      native_kv_memory_active_bytes_.load(std::memory_order_relaxed);
+  snapshot.prefix_retained_bytes =
+      native_kv_memory_prefix_retained_bytes_.load(std::memory_order_relaxed);
+  snapshot.free_bytes =
+      native_kv_memory_free_bytes_.load(std::memory_order_relaxed);
+  snapshot.active_sequences =
+      native_kv_memory_active_sequences_.load(std::memory_order_relaxed);
+  snapshot.prefix_retained_sequences =
+      native_kv_memory_prefix_retained_sequences_.load(
+          std::memory_order_relaxed);
+  snapshot.free_sequences =
+      native_kv_memory_free_sequences_.load(std::memory_order_relaxed);
+  snapshot.max_sequences =
+      native_kv_max_sequences_.load(std::memory_order_relaxed);
+  return snapshot;
 }
 
 std::string MetricsRegistry::RenderPrometheus() const {
@@ -1624,6 +1693,67 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_scheduler_batch_limit_tokens "
       << scheduler_batch_limit_tokens_.load() << "\n";
 
+  out << "# HELP inferflux_scheduler_decode_worker_batch_size_total Decode worker "
+         "batch-size distribution\n";
+  out << "# TYPE inferflux_scheduler_decode_worker_batch_size_total counter\n";
+  {
+    std::vector<std::string> buckets;
+    {
+      std::lock_guard<std::mutex> lock(scheduler_decode_worker_batch_size_mutex_);
+      buckets.reserve(scheduler_decode_worker_batch_size_counts_.size());
+      for (const auto &entry : scheduler_decode_worker_batch_size_counts_) {
+        buckets.push_back(entry.first);
+      }
+    }
+    std::sort(buckets.begin(), buckets.end(), [](const std::string &a,
+                                               const std::string &b) {
+      return std::stoll(a) < std::stoll(b);
+    });
+    for (const auto &bucket : buckets) {
+      uint64_t count = 0;
+      {
+        std::lock_guard<std::mutex> lock(
+            scheduler_decode_worker_batch_size_mutex_);
+        const auto it = scheduler_decode_worker_batch_size_counts_.find(bucket);
+        if (it != scheduler_decode_worker_batch_size_counts_.end()) {
+          count = it->second;
+        }
+      }
+      out << "inferflux_scheduler_decode_worker_batch_size_total{bucket=\""
+          << bucket << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_scheduler_decode_worker_execution_path_total Decode "
+         "worker execution-path selections\n";
+  out << "# TYPE inferflux_scheduler_decode_worker_execution_path_total "
+         "counter\n";
+  {
+    std::vector<std::string> paths;
+    {
+      std::lock_guard<std::mutex> lock(scheduler_decode_worker_batch_size_mutex_);
+      paths.reserve(scheduler_decode_worker_execution_path_counts_.size());
+      for (const auto &entry : scheduler_decode_worker_execution_path_counts_) {
+        paths.push_back(entry.first);
+      }
+    }
+    std::sort(paths.begin(), paths.end());
+    for (const auto &path : paths) {
+      uint64_t count = 0;
+      {
+        std::lock_guard<std::mutex> lock(
+            scheduler_decode_worker_batch_size_mutex_);
+        const auto it =
+            scheduler_decode_worker_execution_path_counts_.find(path);
+        if (it != scheduler_decode_worker_execution_path_counts_.end()) {
+          count = it->second;
+        }
+      }
+      out << "inferflux_scheduler_decode_worker_execution_path_total{path=\""
+          << path << "\"} " << count << "\n";
+    }
+  }
+
   // --- Native CUDA backend metrics ---
   out << "# HELP inferflux_native_forward_passes_total Native CUDA forward "
          "passes by phase\n";
@@ -1877,6 +2007,99 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_native_kv_budget_bytes gauge\n";
   out << "inferflux_native_kv_budget_bytes " << native_kv_budget_bytes_.load()
       << "\n";
+
+  out << "# HELP inferflux_native_kv_memory_total_bytes Native KV bytes "
+         "partitioned by slot state accounting\n";
+  out << "# TYPE inferflux_native_kv_memory_total_bytes gauge\n";
+  out << "inferflux_native_kv_memory_total_bytes "
+      << native_kv_memory_total_bytes_.load(std::memory_order_relaxed) << "\n";
+
+  out << "# HELP inferflux_native_kv_memory_active_bytes Native KV bytes held "
+         "by active slots\n";
+  out << "# TYPE inferflux_native_kv_memory_active_bytes gauge\n";
+  out << "inferflux_native_kv_memory_active_bytes "
+      << native_kv_memory_active_bytes_.load(std::memory_order_relaxed)
+      << "\n";
+
+  out << "# HELP inferflux_native_kv_memory_prefix_retained_bytes Native KV "
+         "bytes retained for session/prefix reuse\n";
+  out << "# TYPE inferflux_native_kv_memory_prefix_retained_bytes gauge\n";
+  out << "inferflux_native_kv_memory_prefix_retained_bytes "
+      << native_kv_memory_prefix_retained_bytes_.load(
+             std::memory_order_relaxed)
+      << "\n";
+
+  out << "# HELP inferflux_native_kv_memory_free_bytes Native KV bytes "
+         "available for new slots\n";
+  out << "# TYPE inferflux_native_kv_memory_free_bytes gauge\n";
+  out << "inferflux_native_kv_memory_free_bytes "
+      << native_kv_memory_free_bytes_.load(std::memory_order_relaxed) << "\n";
+
+  out << "# HELP inferflux_native_kv_memory_sequences Native KV slot counts by "
+         "state partition\n";
+  out << "# TYPE inferflux_native_kv_memory_sequences gauge\n";
+  out << "inferflux_native_kv_memory_sequences{state=\"active\"} "
+      << native_kv_memory_active_sequences_.load(std::memory_order_relaxed)
+      << "\n";
+  out << "inferflux_native_kv_memory_sequences{state=\"prefix_retained\"} "
+      << native_kv_memory_prefix_retained_sequences_.load(
+             std::memory_order_relaxed)
+      << "\n";
+  out << "inferflux_native_kv_memory_sequences{state=\"free\"} "
+      << native_kv_memory_free_sequences_.load(std::memory_order_relaxed)
+      << "\n";
+
+  {
+    const auto snapshot = GetNativeModelMemorySnapshot();
+
+    out << "# HELP inferflux_native_model_memory_reserved_bytes Native model "
+           "memory reserved bytes by scope\n";
+    out << "# TYPE inferflux_native_model_memory_reserved_bytes gauge\n";
+    out << "inferflux_native_model_memory_reserved_bytes{scope=\"total\",model=\""
+        << snapshot.model_label << "\"} " << snapshot.total.reserved_bytes
+        << "\n";
+    for (const auto &entry : snapshot.domains) {
+      out << "inferflux_native_model_memory_reserved_bytes{scope=\"domain\",model=\""
+          << snapshot.model_label << "\",domain=\"" << entry.first
+          << "\"} " << entry.second.reserved_bytes << "\n";
+    }
+
+    out << "# HELP inferflux_native_model_memory_in_use_bytes Native model "
+           "memory in-use bytes by scope\n";
+    out << "# TYPE inferflux_native_model_memory_in_use_bytes gauge\n";
+    out << "inferflux_native_model_memory_in_use_bytes{scope=\"total\",model=\""
+        << snapshot.model_label << "\"} " << snapshot.total.in_use_bytes
+        << "\n";
+    for (const auto &entry : snapshot.domains) {
+      out << "inferflux_native_model_memory_in_use_bytes{scope=\"domain\",model=\""
+          << snapshot.model_label << "\",domain=\"" << entry.first
+          << "\"} " << entry.second.in_use_bytes << "\n";
+    }
+
+    out << "# HELP inferflux_native_model_memory_high_water_bytes Native model "
+           "memory high-water bytes by scope\n";
+    out << "# TYPE inferflux_native_model_memory_high_water_bytes gauge\n";
+    out << "inferflux_native_model_memory_high_water_bytes{scope=\"total\",model=\""
+        << snapshot.model_label << "\"} " << snapshot.total.high_water_bytes
+        << "\n";
+    for (const auto &entry : snapshot.domains) {
+      out << "inferflux_native_model_memory_high_water_bytes{scope=\"domain\",model=\""
+          << snapshot.model_label << "\",domain=\"" << entry.first
+          << "\"} " << entry.second.high_water_bytes << "\n";
+    }
+
+    out << "# HELP inferflux_native_model_memory_evictable_bytes Native model "
+           "memory evictable bytes by scope\n";
+    out << "# TYPE inferflux_native_model_memory_evictable_bytes gauge\n";
+    out << "inferflux_native_model_memory_evictable_bytes{scope=\"total\",model=\""
+        << snapshot.model_label << "\"} " << snapshot.total.evictable_bytes
+        << "\n";
+    for (const auto &entry : snapshot.domains) {
+      out << "inferflux_native_model_memory_evictable_bytes{scope=\"domain\",model=\""
+          << snapshot.model_label << "\",domain=\"" << entry.first
+          << "\"} " << entry.second.evictable_bytes << "\n";
+    }
+  }
 
   out << "# HELP inferflux_cuda_lane_submissions_total Unified-batch lane "
          "submissions in CUDA runtime\n";

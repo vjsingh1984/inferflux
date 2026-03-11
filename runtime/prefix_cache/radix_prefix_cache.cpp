@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <unordered_set>
 
 namespace inferflux {
 
@@ -40,6 +41,32 @@ std::size_t RadixPrefixCache::Size() const {
 std::size_t RadixPrefixCache::LiveSequences() const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
   return live_sequences_;
+}
+
+RadixPrefixMemorySnapshot RadixPrefixCache::MemorySnapshot() const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  std::vector<std::pair<uint64_t, RadixNode *>> seq_nodes;
+  CollectNodes(
+      root_.get(), [](const RadixNode *n) { return n->sequence_id >= 0; },
+      seq_nodes);
+
+  std::unordered_set<int> blocks;
+  for (const auto &[_, node] : seq_nodes) {
+    for (int block_id : node->block_table) {
+      if (block_id >= 0) {
+        blocks.insert(block_id);
+      }
+    }
+  }
+
+  RadixPrefixMemorySnapshot snapshot;
+  snapshot.unique_retained_blocks = blocks.size();
+  snapshot.live_sequences = live_sequences_;
+  if (kv_cache_) {
+    snapshot.retained_bytes =
+        snapshot.unique_retained_blocks * kv_cache_->PageSizeBytes();
+  }
+  return snapshot;
 }
 
 bool RadixPrefixCache::Lookup(const std::vector<int> &tokens,

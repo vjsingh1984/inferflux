@@ -150,6 +150,7 @@ add_library(inferflux_core
 # non-CUDA build paths.
 target_sources(inferflux_core PRIVATE
   runtime/backends/cuda/native/model_loader.cpp
+  runtime/backends/cuda/native/model_memory_ledger.cpp
   runtime/backends/cuda/native/quantization_handler.cpp
   runtime/backends/cuda/native/gguf_util.cpp
   runtime/backends/cuda/native/strategy_registry.cpp
@@ -513,6 +514,7 @@ add_executable(inferflux_tests
   tests/unit/test_logger.cpp
   tests/unit/test_structured_output.cpp
   tests/unit/test_paged_kv_cache.cpp
+  tests/unit/test_http_server_admin_cache.cpp
   tests/unit/test_unified_batching.cpp
   tests/unit/test_lane_dispatcher.cpp
   tests/unit/test_model_registry.cpp
@@ -534,6 +536,7 @@ add_executable(inferflux_tests
   tests/unit/test_native_dequant_policy.cpp
   tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
+  tests/unit/test_model_memory_ledger.cpp
   tests/unit/test_dtype_traits.cpp
   tests/unit/test_gpu_kv_cache.cpp
   tests/unit/test_gpu_sampler.cpp

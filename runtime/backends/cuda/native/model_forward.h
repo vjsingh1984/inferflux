@@ -114,6 +114,16 @@ public:
   virtual void FreeScratchBuffers() = 0;
 
   /**
+   * Startup-accounted device workspace owned by this forwarder.
+   */
+  virtual std::size_t DeviceWorkspaceBytes() const { return 0; }
+
+  /**
+   * Startup-accounted pinned host workspace owned by this forwarder.
+   */
+  virtual std::size_t HostWorkspaceBytes() const { return 0; }
+
+  /**
    * Model type name for logging.
    */
   virtual std::string ModelType() const = 0;

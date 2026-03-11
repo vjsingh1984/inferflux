@@ -44,6 +44,12 @@ struct RadixLookupResult {
   int matched_tokens{0};
 };
 
+struct RadixPrefixMemorySnapshot {
+  std::size_t unique_retained_blocks{0};
+  std::size_t retained_bytes{0};
+  std::size_t live_sequences{0};
+};
+
 class RadixPrefixCache {
 public:
   using EvictCallback = std::function<void(int)>;
@@ -66,6 +72,7 @@ public:
   std::size_t Capacity() const { return capacity_; }
   std::size_t Size() const; // total nodes in tree
   std::size_t LiveSequences() const;
+  RadixPrefixMemorySnapshot MemorySnapshot() const;
 
 private:
   // Walk tree following tokens; return (deepest node reached, tokens matched).

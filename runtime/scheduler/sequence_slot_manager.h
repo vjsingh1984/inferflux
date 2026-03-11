@@ -221,6 +221,25 @@ public:
   std::vector<SequenceSlot> GetSlotStatus() const;
 
   /**
+   * @brief Mark a live lease as retained for session/prefix reuse.
+   * @param lease Lease to mark completed
+   * @param token_count Tokens currently resident in the sequence
+   * @return true if the lease matched and was updated
+   */
+  bool MarkCompleted(const SequenceLease &lease, int token_count);
+
+  /**
+   * @brief Restore a completed retained lease for a new request.
+   * @param lease Existing retained lease
+   * @param request_id New request ID to bind
+   * @param sequence_id Backend sequence ID for the retained slot
+   * @param token_count Tokens already resident in the retained sequence
+   * @return true if the retained lease matched and was reactivated
+   */
+  bool RestoreLease(const SequenceLease &lease, int64_t request_id,
+                    int sequence_id, int token_count);
+
+  /**
    * @brief Set maximum slot count (requires reinitialization)
    * @param max_slots New maximum slot count
    */

@@ -313,6 +313,32 @@ bool GpuSampler::Initialize(int vocab_size, cudaStream_t stream) {
   return true;
 }
 
+std::size_t GpuSampler::DeviceWorkspaceBytes() const {
+  std::size_t bytes = 0;
+  if (d_probs_) {
+    bytes += static_cast<std::size_t>(vocab_size_) * sizeof(float);
+  }
+  if (d_temp_) {
+    bytes += static_cast<std::size_t>(vocab_size_) * sizeof(float);
+  }
+  if (d_result_) {
+    bytes += sizeof(int);
+  }
+  if (d_max_val_) {
+    bytes += sizeof(float);
+  }
+  if (d_max_idx_) {
+    bytes += sizeof(int);
+  }
+  if (d_uniform_) {
+    bytes += sizeof(float);
+  }
+  if (d_result_batch_) {
+    bytes += static_cast<std::size_t>(kMaxBatchSize) * sizeof(int);
+  }
+  return bytes;
+}
+
 int GpuSampler::GreedyArgmax(const float *d_logits) {
   NVTX_SCOPE("Sampler_Argmax");
   int threads = 256;

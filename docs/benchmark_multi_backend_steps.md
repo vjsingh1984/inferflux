@@ -3,7 +3,7 @@
 This doc captures the repeatable steps and instrumentation that keep `run_gguf_comparison_benchmark.sh` trustworthy while the native row-pair kernels run alongside `llama.cpp`.
 
 ## 1. Flags and defaults
-* `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4` now defaults to `true` in `NativeExecutionPolicy`. The benchmark still accepts the environment variable to opt-out for controlled experiments, but day-to-day runs are now stacked on the row-pair path.
+* `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4` now defaults to `false` in `NativeExecutionPolicy`. Keep it opt-in for controlled experiments only; exact-shape isolated benchmarking on Ada RTX 4000 showed the `M=2,N=11008,K=2048` row-pair FFN kernel was numerically clean but slower than the generic grouped path.
 * Keep `INFERFLUX_ENABLE_BATCHED_DECODE=1` in the benchmark so multi-row decode batches naturally occur and exercise the row-pair operator per the metrics below.
 
 ## 2. Run order and reset hook
@@ -17,6 +17,11 @@ If you ever replicate the benchmark manually, follow the same order: stop native
 ## 3. Metrics to validate row-pair activity
 * Inspect `inferflux_native_rowpair_selection_total{phase="decode",operator="q8_1_group_row_pair_w4",bucket="2"}` and `...operator="q8_1_gemv_row_pair"` in the resulting `metrics_cuda_native.txt`. Successful runs record counts (>0) in bucket `2` or `3_4`, proving the specialized operators handled the multi-row batches.
 * The benchmark also captures `inferflux_native_ffn_proj_operator_total` and `inferflux_native_down_proj_operator_total` summaries (written to `native_ffn_proj_summary_cuda_native.json` and `native_operator_summary_cuda_native.json`) so you can correlate which kernels were chosen.
+* Every InferFlux backend run now also captures `/v1/admin/cache` into `admin_cache_<backend>.json`. The corresponding `stats_<backend>.json` embeds that data under `cache_snapshot` and `memory_snapshot`, including:
+  * `memory_snapshot.native_model`
+  * `memory_snapshot.native_kv`
+  * `memory_snapshot.paged_kv`
+* The multi-backend CSV export now carries the key memory fields alongside throughput so concurrency runs can be compared on both tok/s and memory state.
 
 ## 4. Accuracy safeguards
 * The existing similarity report (`similarity.json`) continues to compare paired requests for exact match / Jaccard / overlap. A stable run should remain ≥0.95 overlap and keep exact matches in the high single digits while the throughput benefit holds.
@@ -27,3 +32,7 @@ When promoting the row-pair flag for release:
 * Update client-facing docs (this file) and point to the new metric so operators can verify row-pair usage.
 * Mention that `cuda_llama_cpp` now runs against a clean GPU thanks to the reset hook—this avoids the sporadic `socket: Operation not permitted` issues that plagued earlier runs.
 * Leave the instrumentation (metrics_capture hooks in the benchmark) so any regression gate re-running this benchmark automatically records operator breakdown, row-pair counters, and similarity data.
+
+Current release posture:
+* Keep the proven `Q4_K M=1` grouped hot path on by default.
+* Keep `q8_1_group_row_pair_w4` behind `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4=1` until a future implementation beats the generic grouped path on the exact live `M=2,N=11008,K=2048` envelope.

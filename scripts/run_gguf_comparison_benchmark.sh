@@ -124,8 +124,8 @@ with open(out_path, "w") as f:
 
 prefill = summary.get("prefill", {})
 decode = summary.get("decode", {})
-print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ("q8_1_gemv_v2", "q8_1_gemv", "q8_1_gemv_hot_fixed", "q8_1_gemv_row_pair_v2", "q8_1_gemv_row_pair", "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback")))
-print("decode=" + ",".join(f"{k}:{decode.get(k, 0)}" for k in ("q8_1_gemv_v2", "q8_1_gemv", "q8_1_gemv_hot_fixed", "q8_1_gemv_row_pair_v2", "q8_1_gemv_row_pair", "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback")))
+print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ("q8_1_gemv_v2", "q8_1_gemv", "q8_1_gemv_hot_fixed", "q8_1_gemv_row_pair_hot_fixed", "q8_1_gemv_row_pair_v2", "q8_1_gemv_row_pair", "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback")))
+print("decode=" + ",".join(f"{k}:{decode.get(k, 0)}" for k in ("q8_1_gemv_v2", "q8_1_gemv", "q8_1_gemv_hot_fixed", "q8_1_gemv_row_pair_hot_fixed", "q8_1_gemv_row_pair_v2", "q8_1_gemv_row_pair", "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback")))
 PYEOF
 }
 
@@ -160,8 +160,8 @@ with open(out_path, "w") as f:
 
 prefill = summary.get("prefill", {})
 decode = summary.get("decode", {})
-print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ("q8_1_group_hot_q4k", "q8_1_group_v2", "q8_1_group", "packed_group", "fallback")))
-print("decode=" + ",".join(f"{k}:{decode.get(k, 0)}" for k in ("q8_1_group_hot_q4k", "q8_1_group_v2", "q8_1_group", "packed_group", "fallback")))
+print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ("q8_1_group_hot_q4k", "q8_1_group_row_pair_w4", "q8_1_group_v2", "q8_1_group", "packed_group", "fallback")))
+print("decode=" + ",".join(f"{k}:{decode.get(k, 0)}" for k in ("q8_1_group_hot_q4k", "q8_1_group_row_pair_w4", "q8_1_group_v2", "q8_1_group", "packed_group", "fallback")))
 PYEOF
 }
 
@@ -291,6 +291,58 @@ with open(out_path, "w") as f:
 
 for entry in entries[:8]:
     print(f'{entry["phase"]}:{entry["operator"]}:{entry["quant"]}:m={entry["m_bucket"]}:n={entry["n"]}:k={entry["k"]}:{entry["count"]}')
+PYEOF
+}
+
+capture_inferflux_admin_cache_snapshot() {
+    local port=$1 backend=$2
+    local snapshot_file="$OUTPUT_DIR/admin_cache_${backend}.json"
+    local stats_file="$OUTPUT_DIR/stats_${backend}.json"
+
+    if ! curl -sf -H "Authorization: Bearer $API_KEY" \
+        "http://127.0.0.1:$port/v1/admin/cache" > "$snapshot_file" 2>/dev/null; then
+        log_warn "  Failed to capture admin cache snapshot for $backend"
+        return 0
+    fi
+
+    python3 - "$snapshot_file" "$stats_file" <<'PYEOF'
+import json, sys
+
+snapshot_path, stats_path = sys.argv[1], sys.argv[2]
+with open(snapshot_path) as f:
+    snapshot = json.load(f)
+with open(stats_path) as f:
+    stats = json.load(f)
+
+memory = snapshot.get("memory", {})
+stats["cache_snapshot"] = {
+    "size": snapshot.get("size", 0),
+    "capacity": snapshot.get("capacity", 0),
+    "hits": snapshot.get("hits", 0),
+    "misses": snapshot.get("misses", 0),
+    "hit_rate": snapshot.get("hit_rate", 0.0),
+    "partial_hits": snapshot.get("partial_hits", 0),
+    "matched_tokens": snapshot.get("matched_tokens", 0),
+    "kv_reuse_count": snapshot.get("kv_reuse_count", 0),
+    "kv_reuse_tokens": snapshot.get("kv_reuse_tokens", 0),
+}
+stats["memory_snapshot"] = memory
+
+with open(stats_path, "w") as f:
+    json.dump(stats, f, indent=2)
+
+native_model = memory.get("native_model", {})
+native_kv = memory.get("native_kv", {})
+paged_kv = memory.get("paged_kv", {})
+
+print("native_model_reserved_bytes=" + str(native_model.get("reserved_bytes", 0)))
+print("native_model_in_use_bytes=" + str(native_model.get("in_use_bytes", 0)))
+print("native_kv_active_bytes=" + str(native_kv.get("active_bytes", 0)))
+print("native_kv_prefix_retained_bytes=" +
+      str(native_kv.get("prefix_retained_bytes", 0)))
+print("paged_kv_used_bytes=" + str(paged_kv.get("used_bytes", 0)))
+print("paged_kv_prefix_retained_bytes=" +
+      str(paged_kv.get("prefix_retained_bytes", 0)))
 PYEOF
 }
 
@@ -482,6 +534,28 @@ stop_server() {
     fi
 }
 
+reset_cuda_device() {
+    log "  Resetting CUDA device..."
+    if python3 - <<'PY' >/dev/null 2>&1
+import ctypes, ctypes.util, sys
+
+libname = ctypes.util.find_library('cudart')
+if not libname:
+    sys.exit(1)
+try:
+    cudart = ctypes.CDLL(libname)
+except OSError:
+    sys.exit(1)
+if cudart.cudaDeviceReset() != 0:
+    sys.exit(2)
+PY
+    then
+        log_ok "CUDA device reset"
+    else
+        log_warn "CUDA device reset unavailable; GPU state may persist until OS cleanup"
+    fi
+}
+
 # ============================================================================
 # Request runner
 # ============================================================================
@@ -666,11 +740,18 @@ run_benchmark() {
 }
 EOF
 
+    local memory_summary
+    memory_summary=$(capture_inferflux_admin_cache_snapshot "$port" "$backend" 2>/dev/null || true)
+
     local classified_note=""
     if [ $classified_failures -gt 0 ]; then
         classified_note=", rejected=$classified_failures"
     fi
     log_ok "  $backend: $success_count/$NUM_REQUESTS OK${classified_note}, ${tok_per_sec} tok/s, avg ${avg_latency}ms, mem ${mem_loaded}→${mem_peak} MB"
+    if [ -n "${memory_summary:-}" ]; then
+        log "  Memory snapshot:"
+        printf '%s\n' "$memory_summary" | sed 's/^/    /'
+    fi
 
     if [ "$backend" = "cuda_native" ] && [ "$NATIVE_PHASE_TIMING" != "0" ]; then
         local phase_json="$OUTPUT_DIR/native_phase_timing_${backend}.json"
@@ -1069,6 +1150,9 @@ main() {
             failed_backends+=("$backend")
         fi
         stop_server "$backend"
+        if [ "$backend" = "cuda_native" ]; then
+            reset_cuda_device
+        fi
 
         # Let GPU memory settle
         sleep 3

@@ -107,6 +107,12 @@ public:
   void SetExecutionPolicy(const NativeExecutionPolicy &policy) override;
 
   void FreeScratchBuffers() override;
+  std::size_t DeviceWorkspaceBytes() const override {
+    return device_workspace_bytes_;
+  }
+  std::size_t HostWorkspaceBytes() const override {
+    return host_workspace_bytes_;
+  }
 
   std::string ModelType() const override { return "llama"; }
 
@@ -157,6 +163,10 @@ private:
   int *d_batch_n_past_{nullptr};
   int *d_batch_seq_ids_{nullptr};
   int *d_batch_kv_lens_{nullptr};
+  int *h_batch_token_ids_{nullptr};
+  int *h_batch_n_past_{nullptr};
+  int *h_batch_seq_ids_{nullptr};
+  int *h_batch_kv_lens_{nullptr};
 
   // Device pointer arrays for batched KV/attention (max_batch_size each)
   void *d_k_ptrs_{nullptr};        // T** on device
@@ -169,6 +179,10 @@ private:
   void *d_all_v_append_ptrs_{nullptr};
   void *d_all_k_read_ptrs_{nullptr}; // const T** [num_layers * max_batch_size]
   void *d_all_v_read_ptrs_{nullptr};
+  T **h_all_k_append_ptrs_{nullptr};
+  T **h_all_v_append_ptrs_{nullptr};
+  const T **h_all_k_read_ptrs_{nullptr};
+  const T **h_all_v_read_ptrs_{nullptr};
 
   // CUDA graph state for batched decode
   cudaGraph_t decode_graph_{nullptr};
@@ -176,6 +190,8 @@ private:
   int graph_batch_size_{0};
   bool graph_enabled_{true};
   NativeExecutionPolicy execution_policy_{};
+  std::size_t device_workspace_bytes_{0};
+  std::size_t host_workspace_bytes_{0};
 
   bool AllocateScratch();
 };

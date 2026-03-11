@@ -185,6 +185,8 @@ public:
                                          const std::string &reason);
   void RecordCudaAttentionKernelSwitch(const std::string &from_kernel,
                                        const std::string &to_kernel);
+  void RecordDecodeWorkerBatchSize(std::size_t batch_size);
+  void RecordDecodeWorkerExecutionPath(std::string_view path);
 
   // Native CUDA backend metrics
   void RecordNativeForwardShape(bool is_decode, int batch_size);
@@ -241,6 +243,48 @@ public:
     uint64_t kv_reuse_tokens{0};
   };
   CacheMetrics GetCacheMetrics() const;
+
+  struct MemoryUsageMetrics {
+    uint64_t reserved_bytes{0};
+    uint64_t in_use_bytes{0};
+    uint64_t high_water_bytes{0};
+    uint64_t evictable_bytes{0};
+  };
+
+  struct NativeModelMemorySnapshot {
+    std::string model_label;
+    MemoryUsageMetrics total;
+    std::unordered_map<std::string, MemoryUsageMetrics> domains;
+  };
+
+  struct NativeKvMemorySnapshot {
+    uint64_t total_bytes{0};
+    uint64_t active_bytes{0};
+    uint64_t prefix_retained_bytes{0};
+    uint64_t free_bytes{0};
+    int active_sequences{0};
+    int prefix_retained_sequences{0};
+    int free_sequences{0};
+    int max_sequences{0};
+  };
+
+  void SetNativeModelMemorySnapshot(
+      std::string model_label, MemoryUsageMetrics total,
+      std::unordered_map<std::string, MemoryUsageMetrics> domains);
+  NativeModelMemorySnapshot GetNativeModelMemorySnapshot() const;
+
+  void SetNativeKvMemoryBytes(uint64_t total_bytes, uint64_t active_bytes,
+                              uint64_t prefix_retained_bytes,
+                              uint64_t free_bytes, int active_sequences,
+                              int prefix_retained_sequences,
+                              int free_sequences, int max_sequences);
+  NativeKvMemorySnapshot GetNativeKvMemorySnapshot() const;
+  int GetNativeKvMaxSequences() const {
+    return native_kv_max_sequences_.load(std::memory_order_relaxed);
+  }
+  uint64_t GetNativeKvPlannedBytes() const {
+    return native_kv_planned_bytes_.load(std::memory_order_relaxed);
+  }
 
   std::string RenderPrometheus() const;
 
@@ -349,6 +393,11 @@ private:
       scheduler_prefill_chunk_truncations_;
   std::unordered_map<std::string, uint64_t>
       scheduler_prefill_chunk_truncated_tokens_;
+  mutable std::mutex scheduler_decode_worker_batch_size_mutex_;
+  std::unordered_map<std::string, uint64_t>
+      scheduler_decode_worker_batch_size_counts_;
+  std::unordered_map<std::string, uint64_t>
+      scheduler_decode_worker_execution_path_counts_;
   std::atomic<uint64_t> cuda_lane_overlap_events_{0};
   std::atomic<uint64_t> cuda_lane_overlap_duration_us_{0};
   std::atomic<int> cuda_decode_lane_inflight_{0};
@@ -397,6 +446,15 @@ private:
   std::atomic<uint64_t> native_kv_requested_bytes_{0};
   std::atomic<uint64_t> native_kv_planned_bytes_{0};
   std::atomic<uint64_t> native_kv_budget_bytes_{0};
+  std::atomic<uint64_t> native_kv_memory_total_bytes_{0};
+  std::atomic<uint64_t> native_kv_memory_active_bytes_{0};
+  std::atomic<uint64_t> native_kv_memory_prefix_retained_bytes_{0};
+  std::atomic<uint64_t> native_kv_memory_free_bytes_{0};
+  std::atomic<int> native_kv_memory_active_sequences_{0};
+  std::atomic<int> native_kv_memory_prefix_retained_sequences_{0};
+  std::atomic<int> native_kv_memory_free_sequences_{0};
+  mutable std::mutex native_model_memory_mutex_;
+  NativeModelMemorySnapshot native_model_memory_snapshot_{};
 
   struct ModelStats {
     std::string backend;

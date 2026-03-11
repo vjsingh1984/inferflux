@@ -154,6 +154,9 @@ runtime:
     max_batch_tokens: 16384
     min_batch_size: 1
     batch_accumulation_ms: 2
+  disaggregated:
+    prefill_pool_size: ${INFERFLUX_SCHED_PREFILL_POOL_SIZE:-1}
+    decode_pool_size: ${INFERFLUX_SCHED_DECODE_POOL_SIZE:-0}
   paged_kv:
     cpu_pages: 4096
     eviction: lru
@@ -233,6 +236,66 @@ stop_inferflux_server() {
         fi
         rm -f "$pidfile"
     fi
+}
+
+reset_benchmark_artifacts() {
+    local backend=$1 concurrency=$2
+    rm -rf "$OUTPUT_DIR/responses_${backend}/c${concurrency}"
+    rm -f "$OUTPUT_DIR/stats_${backend}_c${concurrency}.json" \
+          "$OUTPUT_DIR/mem_trace_${backend}_c${concurrency}.txt" \
+          "$OUTPUT_DIR/admin_cache_${backend}_c${concurrency}.json"
+}
+
+capture_inferflux_admin_cache_snapshot() {
+    local backend=$1 port=$2 concurrency=$3
+    local snapshot_file="$OUTPUT_DIR/admin_cache_${backend}_c${concurrency}.json"
+    local stats_file="$OUTPUT_DIR/stats_${backend}_c${concurrency}.json"
+
+    if ! curl -sf -H "Authorization: Bearer $API_KEY" \
+        "http://127.0.0.1:$port/v1/admin/cache" > "$snapshot_file" 2>/dev/null; then
+        log_warn "  Failed to capture admin cache snapshot for $backend @ c=$concurrency"
+        return 0
+    fi
+
+    python3 - "$snapshot_file" "$stats_file" <<'PYEOF'
+import json, sys
+
+snapshot_path, stats_path = sys.argv[1], sys.argv[2]
+with open(snapshot_path) as f:
+    snapshot = json.load(f)
+with open(stats_path) as f:
+    stats = json.load(f)
+
+memory = snapshot.get("memory", {})
+stats["cache_snapshot"] = {
+    "size": snapshot.get("size", 0),
+    "capacity": snapshot.get("capacity", 0),
+    "hits": snapshot.get("hits", 0),
+    "misses": snapshot.get("misses", 0),
+    "hit_rate": snapshot.get("hit_rate", 0.0),
+    "partial_hits": snapshot.get("partial_hits", 0),
+    "matched_tokens": snapshot.get("matched_tokens", 0),
+    "kv_reuse_count": snapshot.get("kv_reuse_count", 0),
+    "kv_reuse_tokens": snapshot.get("kv_reuse_tokens", 0),
+}
+stats["memory_snapshot"] = memory
+
+with open(stats_path, "w") as f:
+    json.dump(stats, f, indent=2)
+
+native_model = memory.get("native_model", {})
+native_kv = memory.get("native_kv", {})
+paged_kv = memory.get("paged_kv", {})
+
+print("native_model_reserved_bytes=" + str(native_model.get("reserved_bytes", 0)))
+print("native_model_in_use_bytes=" + str(native_model.get("in_use_bytes", 0)))
+print("native_kv_active_bytes=" + str(native_kv.get("active_bytes", 0)))
+print("native_kv_prefix_retained_bytes=" +
+      str(native_kv.get("prefix_retained_bytes", 0)))
+print("paged_kv_used_bytes=" + str(paged_kv.get("used_bytes", 0)))
+print("paged_kv_prefix_retained_bytes=" +
+      str(paged_kv.get("prefix_retained_bytes", 0)))
+PYEOF
 }
 
 # ============================================================================
@@ -548,7 +611,17 @@ run_benchmark() {
 }
 EOF
 
+    local memory_summary=""
+    if [ "$backend_kind" = "inferflux" ]; then
+        memory_summary=$(capture_inferflux_admin_cache_snapshot \
+            "$backend" "$port_or_url" "$concurrency" 2>/dev/null || true)
+    fi
+
     log_ok "  $backend @ c=$concurrency: $success_count/$NUM_REQUESTS OK, ${tok_per_sec} tok/s, avg ${avg_latency}ms, GPU ${gpu_util_peak}%"
+    if [ -n "${memory_summary:-}" ]; then
+        log "  Memory snapshot:"
+        printf '%s\n' "$memory_summary" | sed 's/^/    /'
+    fi
 
     if [ $success_count -lt $NUM_REQUESTS ]; then
         return 1
@@ -615,6 +688,12 @@ main() {
 
     BACKEND_PORTS[lmstudio]="$LMSTUDIO_HOST"
     BACKEND_KIND[lmstudio]=lmstudio
+
+    for backend in cuda_native cuda_llama_cpp ollama lmstudio; do
+        for concurrency in "${CONCURRENCY_ARRAY[@]}"; do
+            reset_benchmark_artifacts "$backend" "$concurrency"
+        done
+    done
 
     # Check Ollama availability
     if [ "$SKIP_OLLAMA" = "true" ]; then
@@ -801,13 +880,23 @@ print(f"Combined results saved to: {output_file}")
 # Also generate CSV for easy plotting
 csv_file = os.path.join(output_dir, f"scaling_curves_{time.strftime('%Y%m%d_%H%M%S')}.csv")
 with open(csv_file, 'w') as f:
-    f.write("backend,concurrency,tok_per_sec,avg_latency_ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,gpu_mem_peak_mb,gpu_util_peak_percent\n")
+    f.write("backend,concurrency,tok_per_sec,avg_latency_ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,gpu_mem_peak_mb,gpu_util_peak_percent,")
+    f.write("native_model_reserved_bytes,native_model_in_use_bytes,native_kv_active_bytes,native_kv_prefix_retained_bytes,")
+    f.write("paged_kv_used_bytes,paged_kv_prefix_retained_bytes\n")
     for backend in backends:
         for c in concurrency_levels:
-            if c in combined['backends'].get(backend, {}):
-                r = combined['backends'][backend][int(c)]
+            ci = int(c)
+            if ci in combined['backends'].get(backend, {}):
+                r = combined['backends'][backend][ci]
+                memory = r.get('memory_snapshot', {})
+                native_model = memory.get('native_model', {})
+                native_kv = memory.get('native_kv', {})
+                paged_kv = memory.get('paged_kv', {})
                 f.write(f"{backend},{c},{r['tok_per_sec']},{r['avg_latency_ms']},{r['p50_latency_ms']},")
-                f.write(f"{r['p95_latency_ms']},{r['p99_latency_ms']},{r['gpu_mem_peak_mb']},{r['gpu_util_peak_percent']}\n")
+                f.write(f"{r['p95_latency_ms']},{r['p99_latency_ms']},{r['gpu_mem_peak_mb']},{r['gpu_util_peak_percent']},")
+                f.write(f"{native_model.get('reserved_bytes', 0)},{native_model.get('in_use_bytes', 0)},")
+                f.write(f"{native_kv.get('active_bytes', 0)},{native_kv.get('prefix_retained_bytes', 0)},")
+                f.write(f"{paged_kv.get('used_bytes', 0)},{paged_kv.get('prefix_retained_bytes', 0)}\n")
 
 print(f"CSV for plotting saved to: {csv_file}")
 

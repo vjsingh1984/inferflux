@@ -68,6 +68,9 @@ public:
                    const std::vector<uint32_t> &seeds,
                    std::vector<int> *out_tokens);
 
+  std::size_t DeviceWorkspaceBytes() const;
+  std::size_t HostWorkspaceBytes() const { return 0; }
+
 private:
   int GreedyArgmax(const float *d_logits);
   int StochasticSample(const float *d_logits, float temperature, int top_k,

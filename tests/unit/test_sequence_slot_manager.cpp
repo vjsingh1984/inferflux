@@ -157,6 +157,35 @@ TEST_CASE("SequenceSlotManager can explicitly complete a retiring lease",
   REQUIRE(manager.GetFreeSlotCount() == 1);
 }
 
+TEST_CASE("SequenceSlotManager can retain and restore completed session leases",
+          "[slot_manager]") {
+  SequenceSlotManager manager(1);
+
+  auto lease = manager.AcquireLease(500);
+  REQUIRE(lease.has_value());
+
+  manager.MarkProcessing(lease->slot_id);
+  manager.UpdateTokenCount(lease->slot_id, 128);
+  REQUIRE(manager.MarkCompleted(*lease, 128));
+  REQUIRE(manager.GetUsedSlotCount() == 0);
+  REQUIRE(manager.GetFreeSlotCount() == 0);
+
+  auto status = manager.GetSlotStatus();
+  REQUIRE(status.size() == 1);
+  REQUIRE(status[0].state == SequenceState::kCompleted);
+  REQUIRE(status[0].token_count == 128);
+
+  REQUIRE(manager.RestoreLease(*lease, /*request_id=*/501,
+                               /*sequence_id=*/lease->slot_id,
+                               /*token_count=*/96));
+  status = manager.GetSlotStatus();
+  REQUIRE(status[0].state == SequenceState::kPrefilling);
+  REQUIRE(status[0].request_id == 501);
+  REQUIRE(status[0].sequence_id == lease->slot_id);
+  REQUIRE(status[0].token_count == 96);
+  REQUIRE(manager.GetUsedSlotCount() == 1);
+}
+
 TEST_CASE("SequenceSlotManager timeout-based eviction", "[slot_manager]") {
   SequenceSlotManager manager(16);
 
