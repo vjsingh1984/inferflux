@@ -2952,6 +2952,104 @@ __global__ void fused_dequant_gemv_q4k_q8_1_fixed_blocks(
   }
 }
 
+template <int NumSuperBlocks>
+__global__ void fused_dequant_gemv_q4k_q8_1_rowpair_fixed_blocks(
+    const block_q4_k *__restrict__ weight,
+    const block_q8_1 *__restrict__ act_q8_1, half *__restrict__ output, int N,
+    int total_rows) {
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x * kGemvWarpsPerBlock + warp_id;
+  const int row0 = blockIdx.y * 2;
+  const int row1 = row0 + 1;
+  if (out_idx >= N || row0 >= total_rows)
+    return;
+
+  const bool has_row1 = row1 < total_rows;
+  const block_q4_k *wrow = weight + out_idx * NumSuperBlocks;
+  const block_q8_1 *a_row0 = act_q8_1 + row0 * (NumSuperBlocks * (QK_K / QK8_1));
+  const block_q8_1 *a_row1 =
+      has_row1 ? (act_q8_1 + row1 * (NumSuperBlocks * (QK_K / QK8_1))) : nullptr;
+
+  const int pair = lane >> 3;
+  const int offs = (lane & 7) * 4;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+
+#pragma unroll
+  for (int blk = 0; blk < NumSuperBlocks; ++blk) {
+    const block_q4_k &b = wrow[blk];
+    const float d = __half2float(*reinterpret_cast<const half *>(&b.d));
+    const float dmin = __half2float(*reinterpret_cast<const half *>(&b.dmin));
+
+    unsigned char sc_lo, m_lo, sc_hi, m_hi;
+    get_scale_min_k4(pair * 2, b.scales, &sc_lo, &m_lo);
+    get_scale_min_k4(pair * 2 + 1, b.scales, &sc_hi, &m_hi);
+
+    const float d_sc_lo = d * static_cast<float>(sc_lo);
+    const float dm_m_lo = dmin * static_cast<float>(m_lo);
+    const float d_sc_hi = d * static_cast<float>(sc_hi);
+    const float dm_m_hi = dmin * static_cast<float>(m_hi);
+
+    const int qs4 = *reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]);
+    const int q_lo4 = qs4 & 0x0F0F0F0F;
+    const int q_hi4 = (qs4 >> 4) & 0x0F0F0F0F;
+
+    const block_q8_1 &a0_lo = a_row0[blk * 8 + pair * 2];
+    const block_q8_1 &a0_hi = a_row0[blk * 8 + pair * 2 + 1];
+    int x0_lo4;
+    int x0_hi4;
+    memcpy(&x0_lo4, &a0_lo.qs[offs], sizeof(x0_lo4));
+    memcpy(&x0_hi4, &a0_hi.qs[offs], sizeof(x0_hi4));
+    const float d8_0_lo = __half2float(__low2half(a0_lo.ds));
+    const float d8_0_hi = __half2float(__low2half(a0_hi.ds));
+    const int dot0_lo = Dp4aS8(q_lo4, x0_lo4, 0);
+    const int dot0_hi = Dp4aS8(q_hi4, x0_hi4, 0);
+
+    acc0 += d_sc_lo * d8_0_lo * static_cast<float>(dot0_lo) +
+            d_sc_hi * d8_0_hi * static_cast<float>(dot0_hi);
+    if ((lane & 7) == 0) {
+      const float s0_lo = __half2float(__high2half(a0_lo.ds));
+      const float s0_hi = __half2float(__high2half(a0_hi.ds));
+      acc0 -= dm_m_lo * s0_lo + dm_m_hi * s0_hi;
+    }
+
+    if (has_row1) {
+      const block_q8_1 &a1_lo = a_row1[blk * 8 + pair * 2];
+      const block_q8_1 &a1_hi = a_row1[blk * 8 + pair * 2 + 1];
+      int x1_lo4;
+      int x1_hi4;
+      memcpy(&x1_lo4, &a1_lo.qs[offs], sizeof(x1_lo4));
+      memcpy(&x1_hi4, &a1_hi.qs[offs], sizeof(x1_hi4));
+      const float d8_1_lo = __half2float(__low2half(a1_lo.ds));
+      const float d8_1_hi = __half2float(__low2half(a1_hi.ds));
+      const int dot1_lo = Dp4aS8(q_lo4, x1_lo4, 0);
+      const int dot1_hi = Dp4aS8(q_hi4, x1_hi4, 0);
+
+      acc1 += d_sc_lo * d8_1_lo * static_cast<float>(dot1_lo) +
+              d_sc_hi * d8_1_hi * static_cast<float>(dot1_hi);
+      if ((lane & 7) == 0) {
+        const float s1_lo = __half2float(__high2half(a1_lo.ds));
+        const float s1_hi = __half2float(__high2half(a1_hi.ds));
+        acc1 -= dm_m_lo * s1_lo + dm_m_hi * s1_hi;
+      }
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+    acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+  }
+  if (lane == 0) {
+    output[row0 * N + out_idx] = __float2half(acc0);
+    if (has_row1) {
+      output[row1 * N + out_idx] = __float2half(acc1);
+    }
+  }
+}
+
 __global__ void
 fused_dequant_gemv_q4k_q8_1_rowpair(const block_q4_k *__restrict__ weight,
                                     const block_q8_1 *__restrict__ act_q8_1,
@@ -3564,14 +3662,14 @@ __global__ void fused_dequant_gemv_q4k_q8_1_group_rowpair_fixed_blocks(
 // Experimental grouped-triple row-pair kernel.
 // Kept for rework and future profiling, but disabled by default in dispatch
 // after real-model decode benchmarks showed corrupted output on RTX 4000 Ada.
-template <int Outputs>
+template <int Outputs, int WarpsPerBlock = kGemvWarpsPerBlock>
 __global__ void fused_dequant_gemv_q4k_q8_1_group_rowpair(
     PackedProjectionGroupParams<block_q4_k, Outputs> params,
     const block_q8_1 *__restrict__ act_q8_1, int K, int total_rows) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
-  const int out_idx = blockIdx.x * kGemvWarpsPerBlock + warp_id;
+  const int out_idx = blockIdx.x * WarpsPerBlock + warp_id;
   const int row0 = blockIdx.y * 2;
   const int row1 = row0 + 1;
   if (row0 >= total_rows)
@@ -3832,6 +3930,94 @@ __global__ void fused_dequant_gemv_q6k_q8_1_fixed_blocks(
   }
   if (lane == 0) {
     output[row * N + out_idx] = __float2half(acc);
+  }
+}
+
+template <int NumSuperBlocks>
+__global__ void fused_dequant_gemv_q6k_q8_1_rowpair_fixed_blocks(
+    const block_q6_k *__restrict__ weight,
+    const block_q8_1 *__restrict__ act_q8_1, half *__restrict__ output, int N,
+    int total_rows) {
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x * kGemvWarpsPerBlock + warp_id;
+  const int row0 = blockIdx.y * 2;
+  const int row1 = row0 + 1;
+  if (out_idx >= N || row0 >= total_rows)
+    return;
+
+  const bool has_row1 = row1 < total_rows;
+  const block_q6_k *wrow = weight + out_idx * NumSuperBlocks;
+  const block_q8_1 *a_row0 = act_q8_1 + row0 * (NumSuperBlocks * (QK_K / QK8_1));
+  const block_q8_1 *a_row1 =
+      has_row1 ? (act_q8_1 + row1 * (NumSuperBlocks * (QK_K / QK8_1))) : nullptr;
+
+  const int sub_pair = lane >> 3;
+  const int e_base = (lane & 7) << 2;
+  const int g = sub_pair >> 1;
+  const int sub_base = sub_pair & 1;
+  const int qh_shift_lo = sub_base * 2;
+  const int qh_shift_hi = qh_shift_lo + 4;
+  const int sc_lo = g * 8 + sub_base * 2 + e_base / 16;
+  const int sc_hi = g * 8 + (sub_base + 2) * 2 + e_base / 16;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+
+#pragma unroll
+  for (int blk = 0; blk < NumSuperBlocks; ++blk) {
+    const block_q6_k &b = wrow[blk];
+    const float d = __half2float(*reinterpret_cast<const half *>(&b.d));
+    const int ql4 =
+        LoadPackedInt32Unaligned(&b.ql[g * 64 + sub_base * 32 + e_base]);
+    const int qh4 = LoadPackedInt32Unaligned(&b.qh[g * 32 + e_base]);
+
+    const int vl_lo = ql4 & 0x0F0F0F0F;
+    const int vh_lo = ((qh4 >> qh_shift_lo) << 4) & 0x30303030;
+    const int vi_lo = Vsubss4(vl_lo | vh_lo, 0x20202020);
+    const int vl_hi = (ql4 >> 4) & 0x0F0F0F0F;
+    const int vh_hi = ((qh4 >> qh_shift_hi) << 4) & 0x30303030;
+    const int vi_hi = Vsubss4(vl_hi | vh_hi, 0x20202020);
+
+    const block_q8_1 &a0_lo = a_row0[blk * 8 + g * 4 + sub_base];
+    const block_q8_1 &a0_hi = a_row0[blk * 8 + g * 4 + sub_base + 2];
+    const int x0_lo = LoadPackedInt32Unaligned(&a0_lo.qs[e_base]);
+    const int x0_hi = LoadPackedInt32Unaligned(&a0_hi.qs[e_base]);
+    const float d8_0_lo = __half2float(__low2half(a0_lo.ds));
+    const float d8_0_hi = __half2float(__low2half(a0_hi.ds));
+    const int dot0_lo = Dp4aS8(vi_lo, x0_lo, 0);
+    const int dot0_hi = Dp4aS8(vi_hi, x0_hi, 0);
+    acc0 += d * (static_cast<float>(b.scales[sc_lo]) * d8_0_lo *
+                     static_cast<float>(dot0_lo) +
+                 static_cast<float>(b.scales[sc_hi]) * d8_0_hi *
+                     static_cast<float>(dot0_hi));
+
+    if (has_row1) {
+      const block_q8_1 &a1_lo = a_row1[blk * 8 + g * 4 + sub_base];
+      const block_q8_1 &a1_hi = a_row1[blk * 8 + g * 4 + sub_base + 2];
+      const int x1_lo = LoadPackedInt32Unaligned(&a1_lo.qs[e_base]);
+      const int x1_hi = LoadPackedInt32Unaligned(&a1_hi.qs[e_base]);
+      const float d8_1_lo = __half2float(__low2half(a1_lo.ds));
+      const float d8_1_hi = __half2float(__low2half(a1_hi.ds));
+      const int dot1_lo = Dp4aS8(vi_lo, x1_lo, 0);
+      const int dot1_hi = Dp4aS8(vi_hi, x1_hi, 0);
+      acc1 += d * (static_cast<float>(b.scales[sc_lo]) * d8_1_lo *
+                       static_cast<float>(dot1_lo) +
+                   static_cast<float>(b.scales[sc_hi]) * d8_1_hi *
+                       static_cast<float>(dot1_hi));
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+    acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+  }
+  if (lane == 0) {
+    output[row0 * N + out_idx] = __float2half(acc0);
+    if (has_row1) {
+      output[row1 * N + out_idx] = __float2half(acc1);
+    }
   }
 }
 

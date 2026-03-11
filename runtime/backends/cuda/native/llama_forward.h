@@ -160,29 +160,31 @@ private:
   T *d_logits_typed_{nullptr};
 
   // Batch metadata buffers (pre-allocated for max_batch_size)
+  int *d_batch_meta_{nullptr};
+  int *d_batch_token_ids_{nullptr};
   int *d_batch_n_past_{nullptr};
   int *d_batch_seq_ids_{nullptr};
   int *d_batch_kv_lens_{nullptr};
+  int *h_batch_meta_{nullptr};
   int *h_batch_token_ids_{nullptr};
   int *h_batch_n_past_{nullptr};
   int *h_batch_seq_ids_{nullptr};
   int *h_batch_kv_lens_{nullptr};
 
-  // Device pointer arrays for batched KV/attention (max_batch_size each)
-  void *d_k_ptrs_{nullptr};        // T** on device
-  void *d_v_ptrs_{nullptr};        // T** on device
-  void *d_k_append_ptrs_{nullptr}; // T** on device
-  void *d_v_append_ptrs_{nullptr}; // T** on device
-
   // Bulk KV pointer arrays for all layers (eliminates per-layer H2D copies)
-  void *d_all_k_append_ptrs_{nullptr}; // T** [num_layers * max_batch_size]
-  void *d_all_v_append_ptrs_{nullptr};
-  void *d_all_k_read_ptrs_{nullptr}; // const T** [num_layers * max_batch_size]
-  void *d_all_v_read_ptrs_{nullptr};
-  T **h_all_k_append_ptrs_{nullptr};
-  T **h_all_v_append_ptrs_{nullptr};
-  const T **h_all_k_read_ptrs_{nullptr};
-  const T **h_all_v_read_ptrs_{nullptr};
+  void **d_all_append_ptrs_meta_{nullptr}; // [2 * num_layers * max_batch_size]
+  void **d_all_k_append_ptrs_{nullptr};    // T** view
+  void **d_all_v_append_ptrs_{nullptr};    // T** view
+  const void
+      **d_all_read_ptrs_meta_{nullptr};   // [2 * num_layers * max_batch_size]
+  const void **d_all_k_read_ptrs_{nullptr}; // const T** view
+  const void **d_all_v_read_ptrs_{nullptr}; // const T** view
+  void **h_all_append_ptrs_meta_{nullptr};
+  void **h_all_k_append_ptrs_{nullptr};
+  void **h_all_v_append_ptrs_{nullptr};
+  const void **h_all_read_ptrs_meta_{nullptr};
+  const void **h_all_k_read_ptrs_{nullptr};
+  const void **h_all_v_read_ptrs_{nullptr};
 
   // CUDA graph state for batched decode
   cudaGraph_t decode_graph_{nullptr};

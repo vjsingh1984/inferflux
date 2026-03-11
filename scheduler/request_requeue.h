@@ -6,7 +6,7 @@
 
 namespace inferflux {
 
-inline void PrepareFairnessDecodeRequeue(
+inline void PrepareDecodeRequeue(
     InferenceRequest *inference,
     std::chrono::steady_clock::time_point enqueue_time) {
   if (!inference) {
@@ -16,6 +16,12 @@ inline void PrepareFairnessDecodeRequeue(
   inference->phase = RequestPhase::kDecode;
   // Resumed decode keeps its original prompt/tokenization. Continuity is
   // carried by sequence state, n_past, first_token, and accumulated_output.
+}
+
+inline void PrepareFairnessDecodeRequeue(
+    InferenceRequest *inference,
+    std::chrono::steady_clock::time_point enqueue_time) {
+  PrepareDecodeRequeue(inference, enqueue_time);
 }
 
 } // namespace inferflux

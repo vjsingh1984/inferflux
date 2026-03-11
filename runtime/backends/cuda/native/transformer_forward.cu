@@ -45,6 +45,34 @@ template <typename T> void FreePinnedHostBuffer(T **ptr) {
   *ptr = nullptr;
 }
 
+template <typename T>
+void AssignBatchMetadataViews(T *base, size_t batch_size, T **token_ids,
+                              T **n_past, T **seq_ids, T **kv_lens) {
+  if (!base || batch_size == 0) {
+    *token_ids = nullptr;
+    *n_past = nullptr;
+    *seq_ids = nullptr;
+    *kv_lens = nullptr;
+    return;
+  }
+  *token_ids = base;
+  *n_past = base + batch_size;
+  *seq_ids = base + (batch_size * 2);
+  *kv_lens = base + (batch_size * 3);
+}
+
+template <typename PtrValue>
+void AssignPointerPairViews(PtrValue *base, size_t slot_count,
+                            PtrValue **first, PtrValue **second) {
+  if (!base || slot_count == 0) {
+    *first = nullptr;
+    *second = nullptr;
+    return;
+  }
+  *first = base;
+  *second = base + slot_count;
+}
+
 // Phase timing: sync-based per-phase breakdown when
 // INFERFLUX_NATIVE_PHASE_TIMING=1 Serializes GPU pipeline — for
 // debugging/profiling only, not production.
@@ -833,79 +861,46 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
 
   // Batch metadata buffers for batched decode
   size_t bsz = static_cast<size_t>(max_batch_size_);
-  err = cudaMalloc(&d_batch_n_past_, bsz * sizeof(int));
+  const size_t batch_meta_elements = bsz * 4;
+  err = cudaMalloc(&d_batch_meta_, batch_meta_elements * sizeof(int));
   if (err != cudaSuccess)
     return false;
-  device_workspace_bytes_ += bsz * sizeof(int);
-  err = cudaMalloc(&d_batch_seq_ids_, bsz * sizeof(int));
-  if (err != cudaSuccess)
+  device_workspace_bytes_ += batch_meta_elements * sizeof(int);
+  AssignBatchMetadataViews(d_batch_meta_, bsz, &d_batch_token_ids_,
+                           &d_batch_n_past_, &d_batch_seq_ids_,
+                           &d_batch_kv_lens_);
+  if (!AllocatePinnedHostBuffer(&h_batch_meta_, batch_meta_elements))
     return false;
-  device_workspace_bytes_ += bsz * sizeof(int);
-  err = cudaMalloc(&d_batch_kv_lens_, bsz * sizeof(int));
-  if (err != cudaSuccess)
-    return false;
-  device_workspace_bytes_ += bsz * sizeof(int);
-  if (!AllocatePinnedHostBuffer(&h_batch_token_ids_, bsz))
-    return false;
-  host_workspace_bytes_ += bsz * sizeof(int);
-  if (!AllocatePinnedHostBuffer(&h_batch_n_past_, bsz))
-    return false;
-  host_workspace_bytes_ += bsz * sizeof(int);
-  if (!AllocatePinnedHostBuffer(&h_batch_seq_ids_, bsz))
-    return false;
-  host_workspace_bytes_ += bsz * sizeof(int);
-  if (!AllocatePinnedHostBuffer(&h_batch_kv_lens_, bsz))
-    return false;
-  host_workspace_bytes_ += bsz * sizeof(int);
-
-  // Device pointer arrays for batched KV append and attention
-  err = cudaMalloc(&d_k_ptrs_, bsz * sizeof(T *));
-  if (err != cudaSuccess)
-    return false;
-  device_workspace_bytes_ += bsz * sizeof(T *);
-  err = cudaMalloc(&d_v_ptrs_, bsz * sizeof(T *));
-  if (err != cudaSuccess)
-    return false;
-  device_workspace_bytes_ += bsz * sizeof(T *);
-  err = cudaMalloc(&d_k_append_ptrs_, bsz * sizeof(T *));
-  if (err != cudaSuccess)
-    return false;
-  device_workspace_bytes_ += bsz * sizeof(T *);
-  err = cudaMalloc(&d_v_append_ptrs_, bsz * sizeof(T *));
-  if (err != cudaSuccess)
-    return false;
-  device_workspace_bytes_ += bsz * sizeof(T *);
+  host_workspace_bytes_ += batch_meta_elements * sizeof(int);
+  AssignBatchMetadataViews(h_batch_meta_, bsz, &h_batch_token_ids_,
+                           &h_batch_n_past_, &h_batch_seq_ids_,
+                           &h_batch_kv_lens_);
 
   // Bulk KV pointer arrays for all layers (CUDA graph capture)
   size_t kv_ptr_total = static_cast<size_t>(num_layers_) * bsz;
-  err = cudaMalloc(&d_all_k_append_ptrs_, kv_ptr_total * sizeof(T *));
+  err = cudaMalloc(&d_all_append_ptrs_meta_, kv_ptr_total * 2 * sizeof(T *));
   if (err != cudaSuccess)
     return false;
-  device_workspace_bytes_ += kv_ptr_total * sizeof(T *);
-  err = cudaMalloc(&d_all_v_append_ptrs_, kv_ptr_total * sizeof(T *));
+  device_workspace_bytes_ += kv_ptr_total * 2 * sizeof(T *);
+  AssignPointerPairViews(d_all_append_ptrs_meta_, kv_ptr_total,
+                         &d_all_k_append_ptrs_, &d_all_v_append_ptrs_);
+  err = cudaMalloc(reinterpret_cast<void **>(&d_all_read_ptrs_meta_),
+                   kv_ptr_total * 2 * sizeof(T *));
   if (err != cudaSuccess)
     return false;
-  device_workspace_bytes_ += kv_ptr_total * sizeof(T *);
-  err = cudaMalloc(&d_all_k_read_ptrs_, kv_ptr_total * sizeof(T *));
-  if (err != cudaSuccess)
+  device_workspace_bytes_ += kv_ptr_total * 2 * sizeof(T *);
+  AssignPointerPairViews(d_all_read_ptrs_meta_, kv_ptr_total, &d_all_k_read_ptrs_,
+                         &d_all_v_read_ptrs_);
+  if (!AllocatePinnedHostBuffer(&h_all_append_ptrs_meta_, kv_ptr_total * 2))
     return false;
-  device_workspace_bytes_ += kv_ptr_total * sizeof(T *);
-  err = cudaMalloc(&d_all_v_read_ptrs_, kv_ptr_total * sizeof(T *));
-  if (err != cudaSuccess)
+  host_workspace_bytes_ += kv_ptr_total * 2 * sizeof(T *);
+  AssignPointerPairViews(h_all_append_ptrs_meta_, kv_ptr_total,
+                         &h_all_k_append_ptrs_, &h_all_v_append_ptrs_);
+  if (!AllocatePinnedHostBuffer(&h_all_read_ptrs_meta_, kv_ptr_total * 2))
     return false;
-  device_workspace_bytes_ += kv_ptr_total * sizeof(T *);
-  if (!AllocatePinnedHostBuffer(&h_all_k_append_ptrs_, kv_ptr_total))
-    return false;
-  host_workspace_bytes_ += kv_ptr_total * sizeof(T *);
-  if (!AllocatePinnedHostBuffer(&h_all_v_append_ptrs_, kv_ptr_total))
-    return false;
-  host_workspace_bytes_ += kv_ptr_total * sizeof(T *);
-  if (!AllocatePinnedHostBuffer(&h_all_k_read_ptrs_, kv_ptr_total))
-    return false;
-  host_workspace_bytes_ += kv_ptr_total * sizeof(T *);
-  if (!AllocatePinnedHostBuffer(&h_all_v_read_ptrs_, kv_ptr_total))
-    return false;
-  host_workspace_bytes_ += kv_ptr_total * sizeof(T *);
+  host_workspace_bytes_ += kv_ptr_total * 2 * sizeof(T *);
+  AssignPointerPairViews(h_all_read_ptrs_meta_, kv_ptr_total, &h_all_k_read_ptrs_,
+                         &h_all_v_read_ptrs_);
 
   return true;
 }
@@ -947,19 +942,21 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
     d_token_ids_ = nullptr;
   }
 
-  auto free_int = [](int **ptr) {
-    if (*ptr) {
-      cudaFree(*ptr);
-      *ptr = nullptr;
-    }
-  };
-  free_int(&d_batch_n_past_);
-  free_int(&d_batch_seq_ids_);
-  free_int(&d_batch_kv_lens_);
-  FreePinnedHostBuffer(&h_batch_token_ids_);
-  FreePinnedHostBuffer(&h_batch_n_past_);
-  FreePinnedHostBuffer(&h_batch_seq_ids_);
-  FreePinnedHostBuffer(&h_batch_kv_lens_);
+  if (d_batch_meta_) {
+    cudaFree(d_batch_meta_);
+    d_batch_meta_ = nullptr;
+  }
+  d_batch_token_ids_ = nullptr;
+  d_batch_n_past_ = nullptr;
+  d_batch_seq_ids_ = nullptr;
+  d_batch_kv_lens_ = nullptr;
+  if (h_batch_meta_) {
+    FreePinnedHostBuffer(&h_batch_meta_);
+  }
+  h_batch_token_ids_ = nullptr;
+  h_batch_n_past_ = nullptr;
+  h_batch_seq_ids_ = nullptr;
+  h_batch_kv_lens_ = nullptr;
 
   auto free_void = [](void **ptr) {
     if (*ptr) {
@@ -967,18 +964,18 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
       *ptr = nullptr;
     }
   };
-  free_void(&d_k_ptrs_);
-  free_void(&d_v_ptrs_);
-  free_void(&d_k_append_ptrs_);
-  free_void(&d_v_append_ptrs_);
-  free_void(&d_all_k_append_ptrs_);
-  free_void(&d_all_v_append_ptrs_);
-  free_void(&d_all_k_read_ptrs_);
-  free_void(&d_all_v_read_ptrs_);
-  FreePinnedHostBuffer(&h_all_k_append_ptrs_);
-  FreePinnedHostBuffer(&h_all_v_append_ptrs_);
-  FreePinnedHostBuffer(&h_all_k_read_ptrs_);
-  FreePinnedHostBuffer(&h_all_v_read_ptrs_);
+  free_void(reinterpret_cast<void **>(&d_all_append_ptrs_meta_));
+  d_all_k_append_ptrs_ = nullptr;
+  d_all_v_append_ptrs_ = nullptr;
+  free_void(reinterpret_cast<void **>(&d_all_read_ptrs_meta_));
+  d_all_k_read_ptrs_ = nullptr;
+  d_all_v_read_ptrs_ = nullptr;
+  FreePinnedHostBuffer(&h_all_append_ptrs_meta_);
+  h_all_k_append_ptrs_ = nullptr;
+  h_all_v_append_ptrs_ = nullptr;
+  FreePinnedHostBuffer(&h_all_read_ptrs_meta_);
+  h_all_k_read_ptrs_ = nullptr;
+  h_all_v_read_ptrs_ = nullptr;
 
   if (decode_graph_exec_) {
     cudaGraphExecDestroy(decode_graph_exec_);
@@ -1746,72 +1743,54 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
     h_batch_kv_lens_[b] = h_batch_n_past_[b] + 1;
   }
 
-  err = cudaMemcpyAsync(d_token_ids_, h_batch_token_ids_, B * sizeof(int),
+  // The device metadata slab is laid out as four max_batch_size segments:
+  // [token_ids][n_past][seq_ids][kv_lens]. Because the views are based on the
+  // reserved max batch size rather than the active batch size, we must upload
+  // the full reserved slab here; copying only B * 4 ints would leave the
+  // later segments stale whenever B < max_batch_size_.
+  err = cudaMemcpyAsync(d_batch_meta_, h_batch_meta_,
+                        static_cast<size_t>(max_batch_size_) * 4 * sizeof(int),
                         cudaMemcpyHostToDevice, stream_);
   if (err != cudaSuccess) {
-    log::Error("llama_forward", "BatchForward: token upload failed");
-    return false;
-  }
-  err = cudaMemcpyAsync(d_batch_n_past_, h_batch_n_past_, B * sizeof(int),
-                        cudaMemcpyHostToDevice, stream_);
-  if (err != cudaSuccess) {
-    log::Error("llama_forward", "BatchForward: n_past upload failed");
-    return false;
-  }
-  err = cudaMemcpyAsync(d_batch_seq_ids_, h_batch_seq_ids_, B * sizeof(int),
-                        cudaMemcpyHostToDevice, stream_);
-  if (err != cudaSuccess) {
-    log::Error("llama_forward", "BatchForward: sequence id upload failed");
-    return false;
-  }
-  err = cudaMemcpyAsync(d_batch_kv_lens_, h_batch_kv_lens_, B * sizeof(int),
-                        cudaMemcpyHostToDevice, stream_);
-  if (err != cudaSuccess) {
-    log::Error("llama_forward", "BatchForward: KV length upload failed");
+    log::Error("llama_forward", "BatchForward: batch metadata upload failed");
     return false;
   }
 
   // ===== Phase 2: Bulk KV pointer pre-computation for all layers =====
-  // Replaces num_layers * 4 per-layer H2D copies with 4 bulk copies.
+  // Replaces num_layers * 4 per-layer H2D copies with two fixed-address slab
+  // uploads: append pointers and read pointers.
   auto *typed_cache =
       static_cast<KvCacheGpuTyped<T> *>(static_cast<IKvCacheGpu *>(kv_cache_));
   {
-    size_t total = static_cast<size_t>(num_layers_) * B;
+    const size_t layer_stride = static_cast<size_t>(max_batch_size_);
+    const size_t total_slots = static_cast<size_t>(num_layers_) * layer_stride;
     for (int l = 0; l < num_layers_; l++) {
       typed_cache->GetBatchAppendPtrs(l, h_batch_seq_ids_, h_batch_n_past_, B,
-                                      &h_all_k_append_ptrs_[l * B],
-                                      &h_all_v_append_ptrs_[l * B]);
-      typed_cache->GetBatchKVPtrs(l, h_batch_seq_ids_, B,
-                                  &h_all_k_read_ptrs_[l * B],
-                                  &h_all_v_read_ptrs_[l * B]);
+                                      reinterpret_cast<T **>(
+                                          h_all_k_append_ptrs_ +
+                                          static_cast<size_t>(l) * layer_stride),
+                                      reinterpret_cast<T **>(
+                                          h_all_v_append_ptrs_ +
+                                          static_cast<size_t>(l) * layer_stride));
+      typed_cache->GetBatchKVPtrs(
+          l, h_batch_seq_ids_, B,
+          reinterpret_cast<const T **>(
+              h_all_k_read_ptrs_ + static_cast<size_t>(l) * layer_stride),
+          reinterpret_cast<const T **>(
+              h_all_v_read_ptrs_ + static_cast<size_t>(l) * layer_stride));
     }
-    size_t ptr_bytes = total * sizeof(T *);
-    err = cudaMemcpyAsync(d_all_k_append_ptrs_, h_all_k_append_ptrs_, ptr_bytes,
-                          cudaMemcpyHostToDevice, stream_);
+    const size_t ptr_bytes = total_slots * 2 * sizeof(T *);
+    err = cudaMemcpyAsync(d_all_append_ptrs_meta_, h_all_append_ptrs_meta_,
+                          ptr_bytes, cudaMemcpyHostToDevice, stream_);
     if (err != cudaSuccess) {
-      log::Error("llama_forward",
-                 "BatchForward: KV append pointer upload failed");
+      log::Error("llama_forward", "BatchForward: append pointer upload failed");
       return false;
     }
-    err = cudaMemcpyAsync(d_all_v_append_ptrs_, h_all_v_append_ptrs_, ptr_bytes,
-                          cudaMemcpyHostToDevice, stream_);
+    err = cudaMemcpyAsync(reinterpret_cast<void *>(d_all_read_ptrs_meta_),
+                          reinterpret_cast<const void *>(h_all_read_ptrs_meta_),
+                          ptr_bytes, cudaMemcpyHostToDevice, stream_);
     if (err != cudaSuccess) {
-      log::Error("llama_forward",
-                 "BatchForward: value append pointer upload failed");
-      return false;
-    }
-    err = cudaMemcpyAsync(d_all_k_read_ptrs_, h_all_k_read_ptrs_, ptr_bytes,
-                          cudaMemcpyHostToDevice, stream_);
-    if (err != cudaSuccess) {
-      log::Error("llama_forward",
-                 "BatchForward: KV read pointer upload failed");
-      return false;
-    }
-    err = cudaMemcpyAsync(d_all_v_read_ptrs_, h_all_v_read_ptrs_, ptr_bytes,
-                          cudaMemcpyHostToDevice, stream_);
-    if (err != cudaSuccess) {
-      log::Error("llama_forward",
-                 "BatchForward: value read pointer upload failed");
+      log::Error("llama_forward", "BatchForward: read pointer upload failed");
       return false;
     }
   }
@@ -1891,7 +1870,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
     {
       NVTX_SCOPE("Embedding");
       const T *embed = reinterpret_cast<const T *>(weights_->EmbedTokens());
-      err = cuda_kernel::EmbeddingLookup<T>(embed, d_token_ids_, d_hidden_, B,
+      err = cuda_kernel::EmbeddingLookup<T>(embed, d_batch_token_ids_,
+                                            d_hidden_, B,
                                             hidden_size_, stream_);
       if (err != cudaSuccess)
         return false;
@@ -2085,8 +2065,12 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       // KV append: index into pre-computed bulk pointer arrays
       {
         NVTX_SCOPE("KV_Append");
-        T **k_ap = static_cast<T **>(d_all_k_append_ptrs_) + layer * B;
-        T **v_ap = static_cast<T **>(d_all_v_append_ptrs_) + layer * B;
+        T **k_ap = reinterpret_cast<T **>(d_all_k_append_ptrs_ +
+                                          static_cast<size_t>(layer) *
+                                              max_batch_size_);
+        T **v_ap = reinterpret_cast<T **>(d_all_v_append_ptrs_ +
+                                          static_cast<size_t>(layer) *
+                                              max_batch_size_);
         int kv_dim = num_kv_heads_ * head_dim_;
         err = cuda_kernel::BatchedKvAppend<T>(d_k_new_, d_v_new_, k_ap, v_ap,
                                               B, kv_dim, stream_);
@@ -2103,9 +2087,13 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       {
         NVTX_SCOPE("FlashAttention2");
         const T *const *k_rd =
-            static_cast<const T *const *>(d_all_k_read_ptrs_) + layer * B;
+            reinterpret_cast<const T *const *>(d_all_k_read_ptrs_ +
+                                               static_cast<size_t>(layer) *
+                                                   max_batch_size_);
         const T *const *v_rd =
-            static_cast<const T *const *>(d_all_v_read_ptrs_) + layer * B;
+            reinterpret_cast<const T *const *>(d_all_v_read_ptrs_ +
+                                               static_cast<size_t>(layer) *
+                                                   max_batch_size_);
         float attn_scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
         err = cuda_kernel::FlashDecodeMultiSeq<T>(
             d_q_, k_rd, v_rd, d_attn_out_, d_batch_kv_lens_, B, num_heads_,

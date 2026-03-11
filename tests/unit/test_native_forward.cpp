@@ -174,6 +174,8 @@ TEST_CASE("NativeExecutionPolicy loads hot-path policy from env",
                            "1");
   ScopedEnvVar downproj_hot(
       "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1");
+  ScopedEnvVar downproj_rowpair_hot(
+      "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED", "1");
   ScopedEnvVar enable_mmq("INFERFLUX_ENABLE_DOWNPROJ_MMQ", "1");
   ScopedEnvVar mmq_min_batch("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", "7");
   ScopedEnvVar timing_sample_rate("INFERFLUX_NATIVE_TIMING_SAMPLE_RATE", "9");
@@ -192,12 +194,23 @@ TEST_CASE("NativeExecutionPolicy loads hot-path policy from env",
   REQUIRE(policy.debug_logits_limit == 13);
   REQUIRE(policy.enable_experimental_q81_grouped_hot_q4k);
   REQUIRE(policy.enable_experimental_q81_downproj_hot_fixed);
+  REQUIRE(policy.enable_experimental_q81_downproj_rowpair_hot_fixed);
   REQUIRE(policy.enable_downproj_mmq);
   REQUIRE(policy.downproj_mmq_min_batch_override == 7);
   REQUIRE(policy.timing_sample_rate == 9);
   REQUIRE(policy.require_fused_quantized_matmul_override);
   REQUIRE(policy.require_fused_quantized_matmul);
   REQUIRE(policy.dequantized_cache_policy_override == "batch");
+}
+
+TEST_CASE("NativeExecutionPolicy keeps grouped Q4_K single-row hot path on by "
+          "default",
+          "[native_forward]") {
+  ScopedEnvVar grouped_hot("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K",
+                           nullptr);
+
+  const auto policy = NativeExecutionPolicy::FromEnv();
+  REQUIRE(policy.enable_experimental_q81_grouped_hot_q4k);
 }
 
 TEST_CASE("NativeKernelExecutor: ExecuteUnifiedBatch returns empty when no "
@@ -2859,6 +2872,202 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1Pair preserves per-row grouped Q4_K "
   void *d_act_q8_1 = nullptr;
   half *d_out0 = nullptr;
   half *d_out1 = nullptr;
+  half *d_out0_tuned = nullptr;
+  half *d_out1_tuned = nullptr;
+  half *d_deq0 = nullptr;
+  half *d_deq1 = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_w0),
+                     h_w0.size() * sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_w1),
+                     h_w1.size() * sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_input),
+                     h_input.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(
+      cudaMalloc(&d_act_q8_1,
+                 M * (K / QK8_1) * sizeof(runtime::cuda::native::block_q8_1)) ==
+      cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out0),
+                     M * N0 * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out1),
+                     M * N1 * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out0_tuned),
+                     M * N0 * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out1_tuned),
+                     M * N1 * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_deq0),
+                     N0 * K * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_deq1),
+                     N1 * K * sizeof(half)) == cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_w0, h_w0.data(),
+                     h_w0.size() * sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_w1, h_w1.data(),
+                     h_w1.size() * sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  FusedQuantGemm::QuantizeRowQ8_1(d_input, d_act_q8_1, M, K, nullptr);
+
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(d_w0, d_deq0, N0 * K) ==
+          cudaSuccess);
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(d_w1, d_deq1, N1 * K) ==
+          cudaSuccess);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> deq0 = CopyDeviceHalfs(d_deq0, N0 * K);
+  const std::vector<half> deq1 = CopyDeviceHalfs(d_deq1, N1 * K);
+  std::vector<runtime::cuda::native::block_q8_1> q8_1_blocks(M * (K / QK8_1));
+  REQUIRE(
+      cudaMemcpy(q8_1_blocks.data(), d_act_q8_1,
+                 q8_1_blocks.size() * sizeof(runtime::cuda::native::block_q8_1),
+                 cudaMemcpyDeviceToHost) == cudaSuccess);
+
+  std::vector<float> act_ref(M * K, 0.0f);
+  for (int m = 0; m < M; ++m) {
+    for (int blk = 0; blk < K / QK8_1; ++blk) {
+      const auto &a = q8_1_blocks[m * (K / QK8_1) + blk];
+      const float scale = DecodeQ81Ds(a).first;
+      for (int j = 0; j < QK8_1; ++j) {
+        act_ref[m * K + blk * QK8_1 + j] = scale * static_cast<float>(a.qs[j]);
+      }
+    }
+  }
+
+  auto deq_ref = [&](const std::vector<half> &weights, int rows) {
+    std::vector<float> out(M * rows, 0.0f);
+    for (int m = 0; m < M; ++m) {
+      for (int row = 0; row < rows; ++row) {
+        float acc = 0.0f;
+        for (int i = 0; i < K; ++i) {
+          acc += act_ref[m * K + i] * __half2float(weights[row * K + i]);
+        }
+        out[m * rows + row] = acc;
+      }
+    }
+    return out;
+  };
+
+  const std::vector<float> ref0 = deq_ref(deq0, N0);
+  const std::vector<float> ref1 = deq_ref(deq1, N1);
+
+  const std::array<PackedProjectionSpec, 2> projections = {{
+      {{d_w0, quant_type, static_cast<int64_t>(N0) * K}, d_out0, N0},
+      {{d_w1, quant_type, static_cast<int64_t>(N1) * K}, d_out1, N1},
+  }};
+  REQUIRE(FusedQuantGemm::GemvQ8_1Pair(projections, d_act_q8_1, M, K, nullptr));
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  NativeExecutionPolicy tuned_policy;
+  tuned_policy.enable_experimental_q81_grouped_rowpair_w4 = true;
+  REQUIRE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+      quant_type, FusedDispatchGeometry{M, std::max(N0, N1), K, 2, true, false},
+      &tuned_policy));
+  const std::array<PackedProjectionSpec, 2> tuned_projections = {{
+      {{d_w0, quant_type, static_cast<int64_t>(N0) * K}, d_out0_tuned, N0},
+      {{d_w1, quant_type, static_cast<int64_t>(N1) * K}, d_out1_tuned, N1},
+  }};
+  REQUIRE(FusedQuantGemm::GemvQ8_1Pair(tuned_projections, d_act_q8_1, M, K,
+                                       nullptr, &tuned_policy));
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> out0 = CopyDeviceHalfs(d_out0, M * N0);
+  const std::vector<half> out1 = CopyDeviceHalfs(d_out1, M * N1);
+  const std::vector<half> out0_tuned = CopyDeviceHalfs(d_out0_tuned, M * N0);
+  const std::vector<half> out1_tuned = CopyDeviceHalfs(d_out1_tuned, M * N1);
+  for (int i = 0; i < M * N0; ++i) {
+    REQUIRE(__half2float(out0[i]) == Catch::Approx(ref0[i]).margin(8e-2f));
+    REQUIRE(__half2float(out0_tuned[i]) ==
+            Catch::Approx(ref0[i]).margin(8e-2f));
+  }
+  for (int i = 0; i < M * N1; ++i) {
+    REQUIRE(__half2float(out1[i]) == Catch::Approx(ref1[i]).margin(8e-2f));
+    REQUIRE(__half2float(out1_tuned[i]) ==
+            Catch::Approx(ref1[i]).margin(8e-2f));
+  }
+
+  REQUIRE(cudaFree(d_deq1) == cudaSuccess);
+  REQUIRE(cudaFree(d_deq0) == cudaSuccess);
+  REQUIRE(cudaFree(d_out1_tuned) == cudaSuccess);
+  REQUIRE(cudaFree(d_out0_tuned) == cudaSuccess);
+  REQUIRE(cudaFree(d_out1) == cudaSuccess);
+  REQUIRE(cudaFree(d_out0) == cudaSuccess);
+  REQUIRE(cudaFree(d_act_q8_1) == cudaSuccess);
+  REQUIRE(cudaFree(d_input) == cudaSuccess);
+  REQUIRE(cudaFree(d_w1) == cudaSuccess);
+  REQUIRE(cudaFree(d_w0) == cudaSuccess);
+}
+
+TEST_CASE("FusedQuantGemm::GemvQ8_1Pair preserves per-row grouped Q4_K "
+          "outputs for single-row hot decode geometry",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping single-row hot grouped Q4_K "
+            "Q8_1 parity.");
+    return;
+  }
+
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  if (!FusedQuantGemm::SupportsQ8_1Activations(quant_type)) {
+    SUCCEED("Q8_1 Q4_K kernels unavailable for this device/profile.");
+    return;
+  }
+
+  NativeExecutionPolicy policy;
+  policy.enable_experimental_q81_grouped_hot_q4k = true;
+
+  constexpr int M = 1;
+  constexpr int K = 2048;
+  constexpr int N0 = 8192;
+  constexpr int N1 = 8192;
+  REQUIRE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(
+      quant_type, FusedDispatchGeometry{M, std::max(N0, N1), K, 2, true, false},
+      &policy));
+
+  auto encode_half = [](float value) {
+    const half h = __float2half(value);
+    unsigned short bits = 0;
+    std::memcpy(&bits, &h, sizeof(bits));
+    return bits;
+  };
+
+  const int blocks_per_row = K / QK_K;
+  auto make_q4_k_weights = [&](int rows, int seed) {
+    std::vector<runtime::cuda::native::block_q4_k> blocks(
+        static_cast<size_t>(rows) * blocks_per_row);
+    for (int row = 0; row < rows; ++row) {
+      for (int blk = 0; blk < blocks_per_row; ++blk) {
+        auto &block = blocks[static_cast<size_t>(row) * blocks_per_row + blk];
+        block.d = encode_half(0.02f * static_cast<float>(((row + blk + seed) % 4) + 1));
+        block.dmin =
+            encode_half(0.01f * static_cast<float>(((row + blk + seed) % 3) + 1));
+        for (int i = 0; i < 12; ++i) {
+          block.scales[i] = static_cast<unsigned char>(
+              (seed * 17 + row * 7 + blk * 11 + i * 5) & 0xFF);
+        }
+        for (int i = 0; i < QK_K / 2; ++i) {
+          block.qs[i] = static_cast<unsigned char>(
+              (seed * 11 + row * 13 + blk * 19 + i * 3) & 0xFF);
+        }
+      }
+    }
+    return blocks;
+  };
+
+  const auto h_w0 = make_q4_k_weights(N0, 3);
+  const auto h_w1 = make_q4_k_weights(N1, 7);
+  const std::vector<half> h_input = MakeWaveTensor(M * K, 0.015f, -0.002f);
+
+  runtime::cuda::native::block_q4_k *d_w0 = nullptr;
+  runtime::cuda::native::block_q4_k *d_w1 = nullptr;
+  half *d_input = nullptr;
+  void *d_act_q8_1 = nullptr;
+  half *d_out0 = nullptr;
+  half *d_out1 = nullptr;
   half *d_deq0 = nullptr;
   half *d_deq1 = nullptr;
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_w0),
@@ -2938,7 +3147,8 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1Pair preserves per-row grouped Q4_K "
       {{d_w0, quant_type, static_cast<int64_t>(N0) * K}, d_out0, N0},
       {{d_w1, quant_type, static_cast<int64_t>(N1) * K}, d_out1, N1},
   }};
-  REQUIRE(FusedQuantGemm::GemvQ8_1Pair(projections, d_act_q8_1, M, K, nullptr));
+  REQUIRE(FusedQuantGemm::GemvQ8_1Pair(projections, d_act_q8_1, M, K, nullptr,
+                                       &policy));
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
   const std::vector<half> out0 = CopyDeviceHalfs(d_out0, M * N0);
@@ -4773,6 +4983,297 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for exact "
   REQUIRE(cudaFree(d_w) == cudaSuccess);
 }
 
+TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q4_K outputs for exact "
+          "two-row down-proj hot geometry",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED(
+        "No CUDA device available; skipping Q4_K row-pair hot parity.");
+    return;
+  }
+
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  if (!FusedQuantGemm::SupportsQ8_1Activations(quant_type)) {
+    SUCCEED("Q8_1 Q4_K kernels unavailable for this device/profile.");
+    return;
+  }
+  const char *prev = std::getenv(
+      "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
+  std::string prev_value = prev ? prev : "";
+  REQUIRE(setenv(
+              "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+              "1", 1) == 0);
+
+  constexpr int M = 2;
+  constexpr int K = 11008;
+  constexpr int N = 2048;
+  constexpr int kBlocksPerRow = K / QK_K;
+  REQUIRE(FusedQuantGemm::SelectDownProjOperator(
+              quant_type, FusedDispatchGeometry{M, N, K, 1, true, false}, true,
+              true, true) ==
+          FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
+
+  auto encode_half = [](float value) {
+    const half h = __float2half(value);
+    unsigned short bits = 0;
+    std::memcpy(&bits, &h, sizeof(bits));
+    return bits;
+  };
+
+  std::vector<runtime::cuda::native::block_q4_k> h_w(N * kBlocksPerRow);
+  for (int row = 0; row < N; ++row) {
+    for (int blk = 0; blk < kBlocksPerRow; ++blk) {
+      auto &block = h_w[row * kBlocksPerRow + blk];
+      block.d = encode_half(0.012f * static_cast<float>(((row + blk) % 5) + 1));
+      block.dmin =
+          encode_half(0.006f * static_cast<float>(((row + blk) % 3) + 1));
+      for (int i = 0; i < 12; ++i) {
+        block.scales[i] =
+            static_cast<unsigned char>((row * 17 + blk * 7 + i * 5) & 0xFF);
+      }
+      for (int i = 0; i < QK_K / 2; ++i) {
+        block.qs[i] =
+            static_cast<unsigned char>((row * 13 + blk * 11 + i * 3) & 0xFF);
+      }
+    }
+  }
+  const std::vector<half> h_input = MakeWaveTensor(M * K, 0.009f, -0.001f);
+
+  runtime::cuda::native::block_q4_k *d_w = nullptr;
+  half *d_input = nullptr;
+  void *d_act_q8_1 = nullptr;
+  half *d_out = nullptr;
+  half *d_deq = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_w),
+                     h_w.size() * sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_input),
+                     h_input.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(
+      cudaMalloc(&d_act_q8_1,
+                 M * (K / QK8_1) * sizeof(runtime::cuda::native::block_q8_1)) ==
+      cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out),
+                     M * N * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_deq),
+                     N * K * sizeof(half)) == cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_w, h_w.data(),
+                     h_w.size() * sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  FusedQuantGemm::QuantizeRowQ8_1(d_input, d_act_q8_1, M, K, nullptr);
+
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(d_w, d_deq, N * K) ==
+          cudaSuccess);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> deq =
+      CopyDeviceHalfs(d_deq, static_cast<size_t>(N) * K);
+  std::vector<runtime::cuda::native::block_q8_1> q8_1_blocks(M * (K / QK8_1));
+  REQUIRE(cudaMemcpy(q8_1_blocks.data(), d_act_q8_1,
+                     q8_1_blocks.size() *
+                         sizeof(runtime::cuda::native::block_q8_1),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+
+  std::vector<float> act_ref(M * K, 0.0f);
+  for (int row = 0; row < M; ++row) {
+    for (int blk = 0; blk < K / QK8_1; ++blk) {
+      const auto &a = q8_1_blocks[row * (K / QK8_1) + blk];
+      const float scale = DecodeQ81Ds(a).first;
+      for (int j = 0; j < QK8_1; ++j) {
+        act_ref[row * K + blk * QK8_1 + j] =
+            scale * static_cast<float>(a.qs[j]);
+      }
+    }
+  }
+
+  std::vector<float> ref(M * N, 0.0f);
+  for (int row = 0; row < M; ++row) {
+    for (int out = 0; out < N; ++out) {
+      float acc = 0.0f;
+      for (int i = 0; i < K; ++i) {
+        acc += act_ref[row * K + i] * __half2float(deq[out * K + i]);
+      }
+      ref[row * N + out] = acc;
+    }
+  }
+
+  QuantizedWeightInfo info{d_w, quant_type, static_cast<int64_t>(N) * K};
+  REQUIRE(FusedQuantGemm::GemvQ8_1(info, d_act_q8_1, d_out, M, N, K, nullptr));
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> out = CopyDeviceHalfs(d_out, M * N);
+  for (int i = 0; i < M * N; ++i) {
+    REQUIRE(__half2float(out[i]) == Catch::Approx(ref[i]).margin(1.0e-1f));
+  }
+
+  if (prev) {
+    REQUIRE(setenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+                prev_value.c_str(), 1) == 0);
+  } else {
+    REQUIRE(unsetenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED") ==
+            0);
+  }
+  REQUIRE(cudaFree(d_deq) == cudaSuccess);
+  REQUIRE(cudaFree(d_out) == cudaSuccess);
+  REQUIRE(cudaFree(d_act_q8_1) == cudaSuccess);
+  REQUIRE(cudaFree(d_input) == cudaSuccess);
+  REQUIRE(cudaFree(d_w) == cudaSuccess);
+}
+
+TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for exact "
+          "two-row down-proj hot geometry",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED(
+        "No CUDA device available; skipping Q6_K row-pair hot parity.");
+    return;
+  }
+
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
+  if (!FusedQuantGemm::SupportsQ8_1Activations(quant_type)) {
+    SUCCEED("Q8_1 Q6_K kernels unavailable for this device/profile.");
+    return;
+  }
+  const char *prev = std::getenv(
+      "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
+  std::string prev_value = prev ? prev : "";
+  REQUIRE(setenv(
+              "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+              "1", 1) == 0);
+
+  constexpr int M = 2;
+  constexpr int K = 11008;
+  constexpr int N = 2048;
+  constexpr int kBlocksPerRow = K / QK_K;
+  REQUIRE(FusedQuantGemm::SelectDownProjOperator(
+              quant_type, FusedDispatchGeometry{M, N, K, 1, true, false}, true,
+              true, true) ==
+          FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
+
+  auto encode_half = [](float value) {
+    const half h = __float2half(value);
+    unsigned short bits = 0;
+    std::memcpy(&bits, &h, sizeof(bits));
+    return bits;
+  };
+
+  std::vector<runtime::cuda::native::block_q6_k> h_w(N * kBlocksPerRow);
+  for (int row = 0; row < N; ++row) {
+    for (int blk = 0; blk < kBlocksPerRow; ++blk) {
+      auto &block = h_w[row * kBlocksPerRow + blk];
+      for (int i = 0; i < QK_K / 2; ++i) {
+        block.ql[i] =
+            static_cast<unsigned char>((row * 11 + blk * 13 + i * 3) & 0xFF);
+      }
+      for (int i = 0; i < QK_K / 4; ++i) {
+        block.qh[i] =
+            static_cast<unsigned char>((row * 7 + blk * 5 + i * 9) & 0xFF);
+      }
+      for (int i = 0; i < QK_K / 16; ++i) {
+        block.scales[i] =
+            static_cast<char>((((row + blk) * 5 + i * 7) % 31) - 15);
+      }
+      block.d =
+          encode_half(0.008f * static_cast<float>(((row + blk) % 5) + 1));
+    }
+  }
+  const std::vector<half> h_input = MakeWaveTensor(M * K, 0.008f, 0.001f);
+
+  runtime::cuda::native::block_q6_k *d_w = nullptr;
+  half *d_input = nullptr;
+  void *d_act_q8_1 = nullptr;
+  half *d_out = nullptr;
+  half *d_deq = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_w),
+                     h_w.size() * sizeof(runtime::cuda::native::block_q6_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_input),
+                     h_input.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(
+      cudaMalloc(&d_act_q8_1,
+                 M * (K / QK8_1) * sizeof(runtime::cuda::native::block_q8_1)) ==
+      cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out),
+                     M * N * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_deq),
+                     N * K * sizeof(half)) == cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_w, h_w.data(),
+                     h_w.size() * sizeof(runtime::cuda::native::block_q6_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  FusedQuantGemm::QuantizeRowQ8_1(d_input, d_act_q8_1, M, K, nullptr);
+
+  REQUIRE(runtime::cuda::native::dequantize_q6_k(d_w, d_deq, N * K) ==
+          cudaSuccess);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> deq =
+      CopyDeviceHalfs(d_deq, static_cast<size_t>(N) * K);
+  std::vector<runtime::cuda::native::block_q8_1> q8_1_blocks(M * (K / QK8_1));
+  REQUIRE(cudaMemcpy(q8_1_blocks.data(), d_act_q8_1,
+                     q8_1_blocks.size() *
+                         sizeof(runtime::cuda::native::block_q8_1),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+
+  std::vector<float> act_ref(M * K, 0.0f);
+  for (int row = 0; row < M; ++row) {
+    for (int blk = 0; blk < K / QK8_1; ++blk) {
+      const auto &a = q8_1_blocks[row * (K / QK8_1) + blk];
+      const float scale = DecodeQ81Ds(a).first;
+      for (int j = 0; j < QK8_1; ++j) {
+        act_ref[row * K + blk * QK8_1 + j] =
+            scale * static_cast<float>(a.qs[j]);
+      }
+    }
+  }
+
+  std::vector<float> ref(M * N, 0.0f);
+  for (int row = 0; row < M; ++row) {
+    for (int out = 0; out < N; ++out) {
+      float acc = 0.0f;
+      for (int i = 0; i < K; ++i) {
+        acc += act_ref[row * K + i] * __half2float(deq[out * K + i]);
+      }
+      ref[row * N + out] = acc;
+    }
+  }
+
+  QuantizedWeightInfo info{d_w, quant_type, static_cast<int64_t>(N) * K};
+  REQUIRE(FusedQuantGemm::GemvQ8_1(info, d_act_q8_1, d_out, M, N, K, nullptr));
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> out = CopyDeviceHalfs(d_out, M * N);
+  for (int i = 0; i < M * N; ++i) {
+    REQUIRE(__half2float(out[i]) == Catch::Approx(ref[i]).margin(1.0e-1f));
+  }
+
+  if (prev) {
+    REQUIRE(setenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+                prev_value.c_str(), 1) == 0);
+  } else {
+    REQUIRE(unsetenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED") ==
+            0);
+  }
+  REQUIRE(cudaFree(d_deq) == cudaSuccess);
+  REQUIRE(cudaFree(d_out) == cudaSuccess);
+  REQUIRE(cudaFree(d_act_q8_1) == cudaSuccess);
+  REQUIRE(cudaFree(d_input) == cudaSuccess);
+  REQUIRE(cudaFree(d_w) == cudaSuccess);
+}
+
 TEST_CASE(
     "QuantizedWeightMapAdapter: HasQuantizedWeights delegates to underlying",
     "[native_forward]") {
@@ -4900,11 +5401,22 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes exact Q4_K decode hot "
   }
 }
 
-TEST_CASE("FusedQuantGemm: down-proj selector keeps exact hot geometry on "
-          "generic Q8_1 path by default",
+TEST_CASE("FusedQuantGemm: down-proj selector promotes exact Q4_K hot geometry "
+          "to fixed-block Q8_1 by default",
           "[native_forward]") {
   const int quant_type =
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  REQUIRE(FusedQuantGemm::SelectDownProjOperator(
+              quant_type, FusedDispatchGeometry{1, 2048, 11008, 1, true, false},
+              true, true, true) ==
+          FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed);
+}
+
+TEST_CASE("FusedQuantGemm: down-proj selector keeps exact Q6_K hot geometry on "
+          "generic Q8_1 path by default",
+          "[native_forward]") {
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{1, 2048, 11008, 1, true, false},
               true, true, true) ==
@@ -4936,14 +5448,66 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes exact Q6_K decode hot "
 }
 
 TEST_CASE("FusedQuantGemm: down-proj selector promotes two-row Q4_K decode "
-          "to explicit row-pair Q8_1 operator",
+          "to exact-shape fixed-block row-pair Q8_1 when explicitly enabled",
+          "[native_forward]") {
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  const char *prev = std::getenv(
+      "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
+  std::string prev_value = prev ? prev : "";
+  REQUIRE(setenv(
+              "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+              "1", 1) == 0);
+  REQUIRE(FusedQuantGemm::SelectDownProjOperator(
+              quant_type, FusedDispatchGeometry{2, 2048, 11008, 1, true, false},
+              true, true, true) ==
+          FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
+  if (prev) {
+    REQUIRE(setenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+                prev_value.c_str(), 1) == 0);
+  } else {
+    REQUIRE(unsetenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED") ==
+            0);
+  }
+}
+
+TEST_CASE("FusedQuantGemm: down-proj selector promotes exact two-row Q4_K "
+          "decode to fixed-block row-pair by default",
           "[native_forward]") {
   const int quant_type =
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{2, 2048, 11008, 1, true, false},
               true, true, true) ==
-          FusedQuantGemm::DownProjOperator::kQ81GemvRowPair);
+          FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
+}
+
+TEST_CASE("FusedQuantGemm: down-proj selector promotes two-row Q6_K decode "
+          "to exact-shape fixed-block row-pair Q8_1 when explicitly enabled",
+          "[native_forward]") {
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
+  const char *prev = std::getenv(
+      "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
+  std::string prev_value = prev ? prev : "";
+  REQUIRE(setenv(
+              "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+              "1", 1) == 0);
+  REQUIRE(FusedQuantGemm::SelectDownProjOperator(
+              quant_type, FusedDispatchGeometry{2, 2048, 11008, 1, true, false},
+              true, true, true) ==
+          FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
+  if (prev) {
+    REQUIRE(setenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+                prev_value.c_str(), 1) == 0);
+  } else {
+    REQUIRE(unsetenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED") ==
+            0);
+  }
 }
 
 TEST_CASE("FusedQuantGemm: down-proj selector promotes four-row Q6_K decode "
@@ -5122,7 +5686,7 @@ TEST_CASE("FusedQuantGemm: geometry-aware selector keeps packed grouped paths "
 }
 
 TEST_CASE("FusedQuantGemm: specialized grouped Q8_1 fast path is limited to "
-          "Q4_K small-batch FFN geometry and explicit rollout enablement",
+          "Q4_K single-row FFN geometry and explicit rollout enablement",
           "[native_forward]") {
   const int q4k =
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
@@ -5135,7 +5699,8 @@ TEST_CASE("FusedQuantGemm: specialized grouped Q8_1 fast path is limited to "
       std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K");
   const bool had_prev = prev_value != nullptr;
   const std::string prev = had_prev ? std::string(prev_value) : std::string();
-  REQUIRE(unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K") == 0);
+  REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", "0", 1) ==
+          0);
   REQUIRE_FALSE(
       FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m1));
   REQUIRE_FALSE(
@@ -5144,7 +5709,8 @@ TEST_CASE("FusedQuantGemm: specialized grouped Q8_1 fast path is limited to "
   REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", "1", 1) ==
           0);
   REQUIRE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m1));
-  REQUIRE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m2));
+  REQUIRE_FALSE(
+      FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m2));
 
   if (had_prev) {
     REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K",
@@ -5165,19 +5731,61 @@ TEST_CASE("FusedQuantGemm: specialized grouped Q8_1 fast path is limited to "
       q6k, FusedDispatchGeometry{1, 11008, 2048, 2, true, false}));
 }
 
-TEST_CASE("FusedQuantGemm: FFN grouped selector keeps specialized hot Q4_K "
-          "path disabled by default until parity is proven",
+TEST_CASE("FusedQuantGemm: 4-warp grouped row-pair path is limited to "
+          "Q4_K M=2 FFN decode geometry and explicit rollout enablement",
           "[native_forward]") {
   const int q4k =
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  const int q6k =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
+  const FusedDispatchGeometry hot_m2{2, 11008, 2048, 2, true, false};
+
+  NativeExecutionPolicy disabled_policy;
+  disabled_policy.enable_experimental_q81_grouped_rowpair_w4 = false;
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+      q4k, hot_m2, &disabled_policy));
+
+  NativeExecutionPolicy enabled_policy;
+  enabled_policy.enable_experimental_q81_grouped_rowpair_w4 = true;
+  REQUIRE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+      q4k, hot_m2, &enabled_policy));
+
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+      q4k, FusedDispatchGeometry{1, 11008, 2048, 2, true, false},
+      &enabled_policy));
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+      q4k, FusedDispatchGeometry{2, 2048, 2048, 2, true, false},
+      &enabled_policy));
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+      q4k, FusedDispatchGeometry{2, 11008, 4096, 2, true, false},
+      &enabled_policy));
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+      q4k, FusedDispatchGeometry{2, 11008, 2048, 3, true, false},
+      &enabled_policy));
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+      q6k, hot_m2, &enabled_policy));
+}
+
+TEST_CASE("FusedQuantGemm: FFN grouped selector keeps only the proven "
+          "single-row Q4_K decode path on by default",
+          "[native_forward]") {
+  const int q4k =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  NativeExecutionPolicy policy;
   REQUIRE(FusedQuantGemm::SelectFfnProjOperator(
               q4k, q4k, FusedDispatchGeometry{1, 11008, 2048, 2, true, true},
-              true, true) ==
-          FusedQuantGemm::FfnProjOperator::kQ81Group);
+              true, true, &policy) ==
+          FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K);
   REQUIRE(FusedQuantGemm::SelectFfnProjOperator(
               q4k, q4k, FusedDispatchGeometry{2, 11008, 2048, 2, true, true},
-              true, true) ==
+              true, true, &policy) ==
           FusedQuantGemm::FfnProjOperator::kQ81Group);
+
+  policy.enable_experimental_q81_grouped_rowpair_w4 = true;
+  REQUIRE(FusedQuantGemm::SelectFfnProjOperator(
+              q4k, q4k, FusedDispatchGeometry{2, 11008, 2048, 2, true, true},
+              true, true, &policy) ==
+          FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4);
 }
 
 TEST_CASE("FusedQuantGemm: FFN grouped selector keeps non-hot grouped decode "
@@ -5367,6 +5975,9 @@ TEST_CASE("FusedQuantGemm: metric names distinguish V2 hot-path variants",
   REQUIRE(FusedQuantGemm::FfnProjOperatorMetricName(
               FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K, q4k, 2048) ==
           std::string("q8_1_group_hot_q4k"));
+  REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
+              FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed, q4k, 2,
+              11008) == std::string("q8_1_gemv_row_pair_hot_fixed"));
   REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
               FusedQuantGemm::DownProjOperator::kQ81GemvRowPair, q6k, 2, 11008) ==
           std::string("q8_1_gemv_row_pair"));

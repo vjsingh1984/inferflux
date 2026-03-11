@@ -149,6 +149,7 @@ struct InferenceRequest {
   // Persistent execution state for step-wise batch execution.
   // These fields allow BatchExecutor to pause and resume a request at any token
   // step without losing progress.
+  bool exec_initialized{false};
   bool exec_active{true};
   int exec_tokens_generated{0};
   int exec_decode_limit{0};

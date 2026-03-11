@@ -171,10 +171,10 @@ EOF
     log "Starting profiled server run..."
     nsys profile -o "$OUTPUT_DIR/nsys_${name}" \
         --trace=cuda,nvtx,osrt \
+        --cuda-graph-trace=node \
         --cuda-memory-usage=true \
         --force-overwrite=true \
-        --capture-range=nvtx \
-        --capture-range-end=stop \
+        --sample=none \
         "$BUILD_DIR/inferfluxd" --config "$config_file" \
         > "$OUTPUT_DIR/server_${name}.log" 2>&1 &
     nsys_pid=$!
@@ -246,8 +246,13 @@ EOF
     sleep 3
 
     # Check if nsys report was created
-    if [ -f "${nsys_report}.sqlite" ] || [ -f "${nsys_report}.qdstrm" ]; then
-        log_ok "Profile saved: ${nsys_report}.sqlite"
+    if [ -f "${nsys_report}.nsys-rep" ] || [ -f "${nsys_report}.qdstrm" ] || [ -f "${nsys_report}.sqlite" ]; then
+        log_ok "Profile saved: ${nsys_report}.nsys-rep"
+
+        for report in cuda_gpu_kern_sum cuda_gpu_kern_gb_sum cuda_kern_exec_sum cuda_api_sum cuda_gpu_mem_time_sum; do
+            nsys stats --force-export=true --report "$report" --format csv "${nsys_report}.nsys-rep" \
+                > "$OUTPUT_DIR/${report}_${name}.csv" 2> "$OUTPUT_DIR/${report}_${name}.stderr" || true
+        done
 
         # Extract basic stats from metrics
     batch_1=$(grep -oP 'inferflux_native_forward_batch_size_total\{phase="decode",bucket="1"\} \K\d+' "$OUTPUT_DIR/metrics_${name}.txt" 2>/dev/null || echo "0")
@@ -339,5 +344,5 @@ echo "     - single (forced B=1) vs default vs large (B=16 allowed)"
 echo "     - Kernel efficiency: Is B=4 actually 4× faster than B=1?"
 echo ""
 echo "  4. Export reports:"
-echo "     nsys stats $OUTPUT_DIR/nsys_default.sqlite --report gpukernsum"
+echo "     nsys stats $OUTPUT_DIR/nsys_default.nsys-rep --report cuda_gpu_kern_gb_sum"
 echo ""

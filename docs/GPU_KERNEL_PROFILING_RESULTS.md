@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-Using timing instrumentation (`INFERFLUX_NATIVE_TIMING_SAMPLE_RATE=1`), I profiled the native CUDA backend with 4 concurrent requests. The key finding confirms the earlier hypothesis: **the system processes each decode step separately, not in true batches**.
+Using timing instrumentation (`INFERFLUX_NATIVE_TIMING_SAMPLE_RATE=1`), I profiled the native CUDA backend with 4 concurrent requests. The original signal suggested the system was processing decode mostly one sequence at a time. Follow-up privileged runs on March 11, 2026 refined that conclusion: **the decode queue can form multi-request cohorts, but the active decode loop keeps those cohorts closed instead of continuously merging newly ready sequences**.
 
 ---
 
@@ -80,17 +80,15 @@ From `inferflux_native_forward_duration_ms` histogram:
 
 ## Root Cause Analysis
 
-### Primary Issue: Decode Loop Architecture
+### Primary Issue: Closed-Cohort Decode Loop Architecture
 
-The evidence points to a **decode loop architecture issue**, not a kernel efficiency issue:
+The evidence points to a **decode loop architecture issue**, not just a kernel efficiency issue:
 
 1. **Token-by-token decode**: Each forward pass processes only 1-2 tokens per sequence
-2. **Separate passes per sequence**: Even with 4 concurrent requests, most passes are B=1
-3. **No multi-token batching**: The system doesn't batch multiple decode steps together
+2. **Closed decode cohorts**: scheduler worker batches can start at size 4, but once `ExecuteUnifiedBatchPhased()` begins, only those requests participate in that decode loop
+3. **No continuous join**: newly decode-ready requests wait for later scheduler passes instead of joining the live step loop
 
-**Hypothesis**: The decode loop in `transformer_forward.cu` or `BatchedDecode()` processes each sequence's decode step separately, calling the forward pass once per token per sequence, rather than:
-- Batching all sequences' decode steps together
-- OR processing multiple tokens per sequence in one batch
+**Updated hypothesis**: the main loss is not that the queue never forms `B=4`; it is that the scheduler/executor boundary hands fixed cohorts into `ExecuteUnifiedBatchPhased()`, which then runs them to completion. That prevents a true continuously merged decode lane.
 
 ### Secondary Issue: Scheduler Batching Inefficiency
 
@@ -143,6 +141,17 @@ With 4 concurrent requests, 32 tokens each:
 - If per-token: Redesign to batch multiple tokens
 - If per-batch: Investigate why batches are small
 
+**March 11, 2026 update**:
+- The decode-worker lane now keeps a persistent local working set.
+- Bound decode requests also skip re-routing and use a direct stepwise fast
+  path.
+- On the latest short probe, the direct path handled all decode-worker
+  iterations (`inferflux_scheduler_decode_worker_execution_path_total{path="direct_stepwise"} = 93`),
+  while batch-size counters still matched native forward batch sizes exactly.
+
+This shifts the hotspot away from scheduler scaffolding and toward native decode
+operator cost.
+
 ### 2. Check Decode Worker Isolation 🔴 HIGH PRIORITY
 
 **Goal**: Verify if decode workers prevent batching
@@ -152,9 +161,13 @@ With 4 concurrent requests, 32 tokens each:
 2. Verify if each sequence has its own decode context
 3. Test with decode workers disabled
 
-**Expected outcome**:
-- If workers enabled: Try disabling to improve batching
-- If workers disabled: Issue is elsewhere
+**Observed follow-up**:
+- `decode_pool_size=2` formed worker batches `4:1`, `3:1`, `2:1`, `1:3`
+- `decode_pool_size=1` formed worker batches `4:2`, `2:1`, `1:2`
+- Native throughput improved from `104.8 tok/s` to `118.1 tok/s` when reducing the pool from 2 to 1
+
+This means extra decode workers do fragment cohorts further, but even one worker
+does not solve the root issue because the active batch still remains closed.
 
 ### 3. Profile Request Arrival Timing 🟡 MEDIUM PRIORITY
 
@@ -182,6 +195,18 @@ With 4 concurrent requests, 32 tokens each:
 - If throughput improves: Confirms architecture issue
 - If no improvement: Issue is kernel efficiency
 
+**Current status**:
+- Scheduler-side batching fixes improved cohort fidelity but did not close the
+  remaining throughput gap.
+- Native phase timing still shows decode FFN as the dominant block:
+  - `decode total_mean = 20.874 ms`
+  - `decode ffn_mean = 9.804 ms`
+  - `decode qkv_mean = 2.896 ms`
+  - `decode attn_mean = 2.082 ms`
+
+The next optimization pass should target native FFN/down-proj and related
+decode operator cost rather than more decode-worker restructuring.
+
 ---
 
 ## Next Steps
@@ -203,9 +228,9 @@ With 4 concurrent requests, 32 tokens each:
 ### Long-term (If Architecture Issue Confirmed)
 
 4. **Redesign decode loop**:
-   - Process all sequences' decode steps together
-   - Batch multiple tokens per sequence
-   - Ensure B=4 batches are common
+   - Keep one canonical decode lane per model
+   - Let decode-ready requests join between steps instead of holding fixed cohorts
+   - Preserve per-sequence state across steps so the live batch can be rebuilt continuously
 
 5. **Optimize kernel for larger batches**:
    - Profile B=1 vs B=2 vs B=4 kernel execution time

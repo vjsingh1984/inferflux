@@ -56,6 +56,7 @@ public:
     kFallback = 0,
     kQ81Group,
     kQ81GroupHotQ4K,
+    kQ81GroupRowPairW4,
     kPackedGroup,
   };
 
@@ -63,6 +64,7 @@ public:
     kFallback = 0,
     kQ81Gemv,
     kQ81GemvHotFixed,
+    kQ81GemvRowPairHotFixed,
     kQ81GemvRowPair,
     kQ81GemvRowQuad,
     kPackedGemv,
@@ -315,6 +317,17 @@ public:
                                           const FusedDispatchGeometry &geometry,
                                           const NativeExecutionPolicy *policy =
                                               nullptr);
+
+  /**
+   * Experimental 4-warp grouped row-pair selector.
+   *
+   * This targets the measured M=2 FFN grouped decode envelope for Q4_K using
+   * a smaller 4-warp CTA, following llama.cpp's MMVQ small-batch launch shape
+   * more closely than the generic one-warp-per-output row-pair path.
+   */
+  static bool ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+      int quant_type, const FusedDispatchGeometry &geometry,
+      const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Get the adaptive M threshold for a given quant type.

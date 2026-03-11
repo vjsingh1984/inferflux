@@ -1421,6 +1421,9 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
           if (stop_hit)
             req->exec_active = false;
         }
+        if (req->exec_tokens_generated >= req->exec_decode_limit) {
+          req->exec_active = false;
+        }
         LogUnifiedAssemblyState("step_prefill_emit", *req, piece,
                                 req->exec_result.completion, res.token,
                                 req->exec_tokens_generated, req->n_past,
@@ -1452,6 +1455,9 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
       }
       if (stop_hit)
         req->exec_active = false;
+      if (req->exec_tokens_generated >= req->exec_decode_limit) {
+        req->exec_active = false;
+      }
       LogUnifiedAssemblyState("step_decode_emit", *req, piece,
                               req->exec_result.completion, res.token,
                               req->exec_tokens_generated, req->n_past, stop_hit,

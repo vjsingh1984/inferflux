@@ -164,10 +164,6 @@ float BitsPerWeight(GGUF::TensorType qtype) {
   }
 }
 
-bool ExperimentalQ8_1TripleRowPairEnabled() {
-  return ResolveExecutionPolicy(nullptr).enable_experimental_q81_triple_rowpair;
-}
-
 // Compute the adaptive M threshold for a given quant type.
 //
 // Formula: threshold = base_threshold * (16.0 / bpw)
@@ -420,6 +416,9 @@ struct PackedDispatchTripleEntry {
 constexpr int kMaxTensorType = 16;
 constexpr int kQ4KGroupedHotPathK = 2048;
 constexpr int kQ4KGroupedHotPathBlocks = kQ4KGroupedHotPathK / QK_K;
+constexpr int kQ4KGroupedRowPairW4WarpsPerBlock = 4;
+constexpr int kQ4KGroupedRowPairW4ThreadsPerBlock =
+    kQ4KGroupedRowPairW4WarpsPerBlock * 32;
 constexpr int kDownProjHotPathK = 11008;
 constexpr int kDownProjHotPathN = 2048;
 constexpr int kDownProjHotPathBlocks = kDownProjHotPathK / QK_K;
@@ -527,27 +526,48 @@ bool ShouldUseSpecializedQ8_1GroupedFastPathImpl(
     int quant_type, const FusedDispatchGeometry &geometry) {
   return quant_type ==
              static_cast<int>(GGUF::TensorType::Q4_K) &&
-         geometry.grouped_outputs == 2 && geometry.M > 0 && geometry.M <= 2 &&
+         geometry.grouped_outputs == 2 && geometry.M == 1 &&
          geometry.N >= 8192 &&
          geometry.K == kQ4KGroupedHotPathK;
 }
 
 bool ShouldUseSpecializedQ8_1DownProjHotPathImpl(
     int quant_type, const FusedDispatchGeometry &geometry) {
-  const bool hot_quant =
-      quant_type == static_cast<int>(GGUF::TensorType::Q4_K) ||
+  const auto &policy = ResolveExecutionPolicy(nullptr);
+  const bool q4k =
+      quant_type == static_cast<int>(GGUF::TensorType::Q4_K);
+  const bool q6k =
       quant_type == static_cast<int>(GGUF::TensorType::Q6_K);
-  if (!ResolveExecutionPolicy(nullptr)
-           .enable_experimental_q81_downproj_hot_fixed) {
+  if ((!q4k && !q6k) || (q6k && !policy.enable_experimental_q81_downproj_hot_fixed)) {
     return false;
   }
-  return hot_quant && geometry.grouped_outputs == 1 &&
-         geometry.M == 1 && geometry.N == kDownProjHotPathN &&
+  return geometry.grouped_outputs == 1 && geometry.M == 1 &&
+         geometry.N == kDownProjHotPathN &&
+         geometry.K == kDownProjHotPathK;
+}
+
+bool ShouldUseSpecializedQ8_1DownProjRowPairHotPathImpl(
+    int quant_type, const FusedDispatchGeometry &geometry) {
+  const auto &policy = ResolveExecutionPolicy(nullptr);
+  const bool q4k =
+      quant_type == static_cast<int>(GGUF::TensorType::Q4_K);
+  const bool q6k =
+      quant_type == static_cast<int>(GGUF::TensorType::Q6_K);
+  if ((!q4k && !q6k) ||
+      (q6k && !policy.enable_experimental_q81_downproj_rowpair_hot_fixed)) {
+    return false;
+  }
+  return geometry.grouped_outputs == 1 && geometry.M == 2 &&
+         geometry.N == kDownProjHotPathN &&
          geometry.K == kDownProjHotPathK;
 }
 
 bool ExperimentalQ8_1GroupedHotQ4KEnabled() {
   return ResolveExecutionPolicy(nullptr).enable_experimental_q81_grouped_hot_q4k;
+}
+
+bool ExperimentalQ8_1GroupedRowPairW4Enabled() {
+  return ResolveExecutionPolicy(nullptr).enable_experimental_q81_grouped_rowpair_w4;
 }
 
 const DispatchEntry &GetDispatchEntry(GGUF::TensorType qtype) {
@@ -1180,6 +1200,16 @@ bool FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(
          ShouldUseSpecializedQ8_1GroupedFastPathImpl(quant_type, geometry);
 }
 
+bool FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+    int quant_type, const FusedDispatchGeometry &geometry,
+    const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
+  return ExperimentalQ8_1GroupedRowPairW4Enabled() &&
+         quant_type == static_cast<int>(GGUF::TensorType::Q4_K) &&
+         geometry.grouped_outputs == 2 && geometry.M == 2 &&
+         geometry.N >= 8192 && geometry.K == kQ4KGroupedHotPathK;
+}
+
 FusedQuantGemm::FfnProjOperator FusedQuantGemm::SelectFfnProjOperator(
     int quant_type0, int quant_type1, const FusedDispatchGeometry &geometry,
     bool allow_q81, bool allow_packed, const NativeExecutionPolicy *policy) {
@@ -1204,8 +1234,19 @@ FusedQuantGemm::FfnProjOperator FusedQuantGemm::SelectFfnProjOperator(
 
   if (q81_ready) {
     if (quant_type0 == quant_type1 &&
-        ShouldUseSpecializedQ8_1GroupedFastPath(quant_type0, geometry)) {
+        ShouldUseSpecializedQ8_1GroupedFastPath(quant_type0, geometry,
+                                               policy)) {
       selected = FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K;
+      LogOperatorSelection(
+          "ffn_proj", FfnProjOperatorName(selected), geometry,
+          "quant0=" + QuantTypeToString(quant_type0) +
+              ", quant1=" + QuantTypeToString(quant_type1) + ", q81_ready=true");
+      return selected;
+    }
+    if (quant_type0 == quant_type1 &&
+        ShouldUseSpecializedQ8_1GroupedRowPairW4Path(quant_type0, geometry,
+                                                     policy)) {
+      selected = FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4;
       LogOperatorSelection(
           "ffn_proj", FfnProjOperatorName(selected), geometry,
           "quant0=" + QuantTypeToString(quant_type0) +
@@ -1250,6 +1291,8 @@ const char *FusedQuantGemm::FfnProjOperatorName(
     return "q8_1_group";
   case FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K:
     return "q8_1_group_hot_q4k";
+  case FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4:
+    return "q8_1_group_row_pair_w4";
   case FusedQuantGemm::FfnProjOperator::kPackedGroup:
     return "packed_group";
   case FusedQuantGemm::FfnProjOperator::kFallback:
@@ -1316,6 +1359,14 @@ FusedQuantGemm::DownProjOperator FusedQuantGemm::SelectDownProjOperator(
                                          ", q81_ready=true");
       return selected;
     }
+    if (ShouldUseSpecializedQ8_1DownProjRowPairHotPathImpl(quant_type,
+                                                           geometry)) {
+      selected = FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed;
+      LogOperatorSelection("down_proj", DownProjOperatorName(selected),
+                           geometry, "quant=" + QuantTypeToString(quant_type) +
+                                         ", q81_ready=true");
+      return selected;
+    }
     if ((qtype == GGUF::TensorType::Q4_K || qtype == GGUF::TensorType::Q6_K) &&
         geometry.M >= 4) {
       selected = FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad;
@@ -1359,6 +1410,8 @@ const char *FusedQuantGemm::DownProjOperatorName(
     return "q8_1_gemv";
   case FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed:
     return "q8_1_gemv_hot_fixed";
+  case FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed:
+    return "q8_1_gemv_row_pair_hot_fixed";
   case FusedQuantGemm::DownProjOperator::kQ81GemvRowPair:
     return "q8_1_gemv_row_pair";
   case FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad:
@@ -1696,48 +1749,6 @@ bool DispatchQ8_1GemvRowPairQuad(const void *data, const void *act_q8_1,
   return true;
 }
 
-bool DispatchQ8_1GemvQ4KHotDownProj(const void *data, const void *act_q8_1,
-                                    half *output, int M, int N, int K,
-                                    cudaStream_t stream) {
-  if (ShouldUseSpecializedQ8_1DownProjHotPathImpl(
-          static_cast<int>(GGUF::TensorType::Q4_K),
-          FusedDispatchGeometry{M, N, K, 1, true, false})) {
-    auto *w = static_cast<const block_q4_k *>(data);
-    auto *a = static_cast<const block_q8_1 *>(act_q8_1);
-    const int grid_x = (N + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
-    dim3 grid(grid_x, M);
-    fused_dequant_gemv_q4k_q8_1_fixed_blocks<kDownProjHotPathBlocks>
-        <<<grid, kGemvThreadsPerBlock, 0, stream>>>(w, a, output, N);
-    return true;
-  }
-  return DispatchQ8_1GemvColPairWithFallback<
-      block_q4_k, fused_dequant_gemv_q4k_q8_1_colpair,
-      fused_dequant_gemv_q4k_q8_1, fused_dequant_gemv_q4k_q8_1_rowpair,
-      fused_dequant_gemv_q4k_q8_1_rowquad>(data, act_q8_1, output, M, N, K,
-                                           stream);
-}
-
-bool DispatchQ8_1GemvQ6KHotDownProj(const void *data, const void *act_q8_1,
-                                    half *output, int M, int N, int K,
-                                    cudaStream_t stream) {
-  if (ShouldUseSpecializedQ8_1DownProjHotPathImpl(
-          static_cast<int>(GGUF::TensorType::Q6_K),
-          FusedDispatchGeometry{M, N, K, 1, true, false})) {
-    auto *w = static_cast<const block_q6_k *>(data);
-    auto *a = static_cast<const block_q8_1 *>(act_q8_1);
-    const int grid_x = (N + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
-    dim3 grid(grid_x, M);
-    fused_dequant_gemv_q6k_q8_1_fixed_blocks<kDownProjHotPathBlocks>
-        <<<grid, kGemvThreadsPerBlock, 0, stream>>>(w, a, output, N);
-    return true;
-  }
-  return DispatchQ8_1GemvColPairWithFallback<
-      block_q6_k, fused_dequant_gemv_q6k_q8_1_colpair,
-      fused_dequant_gemv_q6k_q8_1, fused_dequant_gemv_q6k_q8_1_rowpair,
-      fused_dequant_gemv_q6k_q8_1_rowquad>(data, act_q8_1, output, M, N, K,
-                                           stream);
-}
-
 template <typename BlockType, int Outputs,
           void (*Q8_1GroupKernel)(
               PackedProjectionGroupParams<BlockType, Outputs>,
@@ -1817,7 +1828,8 @@ template <typename BlockType,
               const block_q8_1 *, int, int),
           void (*Q8_1RowQuadKernel)(
               PackedProjectionGroupParams<BlockType, 2>,
-              const block_q8_1 *, int, int)>
+              const block_q8_1 *, int, int),
+          int RowPairWarpsPerBlock = kGemvWarpsPerBlock>
 bool DispatchQ8_1GemvPairRowPairQuad(const void *data0, const void *data1,
                                      const void *act_q8_1, half *output0,
                                      int N0, half *output1, int N1, int M,
@@ -1840,9 +1852,11 @@ bool DispatchQ8_1GemvPairRowPairQuad(const void *data0, const void *data1,
     return true;
   }
   if (M > 1) {
-    dim3 grid(grid_x, (M + 1) / 2);
-    Q8_1RowPairKernel<<<grid, kGemvThreadsPerBlock, 0, stream>>>(params, a, K,
-                                                                 M);
+    const int rowpair_grid_x =
+        (max_output_cols + RowPairWarpsPerBlock - 1) / RowPairWarpsPerBlock;
+    dim3 grid(rowpair_grid_x, (M + 1) / 2);
+    Q8_1RowPairKernel<<<grid, RowPairWarpsPerBlock * 32, 0, stream>>>(params,
+                                                                       a, K, M);
     return true;
   }
   dim3 grid(grid_x, M);
@@ -1880,6 +1894,28 @@ bool DispatchQ8_1GemvPairQ4KSpecialized(const void *data0, const void *data1,
     fused_dequant_gemv_q4k_q8_1_group_fixed_blocks<
         2, kQ4KGroupedHotPathBlocks><<<grid, kGemvThreadsPerBlock, 0, stream>>>(
         params, a, K);
+    return true;
+  }
+
+  if (FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+          static_cast<int>(GGUF::TensorType::Q4_K), geometry)) {
+    auto *a = static_cast<const block_q8_1 *>(act_q8_1);
+    PackedProjectionGroupParams<block_q4_k, 2> params{};
+    params.weights[0] = static_cast<const block_q4_k *>(data0);
+    params.weights[1] = static_cast<const block_q4_k *>(data1);
+    params.outputs[0] = output0;
+    params.outputs[1] = output1;
+    params.output_cols[0] = N0;
+    params.output_cols[1] = N1;
+    const int max_output_cols = std::max(N0, N1);
+    const int grid_x =
+        (max_output_cols + kQ4KGroupedRowPairW4WarpsPerBlock - 1) /
+        kQ4KGroupedRowPairW4WarpsPerBlock;
+    dim3 grid(grid_x, (M + 1) / 2);
+    fused_dequant_gemv_q4k_q8_1_group_rowpair<
+        2, kQ4KGroupedRowPairW4WarpsPerBlock>
+        <<<grid, kQ4KGroupedRowPairW4ThreadsPerBlock, 0, stream>>>(params, a,
+                                                                     K, M);
     return true;
   }
 
@@ -1979,6 +2015,17 @@ bool DispatchQ8_1GemvQ4KV2(const void *data, const void *act_q8_1,
     return true;
   }
   // Check hot-path first, then fall back to v1
+  if (ShouldUseSpecializedQ8_1DownProjRowPairHotPathImpl(
+          static_cast<int>(GGUF::TensorType::Q4_K),
+          FusedDispatchGeometry{M, N, K, 1, true, false})) {
+    auto *w = static_cast<const block_q4_k *>(data);
+    auto *a = static_cast<const block_q8_1 *>(act_q8_1);
+    const int grid_x = (N + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
+    dim3 grid(grid_x, (M + 1) / 2);
+    fused_dequant_gemv_q4k_q8_1_rowpair_fixed_blocks<kDownProjHotPathBlocks>
+        <<<grid, kGemvThreadsPerBlock, 0, stream>>>(w, a, output, N, M);
+    return true;
+  }
   if (ShouldUseSpecializedQ8_1DownProjHotPathImpl(
           static_cast<int>(GGUF::TensorType::Q4_K),
           FusedDispatchGeometry{M, N, K, 1, true, false})) {
@@ -2015,6 +2062,17 @@ bool DispatchQ8_1GemvQ6KV2(const void *data, const void *act_q8_1,
     fused_dequant_gemv_q6k_q8_1_v2
         <<<grid, kGemvThreadsPerBlockV2,
            sizeof(float) * kGemvWarpsPerBlockV2, stream>>>(w, a, output, N, K);
+    return true;
+  }
+  if (ShouldUseSpecializedQ8_1DownProjRowPairHotPathImpl(
+          static_cast<int>(GGUF::TensorType::Q6_K),
+          FusedDispatchGeometry{M, N, K, 1, true, false})) {
+    auto *w = static_cast<const block_q6_k *>(data);
+    auto *a = static_cast<const block_q8_1 *>(act_q8_1);
+    const int grid_x = (N + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
+    dim3 grid(grid_x, (M + 1) / 2);
+    fused_dequant_gemv_q6k_q8_1_rowpair_fixed_blocks<kDownProjHotPathBlocks>
+        <<<grid, kGemvThreadsPerBlock, 0, stream>>>(w, a, output, N, M);
     return true;
   }
   if (ShouldUseSpecializedQ8_1DownProjHotPathImpl(
@@ -2439,6 +2497,13 @@ bool FusedQuantGemm::GemvQ8_1(const QuantizedWeightInfo &weight,
                 std::string("Using fixed-block Q8_1 down-proj kernel for ") +
                     entry.name + " (M=" + std::to_string(M) + ", N=" +
                     std::to_string(N) + ", K=" + std::to_string(K) + ")");
+    } else if (ShouldUseSpecializedQ8_1DownProjRowPairHotPathImpl(
+                   weight.quant_type, geometry)) {
+      log::Info(
+          "fused_quant_gemm",
+          std::string("Using fixed-block row-pair Q8_1 down-proj kernel for ") +
+              entry.name + " (M=" + std::to_string(M) + ", N=" +
+              std::to_string(N) + ", K=" + std::to_string(K) + ")");
     } else {
       log::Info("fused_quant_gemm",
                 std::string("Using Q8_1 activation GEMV for ") + entry.name +
@@ -2517,6 +2582,18 @@ bool FusedQuantGemm::GemvQ8_1Pair(
       specialized_logged[idx] = true;
       log::Info("fused_quant_gemm",
                 std::string("Using fixed-block grouped Q8_1 pair kernel for ") +
+                    entry.name + " (M=" + std::to_string(M) + ", N=" +
+                    std::to_string(projections[0].output_cols) + "/" +
+                    std::to_string(projections[1].output_cols) + ", K=" +
+                    std::to_string(K) + ")");
+    }
+  } else if (ShouldUseSpecializedQ8_1GroupedRowPairW4Path(quant_type,
+                                                           geometry)) {
+    static bool w4_logged[kMaxTensorType] = {};
+    if (idx < kMaxTensorType && !w4_logged[idx] && entry.name) {
+      w4_logged[idx] = true;
+      log::Info("fused_quant_gemm",
+                std::string("Using 4-warp grouped Q8_1 row-pair kernel for ") +
                     entry.name + " (M=" + std::to_string(M) + ", N=" +
                     std::to_string(projections[0].output_cols) + "/" +
                     std::to_string(projections[1].output_cols) + ", K=" +

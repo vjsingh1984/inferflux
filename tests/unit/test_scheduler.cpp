@@ -537,6 +537,81 @@ private:
   bool process_local_{false};
 };
 
+class CountingRouter final : public ModelRouter {
+public:
+  void AddModel(const ModelInfo &info,
+                std::shared_ptr<LlamaCPUBackend> backend) {
+    models_[info.id] = info;
+    backends_[info.id] = std::move(backend);
+    if (default_model_id_.empty()) {
+      default_model_id_ = info.id;
+    }
+  }
+
+  std::vector<ModelInfo> ListModels() const override {
+    std::vector<ModelInfo> out;
+    out.reserve(models_.size());
+    for (const auto &entry : models_) {
+      out.push_back(entry.second);
+    }
+    return out;
+  }
+
+  std::string LoadModel(const std::string &, const std::string &,
+                        const std::string &, const std::string &) override {
+    return "";
+  }
+
+  bool UnloadModel(const std::string &id) override {
+    backends_.erase(id);
+    return models_.erase(id) > 0;
+  }
+
+  ModelInfo *Resolve(const std::string &requested_model) override {
+    resolve_calls_.fetch_add(1, std::memory_order_relaxed);
+    if (models_.empty()) {
+      return nullptr;
+    }
+    const std::string &key =
+        requested_model.empty() ? default_model_id_ : requested_model;
+    auto it = models_.find(key);
+    return it == models_.end() ? nullptr : &it->second;
+  }
+
+  ModelInfo *ResolveExact(const std::string &model_id) override {
+    resolve_calls_.fetch_add(1, std::memory_order_relaxed);
+    auto it = models_.find(model_id);
+    return it == models_.end() ? nullptr : &it->second;
+  }
+
+  std::shared_ptr<LlamaCPUBackend>
+  GetBackend(const std::string &model_id) override {
+    auto it = backends_.find(model_id);
+    return it == backends_.end() ? nullptr : it->second;
+  }
+
+  bool SetDefaultModel(const std::string &model_id) override {
+    if (models_.find(model_id) == models_.end()) {
+      return false;
+    }
+    default_model_id_ = model_id;
+    return true;
+  }
+
+  std::string DefaultModelId() const override { return default_model_id_; }
+  std::string Name() const override { return "counting_router"; }
+
+  int ResolveCalls() const {
+    return resolve_calls_.load(std::memory_order_relaxed);
+  }
+
+private:
+  std::unordered_map<std::string, ModelInfo> models_;
+  std::unordered_map<std::string, std::shared_ptr<LlamaCPUBackend>> backends_;
+  std::string default_model_id_;
+  std::atomic<int> resolve_calls_{0};
+};
+
 } // namespace
 
 TEST_CASE("Scheduler stub response with no backend", "[scheduler]") {
@@ -904,6 +979,130 @@ TEST_CASE("Scheduler opportunistically accumulates decode batches when "
   const auto decode_batch_sizes = backend->DecodeBatchSizes();
   REQUIRE(std::any_of(decode_batch_sizes.begin(), decode_batch_sizes.end(),
                       [](int size) { return size >= 2; }));
+}
+
+TEST_CASE("Scheduler decode worker rebuilds stepwise decode cohorts",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<AsyncLaneStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "stepwise-decode-model";
+  info.path = "/tmp/stepwise-decode.gguf";
+  info.backend = "cuda";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  Scheduler::Config scheduler_config;
+  scheduler_config.max_batch_size = 4;
+  scheduler_config.min_batch_size = 2;
+  scheduler_config.batch_accumulation_ms = 10;
+  scheduler_config.decode_burst_tokens = 0;
+
+  DisaggregatedConfig disagg_config;
+  disagg_config.decode_pool_size = 1;
+
+  const int64_t bucket2_before = ReadScalarMetric(
+      "inferflux_scheduler_decode_worker_batch_size_total{bucket=\"2\"} ");
+  const int64_t bucket1_before = ReadScalarMetric(
+      "inferflux_scheduler_decode_worker_batch_size_total{bucket=\"1\"} ");
+  const int64_t direct_before = ReadScalarMetric(
+      "inferflux_scheduler_decode_worker_execution_path_total{path=\"direct_stepwise\"} ");
+  const int64_t general_before = ReadScalarMetric(
+      "inferflux_scheduler_decode_worker_execution_path_total{path=\"general\"} ");
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, disagg_config, ModelSelectionOptions{},
+                      scheduler_config);
+
+  auto make_request = [&]() {
+    InferenceRequest req;
+    req.model = info.id;
+    req.prompt = "stepwise decode lane";
+    req.max_tokens = 3;
+    return req;
+  };
+
+  auto first = scheduler.Generate(make_request());
+  auto second = scheduler.Generate(make_request());
+
+  auto first_resp = first.get();
+  auto second_resp = second.get();
+
+  REQUIRE_FALSE(first_resp.no_backend);
+  REQUIRE_FALSE(second_resp.no_backend);
+  REQUIRE(first_resp.completion == "pdd");
+  REQUIRE(second_resp.completion == "pdd");
+
+  const int64_t bucket2_after = ReadScalarMetric(
+      "inferflux_scheduler_decode_worker_batch_size_total{bucket=\"2\"} ");
+  const int64_t bucket1_after = ReadScalarMetric(
+      "inferflux_scheduler_decode_worker_batch_size_total{bucket=\"1\"} ");
+  const int64_t direct_after = ReadScalarMetric(
+      "inferflux_scheduler_decode_worker_execution_path_total{path=\"direct_stepwise\"} ");
+  const int64_t general_after = ReadScalarMetric(
+      "inferflux_scheduler_decode_worker_execution_path_total{path=\"general\"} ");
+  REQUIRE(bucket2_after - bucket2_before == 2);
+  REQUIRE(bucket1_after - bucket1_before == 0);
+  REQUIRE(direct_after - direct_before == 2);
+  REQUIRE(general_after - general_before == 0);
+}
+
+TEST_CASE("Scheduler preserves bound backend for in-flight decode requests",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<CountingRouter>();
+  auto backend = std::make_shared<ReadyStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "bound-decode-model";
+  info.path = "/tmp/bound-decode.gguf";
+  info.backend = "cuda";
+  router->AddModel(info, backend);
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  Scheduler scheduler(tokenizer, device, cache, router);
+
+  auto decode_pending = std::make_shared<Scheduler::PendingRequest>();
+  decode_pending->inference.id = 7;
+  decode_pending->inference.model = info.id;
+  decode_pending->inference.resolved_model = info.id;
+  decode_pending->inference.prompt = "decode binding";
+  decode_pending->inference.phase = RequestPhase::kDecode;
+  decode_pending->inference.sequence_id = 3;
+  decode_pending->inference.sequence_generation = 1;
+  decode_pending->inference.n_past = 4;
+  decode_pending->inference.first_token = 42;
+  decode_pending->resolved_backend = backend;
+
+  std::vector<std::shared_ptr<Scheduler::PendingRequest>> decode_batch{
+      decode_pending};
+  scheduler.ResolveBackends(decode_batch);
+
+  REQUIRE(router->ResolveCalls() == 0);
+  REQUIRE(decode_pending->resolved_backend.get() == backend.get());
+  REQUIRE(decode_pending->inference.resolved_model == info.id);
+
+  auto fresh_pending = std::make_shared<Scheduler::PendingRequest>();
+  fresh_pending->inference.id = 8;
+  fresh_pending->inference.model = info.id;
+  fresh_pending->inference.prompt = "fresh routing";
+  fresh_pending->inference.phase = RequestPhase::kPending;
+
+  std::vector<std::shared_ptr<Scheduler::PendingRequest>> fresh_batch{
+      fresh_pending};
+  scheduler.ResolveBackends(fresh_batch);
+
+  REQUIRE(router->ResolveCalls() == 1);
+  REQUIRE(fresh_pending->resolved_backend.get() == backend.get());
+  REQUIRE(fresh_pending->inference.resolved_model == info.id);
 }
 
 TEST_CASE("Scheduler batch selection deduplicates one pending request leaked "

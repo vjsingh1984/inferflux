@@ -10,7 +10,7 @@
 
 **Result**: INCREASING `max_batch_size` does NOT improve concurrent throughput. In fact, `max_batch=4` performs BEST at concurrency=4 (69.9 tok/s vs 67.1 tok/s for max_batch=32).
 
-**Key Finding**: The bottleneck is NOT the scheduler batch size limit. The issue is that the scheduler predominantly processes single-sequence batches even when multiple requests are concurrent.
+**Key Finding**: The bottleneck is NOT the scheduler batch size limit. Follow-up tracing on March 11, 2026 shows the decode queue can form multi-request cohorts, but those cohorts are then executed as closed groups to completion, so later decode-ready requests cannot merge into the live loop.
 
 ---
 
@@ -89,6 +89,121 @@
 - This means 4 concurrent requests are mostly processed as 4 separate single-sequence batches
 
 **Implication**: The scheduler's continuous batching logic is not effectively grouping concurrent requests into larger batches.
+
+### March 11 Follow-up: decode workers do form cohorts, but they stay isolated
+
+Privileged benchmark runs with the new `inferflux_scheduler_decode_worker_batch_size_total`
+metric show the queue is not purely starving:
+
+- `decode_pool_size=2`: worker batches were `4:1`, `3:1`, `2:1`, `1:3`
+- `decode_pool_size=1`: worker batches were `4:2`, `2:1`, `1:2`
+
+Yet native decode forward passes still skew heavily small:
+
+- `decode_pool_size=2`: decode forward buckets `1:147`, `2:6`, `3_4:33`
+- `decode_pool_size=1`: decode forward buckets `1:89`, `2:31`, `3_4:35`
+
+This narrows the root cause: the queue can hand off multi-request work, but
+`ExecuteUnifiedBatchPhased()` keeps each selected cohort closed until its decode
+slice completes. New decode-ready requests wait for a later scheduler pass
+instead of joining the active batch, which fragments continuous batching.
+
+### March 11 Follow-up 2: persistent decode working set removes most queue churn
+
+The first scheduler refactor changed decode workers to keep unfinished requests
+in a local working set instead of requeueing every token through
+`pending_decode_`. On the same short `concurrency=4` Qwen2.5-3B Q4_K_M probe:
+
+- Native throughput improved from `101.7 tok/s` to `117.4 tok/s`
+- Exact match stayed `8/10`
+- Scheduler decode-worker executed batch sizes became:
+  - `1:94`
+  - `2:32`
+  - `3:34`
+- Native decode forward batch sizes became:
+  - `1:94`
+  - `2:32`
+  - `3_4:34`
+
+This is the strongest scheduler-side signal so far: once queue churn is
+removed, the decode-worker cohort size and the native forward batch size line
+up almost exactly. That means the remaining throughput gap is no longer caused
+primarily by scheduler admission fragmentation on the safe path.
+
+### March 11 Follow-up 3: preserving bound decode routing removes redundant work, but not the remaining throughput gap
+
+The next safe slice stopped `ResolveBackends()` from re-routing requests that
+were already in decode with a live sequence slot and bound backend. That
+preserves correct request affinity and removes redundant per-step routing work,
+but the short live probe did **not** produce a meaningful throughput win:
+
+- Native throughput: `110.6 tok/s`
+- `cuda_llama_cpp`: `153.0 tok/s`
+- Exact match: `6/8`
+
+Most importantly, the new scheduler metric still matched the native forward
+histogram exactly:
+
+- Scheduler decode-worker executed batch sizes:
+  - `1:105`
+  - `2:57`
+  - `3:2`
+- Native decode forward batch sizes:
+  - `1:105`
+  - `2:57`
+  - `3_4:2`
+
+This confirms the remaining gap is not coming from decode-worker re-routing or
+queue admission drift. The next optimization pass should focus on native
+executor/backend hot-path cost, not more scheduler routing changes.
+
+### March 11 Follow-up 4: direct stepwise fast path was exercised end-to-end and still did not unlock throughput
+
+The next scheduler slice added a direct decode-worker fast path for sticky local
+working sets. When every request in the active decode lane was already bound to
+the same backend with valid step state, the worker skipped rebuilding
+`RequestBatch`, `overrides`, and `exec_pending`.
+
+The short privileged probe showed that this fast path dominated execution:
+
+- `inferflux_scheduler_decode_worker_execution_path_total{path="direct_stepwise"} = 178`
+- no `general` decode-worker path executions were recorded
+- scheduler decode-worker batch sizes still matched native decode forward batch
+  sizes exactly
+
+Yet throughput remained behind:
+
+- Native throughput: `101.7 tok/s`
+- `cuda_llama_cpp`: `131.0 tok/s`
+- Exact match: `6/8`
+
+That closes the scheduler-side investigation for this path. The remaining gap is
+now attributable to native backend/operator cost, not decode-worker scaffolding.
+
+### March 11 Follow-up 5: exact-shape Q4_K down-proj hot kernels close most of the remaining gap
+
+Backend-side benchmarking changed the picture. The isolated native benchmark for
+the exact decode down-proj shape (`N=2048`, `K=11008`) showed:
+
+- `Q4_K M=1`: `1.104x` speedup for `q8_1_gemv_hot_fixed`
+- `Q4_K M=2`: `1.160x` speedup for `q8_1_gemv_row_pair_hot_fixed`
+- `Q6_K` regressions in the same envelopes
+
+That justified a narrow promotion: enable the exact-shape `Q4_K` hot kernels by
+default while keeping `Q6_K` behind the existing experimental env gates.
+
+The end-to-end short probe with those kernels enabled moved native much closer
+to `cuda_llama_cpp` without additional accuracy drift:
+
+- Native throughput: `121.4 tok/s`
+- `cuda_llama_cpp`: `129.1 tok/s`
+- Exact match: `6/8`
+- Native/llama throughput ratio: `0.94x`
+
+This is the first backend-side change in the current pass that materially
+improves the native gap. The next optimization target remains decode FFN/down-
+proj, but it should now focus on the still-dominant grouped FFN path rather
+than more scheduler work.
 
 ### Finding 3: Lower Batch Count is Correlated with Higher Throughput
 
