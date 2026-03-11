@@ -464,6 +464,15 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   target_include_directories(benchmark_fused_ffn PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_fused_ffn PRIVATE inferflux_core)
+  add_executable(benchmark_downproj_q81 tests/unit/benchmark_downproj_q81.cu)
+  target_include_directories(benchmark_downproj_q81 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(benchmark_downproj_q81 PRIVATE inferflux_core)
+  add_executable(benchmark_grouped_q81_pair
+                 tests/unit/benchmark_grouped_q81_pair.cu)
+  target_include_directories(benchmark_grouped_q81_pair PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(benchmark_grouped_q81_pair PRIVATE inferflux_core)
 endif()
 
 install(TARGETS inferfluxd inferctl
@@ -520,6 +529,7 @@ add_executable(inferflux_tests
   tests/unit/test_batch_analyzer.cpp
   tests/unit/test_backend_interface.cpp
   tests/unit/test_native_forward.cpp
+  tests/unit/test_native_rowpair_kernels.cpp
   tests/unit/test_native_bootstrap_config.cpp
   tests/unit/test_native_dequant_policy.cpp
   tests/unit/test_kv_cache_planner.cpp

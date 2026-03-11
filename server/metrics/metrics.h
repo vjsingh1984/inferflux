@@ -206,6 +206,8 @@ public:
                                     std::string_view op,
                                     std::string_view quant, int batch_size,
                                     int n, int k);
+  void RecordNativeRowPairSelection(std::string_view phase,
+                                    std::string_view op, int batch_rows);
   void RecordNativeKvAutoTunePlan(int requested_max_seq, int planned_max_seq,
                                   std::size_t requested_bytes,
                                   std::size_t planned_bytes,
@@ -384,6 +386,9 @@ private:
   std::unordered_map<std::string, uint64_t> native_down_proj_operator_counts_;
   mutable std::mutex native_down_proj_geometry_mutex_;
   std::unordered_map<std::string, uint64_t> native_down_proj_geometry_counts_;
+  mutable std::mutex native_rowpair_selection_mutex_;
+  std::unordered_map<std::string, uint64_t>
+      native_rowpair_selection_counts_;
   std::atomic<int> native_kv_active_sequences_{0};
   std::atomic<int> native_kv_max_sequences_{0};
   std::atomic<uint64_t> native_kv_autotune_events_total_{0};

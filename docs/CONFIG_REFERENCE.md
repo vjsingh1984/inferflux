@@ -197,6 +197,7 @@ For `backend: cuda` requests, runtime fallback order is:
 | `runtime.scheduler.batch_accumulation_ms` | 0-5 | small wait to form better batches |
 | `runtime.scheduler.policy` | `priority_age` | queue ranking policy (`priority_age`, `lpm_priority`, `throughput_balanced`) |
 | `runtime.scheduler.decode_burst_tokens` | `0` | decode burst cap per executor pass (`0` disables burst slicing) |
+| `runtime.scheduler.decode_pool_size` | `1` | dedicated decode lane count (0 = inline on worker loop, 1+ = decode threads; 1 is default/arch recommendation) |
 | `runtime.scheduler.chunked_prefill_tokens` | `512` | max tokens submitted per prefill chunk in mixed execution |
 | `runtime.scheduler.mixed_prefill_budget_ratio` | `1.0` | fraction (`0.0-1.0`) of token budget reserved for prefill in mixed steps |
 | `runtime.scheduler.session_handles.enabled` | `false` | optional `session_id -> sequence slot` mapping layer |

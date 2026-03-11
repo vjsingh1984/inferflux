@@ -265,6 +265,7 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
   registry.RecordNativeForwardBatchSize("decode", 2);
   registry.RecordNativeForwardBatchSize("decode", 7);
   registry.RecordNativeFfnProjOperator("prefill", "q8_1_group_hot_q4k");
+  registry.RecordNativeFfnProjOperator("prefill", "q8_1_group_row_pair_w4");
   registry.RecordNativeFfnProjOperator("prefill", "q8_1_group_v2");
   registry.RecordNativeFfnProjOperator("prefill", "q8_1_group");
   registry.RecordNativeFfnProjOperator("decode", "packed_group");
@@ -278,6 +279,8 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
   registry.RecordNativeDownProjOperator("prefill", "q8_1_gemv_v2");
   registry.RecordNativeDownProjOperator("prefill", "q8_1_gemv");
   registry.RecordNativeDownProjOperator("prefill", "q8_1_gemv_hot_fixed");
+  registry.RecordNativeDownProjOperator("prefill",
+                                        "q8_1_gemv_row_pair_hot_fixed");
   registry.RecordNativeDownProjOperator("prefill", "q8_1_gemv_row_pair_v2");
   registry.RecordNativeDownProjOperator("prefill", "q8_1_gemv_row_pair");
   registry.RecordNativeDownProjOperator("decode", "q8_1_gemv_row_quad");
@@ -288,6 +291,9 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
                                         3072, 8192);
   registry.RecordNativeDownProjGeometry("prefill", "q8_1_gemv_hot_fixed",
                                         "q4_k", 1, 2048, 11008);
+  registry.RecordNativeDownProjGeometry("prefill",
+                                        "q8_1_gemv_row_pair_hot_fixed", "q4_k",
+                                        2, 2048, 11008);
   registry.RecordNativeDownProjGeometry("prefill", "q8_1_gemv_row_pair",
                                         "q4_k", 2, 2048, 11008);
   registry.RecordNativeDownProjGeometry("decode", "q8_1_gemv_row_quad",
@@ -296,6 +302,9 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
                                         2048, 11008);
   registry.RecordNativeDownProjGeometry("decode", "mmq", "q6_k", 2, 3072,
                                         8192);
+  registry.RecordNativeRowPairSelection("prefill",
+                                         "q8_1_group_row_pair_w4", 2);
+  registry.RecordNativeRowPairSelection("decode", "q8_1_gemv_row_pair", 4);
 
   auto output = registry.RenderPrometheus();
   REQUIRE(output.find("# HELP inferflux_native_forward_batch_size_total") !=
@@ -314,8 +323,19 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
           std::string::npos);
   REQUIRE(output.find("# TYPE inferflux_native_ffn_proj_operator_total "
                       "counter") != std::string::npos);
+  REQUIRE(output.find("# HELP inferflux_native_rowpair_selection_total") !=
+          std::string::npos);
+  REQUIRE(output.find(
+              "inferflux_native_rowpair_selection_total{phase=\"prefill\",operator=\"q8_1_group_row_pair_w4\",bucket=\"2\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find(
+              "inferflux_native_rowpair_selection_total{phase=\"decode\",operator=\"q8_1_gemv_row_pair\",bucket=\"3_4\"} 1") !=
+          std::string::npos);
   REQUIRE(output.find("inferflux_native_ffn_proj_operator_total{phase="
                       "\"prefill\",operator=\"q8_1_group_hot_q4k\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_ffn_proj_operator_total{phase="
+                      "\"prefill\",operator=\"q8_1_group_row_pair_w4\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_native_ffn_proj_operator_total{phase="
                       "\"prefill\",operator=\"q8_1_group_v2\"} 1") !=
@@ -341,6 +361,9 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
           std::string::npos);
   REQUIRE(output.find("inferflux_native_down_proj_operator_total{phase="
                       "\"prefill\",operator=\"q8_1_gemv_hot_fixed\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_operator_total{phase="
+                      "\"prefill\",operator=\"q8_1_gemv_row_pair_hot_fixed\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_native_down_proj_operator_total{phase="
                       "\"prefill\",operator=\"q8_1_gemv_row_pair_v2\"} 1") !=
@@ -393,6 +416,11 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
   REQUIRE(output.find("inferflux_native_down_proj_geometry_total{phase="
                       "\"prefill\",operator=\"q8_1_gemv_hot_fixed\",quant=\"q4_k\","
                       "m_bucket=\"1\",n=\"2048\",n_bucket=\"1025_2048\","
+                      "k=\"11008\",k_bucket=\"8193_16384\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_native_down_proj_geometry_total{phase="
+                      "\"prefill\",operator=\"q8_1_gemv_row_pair_hot_fixed\",quant=\"q4_k\","
+                      "m_bucket=\"2\",n=\"2048\",n_bucket=\"1025_2048\","
                       "k=\"11008\",k_bucket=\"8193_16384\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_native_down_proj_geometry_total{phase="

@@ -22,7 +22,17 @@ import unittest
 
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 18083
-SERVER_BIN = os.environ.get("INFERFLUX_SERVER_BIN", "./build/inferfluxd")
+
+
+def _default_server_bin():
+    if "INFERFLUX_SERVER_BIN" in os.environ:
+        return os.environ["INFERFLUX_SERVER_BIN"]
+    if os.path.exists("./build-cuda/inferfluxd"):
+        return "./build-cuda/inferfluxd"
+    return "./build/inferfluxd"
+
+
+SERVER_BIN = _default_server_bin()
 
 
 def _start_server(env):
@@ -154,8 +164,21 @@ class NativeMetricsStubTests(unittest.TestCase):
         self.assertIn(
             "# TYPE inferflux_native_ffn_proj_operator_total counter", body
         )
+        self.assertIn("# HELP inferflux_native_rowpair_selection_total", body)
+        self.assertIn(
+            'inferflux_native_rowpair_selection_total{phase="prefill",operator="q8_1_group_row_pair_w4"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_rowpair_selection_total{phase="decode",operator="q8_1_gemv_row_pair"}',
+            body,
+        )
         self.assertIn(
             'inferflux_native_ffn_proj_operator_total{phase="prefill",operator="q8_1_group_hot_q4k"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_ffn_proj_operator_total{phase="prefill",operator="q8_1_group_row_pair_w4"}',
             body,
         )
         self.assertIn(
@@ -186,6 +209,10 @@ class NativeMetricsStubTests(unittest.TestCase):
         )
         self.assertIn(
             'inferflux_native_down_proj_operator_total{phase="prefill",operator="q8_1_gemv_hot_fixed"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_native_down_proj_operator_total{phase="prefill",operator="q8_1_gemv_row_pair_hot_fixed"}',
             body,
         )
         self.assertIn(

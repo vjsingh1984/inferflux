@@ -235,7 +235,7 @@ int main(int argc, char **argv) {
   std::size_t prefix_cache_capacity = 256;
   int prefill_pool_size = 1;
   int decode_pool_size =
-      0; // 0 = decode on WorkerLoop thread (no separate pool)
+      1; // 0 = decode on WorkerLoop thread (legacy); 1 = single dedicated decode lane (current default)
   std::size_t kv_channel_capacity = 64;
   std::string kv_transport_type = "channel"; // "channel" | "shm"
   int kv_enqueue_max_retries = 3;

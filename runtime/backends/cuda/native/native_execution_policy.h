@@ -28,7 +28,9 @@ struct NativeExecutionPolicy {
   std::string dequantized_cache_policy_override;
   bool enable_experimental_q81_triple_rowpair{false};
   bool enable_experimental_q81_downproj_hot_fixed{false};
-  bool enable_experimental_q81_grouped_hot_q4k{false};
+  bool enable_experimental_q81_downproj_rowpair_hot_fixed{false};
+  bool enable_experimental_q81_grouped_hot_q4k{true};
+  bool enable_experimental_q81_grouped_rowpair_w4{true};
   bool enable_downproj_mmq{false};
   int downproj_mmq_min_batch_override{-1};
   bool use_vectorized_loads{false};
@@ -78,8 +80,13 @@ struct NativeExecutionPolicy {
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_TRIPLE_ROWPAIR", false);
     policy.enable_experimental_q81_downproj_hot_fixed = ParseBoolEnv(
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", false);
+    policy.enable_experimental_q81_downproj_rowpair_hot_fixed = ParseBoolEnv(
+        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+        false);
     policy.enable_experimental_q81_grouped_hot_q4k = ParseBoolEnv(
-        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", false);
+        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", true);
+    policy.enable_experimental_q81_grouped_rowpair_w4 = ParseBoolEnv(
+        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4", true);
     policy.enable_downproj_mmq =
         ParseBoolEnv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", false);
     policy.downproj_mmq_min_batch_override =

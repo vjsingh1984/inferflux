@@ -716,6 +716,7 @@ void MetricsRegistry::RecordNativeFfnProjOperator(std::string_view phase,
   const std::string phase_label = NormalizeNativePhase(phase);
   const std::string op_label =
       op == "q8_1_group_hot_q4k" ? "q8_1_group_hot_q4k"
+      : op == "q8_1_group_row_pair_w4" ? "q8_1_group_row_pair_w4"
       : op == "q8_1_group_v2"    ? "q8_1_group_v2"
       : op == "q8_1_group"       ? "q8_1_group"
       : op == "packed_group"     ? "packed_group"
@@ -750,6 +751,7 @@ void MetricsRegistry::RecordNativeDownProjOperator(std::string_view phase,
       : op == "q8_1_gemv_v2"       ? "q8_1_gemv_v2"
       : op == "q8_1_gemv"          ? "q8_1_gemv"
       : op == "q8_1_gemv_hot_fixed" ? "q8_1_gemv_hot_fixed"
+      : op == "q8_1_gemv_row_pair_hot_fixed" ? "q8_1_gemv_row_pair_hot_fixed"
       : op == "q8_1_gemv_row_pair_v2" ? "q8_1_gemv_row_pair_v2"
       : op == "q8_1_gemv_row_pair" ? "q8_1_gemv_row_pair"
       : op == "q8_1_gemv_row_quad" ? "q8_1_gemv_row_quad"
@@ -774,6 +776,19 @@ void MetricsRegistry::RecordNativeDownProjGeometry(std::string_view phase,
       NativeLinearDimBucket(k);
   std::lock_guard<std::mutex> lock(native_down_proj_geometry_mutex_);
   native_down_proj_geometry_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordNativeRowPairSelection(std::string_view phase,
+                                                  std::string_view op,
+                                                  int batch_rows) {
+  if (batch_rows < 2) {
+    return;
+  }
+  const std::string key =
+      NormalizeNativePhase(phase) + "|" + std::string(op) + "|" +
+      NativeForwardBatchSizeBucket(batch_rows);
+  std::lock_guard<std::mutex> lock(native_rowpair_selection_mutex_);
+  native_rowpair_selection_counts_[key] += 1;
 }
 
 void MetricsRegistry::RecordNativeKvAutoTunePlan(int requested_max_seq,
@@ -1650,6 +1665,7 @@ std::string MetricsRegistry::RenderPrometheus() const {
   {
     static constexpr const char *kPhases[] = {"prefill", "decode"};
     static constexpr const char *kOps[] = {"q8_1_group_hot_q4k",
+                                           "q8_1_group_row_pair_w4",
                                            "q8_1_group_v2", "q8_1_group",
                                            "packed_group", "fallback"};
     std::lock_guard<std::mutex> lock(native_ffn_proj_operator_mutex_);
@@ -1672,6 +1688,7 @@ std::string MetricsRegistry::RenderPrometheus() const {
     static constexpr const char *kPhases[] = {"prefill", "decode"};
     static constexpr const char *kOps[] = {
         "q8_1_gemv_v2", "q8_1_gemv", "q8_1_gemv_hot_fixed",
+        "q8_1_gemv_row_pair_hot_fixed",
         "q8_1_gemv_row_pair_v2", "q8_1_gemv_row_pair",
         "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback"};
     std::lock_guard<std::mutex> lock(native_down_proj_operator_mutex_);
@@ -1747,7 +1764,35 @@ std::string MetricsRegistry::RenderPrometheus() const {
           << "\",operator=\"" << op << "\",quant=\"" << quant
           << "\",m_bucket=\"" << m_bucket << "\",n=\"" << n_exact
           << "\",n_bucket=\"" << n_bucket << "\",k=\"" << k_exact
-          << "\",k_bucket=\"" << k_bucket << "\"} " << entry.second << "\n";
+          << "\",k_bucket=\"" << k_bucket << "\"} " << entry.second
+          << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_native_rowpair_selection_total Row-pair kernel "
+         "dispatch counts for multi-row batches\n";
+  out << "# TYPE inferflux_native_rowpair_selection_total counter\n";
+  static constexpr const char *kRowPairPhases[] = {"prefill", "decode"};
+  static constexpr const char *kRowPairOps[] = {
+      "q8_1_group_row_pair_w4",
+      "q8_1_gemv_row_pair",
+      "q8_1_gemv_row_pair_v2",
+      "q8_1_gemv_row_pair_hot_fixed",
+  };
+  static constexpr const char *kBuckets[] = {"1", "2", "3_4", "5_8",
+                                             "9_16", "17_plus"};
+  std::lock_guard<std::mutex> rowpair_lock(native_rowpair_selection_mutex_);
+  for (const char *phase : kRowPairPhases) {
+    for (const char *op : kRowPairOps) {
+      for (const char *bucket : kBuckets) {
+        const std::string key = std::string(phase) + "|" + op + "|" + bucket;
+        const auto it = native_rowpair_selection_counts_.find(key);
+        const uint64_t count =
+            it == native_rowpair_selection_counts_.end() ? 0 : it->second;
+        out << "inferflux_native_rowpair_selection_total{phase=\"" << phase
+            << "\",operator=\"" << op << "\",bucket=\"" << bucket
+            << "\"} " << count << "\n";
+      }
     }
   }
 

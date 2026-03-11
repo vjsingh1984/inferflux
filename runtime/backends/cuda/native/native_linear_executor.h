@@ -75,7 +75,8 @@ bool ExecuteNativeFfnProjectionStage(
   NativeFfnExecutionSummary local_summary;
 
   if (selected_op == FusedQuantGemm::FfnProjOperator::kQ81Group ||
-      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K) {
+      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K ||
+      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4) {
     local_summary.used_q81 = std::forward<TryQ81Fn>(try_q81_group)();
     if (local_summary.used_q81) {
       local_summary.actual_op = selected_op;
@@ -101,6 +102,10 @@ bool ExecuteNativeFfnProjectionStage(
   GlobalMetrics().RecordNativeFfnProjGeometry(
       phase, metric_op, quant_label, batch_rows, intermediate_size, hidden_size,
       /*grouped_outputs=*/2);
+  if (local_summary.actual_op ==
+      FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4) {
+    GlobalMetrics().RecordNativeRowPairSelection(phase, metric_op, batch_rows);
+  }
 
   if (summary) {
     *summary = local_summary;
@@ -173,6 +178,12 @@ bool ExecuteNativeDownProjStage(
   GlobalMetrics().RecordNativeDownProjOperator(phase, metric_op);
   GlobalMetrics().RecordNativeDownProjGeometry(
       phase, metric_op, quant_label, batch_rows, hidden_size, intermediate_size);
+  if (local_summary.actual_op ==
+          FusedQuantGemm::DownProjOperator::kQ81GemvRowPair ||
+      local_summary.actual_op ==
+          FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed) {
+    GlobalMetrics().RecordNativeRowPairSelection(phase, metric_op, batch_rows);
+  }
 
   if (local_summary.actual_op != FusedQuantGemm::DownProjOperator::kFallback) {
     std::forward<LogFn>(log_selected_operator)(local_summary.actual_op);
