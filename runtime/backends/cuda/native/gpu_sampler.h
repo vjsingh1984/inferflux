@@ -69,7 +69,7 @@ public:
                    std::vector<int> *out_tokens);
 
   std::size_t DeviceWorkspaceBytes() const;
-  std::size_t HostWorkspaceBytes() const { return 0; }
+  std::size_t HostWorkspaceBytes() const;
 
 private:
   int GreedyArgmax(const float *d_logits);
@@ -91,7 +91,7 @@ private:
   int *d_indices_{nullptr}; // [vocab_size] sorted indices
   float *d_temp_{nullptr};  // [vocab_size] temp storage
   int *d_result_{nullptr};  // [1] sampled token ID (device)
-  int h_result_{0};         // sampled token ID (host)
+  int *h_result_pinned_{nullptr}; // [1] sampled token ID (host pinned)
 
   // For argmax
   float *d_max_val_{nullptr}; // [1] max value
@@ -99,8 +99,9 @@ private:
 
   // Batch buffers (allocated once, sized for max batch)
   static constexpr int kMaxBatchSize = 64;
-  int *d_result_batch_{nullptr};        // [kMaxBatchSize] on device
-  int h_result_batch_[kMaxBatchSize]{}; // host buffer
+  int *d_result_batch_{nullptr};             // [kMaxBatchSize] on device
+  int *h_result_batch_pinned_{nullptr};      // [kMaxBatchSize] host pinned
+  float *h_logits_pinned_{nullptr};          // [vocab_size] host pinned
 
   // cuRAND
   curandGenerator_t rng_{nullptr};

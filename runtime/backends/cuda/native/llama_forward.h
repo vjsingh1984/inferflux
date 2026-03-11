@@ -171,15 +171,6 @@ private:
   int *h_batch_seq_ids_{nullptr};
   int *h_batch_kv_lens_{nullptr};
 
-  // Bulk KV read pointer arrays for all layers (CUDA graph capture)
-  const void
-      **d_all_read_ptrs_meta_{nullptr};   // [2 * num_layers * max_batch_size]
-  const void **d_all_k_read_ptrs_{nullptr}; // const T** view
-  const void **d_all_v_read_ptrs_{nullptr}; // const T** view
-  const void **h_all_read_ptrs_meta_{nullptr};
-  const void **h_all_k_read_ptrs_{nullptr};
-  const void **h_all_v_read_ptrs_{nullptr};
-
   // CUDA graph state for batched decode
   cudaGraph_t decode_graph_{nullptr};
   cudaGraphExec_t decode_graph_exec_{nullptr};

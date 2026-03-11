@@ -1,6 +1,7 @@
 #include "runtime/backends/cuda/common/dtype_traits.cuh"
 #include "runtime/backends/cuda/kernels/flash_attention.cuh"
 #include "runtime/backends/cuda/native/cuda_kernels.cuh"
+#include "runtime/backends/cuda/native/cuda_copy_trace.h"
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/llama_forward.h"
@@ -59,18 +60,6 @@ void AssignBatchMetadataViews(T *base, size_t batch_size, T **token_ids,
   *n_past = base + batch_size;
   *seq_ids = base + (batch_size * 2);
   *kv_lens = base + (batch_size * 3);
-}
-
-template <typename PtrValue>
-void AssignPointerPairViews(PtrValue *base, size_t slot_count,
-                            PtrValue **first, PtrValue **second) {
-  if (!base || slot_count == 0) {
-    *first = nullptr;
-    *second = nullptr;
-    return;
-  }
-  *first = base;
-  *second = base + slot_count;
 }
 
 // Phase timing: sync-based per-phase breakdown when
@@ -876,21 +865,6 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
                            &h_batch_n_past_, &h_batch_seq_ids_,
                            &h_batch_kv_lens_);
 
-  // Bulk KV read pointer arrays for all layers (CUDA graph capture)
-  size_t kv_ptr_total = static_cast<size_t>(num_layers_) * bsz;
-  err = cudaMalloc(reinterpret_cast<void **>(&d_all_read_ptrs_meta_),
-                   kv_ptr_total * 2 * sizeof(T *));
-  if (err != cudaSuccess)
-    return false;
-  device_workspace_bytes_ += kv_ptr_total * 2 * sizeof(T *);
-  AssignPointerPairViews(d_all_read_ptrs_meta_, kv_ptr_total, &d_all_k_read_ptrs_,
-                         &d_all_v_read_ptrs_);
-  if (!AllocatePinnedHostBuffer(&h_all_read_ptrs_meta_, kv_ptr_total * 2))
-    return false;
-  host_workspace_bytes_ += kv_ptr_total * 2 * sizeof(T *);
-  AssignPointerPairViews(h_all_read_ptrs_meta_, kv_ptr_total, &h_all_k_read_ptrs_,
-                         &h_all_v_read_ptrs_);
-
   return true;
 }
 
@@ -946,19 +920,6 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
   h_batch_n_past_ = nullptr;
   h_batch_seq_ids_ = nullptr;
   h_batch_kv_lens_ = nullptr;
-
-  auto free_void = [](void **ptr) {
-    if (*ptr) {
-      cudaFree(*ptr);
-      *ptr = nullptr;
-    }
-  };
-  free_void(reinterpret_cast<void **>(&d_all_read_ptrs_meta_));
-  d_all_k_read_ptrs_ = nullptr;
-  d_all_v_read_ptrs_ = nullptr;
-  FreePinnedHostBuffer(&h_all_read_ptrs_meta_);
-  h_all_k_read_ptrs_ = nullptr;
-  h_all_v_read_ptrs_ = nullptr;
 
   if (decode_graph_exec_) {
     cudaGraphExecDestroy(decode_graph_exec_);
@@ -1050,8 +1011,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
   pt.Begin(stream_, execution_policy_.phase_timing_enabled);
 
   // Step 1: Upload token_ids to GPU
-  err = cudaMemcpyAsync(d_token_ids_, token_ids.data(), seq_len * sizeof(int),
-                        cudaMemcpyHostToDevice, stream_);
+  err = runtime::cuda::native::TracedCudaMemcpyAsync(
+      runtime::cuda::native::CopyTraceSite::kForwardTokenIdsH2D, d_token_ids_,
+      token_ids.data(), seq_len * sizeof(int), cudaMemcpyHostToDevice,
+      stream_);
   if (err != cudaSuccess) {
     log::Error("llama_forward", "Failed to upload token_ids");
     return false;
@@ -1075,9 +1038,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                   stream_, &execution_policy_);
 
   // Step 3: Copy to residual stream
-  err = cudaMemcpyAsync(d_residual_, d_hidden_,
-                        (size_t)seq_len * hidden_size_ * sizeof(T),
-                        cudaMemcpyDeviceToDevice, stream_);
+  err = runtime::cuda::native::TracedCudaMemcpyAsync(
+      runtime::cuda::native::CopyTraceSite::kForwardResidualD2D, d_residual_,
+      d_hidden_, static_cast<size_t>(seq_len) * hidden_size_ * sizeof(T),
+      cudaMemcpyDeviceToDevice, stream_);
   if (err != cudaSuccess) {
     log::Error("llama_forward", "Residual copy failed");
     return false;
@@ -1731,40 +1695,20 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   // reserved max batch size rather than the active batch size, we must upload
   // the full reserved slab here; copying only B * 4 ints would leave the
   // later segments stale whenever B < max_batch_size_.
-  err = cudaMemcpyAsync(d_batch_meta_, h_batch_meta_,
-                        static_cast<size_t>(max_batch_size_) * 4 * sizeof(int),
-                        cudaMemcpyHostToDevice, stream_);
+  err = runtime::cuda::native::TracedCudaMemcpyAsync(
+      runtime::cuda::native::CopyTraceSite::kBatchMetaH2D, d_batch_meta_,
+      h_batch_meta_, static_cast<size_t>(max_batch_size_) * 4 * sizeof(int),
+      cudaMemcpyHostToDevice, stream_);
   if (err != cudaSuccess) {
     log::Error("llama_forward", "BatchForward: batch metadata upload failed");
     return false;
   }
 
-  // ===== Phase 2: Bulk KV read pointer pre-computation for all layers =====
-  // FlashDecode still consumes fixed-address read pointer slabs for graph-safe
-  // replay. KV append addresses are now derived on device from the regular KV
-  // layout, so only the read slab is built and uploaded here.
+  // ===== Phase 2: metadata upload only =====
+  // KV append and FlashDecode now derive addresses on device from the regular
+  // KV layout, so there is no per-batch read-pointer upload here.
   auto *typed_cache =
       static_cast<KvCacheGpuTyped<T> *>(static_cast<IKvCacheGpu *>(kv_cache_));
-  {
-    const size_t layer_stride = static_cast<size_t>(max_batch_size_);
-    const size_t total_slots = static_cast<size_t>(num_layers_) * layer_stride;
-    for (int l = 0; l < num_layers_; l++) {
-      typed_cache->GetBatchKVPtrs(
-          l, h_batch_seq_ids_, B,
-          reinterpret_cast<const T **>(
-              h_all_k_read_ptrs_ + static_cast<size_t>(l) * layer_stride),
-          reinterpret_cast<const T **>(
-              h_all_v_read_ptrs_ + static_cast<size_t>(l) * layer_stride));
-    }
-    const size_t ptr_bytes = total_slots * 2 * sizeof(T *);
-    err = cudaMemcpyAsync(reinterpret_cast<void *>(d_all_read_ptrs_meta_),
-                          reinterpret_cast<const void *>(h_all_read_ptrs_meta_),
-                          ptr_bytes, cudaMemcpyHostToDevice, stream_);
-    if (err != cudaSuccess) {
-      log::Error("llama_forward", "BatchForward: read pointer upload failed");
-      return false;
-    }
-  }
 
   // ===== Phase 3: CUDA graph replay or capture =====
   // CUDA graph capture eliminates per-kernel launch overhead
@@ -1849,9 +1793,10 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
     }
 
     // Copy to residual stream
-    err = cudaMemcpyAsync(d_residual_, d_hidden_,
-                          (size_t)B * hidden_size_ * sizeof(T),
-                          cudaMemcpyDeviceToDevice, stream_);
+    err = runtime::cuda::native::TracedCudaMemcpyAsync(
+        runtime::cuda::native::CopyTraceSite::kBatchResidualD2D, d_residual_,
+        d_hidden_, static_cast<size_t>(B) * hidden_size_ * sizeof(T),
+        cudaMemcpyDeviceToDevice, stream_);
     if (err != cudaSuccess)
       return false;
     pt.embed_ms += pt.Mark();
@@ -2051,24 +1996,18 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       }
       pt.kv_ms += pt.Mark();
 
-      // FlashDecode: index into pre-computed bulk pointer arrays
+      // FlashDecode: derive K/V bases on device from the regular KV layout.
       {
         NVTX_SCOPE("FlashAttention2");
-        const T *const *k_rd =
-            reinterpret_cast<const T *const *>(d_all_k_read_ptrs_ +
-                                               static_cast<size_t>(layer) *
-                                                   max_batch_size_);
-        const T *const *v_rd =
-            reinterpret_cast<const T *const *>(d_all_v_read_ptrs_ +
-                                               static_cast<size_t>(layer) *
-                                                   max_batch_size_);
         float attn_scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
-        err = cuda_kernel::FlashDecodeMultiSeq<T>(
-            d_q_, k_rd, v_rd, d_attn_out_, d_batch_kv_lens_, B, num_heads_,
-            num_kv_heads_, head_dim_, attn_scale, stream_);
+        err = cuda_kernel::FlashDecodeMultiSeqStrided<T>(
+            d_q_, typed_cache->Buffer(), d_attn_out_, d_batch_seq_ids_,
+            d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_, head_dim_,
+            typed_cache->SlotStride(), typed_cache->LayerStride(),
+            typed_cache->KvStride(), attn_scale, stream_);
         if (err != cudaSuccess) {
           log::Error("llama_forward",
-                     "FlashDecodeMultiSeq launch failed: " +
+                     "FlashDecodeMultiSeqStrided launch failed: " +
                          std::string(cudaGetErrorString(err)));
           return false;
         }

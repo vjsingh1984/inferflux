@@ -31,5 +31,23 @@ cudaError_t FlashDecodeMultiSeq(const T *Q, const T *const *d_k_ptrs,
                                 int num_heads, int num_kv_heads, int head_dim,
                                 float scale, cudaStream_t stream = 0);
 
+/**
+ * FlashDecodeMultiSeqStrided: Batched decode attention for B sequences with
+ * different KV lengths, deriving K/V bases on device from a regular KV cache
+ * layout.
+ *
+ * kv_buffer layout: [max_batch][num_layers][2][max_seq_len][kv_dim]
+ * d_seq_ids/d_kv_lens: [B] sequence IDs and KV lengths on device.
+ */
+template <typename T>
+cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
+                                       const int *d_seq_ids,
+                                       const int *d_kv_lens, int layer,
+                                       int batch_size, int num_heads,
+                                       int num_kv_heads, int head_dim,
+                                       size_t slot_stride, size_t layer_stride,
+                                       size_t kv_stride, float scale,
+                                       cudaStream_t stream = 0);
+
 } // namespace cuda_kernel
 } // namespace inferflux

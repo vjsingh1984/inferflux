@@ -1,4 +1,5 @@
 #include "runtime/backends/cuda/native/gpu_sampler.h"
+#include "runtime/backends/cuda/native/cuda_copy_trace.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
 
 #include "server/logging/logger.h"
@@ -267,6 +268,12 @@ GpuSampler::~GpuSampler() {
     cudaFree(d_result_batch_);
   if (d_uniform_)
     cudaFree(d_uniform_);
+  if (h_result_pinned_)
+    cudaFreeHost(h_result_pinned_);
+  if (h_result_batch_pinned_)
+    cudaFreeHost(h_result_batch_pinned_);
+  if (h_logits_pinned_)
+    cudaFreeHost(h_logits_pinned_);
   if (rng_initialized_)
     curandDestroyGenerator(rng_);
 }
@@ -295,6 +302,18 @@ bool GpuSampler::Initialize(int vocab_size, cudaStream_t stream) {
   if (err != cudaSuccess)
     return false;
   err = cudaMalloc(&d_result_batch_, kMaxBatchSize * sizeof(int));
+  if (err != cudaSuccess)
+    return false;
+  err = cudaMallocHost(reinterpret_cast<void **>(&h_result_pinned_),
+                       sizeof(int));
+  if (err != cudaSuccess)
+    return false;
+  err = cudaMallocHost(reinterpret_cast<void **>(&h_result_batch_pinned_),
+                       kMaxBatchSize * sizeof(int));
+  if (err != cudaSuccess)
+    return false;
+  err = cudaMallocHost(reinterpret_cast<void **>(&h_logits_pinned_),
+                       static_cast<size_t>(vocab_size) * sizeof(float));
   if (err != cudaSuccess)
     return false;
 
@@ -339,6 +358,20 @@ std::size_t GpuSampler::DeviceWorkspaceBytes() const {
   return bytes;
 }
 
+std::size_t GpuSampler::HostWorkspaceBytes() const {
+  std::size_t bytes = 0;
+  if (h_result_pinned_) {
+    bytes += sizeof(int);
+  }
+  if (h_result_batch_pinned_) {
+    bytes += static_cast<std::size_t>(kMaxBatchSize) * sizeof(int);
+  }
+  if (h_logits_pinned_) {
+    bytes += static_cast<std::size_t>(vocab_size_) * sizeof(float);
+  }
+  return bytes;
+}
+
 int GpuSampler::GreedyArgmax(const float *d_logits) {
   NVTX_SCOPE("Sampler_Argmax");
   int threads = 256;
@@ -346,10 +379,12 @@ int GpuSampler::GreedyArgmax(const float *d_logits) {
 
   ArgmaxKernel<<<1, threads, smem, stream_>>>(d_logits, d_result_, vocab_size_);
 
-  cudaMemcpyAsync(&h_result_, d_result_, sizeof(int), cudaMemcpyDeviceToHost,
-                  stream_);
+  runtime::cuda::native::TracedCudaMemcpyAsync(
+      runtime::cuda::native::CopyTraceSite::kSamplerGreedyResultD2H,
+      h_result_pinned_, d_result_, sizeof(int), cudaMemcpyDeviceToHost,
+      stream_);
   cudaStreamSynchronize(stream_);
-  return h_result_;
+  return h_result_pinned_ ? *h_result_pinned_ : 0;
 }
 
 int GpuSampler::StochasticSample(const float *d_logits, float temperature,
@@ -359,8 +394,9 @@ int GpuSampler::StochasticSample(const float *d_logits, float temperature,
   int blocks = (vocab_size_ + threads - 1) / threads;
 
   // Step 1: Copy logits to probs buffer
-  cudaMemcpyAsync(d_probs_, d_logits, vocab_size_ * sizeof(float),
-                  cudaMemcpyDeviceToDevice, stream_);
+  runtime::cuda::native::TracedCudaMemcpyAsync(
+      runtime::cuda::native::CopyTraceSite::kSamplerLogitsToProbsD2D, d_probs_,
+      d_logits, vocab_size_ * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
 
   // Step 2: Temperature scaling
   if (temperature != 1.0f) {
@@ -379,8 +415,9 @@ int GpuSampler::StochasticSample(const float *d_logits, float temperature,
                                                      vocab_size_);
 
   // Copy normalized probs back
-  cudaMemcpyAsync(d_probs_, d_temp_, vocab_size_ * sizeof(float),
-                  cudaMemcpyDeviceToDevice, stream_);
+  runtime::cuda::native::TracedCudaMemcpyAsync(
+      runtime::cuda::native::CopyTraceSite::kSamplerTempToProbsD2D, d_probs_,
+      d_temp_, vocab_size_ * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
 
   // Step 4: Top-k filtering (if enabled)
   if (top_k > 0 && top_k < vocab_size_) {
@@ -401,10 +438,12 @@ int GpuSampler::StochasticSample(const float *d_logits, float temperature,
   MultinomialSampleKernel<<<1, 1, 0, stream_>>>(d_probs_, d_uniform_, d_result_,
                                                 vocab_size_);
 
-  cudaMemcpyAsync(&h_result_, d_result_, sizeof(int), cudaMemcpyDeviceToHost,
-                  stream_);
+  runtime::cuda::native::TracedCudaMemcpyAsync(
+      runtime::cuda::native::CopyTraceSite::kSamplerGreedyResultD2H,
+      h_result_pinned_, d_result_, sizeof(int), cudaMemcpyDeviceToHost,
+      stream_);
   cudaStreamSynchronize(stream_);
-  return h_result_;
+  return h_result_pinned_ ? *h_result_pinned_ : 0;
 }
 
 int GpuSampler::Sample(const float *d_logits, float temperature, int top_k,
@@ -430,13 +469,15 @@ void GpuSampler::GreedyArgmaxBatch(const float *d_logits, int batch_size,
   BatchedArgmaxKernel<<<B, threads, smem, stream_>>>(d_logits, d_result_batch_,
                                                      vocab_size_, B);
 
-  cudaMemcpyAsync(h_result_batch_, d_result_batch_, B * sizeof(int),
-                  cudaMemcpyDeviceToHost, stream_);
+  runtime::cuda::native::TracedCudaMemcpyAsync(
+      runtime::cuda::native::CopyTraceSite::kSamplerBatchResultD2H,
+      h_result_batch_pinned_, d_result_batch_, B * sizeof(int),
+      cudaMemcpyDeviceToHost, stream_);
   cudaStreamSynchronize(stream_);
 
   out_tokens->resize(B);
   for (int i = 0; i < B; ++i) {
-    (*out_tokens)[i] = h_result_batch_[i];
+    (*out_tokens)[i] = h_result_batch_pinned_[i];
   }
 }
 
@@ -470,9 +511,13 @@ void GpuSampler::SampleBatch(const float *d_logits, int batch_size,
 
 void GpuSampler::CopyLogitsToHost(const float *d_logits, float *host_buf) {
   NVTX_SCOPE("Sampler_CopyLogits");
-  cudaMemcpyAsync(host_buf, d_logits, vocab_size_ * sizeof(float),
-                  cudaMemcpyDeviceToHost, stream_);
+  runtime::cuda::native::TracedCudaMemcpyAsync(
+      runtime::cuda::native::CopyTraceSite::kSamplerCopyLogitsD2H,
+      h_logits_pinned_, d_logits, vocab_size_ * sizeof(float),
+      cudaMemcpyDeviceToHost, stream_);
   cudaStreamSynchronize(stream_);
+  std::memcpy(host_buf, h_logits_pinned_,
+              static_cast<size_t>(vocab_size_) * sizeof(float));
 }
 
 } // namespace inferflux

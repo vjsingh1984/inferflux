@@ -24,7 +24,7 @@ SERVER_BIN="$BUILD_DIR/inferfluxd"
 API_KEY="${INFERCTL_API_KEY:-dev-key-123}"
 GPU_PROFILE="${GPU_PROFILE:-ada_rtx_4000}"
 WORKLOAD_GPU_PROFILE="${WORKLOAD_GPU_PROFILE:-none}"
-PORT="${INFERFLUX_PROFILE_PORT:-18088}"
+PORT=""
 HOST="127.0.0.1"
 CONCURRENCY="${CONCURRENCY:-4}"
 REQUESTS="${REQUESTS:-8}"
@@ -39,6 +39,8 @@ BENCH_LOG_LEVEL="${BENCH_LOG_LEVEL:-warning}"
 REQUEST_TIMEOUT_SEC="${REQUEST_TIMEOUT_SEC:-180}"
 STARTUP_TIMEOUT_SEC="${STARTUP_TIMEOUT_SEC:-60}"
 PROFILE_STEADY_STATE_ONLY="${PROFILE_STEADY_STATE_ONLY:-1}"
+PROFILE_LOCK_FILE="${INFERFLUX_PROFILE_LOCK_FILE:-/tmp/inferflux_profile_backend.lock}"
+PROFILE_LOCK_WAIT_SEC="${INFERFLUX_PROFILE_LOCK_WAIT_SEC:-300}"
 PROFILE_PID=""
 NSYS_SESSION_NAME=""
 
@@ -46,6 +48,7 @@ normalize_backend() {
   case "$BACKEND_INPUT" in
     native|cuda_native)
       BACKEND_ID="cuda_native"
+      BACKEND_PORT_DEFAULT=18088
       PREFER_NATIVE="true"
       ALLOW_LLAMA_FALLBACK="false"
       STRICT_NATIVE="1"
@@ -53,6 +56,7 @@ normalize_backend() {
       ;;
     llamacpp|llama_cpp|cuda_llama_cpp)
       BACKEND_ID="cuda_llama_cpp"
+      BACKEND_PORT_DEFAULT=18089
       PREFER_NATIVE="false"
       ALLOW_LLAMA_FALLBACK="true"
       STRICT_NATIVE="0"
@@ -63,6 +67,7 @@ normalize_backend() {
       exit 1
       ;;
   esac
+  PORT="${INFERFLUX_PROFILE_PORT:-$BACKEND_PORT_DEFAULT}"
 }
 
 require_tools() {
@@ -181,6 +186,15 @@ cleanup() {
   stop_profiled_server
 }
 trap cleanup EXIT
+
+acquire_profile_lock() {
+  mkdir -p "$(dirname "$PROFILE_LOCK_FILE")"
+  exec 9>"$PROFILE_LOCK_FILE"
+  if ! flock -w "$PROFILE_LOCK_WAIT_SEC" 9; then
+    log_err "Failed to acquire profile lock at $PROFILE_LOCK_FILE"
+    exit 1
+  fi
+}
 
 start_profiled_server() {
   local server_log="$OUTPUT_DIR/server.log"
@@ -415,7 +429,9 @@ main() {
   echo "  Prompt:      $WORKLOAD_PROMPT"
   echo "  Scheduler:   min_batch=$MIN_BATCH_SIZE accum_ms=$BATCH_ACCUMULATION_MS decode_burst=$DECODE_BURST_TOKENS batched_decode=$ENABLE_BATCHED_DECODE"
   echo "  Profile:     $([ "$PROFILE_STEADY_STATE_ONLY" = "1" ] && echo steady-state-only || echo includes-startup)"
+  echo "  Lock file:   $PROFILE_LOCK_FILE"
 
+  acquire_profile_lock
   write_config
   start_profiled_server
   run_workload

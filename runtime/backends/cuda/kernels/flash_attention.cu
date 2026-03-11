@@ -353,5 +353,146 @@ template cudaError_t FlashDecodeMultiSeq<__nv_bfloat16>(
     const __nv_bfloat16 *const *, __nv_bfloat16 *, const int *, int, int, int,
     int, float, cudaStream_t);
 
+template <typename T>
+__global__ void FlashDecodeMultiSeqStridedKernel(
+    const T *__restrict__ Q, const T *__restrict__ kv_buffer,
+    T *__restrict__ O, const int *__restrict__ seq_ids,
+    const int *__restrict__ kv_lens, int layer, int num_heads,
+    int num_kv_heads, int head_dim, size_t slot_stride, size_t layer_stride,
+    size_t kv_stride, float scale) {
+  const int b = blockIdx.x;
+  const int head_idx = blockIdx.y;
+
+  const int d = threadIdx.x;
+  const int num_threads = blockDim.x;
+  const int warp_id = d / 32;
+  const int lane = d & 31;
+  const int num_warps = num_threads / 32;
+
+  const int kv_len = kv_lens[b];
+  if (kv_len <= 0) {
+    return;
+  }
+
+  const int kv_head_ratio =
+      (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 1;
+  const int kv_head_idx = head_idx / kv_head_ratio;
+
+  float q_reg = 0.0f;
+  if (d < head_dim) {
+    q_reg = DtypeTraits<T>::to_float(
+        Q[b * num_heads * head_dim + head_idx * head_dim + d]);
+  }
+
+  const size_t seq_offset = static_cast<size_t>(seq_ids[b]) * slot_stride;
+  const size_t layer_offset = static_cast<size_t>(layer) * layer_stride;
+  const T *K = kv_buffer + seq_offset + layer_offset;
+  const T *V = K + kv_stride;
+  const int kv_stride_elems = num_kv_heads * head_dim;
+
+  extern __shared__ float smem[];
+  float *s_k = smem;
+  float *s_v = smem + FA2_TILE_KV * head_dim;
+  float *s_warp_dots = s_v + FA2_TILE_KV * head_dim;
+  float *s_scores = s_warp_dots + num_warps * FA2_TILE_KV;
+
+  float row_max = -INFINITY;
+  float row_sum = 0.0f;
+  float o_acc = 0.0f;
+
+  for (int kv_start = 0; kv_start < kv_len; kv_start += FA2_TILE_KV) {
+    const int tile_len = min(FA2_TILE_KV, kv_len - kv_start);
+    const int total_elements = tile_len * head_dim;
+
+    for (int i = d; i < total_elements; i += num_threads) {
+      const int t = i / head_dim;
+      const int dim = i % head_dim;
+      const size_t kv_offset = static_cast<size_t>(kv_start + t) *
+                                   static_cast<size_t>(kv_stride_elems) +
+                               static_cast<size_t>(kv_head_idx * head_dim + dim);
+      s_k[i] = DtypeTraits<T>::to_float(K[kv_offset]);
+      s_v[i] = DtypeTraits<T>::to_float(V[kv_offset]);
+    }
+    __syncthreads();
+
+    for (int t = 0; t < tile_len; t++) {
+      float partial = (d < head_dim) ? q_reg * s_k[t * head_dim + d] : 0.0f;
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        partial += __shfl_down_sync(0xFFFFFFFF, partial, offset);
+      }
+      if (lane == 0) {
+        s_warp_dots[warp_id * FA2_TILE_KV + t] = partial;
+      }
+    }
+    __syncthreads();
+
+    if (d < tile_len) {
+      float dot_sum = 0.0f;
+      for (int w = 0; w < num_warps; w++) {
+        dot_sum += s_warp_dots[w * FA2_TILE_KV + d];
+      }
+      s_scores[d] = dot_sum * scale;
+    }
+    __syncthreads();
+
+    for (int t = 0; t < tile_len; t++) {
+      const float score = s_scores[t];
+      const float new_max = fmaxf(row_max, score);
+      const float rescale = expf(row_max - new_max);
+      const float exp_w = expf(score - new_max);
+
+      if (d < head_dim) {
+        o_acc = o_acc * rescale + exp_w * s_v[t * head_dim + d];
+      }
+
+      row_sum = row_sum * rescale + exp_w;
+      row_max = new_max;
+    }
+    __syncthreads();
+  }
+
+  if (d < head_dim) {
+    O[b * num_heads * head_dim + head_idx * head_dim + d] =
+        DtypeTraits<T>::from_float((row_sum > 0.0f) ? (o_acc / row_sum) : 0.0f);
+  }
+}
+
+template <typename T>
+cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
+                                       const int *d_seq_ids,
+                                       const int *d_kv_lens, int layer,
+                                       int batch_size, int num_heads,
+                                       int num_kv_heads, int head_dim,
+                                       size_t slot_stride, size_t layer_stride,
+                                       size_t kv_stride, float scale,
+                                       cudaStream_t stream) {
+  int threads = 1;
+  while (threads < head_dim) {
+    threads <<= 1;
+  }
+  threads = min(threads, 1024);
+  const int num_warps = threads / 32;
+  const int smem =
+      (2 * FA2_TILE_KV * head_dim + num_warps * FA2_TILE_KV + FA2_TILE_KV) *
+      sizeof(float);
+  dim3 grid(batch_size, num_heads);
+
+  FlashDecodeMultiSeqStridedKernel<T>
+      <<<grid, threads, smem, stream>>>(Q, kv_buffer, O, d_seq_ids, d_kv_lens,
+                                        layer, num_heads, num_kv_heads,
+                                        head_dim, slot_stride, layer_stride,
+                                        kv_stride, scale);
+  return cudaGetLastError();
+}
+
+template cudaError_t FlashDecodeMultiSeqStrided<half>(
+    const half *, const half *, half *, const int *, const int *, int, int,
+    int, int, int, size_t, size_t, size_t, float, cudaStream_t);
+template cudaError_t FlashDecodeMultiSeqStrided<__nv_bfloat16>(
+    const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, const int *,
+    const int *, int, int, int, int, int, size_t, size_t, size_t, float,
+    cudaStream_t);
+
 } // namespace cuda_kernel
 } // namespace inferflux

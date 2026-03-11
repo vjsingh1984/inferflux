@@ -14,13 +14,14 @@ This is the next throughput step after:
 
 ## Current State
 
-Native decode still performs a host-side pointer build in
-[transformer_forward.cu](/home/vsingh/code/inferflux/runtime/backends/cuda/native/transformer_forward.cu):
+Native decode now derives both append and read addresses on device from the
+regular KV layout in
+[transformer_forward.cu](/home/vsingh/code/inferflux/runtime/backends/cuda/native/transformer_forward.cu)
+and
+[flash_attention.cu](/home/vsingh/code/inferflux/runtime/backends/cuda/kernels/flash_attention.cu).
 
-- host loops over `layer x batch`
-- fills `h_all_k_append_ptrs_`, `h_all_v_append_ptrs_`
-- fills `h_all_k_read_ptrs_`, `h_all_v_read_ptrs_`
-- uploads two pointer slabs per batch
+Per-batch pointer slab generation/upload has been removed from the live native
+decode path.
 
 The backing KV layout is already regular in
 [kv_cache_gpu.cu](/home/vsingh/code/inferflux/runtime/backends/cuda/native/kv_cache_gpu.cu):
@@ -37,7 +38,7 @@ Steady-state `nsys` profiling shows startup allocator churn is no longer the
 main problem. The remaining native-vs-llama gap is now a real decode hot-path
 gap, and `cudaMemcpyAsync` is still dominated by runtime metadata traffic.
 
-That means the next safe win is not another host-side slab compression. It is
+That means the next safe win was not another host-side slab compression. It was
 removing the host-built pointer slabs entirely.
 
 ## Safe First Slice
@@ -99,6 +100,14 @@ Implementation:
 2. Compute `k_rd` and `v_rd` inside the kernel from the same address formula.
 3. Remove the remaining host read slab and its H2D upload.
 
+Status:
+
+- implemented
+- `FlashDecodeMultiSeqStrided(...)` now derives read bases on device from
+  `kv_buffer + seq_id/stride + layer/stride`
+- native `BatchForward()` no longer builds or uploads read pointer slabs
+- direct parity coverage exists for both generic and Qwen decode geometry
+
 Why second:
 
 - FlashDecode is the more sensitive path
@@ -128,27 +137,80 @@ Before rollout:
 
 ## Current Evidence
 
-Phase A correctness is now covered by:
+Phase A/Phase B correctness is now covered by:
 
 1. `./build-cuda/inferflux_tests "[batched_decode]"`
 2. the new `BatchedKvAppendStrided` parity test in
    [test_batched_decode.cpp](/home/vsingh/code/inferflux/tests/unit/test_batched_decode.cpp)
+3. `FlashDecodeMultiSeqStrided matches per-sequence FlashAttention decode for Qwen geometry`
+   in [test_native_forward.cpp](/home/vsingh/code/inferflux/tests/unit/test_native_forward.cpp)
 
-Short end-to-end benchmark after transplanting Phase A onto the source branch:
+Short end-to-end benchmark after Phase B on the source branch:
 
-- native: `104.2 tok/s`
-- `cuda_llama_cpp`: `127.8 tok/s`
-- exact match: `7/8`
+- native: `113.9 tok/s`
+- `cuda_llama_cpp`: `115.0 tok/s`
+- exact match: `6/8`
+- artifact:
+  [comparison_20260311_122203.json](/home/vsingh/code/inferflux/gguf_benchmark_results/comparison_20260311_122203.json)
 
-That means Phase A is a correctness/architecture cleanup first. It removes one
-class of host-built metadata and keeps the path graph-safe, but it does not yet
-prove a throughput win by itself. The next required proof step is steady-state
-profiling on this branch, then Phase B or deeper device-side KV address
-derivation if the copy-path delta is still material.
+Serialized steady-state `nsys` profiling on this branch is now trustworthy
+because [profile_backend.sh](/home/vsingh/code/inferflux/scripts/profile_backend.sh)
+uses backend-specific default ports plus a lock file to prevent overlapping
+profiling sessions.
+
+Current API-level result:
+
+- native: `cudaMemcpyAsync calls=754 total=1548.199 ms avg=2.053 ms`
+- llama.cpp: `cudaMemcpyAsync calls=924 total=3.179 ms avg=3.441 us`
+- both backends now show `cudaMalloc=0` and `cudaFree=0` in steady state
+
+That means the remaining native gap is no longer allocator churn or KV pointer
+slab upload. The dominant unresolved issue is the cost of the remaining
+`cudaMemcpyAsync` path itself.
+
+## Follow-up: Pinned Host Sampling and Copy Trace
+
+After adding:
+
+- pinned host buffers for sampler result/logits staging in
+  [gpu_sampler.cu](/home/vsingh/code/inferflux/runtime/backends/cuda/native/gpu_sampler.cu)
+- per-site native copy tracing in
+  [cuda_copy_trace.h](/home/vsingh/code/inferflux/runtime/backends/cuda/native/cuda_copy_trace.h)
+
+the short `c=4` benchmark reported:
+
+- native: `123.6 tok/s`
+- `cuda_llama_cpp`: `127.9 tok/s`
+- ratio: `0.97x`
+- artifact:
+  [comparison_20260311_123017.json](/home/vsingh/code/inferflux/gguf_benchmark_results/comparison_20260311_123017.json)
+
+The native server log now shows the exact live copy sites:
+
+- `batch.meta_h2d`: `128 calls`, `1.677 ms total`
+- `sampler.batch_result_d2h`: `128 calls`, `0.612 ms total`
+- `forward.token_ids_h2d`: `10 calls`, `0.174 ms total`
+- `forward.residual_d2d`: `10 calls`, `0.100 ms total`
+- `batch.residual_d2d`: `9 calls`, `0.094 ms total`
+- `sampler.greedy_result_d2h`: `10 calls`, `0.063 ms total`
+
+Serialized steady-state `nsys` then moved native to:
+
+- `cudaMemcpyAsync calls=767 total=5.697 ms avg=7.428 us`
+
+which is now effectively at parity with llama.cpp:
+
+- `cudaMemcpyAsync calls=924 total=5.614 ms avg=6.075 us`
+
+This confirms the old native copy bottleneck was mostly pageable host staging
+in sampling, not the remaining metadata slab itself.
+
+The next native bottleneck is now `cudaStreamSynchronize`, not
+`cudaMemcpyAsync`.
 
 ## Success Metric
 
-The steady-state profiler should move from:
+The steady-state profiler has now moved from:
 
 - host-built pointer slabs
 - two KV pointer H2D uploads per batch
@@ -156,7 +218,7 @@ The steady-state profiler should move from:
 to:
 
 - metadata-only batch upload
-- zero KV pointer H2D uploads per batch
+- zero KV pointer H2D uploads per batch in the live native decode path
 
 That is the cleanest next step toward exceeding llama.cpp on native decode
 throughput without changing model math or destabilizing batching.

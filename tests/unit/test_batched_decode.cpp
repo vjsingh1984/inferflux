@@ -509,29 +509,16 @@ TEST_CASE("Batched decode pipeline runs without CUDA errors",
     REQUIRE(err == cudaSuccess);
   }
 
-  // Step 3: FlashDecodeMultiSeq
+  // Step 3: FlashDecodeMultiSeqStrided
   {
-    std::vector<const half *> h_k_rd(B), h_v_rd(B);
-    cache.GetBatchKVPtrs(0, h_seq_ids.data(), B, h_k_rd.data(), h_v_rd.data());
-
-    const half **d_k_rd = nullptr;
-    const half **d_v_rd = nullptr;
-    REQUIRE(cudaMalloc(&d_k_rd, B * sizeof(half *)) == cudaSuccess);
-    REQUIRE(cudaMalloc(&d_v_rd, B * sizeof(half *)) == cudaSuccess);
-    REQUIRE(cudaMemcpy(const_cast<half **>(d_k_rd), h_k_rd.data(),
-                       B * sizeof(half *),
-                       cudaMemcpyHostToDevice) == cudaSuccess);
-    REQUIRE(cudaMemcpy(const_cast<half **>(d_v_rd), h_v_rd.data(),
-                       B * sizeof(half *),
-                       cudaMemcpyHostToDevice) == cudaSuccess);
-
-    cudaError_t err = cuda_kernel::FlashDecodeMultiSeq<half>(
-        d_q, d_k_rd, d_v_rd, d_attn_out, d_kv_lens, B, num_heads,
-        num_kv_heads, head_dim, scale, nullptr);
-    INFO("FlashDecodeMultiSeq launch: " << cudaGetErrorString(err));
+    cudaError_t err = cuda_kernel::FlashDecodeMultiSeqStrided<half>(
+        d_q, cache.Buffer(), d_attn_out, d_seq_ids, d_kv_lens, 0, B,
+        num_heads, num_kv_heads, head_dim, cache.SlotStride(),
+        cache.LayerStride(), cache.KvStride(), scale, nullptr);
+    INFO("FlashDecodeMultiSeqStrided launch: " << cudaGetErrorString(err));
     REQUIRE(err == cudaSuccess);
     err = cudaDeviceSynchronize();
-    INFO("FlashDecodeMultiSeq sync: " << cudaGetErrorString(err));
+    INFO("FlashDecodeMultiSeqStrided sync: " << cudaGetErrorString(err));
     REQUIRE(err == cudaSuccess);
 
     // Verify non-zero output
@@ -545,8 +532,6 @@ TEST_CASE("Batched decode pipeline runs without CUDA errors",
     }
     CHECK(nonzero > 0);
 
-    cudaFree(const_cast<half **>(d_k_rd));
-    cudaFree(const_cast<half **>(d_v_rd));
   }
 
   cudaFree(d_q);

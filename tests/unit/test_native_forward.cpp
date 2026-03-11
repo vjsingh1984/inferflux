@@ -7,6 +7,7 @@
 #include "runtime/backends/cuda/native/cuda_kernels.cuh"
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
+#include "runtime/backends/cuda/native/kv_cache_gpu.h"
 #include "runtime/backends/cuda/native/kernels/dequantization.cuh"
 #include "runtime/backends/cuda/native/llama_forward.h"
 #include "runtime/backends/cuda/native/native_linear_executor.h"
@@ -1094,6 +1095,146 @@ TEST_CASE(
   REQUIRE(cudaFree(d_kv_lens) == cudaSuccess);
   REQUIRE(cudaFree(reinterpret_cast<void *>(d_v_ptrs)) == cudaSuccess);
   REQUIRE(cudaFree(reinterpret_cast<void *>(d_k_ptrs)) == cudaSuccess);
+  REQUIRE(cudaFree(d_v1) == cudaSuccess);
+  REQUIRE(cudaFree(d_k1) == cudaSuccess);
+  REQUIRE(cudaFree(d_v0) == cudaSuccess);
+  REQUIRE(cudaFree(d_k0) == cudaSuccess);
+  REQUIRE(cudaFree(d_o_batch) == cudaSuccess);
+  REQUIRE(cudaFree(d_q_batch) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+}
+
+TEST_CASE(
+    "FlashDecodeMultiSeqStrided matches per-sequence FlashAttention decode for "
+    "Qwen geometry",
+    "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping Qwen-geometry strided "
+            "FlashDecode parity.");
+    return;
+  }
+
+  constexpr int batch_size = 2;
+  constexpr int num_heads = 16;
+  constexpr int num_kv_heads = 2;
+  constexpr int head_dim = 128;
+  constexpr int q_cols = num_heads * head_dim;
+  constexpr int kv_cols = num_kv_heads * head_dim;
+  constexpr int max_seq_len = 16;
+  constexpr int max_batch = 4;
+  constexpr int layer = 0;
+  const std::array<int, batch_size> seq_ids = {1, 3};
+  const std::array<int, batch_size> kv_lens = {7, 13};
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  cudaStream_t stream = nullptr;
+  REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
+
+  KvCacheGpuTyped<half> cache;
+  REQUIRE(cache.Allocate(/*num_layers=*/1, num_kv_heads, head_dim, max_seq_len,
+                         max_batch));
+
+  const std::vector<half> h_q =
+      MakeWaveTensor(static_cast<size_t>(batch_size) * q_cols, 0.03f);
+  const std::vector<half> h_k0 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[0]) * kv_cols, 0.02f, 0.01f);
+  const std::vector<half> h_v0 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[0]) * kv_cols, 0.02f, -0.01f);
+  const std::vector<half> h_k1 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[1]) * kv_cols, 0.025f, 0.02f);
+  const std::vector<half> h_v1 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[1]) * kv_cols, 0.015f, 0.03f);
+
+  half *d_q_batch = nullptr;
+  half *d_o_batch = nullptr;
+  half *d_k0 = nullptr;
+  half *d_v0 = nullptr;
+  half *d_k1 = nullptr;
+  half *d_v1 = nullptr;
+  int *d_seq_ids = nullptr;
+  int *d_kv_lens = nullptr;
+
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_q_batch),
+                     h_q.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_o_batch),
+                     h_q.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_k0),
+                     h_k0.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_v0),
+                     h_v0.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_k1),
+                     h_k1.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_v1),
+                     h_v1.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_seq_ids),
+                     batch_size * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_kv_lens),
+                     batch_size * sizeof(int)) == cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_q_batch, h_q.data(), h_q.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_k0, h_k0.data(), h_k0.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_v0, h_v0.data(), h_v0.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_k1, h_k1.data(), h_k1.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_v1, h_v1.data(), h_v1.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cache.Append(layer, seq_ids[0], /*start_pos=*/0, kv_lens[0], d_k0,
+                       d_v0, stream) == cudaSuccess);
+  REQUIRE(cache.Append(layer, seq_ids[1], /*start_pos=*/0, kv_lens[1], d_k1,
+                       d_v1, stream) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_seq_ids, seq_ids.data(), batch_size * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_kv_lens, kv_lens.data(), batch_size * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+  REQUIRE(cuda_kernel::FlashDecodeMultiSeqStrided<half>(
+              d_q_batch, cache.Buffer(), d_o_batch, d_seq_ids, d_kv_lens,
+              layer, batch_size, num_heads, num_kv_heads, head_dim,
+              cache.SlotStride(), cache.LayerStride(), cache.KvStride(), scale,
+              stream) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+  const std::vector<half> o_batched = CopyDeviceHalfs(d_o_batch, h_q.size());
+
+  for (int b = 0; b < batch_size; ++b) {
+    half *d_q_single = nullptr;
+    half *d_o_single = nullptr;
+    REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_q_single),
+                       q_cols * sizeof(half)) == cudaSuccess);
+    REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_o_single),
+                       q_cols * sizeof(half)) == cudaSuccess);
+    REQUIRE(cudaMemcpy(d_q_single, h_q.data() + b * q_cols,
+                       q_cols * sizeof(half),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    const half *d_k_single = (b == 0) ? cache.GetK(layer, seq_ids[0])
+                                      : cache.GetK(layer, seq_ids[1]);
+    const half *d_v_single = (b == 0) ? cache.GetV(layer, seq_ids[0])
+                                      : cache.GetV(layer, seq_ids[1]);
+    REQUIRE(cuda_kernel::FlashAttention2Typed<half>(
+                d_q_single, d_k_single, d_v_single, d_o_single,
+                /*batch_size=*/1, /*query_len=*/1, kv_lens[b], num_heads,
+                num_kv_heads, head_dim, scale, /*causal=*/true,
+                stream) == cudaSuccess);
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+    const std::vector<half> o_single = CopyDeviceHalfs(d_o_single, q_cols);
+    for (int i = 0; i < q_cols; ++i) {
+      REQUIRE(__half2float(o_batched[b * q_cols + i]) ==
+              Catch::Approx(__half2float(o_single[i])).margin(2e-3f));
+    }
+
+    REQUIRE(cudaFree(d_o_single) == cudaSuccess);
+    REQUIRE(cudaFree(d_q_single) == cudaSuccess);
+  }
+
+  REQUIRE(cudaFree(d_kv_lens) == cudaSuccess);
+  REQUIRE(cudaFree(d_seq_ids) == cudaSuccess);
   REQUIRE(cudaFree(d_v1) == cudaSuccess);
   REQUIRE(cudaFree(d_k1) == cudaSuccess);
   REQUIRE(cudaFree(d_v0) == cudaSuccess);
