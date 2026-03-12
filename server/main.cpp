@@ -4,7 +4,7 @@
 #include "runtime/backends/backend_factory.h"
 #include "runtime/backends/backend_manager.h"
 #include "runtime/backends/cpu/cpu_backend.h"
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 #include "runtime/disaggregated/kv_channel.h"
 #include "runtime/disaggregated/shm_kv_transport.h"
 #include "runtime/execution/parallel_context.h"
@@ -212,15 +212,15 @@ int main(int argc, char **argv) {
   bool cuda_flash_attention_enabled = false;
   int cuda_flash_attention_tile = 128;
   std::string cuda_attention_kernel = "auto";
-  std::string native_kv_cache_dtype = "auto";
-  std::string native_dequantized_cache_policy = "none";
-  bool native_require_fused_quantized_matmul = false;
+  std::string inferflux_cuda_kv_cache_dtype = "auto";
+  std::string inferflux_cuda_dequantized_cache_policy = "none";
+  bool inferflux_cuda_require_fused_quantized_matmul = false;
   bool cuda_phase_overlap_scaffold = false;
   int cuda_phase_overlap_min_prefill_tokens = 256;
   bool cuda_phase_overlap_prefill_replica = false;
-  bool backend_prefer_native = true;
+  bool backend_prefer_inferflux = true;
   bool backend_allow_llama_cpp_fallback = true;
-  bool backend_strict_native_request = false;
+  bool backend_strict_inferflux_request = false;
   std::vector<std::string> backend_priority;
   bool speculative_enabled = false;
   std::string speculative_draft_model;
@@ -365,13 +365,13 @@ int main(int argc, char **argv) {
         if (config["runtime"]["cuda"] &&
             config["runtime"]["cuda"]["kv_cache_dtype"] &&
             config["runtime"]["cuda"]["kv_cache_dtype"].IsScalar()) {
-          native_kv_cache_dtype = ToLower(
+          inferflux_cuda_kv_cache_dtype = ToLower(
               config["runtime"]["cuda"]["kv_cache_dtype"].as<std::string>());
         }
         if (config["runtime"]["cuda"] &&
             config["runtime"]["cuda"]["dequantized_cache_policy"] &&
             config["runtime"]["cuda"]["dequantized_cache_policy"].IsScalar()) {
-          native_dequantized_cache_policy =
+          inferflux_cuda_dequantized_cache_policy =
               ToLower(config["runtime"]["cuda"]["dequantized_cache_policy"]
                           .as<std::string>());
         }
@@ -379,7 +379,7 @@ int main(int argc, char **argv) {
             config["runtime"]["cuda"]["quantized_runtime"] &&
             config["runtime"]["cuda"]["quantized_runtime"]
                   ["require_fused_matmul"]) {
-          native_require_fused_quantized_matmul =
+          inferflux_cuda_require_fused_quantized_matmul =
               config["runtime"]["cuda"]["quantized_runtime"]
                     ["require_fused_matmul"]
                         .as<bool>();
@@ -407,16 +407,16 @@ int main(int argc, char **argv) {
         }
         if (config["runtime"]["backend_exposure"]) {
           const auto &exposure = config["runtime"]["backend_exposure"];
-          if (exposure["prefer_native"]) {
-            backend_prefer_native = exposure["prefer_native"].as<bool>();
+          if (exposure["prefer_inferflux"]) {
+            backend_prefer_inferflux = exposure["prefer_inferflux"].as<bool>();
           }
           if (exposure["allow_llama_cpp_fallback"]) {
             backend_allow_llama_cpp_fallback =
                 exposure["allow_llama_cpp_fallback"].as<bool>();
           }
-          if (exposure["strict_native_request"]) {
-            backend_strict_native_request =
-                exposure["strict_native_request"].as<bool>();
+          if (exposure["strict_inferflux_request"]) {
+            backend_strict_inferflux_request =
+                exposure["strict_inferflux_request"].as<bool>();
           }
         }
         if (config["runtime"]["capability_routing"]) {
@@ -787,17 +787,19 @@ int main(int argc, char **argv) {
           std::getenv("INFERFLUX_CUDA_ATTENTION_KERNEL")) {
     cuda_attention_kernel = ToLower(env_cuda_attention_kernel);
   }
-  if (const char *env_native_kv_precision =
-          std::getenv("INFERFLUX_NATIVE_KV_DTYPE")) {
-    native_kv_cache_dtype = ToLower(env_native_kv_precision);
+  if (const char *env_inferflux_cuda_kv_precision =
+          std::getenv("INFERFLUX_CUDA_KV_DTYPE")) {
+    inferflux_cuda_kv_cache_dtype = ToLower(env_inferflux_cuda_kv_precision);
   }
-  if (const char *env_native_dequant_policy =
-          std::getenv("INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY")) {
-    native_dequantized_cache_policy = ToLower(env_native_dequant_policy);
+  if (const char *env_inferflux_cuda_dequant_policy =
+          std::getenv("INFERFLUX_CUDA_DEQUANT_CACHE_POLICY")) {
+    inferflux_cuda_dequantized_cache_policy =
+        ToLower(env_inferflux_cuda_dequant_policy);
   }
-  if (const char *env_native_require_fused =
-          std::getenv("INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL")) {
-    native_require_fused_quantized_matmul = ParseBool(env_native_require_fused);
+  if (const char *env_inferflux_cuda_require_fused =
+          std::getenv("INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL")) {
+    inferflux_cuda_require_fused_quantized_matmul =
+        ParseBool(env_inferflux_cuda_require_fused);
   }
   if (const char *env_cuda_overlap =
           std::getenv("INFERFLUX_CUDA_PHASE_OVERLAP")) {
@@ -815,17 +817,17 @@ int main(int argc, char **argv) {
     cuda_phase_overlap_prefill_replica =
         ParseBool(env_cuda_overlap_prefill_replica);
   }
-  if (const char *env_prefer_native =
-          std::getenv("INFERFLUX_BACKEND_PREFER_NATIVE")) {
-    backend_prefer_native = ParseBool(env_prefer_native);
+  if (const char *env_prefer_inferflux =
+          std::getenv("INFERFLUX_BACKEND_PREFER_INFERFLUX")) {
+    backend_prefer_inferflux = ParseBool(env_prefer_inferflux);
   }
   if (const char *env_allow_fallback =
           std::getenv("INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK")) {
     backend_allow_llama_cpp_fallback = ParseBool(env_allow_fallback);
   }
-  if (const char *env_strict_native =
-          std::getenv("INFERFLUX_BACKEND_STRICT_NATIVE_REQUEST")) {
-    backend_strict_native_request = ParseBool(env_strict_native);
+  if (const char *env_strict_inferflux =
+          std::getenv("INFERFLUX_BACKEND_STRICT_INFERFLUX_REQUEST")) {
+    backend_strict_inferflux_request = ParseBool(env_strict_inferflux);
   }
   if (const char *env_backend_priority =
           std::getenv("INFERFLUX_BACKEND_PRIORITY")) {
@@ -1050,31 +1052,31 @@ int main(int argc, char **argv) {
   std::cout << "Paged KV cache pages: " << cache_pages
             << " eviction=" << normalized_policy << std::endl;
   inferflux::BackendFactory::SetExposurePolicy(
-      {backend_prefer_native, backend_allow_llama_cpp_fallback,
-       backend_strict_native_request});
+      {backend_prefer_inferflux, backend_allow_llama_cpp_fallback,
+       backend_strict_inferflux_request});
   inferflux::log::Info(
       "server",
-      "Backend exposure policy: prefer_native=" +
-          std::string(backend_prefer_native ? "true" : "false") +
+      "Backend exposure policy: prefer_inferflux=" +
+          std::string(backend_prefer_inferflux ? "true" : "false") +
           ", allow_llama_cpp_fallback=" +
           std::string(backend_allow_llama_cpp_fallback ? "true" : "false") +
-          ", strict_native_request=" +
-          std::string(backend_strict_native_request ? "true" : "false"));
-  // TODO(perf): When allow_llama_cpp_fallback=true with prefer_native=true,
+          ", strict_inferflux_request=" +
+          std::string(backend_strict_inferflux_request ? "true" : "false"));
+  // TODO(perf): When allow_llama_cpp_fallback=true with prefer_inferflux=true,
   // the parity delegate may load a second copy of model weights via llama.cpp
-  // for features the native backend doesn't support (logprobs, structured
+  // for features the inferflux backend doesn't support (logprobs, structured
   // output). This doubles GPU memory for model weights. Disable fallback via
   // allow_llama_cpp_fallback=false or
-  // INFERFLUX_NATIVE_DISABLE_PARITY_DELEGATE=1 to avoid this. Long-term fix:
+  // INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE=1 to avoid this. Long-term fix:
   // make the parity delegate truly lazy and share the GGUF weight data with the
-  // native backend.
-  if (backend_prefer_native && backend_allow_llama_cpp_fallback) {
+  // inferflux backend.
+  if (backend_prefer_inferflux && backend_allow_llama_cpp_fallback) {
     inferflux::log::Warn(
         "server",
-        "allow_llama_cpp_fallback=true with prefer_native=true: parity "
+        "allow_llama_cpp_fallback=true with prefer_inferflux=true: parity "
         "delegate may load duplicate model weights. Set "
         "allow_llama_cpp_fallback=false or "
-        "INFERFLUX_NATIVE_DISABLE_PARITY_DELEGATE=1 to reduce GPU memory.");
+        "INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE=1 to reduce GPU memory.");
   }
   inferflux::log::Info(
       "server",
@@ -1124,10 +1126,11 @@ int main(int argc, char **argv) {
       cuda_enabled && cuda_flash_attention_enabled;
   primary_cfg.flash_attention_tile = cuda_flash_attention_tile;
   primary_cfg.cuda_attention_kernel = cuda_attention_kernel;
-  primary_cfg.native_kv_cache_dtype = native_kv_cache_dtype;
-  primary_cfg.native_dequantized_cache_policy = native_dequantized_cache_policy;
-  primary_cfg.native_require_fused_quantized_matmul =
-      native_require_fused_quantized_matmul;
+  primary_cfg.inferflux_cuda_kv_cache_dtype = inferflux_cuda_kv_cache_dtype;
+  primary_cfg.inferflux_cuda_dequantized_cache_policy =
+      inferflux_cuda_dequantized_cache_policy;
+  primary_cfg.inferflux_cuda_require_fused_quantized_matmul =
+      inferflux_cuda_require_fused_quantized_matmul;
   primary_cfg.cuda_phase_overlap_scaffold =
       cuda_enabled && cuda_phase_overlap_scaffold;
   primary_cfg.cuda_phase_overlap_min_prefill_tokens =
@@ -1176,13 +1179,13 @@ int main(int argc, char **argv) {
   }
 #ifdef INFERFLUX_HAS_CUDA
   if (cuda_enabled) {
-    std::cout << "[server] Native CUDA KV cache precision policy: "
-              << native_kv_cache_dtype << ".\n";
-    std::cout << "[server] Native CUDA dequant cache policy: "
-              << native_dequantized_cache_policy
+    std::cout << "[server] InferFlux CUDA KV cache precision policy: "
+              << inferflux_cuda_kv_cache_dtype << ".\n";
+    std::cout << "[server] InferFlux CUDA dequant cache policy: "
+              << inferflux_cuda_dequantized_cache_policy
               << " (none default, memory-first).\n";
-    std::cout << "[server] Native CUDA strict fused quantized matmul: "
-              << (native_require_fused_quantized_matmul ? "enabled"
+    std::cout << "[server] InferFlux CUDA strict fused quantized matmul: "
+              << (inferflux_cuda_require_fused_quantized_matmul ? "enabled"
                                                         : "disabled")
               << ".\n";
   }
@@ -1425,7 +1428,7 @@ int main(int argc, char **argv) {
   spec_config.max_prefill_tokens = speculative_max_prefill_tokens;
   spec_config.draft_model = speculative_draft_model;
   spec_config.chunk_size = speculative_chunk_size;
-  std::shared_ptr<inferflux::LlamaCPUBackend> draft_backend = llama_backend;
+  std::shared_ptr<inferflux::LlamaCppBackend> draft_backend = llama_backend;
   if (speculative_enabled && !speculative_draft_model.empty() &&
       speculative_draft_model != model_path) {
     auto draft_cfg = primary_cfg;
@@ -1552,10 +1555,11 @@ int main(int argc, char **argv) {
     advisor_ctx.config.max_batch_size = scheduler_config.max_batch_size;
     advisor_ctx.config.max_batch_tokens = scheduler_config.max_batch_tokens;
     advisor_ctx.config.kv_cpu_pages = paged_kv_pages;
-    advisor_ctx.config.prefer_native = backend_prefer_native;
+    advisor_ctx.config.prefer_inferflux = backend_prefer_inferflux;
     advisor_ctx.config.allow_llama_cpp_fallback =
         backend_allow_llama_cpp_fallback;
-    advisor_ctx.config.strict_native_request = backend_strict_native_request;
+    advisor_ctx.config.strict_inferflux_request =
+        backend_strict_inferflux_request;
     advisor_ctx.config.backend_priority =
         normalized_backend_priority.empty()
             ? ""

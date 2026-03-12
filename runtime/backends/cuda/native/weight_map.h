@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/backends/cuda/native_kernel_executor.h"
+#include "runtime/backends/cuda/inferflux_cuda_executor.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

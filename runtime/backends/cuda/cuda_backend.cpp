@@ -10,7 +10,7 @@ bool CudaBackend::LoadModel(const std::filesystem::path &model_path,
 #ifdef INFERFLUX_HAS_CUDA
   LlamaBackendConfig tuned =
       TuneLlamaBackendConfig(LlamaBackendTarget::kCuda, config);
-  if (!LlamaCPUBackend::LoadModel(model_path, tuned)) {
+  if (!LlamaCppBackend::LoadModel(model_path, tuned)) {
     log::Error("cuda_backend",
                "failed to load CUDA model at " + model_path.string());
     return false;

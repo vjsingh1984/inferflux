@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared utilities used by multiple backends (LlamaCPUBackend, MlxBackend).
+// Shared utilities used by multiple backends (LlamaCppBackend, MlxBackend).
 // Keep this header dependency-free: no llama.h, no mlx headers.
 
 #include "runtime/logprob.h"

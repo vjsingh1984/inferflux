@@ -4,7 +4,7 @@
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
 #include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/weight_map.h"
-#include "runtime/backends/cuda/native_kernel_executor.h"
+#include "runtime/backends/cuda/inferflux_cuda_executor.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

@@ -998,7 +998,7 @@ class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
         env["INFERFLUX_HOST_OVERRIDE"] = SERVER_HOST
         env["INFERFLUX_PORT_OVERRIDE"] = str(SERVER_STRICT_PORT)
         env["INFERFLUX_MODEL_PATH"] = ""
-        env["INFERFLUX_BACKEND_STRICT_NATIVE_REQUEST"] = "true"
+        env["INFERFLUX_BACKEND_STRICT_INFERFLUX_REQUEST"] = "true"
         cls.server_proc = subprocess.Popen(
             [SERVER_BIN, "--config", "config/server.yaml"],
             env=env,
@@ -1056,7 +1056,7 @@ class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
             {
                 "id": "strict-native-test",
                 "path": "/tmp/strict-native-test.gguf",
-                "backend": "cuda_native",
+                "backend": "inferflux_cuda",
                 "format": "gguf",
             },
         )
@@ -1064,7 +1064,7 @@ class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(payload.get("error"), "backend_policy_violation")
         reason = payload.get("reason", "")
-        self.assertIn("strict_native_request", reason)
+        self.assertIn("strict_inferflux_request", reason)
 
 if __name__ == "__main__":
     unittest.main()

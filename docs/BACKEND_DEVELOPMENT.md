@@ -13,8 +13,8 @@ graph TB
         B --> C3[MPS Backend]
         B --> C4[CPU Backend]
 
-        C1 --> D1[Native Provider]
-        C1 --> D2[Universal Provider]
+        C1 --> D1[InferFlux Engine]
+        C1 --> D2[llama.cpp Engine]
 
         D1 --> E1[Custom Kernels]
         D2 --> E2[llama.cpp Bridge]
@@ -49,11 +49,11 @@ graph TB
 mindmap
   root((InferFlux Backends))
     CUDA
-      cuda_native
+      inferflux_cuda
         Custom kernels
         FlashAttention-2
         Phase overlap
-      cuda_llama_cpp
+      llama_cpp_cuda
         llama.cpp bridge
         GGUF support
         Cross-platform
@@ -276,8 +276,8 @@ BackendCapabilities GetCapabilities() const override {
 ```mermaid
 graph LR
     subgraph "Model Format Ecosystem"
-        A[GGUF] --> D[cuda_llama_cpp, cpu, mps]
-        B[Safetensors] --> E[cuda_native]
+        A[GGUF] --> D[llama_cpp_cuda, cpu, mps]
+        B[Safetensors] --> E[inferflux_cuda]
         C[HuggingFace] --> F[Auto-detect]
     end
 
@@ -315,13 +315,13 @@ ModelFormat DetectModelFormat(const std::string &path) {
 
 ## CUDA Backend Development
 
-### Native vs Universal Providers
+### InferFlux vs llama.cpp Engines
 
 ```mermaid
 graph TB
     subgraph "CUDA Backend Paths"
-        A[cuda_native Backend] --> B{Native Provider}
-        A --> C{Universal Provider}
+        A[inferflux_cuda Backend] --> B{InferFlux Engine}
+        A --> C{llama.cpp Engine}
 
         B --> D[Custom CUDA Kernels]
         B --> E[FlashAttention-2]
@@ -342,11 +342,11 @@ graph TB
 
 ### Native Kernel Executor
 
-The native kernel executor (`runtime/backends/cuda/native_kernel_executor.cpp`) provides a framework for implementing custom CUDA kernels.
+The InferFlux CUDA executor (`runtime/backends/cuda/inferflux_cuda_executor.cpp`) provides a framework for implementing custom CUDA kernels.
 
 ```cpp
 // Example: Adding a custom attention kernel
-class NativeKernelExecutor {
+class InferfluxCudaExecutor {
 public:
     bool LaunchAttentionKernel(const AttentionParams &params) {
         // Select kernel based on hardware capability

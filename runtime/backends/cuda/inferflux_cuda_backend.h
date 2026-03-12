@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 
 #include <atomic>
 #include <filesystem>
@@ -10,23 +10,23 @@
 
 namespace inferflux {
 
-class NativeCudaRuntime;
+class InferfluxCudaRuntime;
 
-// NativeCudaBackend is the provider entry point for the InferFlux native CUDA
+// InferfluxCudaBackend is the provider entry point for the InferFlux CUDA
 // runtime.
-// PHASE 1 NOTE: Still inherits from LlamaCPUBackend due to extensive method
+// PHASE 1 NOTE: Still inherits from LlamaCppBackend due to extensive method
 // set.
 // TODO: Phase 1.5 - Extract ILlamaBackend interface with full method set
-class NativeCudaBackend : public LlamaCPUBackend {
+class InferfluxCudaBackend : public LlamaCppBackend {
 public:
-  NativeCudaBackend();
-  ~NativeCudaBackend() override;
+  InferfluxCudaBackend();
+  ~InferfluxCudaBackend() override;
 
   bool LoadModel(const std::filesystem::path &model_path,
                  const LlamaBackendConfig &config = {}) override;
 
 #ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
-  std::string Name() const override { return "native_cuda"; }
+  std::string Name() const override { return "inferflux_cuda"; }
 #endif
 
   std::vector<UnifiedBatchOutput>
@@ -90,27 +90,27 @@ public:
   virtual bool SupportsEmbeddingsContract() const;
   virtual bool SupportsSpeculativeDecodingContract() const;
 
-  // Returns true when native CUDA kernels are compiled and CUDA runtime is
+  // Returns true when InferFlux CUDA kernels are compiled and CUDA runtime is
   // available.
   static bool NativeKernelsReady();
 
 private:
   bool IsParityDelegateAvailable() const;
-  std::shared_ptr<LlamaCPUBackend> EnsureParityBackend() const;
-  std::shared_ptr<LlamaCPUBackend> DelegateBackend() const;
+  std::shared_ptr<LlamaCppBackend> EnsureParityBackend() const;
+  std::shared_ptr<LlamaCppBackend> DelegateBackend() const;
   bool UsesStructuredConstraintSampler() const;
   SamplingParams SnapshotSamplingParams() const;
   static int AcquireEphemeralSequenceId();
 
-  std::unique_ptr<NativeCudaRuntime> runtime_;
+  std::unique_ptr<InferfluxCudaRuntime> runtime_;
   std::filesystem::path loaded_model_path_;
   LlamaBackendConfig loaded_config_{};
   std::filesystem::path parity_load_path_;
   bool parity_delegate_enabled_{true};
   mutable bool parity_delegate_available_{false};
   mutable bool parity_delegate_init_attempted_{false};
-  mutable std::shared_ptr<LlamaCPUBackend> parity_backend_;
-  std::string runtime_kind_{"native_cuda"};
+  mutable std::shared_ptr<LlamaCppBackend> parity_backend_;
+  std::string runtime_kind_{"inferflux_cuda"};
   bool fallback_mode_{true};
   std::string fallback_reason_;
   mutable std::recursive_mutex runtime_mutex_;

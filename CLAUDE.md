@@ -115,12 +115,12 @@ The CMake target `inferflux_core` links all modules into a single library consum
 
 ## Backend Selection & Model Format Routing
 
-**Backend types:** `cpu`, `cuda`, `cuda_native` (native CUDA implementation), `cuda_llama_cpp`/`cuda_llama` (llama.cpp-backed), `mps`, `rocm`
+**Backend types:** `cpu`, `cuda`, `inferflux_cuda` (InferFlux CUDA implementation), `llama_cpp_cuda` (llama.cpp-backed), `mps`, `rocm`
 
 **Model formats:** `auto` (default), `gguf`, `safetensors`, `hf` (HuggingFace URI-style `hf://org/repo`)
 
 **Backend resolution logic:**
-1. Explicit backend hints (`cuda_native`, `cuda_llama_cpp`) are honored when available
+1. Explicit backend hints (`inferflux_cuda`, `llama_cpp_cuda`) are honored when available
 2. Backend priority (`runtime.backend_priority`, `INFERFLUX_BACKEND_PRIORITY`) determines fallback order
 3. Capability routing (`runtime.capability_routing.*`) enables graceful degradation when requested capabilities aren't available
 4. Backend exposure policy controls which backends are exposed via `/v1/models`
@@ -140,16 +140,16 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 - `INFERFLUX_POLICY_PASSPHRASE` — enables AES-GCM encryption on the policy store
 - `INFERFLUX_MPS_LAYERS` — number of layers to offload to Metal
 - `INFERFLUX_PORT_OVERRIDE` / `INFERFLUX_HOST_OVERRIDE` — network overrides
-- `INFERFLUX_BACKEND_PREFER_NATIVE` — prefer native implementations over universal
+- `INFERFLUX_BACKEND_PREFER_INFERFLUX` — prefer InferFlux implementations over llama.cpp
 - `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` — allow fallback to llama.cpp backends
-- `INFERFLUX_NATIVE_CUDA_STRICT` — fail load if native CUDA runtime reports fallback
+- `INFERFLUX_CUDA_STRICT` — fail load if native CUDA runtime reports fallback
 - `INFERFLUX_MODEL_FORMAT` — override model format detection
 
 ## CUDA Development
 
 **Two-backend architecture:** The CUDA path has two providers that both accept GGUF models:
-- `native_cuda` (`runtime/backends/cuda/native_cuda_backend.cpp`, `native_kernel_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp). Still trails llama.cpp on single-sequence throughput (~0.35-0.76x).
-- `cuda_llama_cpp` — delegates to llama.cpp for inference. Higher throughput today, lower ceiling for InferFlux-specific innovation.
+- `inferflux_cuda` (`runtime/backends/cuda/inferflux_cuda_backend.cpp`, `inferflux_cuda_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp). Still trails llama.cpp on single-sequence throughput (~0.35-0.76x).
+- `llama_cpp_cuda` — delegates to llama.cpp for inference. Higher throughput today, lower ceiling for InferFlux-specific innovation.
 
 Only structured output (grammar-constrained generation) still delegates to the llama.cpp parity backend. Logprobs and embeddings are native.
 
@@ -157,12 +157,12 @@ Only structured output (grammar-constrained generation) still delegates to the l
 - `INFERFLUX_DISABLE_BATCHED_DECODE=1` — opt out of batched decode (default-on)
 - `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` — disable pre-quantized Q8_1 activation path
 - `INFERFLUX_GEMV_V2=1` — opt-in to v2 cooperative-warp GEMV (default: v1 column-major, faster on Ada)
-- `INFERFLUX_NATIVE_TIMING_SAMPLE_RATE=N` — record CUDA event timing every Nth batch (0=off)
+- `INFERFLUX_CUDA_TIMING_SAMPLE_RATE=N` — record CUDA event timing every Nth batch (0=off)
 - `INFERFLUX_CUDA_PHASE_OVERLAP` — enable prefill/decode lane overlap
 - `INFERFLUX_CUDA_ATTENTION_KERNEL` — force attention kernel (`auto`, `fa2`, `standard`)
-- `INFERFLUX_NATIVE_KV_MAX_BATCH` / `INFERFLUX_NATIVE_KV_MAX_SEQ` — KV cache sizing
+- `INFERFLUX_CUDA_KV_MAX_BATCH` / `INFERFLUX_CUDA_KV_MAX_SEQ` — KV cache sizing
 
-**Native CUDA kernel files:**
+**InferFlux CUDA kernel files:**
 - `runtime/backends/cuda/native/kernels/fused_dequant_gemv.cuh` — v1 GEMV kernels (column-major, 8 warps/block)
 - `runtime/backends/cuda/native/kernels/fused_dequant_gemv_v2.cuh` — v2 GEMV kernels (cooperative 4-warp, L2-friendly)
 - `runtime/backends/cuda/native/fused_quant_gemm.cu` — dispatch tables, v1/v2 selection, threshold logic
@@ -170,13 +170,13 @@ Only structured output (grammar-constrained generation) still delegates to the l
 - `runtime/backends/cuda/native/cuda_kernels.cu` — batched RoPE/KvAppend, MeanPool, utility kernels
 - `runtime/backends/cuda/kernels/flash_attention.cu` — FlashAttention-2 and FlashDecodeMultiSeq
 
-**Native CUDA policy and execution files:**
+**InferFlux CUDA policy and execution files:**
 - `runtime/backends/cuda/native/native_execution_policy.h` — `NativeExecutionPolicy` struct, env var parsing
 - `runtime/backends/cuda/native/native_dispatch_policy.{h,cpp}` — operator selection, dispatch decisions
 - `runtime/backends/cuda/native/native_bootstrap_config.{h,cpp}` — KV cache sizing, startup config
 - `runtime/backends/cuda/native/native_linear_executor.h` — projection stage execution with fallback chains
 
-**Native CUDA metrics:** Prometheus at `/metrics`: `inferflux_native_forward_passes_total{phase}`, `inferflux_native_forward_batch_tokens_total`, `inferflux_native_forward_duration_ms`, `inferflux_native_sampling_duration_ms`, `inferflux_native_kv_active_sequences`, `inferflux_native_kv_max_sequences`, FFN/down-proj operator counters. NVTX annotations for Nsight Systems profiling.
+**InferFlux CUDA metrics:** Prometheus at `/metrics`: `inferflux_cuda_forward_passes_total{phase}`, `inferflux_cuda_forward_batch_tokens_total`, `inferflux_cuda_forward_duration_ms`, `inferflux_cuda_sampling_duration_ms`, `inferflux_cuda_kv_active_sequences`, `inferflux_cuda_kv_max_sequences`, FFN/down-proj operator counters. NVTX annotations for Nsight Systems profiling.
 
 **Throughput validation:**
 ```bash

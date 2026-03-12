@@ -1,4 +1,4 @@
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 #include "runtime/execution/batch_executor.h"
 #include "scheduler/single_model_router.h"
 #include "server/metrics/metrics.h"
@@ -11,7 +11,7 @@
 using namespace inferflux;
 
 // Mock backend to intercept ExecuteUnifiedBatch calls.
-class MockUnifiedBackend : public LlamaCPUBackend {
+class MockUnifiedBackend : public LlamaCppBackend {
 public:
   struct CallInfo {
     std::vector<UnifiedBatchInput> inputs;
@@ -40,7 +40,7 @@ public:
   int UnifiedBatchTokenCapacity() const override { return token_capacity; }
 };
 
-class MockAsyncUnifiedBackend : public LlamaCPUBackend {
+class MockAsyncUnifiedBackend : public LlamaCppBackend {
 public:
   enum class EventType {
     kSubmitDecode,
@@ -128,7 +128,7 @@ public:
   int TokenCount(const std::string &) const override { return 5; }
 };
 
-class EmptyGenerateBackend : public LlamaCPUBackend {
+class EmptyGenerateBackend : public LlamaCppBackend {
 public:
   bool IsReady() const override { return true; }
 
@@ -147,7 +147,7 @@ public:
   }
 };
 
-class SequencedAsyncUnifiedBackend : public LlamaCPUBackend {
+class SequencedAsyncUnifiedBackend : public LlamaCppBackend {
 public:
   struct SequencePlan {
     std::deque<UnifiedBatchOutput> outputs;
@@ -477,7 +477,7 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
 
     REQUIRE_FALSE(async_backend->submit_calls.empty());
     REQUIRE(async_backend->submit_calls.front().lane ==
-            LlamaCPUBackend::UnifiedBatchLane::kPrefill);
+            LlamaCppBackend::UnifiedBatchLane::kPrefill);
     REQUIRE(async_backend->submit_calls.front().inputs.size() == 1);
     REQUIRE(async_backend->submit_calls.front().inputs[0].n_past == 4);
     REQUIRE(async_backend->submit_calls.front().inputs[0].tokens.size() == 4);
@@ -551,10 +551,10 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     bool saw_decode_lane = false;
     bool saw_prefill_lane = false;
     for (const auto &call : async_backend->submit_calls) {
-      if (call.lane == LlamaCPUBackend::UnifiedBatchLane::kDecode) {
+      if (call.lane == LlamaCppBackend::UnifiedBatchLane::kDecode) {
         saw_decode_lane = true;
       }
-      if (call.lane == LlamaCPUBackend::UnifiedBatchLane::kPrefill) {
+      if (call.lane == LlamaCppBackend::UnifiedBatchLane::kPrefill) {
         saw_prefill_lane = true;
       }
     }
@@ -633,9 +633,9 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     bool saw_prefill_lane = false;
     bool saw_auto_lane = false;
     for (const auto &call : async_backend->submit_calls) {
-      if (call.lane == LlamaCPUBackend::UnifiedBatchLane::kDecode) {
+      if (call.lane == LlamaCppBackend::UnifiedBatchLane::kDecode) {
         saw_decode_lane = true;
-      } else if (call.lane == LlamaCPUBackend::UnifiedBatchLane::kPrefill) {
+      } else if (call.lane == LlamaCppBackend::UnifiedBatchLane::kPrefill) {
         saw_prefill_lane = true;
       } else {
         saw_auto_lane = true;
@@ -680,7 +680,7 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
 
     REQUIRE_FALSE(async_backend->submit_calls.empty());
     REQUIRE(async_backend->submit_calls.front().lane ==
-            LlamaCPUBackend::UnifiedBatchLane::kPrefill);
+            LlamaCppBackend::UnifiedBatchLane::kPrefill);
     REQUIRE(async_backend->submit_calls.front().inputs.size() == 2);
     REQUIRE(async_backend->submit_calls.front().inputs[0].tokens.size() == 3);
     REQUIRE(async_backend->submit_calls.front().inputs[1].tokens.size() == 3);
@@ -698,15 +698,15 @@ TEST_CASE("BatchExecutor keeps async phased completions isolated per request",
                                                   router, nullptr);
   auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
 
-  LlamaCPUBackend::UnifiedBatchOutput a0;
+  LlamaCppBackend::UnifiedBatchOutput a0;
   a0.token = 501;
   a0.piece = "A0";
   a0.ok = true;
-  LlamaCPUBackend::UnifiedBatchOutput a1;
+  LlamaCppBackend::UnifiedBatchOutput a1;
   a1.token = 502;
   a1.piece = "A1";
   a1.ok = true;
-  LlamaCPUBackend::UnifiedBatchOutput b1;
+  LlamaCppBackend::UnifiedBatchOutput b1;
   b1.token = 601;
   b1.piece = "B1";
   b1.ok = true;
@@ -762,11 +762,11 @@ TEST_CASE("BatchExecutor resumes fairness-sliced seeded decode without re-emitti
       &tokenizer, device, cache, router, nullptr, tuning);
   auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
 
-  LlamaCPUBackend::UnifiedBatchOutput b1;
+  LlamaCppBackend::UnifiedBatchOutput b1;
   b1.token = 601;
   b1.piece = "B1";
   b1.ok = true;
-  LlamaCPUBackend::UnifiedBatchOutput b2;
+  LlamaCppBackend::UnifiedBatchOutput b2;
   b2.token = 602;
   b2.piece = "B2";
   b2.ok = true;
@@ -823,11 +823,11 @@ TEST_CASE("BatchExecutor resumes fairness-sliced unified prefill decode with"
       &tokenizer, device, cache, router, nullptr, tuning);
   auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
 
-  LlamaCPUBackend::UnifiedBatchOutput a0;
+  LlamaCppBackend::UnifiedBatchOutput a0;
   a0.token = 700;
   a0.piece = "A0";
   a0.ok = true;
-  LlamaCPUBackend::UnifiedBatchOutput a1;
+  LlamaCppBackend::UnifiedBatchOutput a1;
   a1.token = 701;
   a1.piece = "A1";
   a1.ok = true;
@@ -876,19 +876,19 @@ TEST_CASE("BatchExecutor keeps interleaved fairness-sliced phased requests"
       &tokenizer, device, cache, router, nullptr, tuning);
   auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
 
-  LlamaCPUBackend::UnifiedBatchOutput a0;
+  LlamaCppBackend::UnifiedBatchOutput a0;
   a0.token = 800;
   a0.piece = "A0";
   a0.ok = true;
-  LlamaCPUBackend::UnifiedBatchOutput a1;
+  LlamaCppBackend::UnifiedBatchOutput a1;
   a1.token = 801;
   a1.piece = "A1";
   a1.ok = true;
-  LlamaCPUBackend::UnifiedBatchOutput b1;
+  LlamaCppBackend::UnifiedBatchOutput b1;
   b1.token = 901;
   b1.piece = "B1";
   b1.ok = true;
-  LlamaCPUBackend::UnifiedBatchOutput b2;
+  LlamaCppBackend::UnifiedBatchOutput b2;
   b2.token = 902;
   b2.piece = "B2";
   b2.ok = true;
@@ -1000,15 +1000,15 @@ TEST_CASE(
                                                   router, nullptr);
   auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
 
-  LlamaCPUBackend::UnifiedBatchOutput a;
+  LlamaCppBackend::UnifiedBatchOutput a;
   a.token = 700;
   a.piece = "A";
   a.ok = true;
-  LlamaCPUBackend::UnifiedBatchOutput control;
+  LlamaCppBackend::UnifiedBatchOutput control;
   control.token = 151643;
   control.piece = "";
   control.ok = true;
-  LlamaCPUBackend::UnifiedBatchOutput b;
+  LlamaCppBackend::UnifiedBatchOutput b;
   b.token = 701;
   b.piece = "B";
   b.ok = true;

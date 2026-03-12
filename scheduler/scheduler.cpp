@@ -41,6 +41,14 @@ bool SequenceSlotDebugEnabled() {
   return enabled;
 }
 
+bool StickyDecodeAccumulationWaitEnabled() {
+  const char *value =
+      std::getenv("INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT");
+  return value && std::string_view(value) != "0" &&
+         std::string_view(value) != "false" &&
+         std::string_view(value) != "FALSE";
+}
+
 std::string RequestPhaseDebugString(RequestPhase phase) {
   switch (phase) {
   case RequestPhase::kPending:
@@ -206,8 +214,8 @@ int ResidentSequenceTokenCount(const InferenceRequest &inference) {
 }
 
 bool WaitForUnifiedBatchAsync(
-    LlamaCPUBackend *backend, LlamaCPUBackend::UnifiedBatchHandle handle,
-    std::vector<LlamaCPUBackend::UnifiedBatchOutput> *outputs,
+    LlamaCppBackend *backend, LlamaCppBackend::UnifiedBatchHandle handle,
+    std::vector<LlamaCppBackend::UnifiedBatchOutput> *outputs,
     std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
   if (!backend || !outputs || handle == 0) {
     return false;
@@ -228,10 +236,10 @@ struct PrefillStepState {
   uint64_t sequence_generation{0};
 };
 
-bool ExecutePhasedPrefillStep(LlamaCPUBackend *backend,
+bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
                               const InferenceRequest &inference,
                               const PrefillStepState &state,
-                              LlamaCPUBackend::PrefillResult *result) {
+                              LlamaCppBackend::PrefillResult *result) {
   const int sequence_id = state.sequence_id;
   const int n_past_start = state.n_past_start;
   if (!backend || !result || sequence_id < 0) {
@@ -256,7 +264,7 @@ bool ExecutePhasedPrefillStep(LlamaCPUBackend *backend,
 
   const int token_cap = std::max(1, backend->UnifiedBatchTokenCapacity());
   int chunk_start = bounded_start;
-  LlamaCPUBackend::UnifiedBatchOutput final_output{};
+  LlamaCppBackend::UnifiedBatchOutput final_output{};
   while (chunk_start < static_cast<int>(prompt_tokens.size())) {
     int chunk_end = std::min(chunk_start + token_cap,
                              static_cast<int>(prompt_tokens.size()));
@@ -265,8 +273,8 @@ bool ExecutePhasedPrefillStep(LlamaCPUBackend *backend,
     const bool request_logits =
         chunk_end == static_cast<int>(prompt_tokens.size());
 
-    std::vector<LlamaCPUBackend::UnifiedBatchInput> inputs;
-    LlamaCPUBackend::UnifiedBatchInput input;
+    std::vector<LlamaCppBackend::UnifiedBatchInput> inputs;
+    LlamaCppBackend::UnifiedBatchInput input;
     input.sequence_id = sequence_id;
     input.n_past = chunk_start;
     input.tokens = std::move(chunk);
@@ -276,10 +284,10 @@ bool ExecutePhasedPrefillStep(LlamaCPUBackend *backend,
     input.sequence_generation = state.sequence_generation;
     inputs.push_back(std::move(input));
 
-    std::vector<LlamaCPUBackend::UnifiedBatchOutput> outputs;
+    std::vector<LlamaCppBackend::UnifiedBatchOutput> outputs;
     if (backend->SupportsAsyncUnifiedBatch()) {
       const auto handle = backend->SubmitUnifiedBatchAsync(
-          inputs, LlamaCPUBackend::UnifiedBatchLane::kPrefill);
+          inputs, LlamaCppBackend::UnifiedBatchLane::kPrefill);
       if (handle == 0 || !WaitForUnifiedBatchAsync(backend, handle, &outputs) ||
           outputs.size() != 1) {
         return false;
@@ -325,7 +333,7 @@ bool HasValidUnifiedStepState(const InferenceRequest &req) {
 
 bool HasBoundDecodeBackend(
     const InferenceRequest &req,
-    const std::shared_ptr<LlamaCPUBackend> &resolved_backend) {
+    const std::shared_ptr<LlamaCppBackend> &resolved_backend) {
   return resolved_backend && req.phase == RequestPhase::kDecode &&
          HasValidUnifiedStepState(req);
 }
@@ -625,28 +633,28 @@ void Scheduler::SyncSequenceSlotProgress(
 
 void Scheduler::RefreshNativeKvMemoryMetrics() const {
   if (!slot_manager_) {
-    GlobalMetrics().SetNativeKvMemoryBytes(/*total_bytes=*/0,
-                                           /*active_bytes=*/0,
-                                           /*prefix_retained_bytes=*/0,
-                                           /*free_bytes=*/0,
-                                           /*active_sequences=*/0,
-                                           /*prefix_retained_sequences=*/0,
-                                           /*free_sequences=*/0,
-                                           /*max_sequences=*/0);
+    GlobalMetrics().SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/0,
+                                                  /*active_bytes=*/0,
+                                                  /*prefix_retained_bytes=*/0,
+                                                  /*free_bytes=*/0,
+                                                  /*active_sequences=*/0,
+                                                  /*prefix_retained_sequences=*/0,
+                                                  /*free_sequences=*/0,
+                                                  /*max_sequences=*/0);
     return;
   }
 
-  const uint64_t total_bytes = GlobalMetrics().GetNativeKvPlannedBytes();
-  const int max_sequences = GlobalMetrics().GetNativeKvMaxSequences();
+  const uint64_t total_bytes = GlobalMetrics().GetInferfluxCudaKvPlannedBytes();
+  const int max_sequences = GlobalMetrics().GetInferfluxCudaKvMaxSequences();
   if (total_bytes == 0 || max_sequences <= 0) {
-    GlobalMetrics().SetNativeKvMemoryBytes(/*total_bytes=*/0,
-                                           /*active_bytes=*/0,
-                                           /*prefix_retained_bytes=*/0,
-                                           /*free_bytes=*/0,
-                                           /*active_sequences=*/0,
-                                           /*prefix_retained_sequences=*/0,
-                                           /*free_sequences=*/0,
-                                           /*max_sequences=*/0);
+    GlobalMetrics().SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/0,
+                                                  /*active_bytes=*/0,
+                                                  /*prefix_retained_bytes=*/0,
+                                                  /*free_bytes=*/0,
+                                                  /*active_sequences=*/0,
+                                                  /*prefix_retained_sequences=*/0,
+                                                  /*free_sequences=*/0,
+                                                  /*max_sequences=*/0);
     return;
   }
 
@@ -677,7 +685,7 @@ void Scheduler::RefreshNativeKvMemoryMetrics() const {
           ? total_bytes - active_bytes - prefix_retained_bytes
           : 0;
 
-  GlobalMetrics().SetNativeKvMemoryBytes(
+  GlobalMetrics().SetInferfluxCudaKvMemoryBytes(
       total_bytes, active_bytes, prefix_retained_bytes, free_bytes,
       active_sequences, prefix_retained_sequences, free_sequences,
       max_sequences);
@@ -700,9 +708,66 @@ bool Scheduler::RequestUsesSessionHandle(
 }
 
 bool Scheduler::BackendUsesSplitDecodeWorkers(
-    const std::shared_ptr<LlamaCPUBackend> &backend) const {
+    const std::shared_ptr<LlamaCppBackend> &backend) const {
   return use_decode_workers_ && backend != nullptr &&
          backend->SupportsSplitPrefillDecodeHandoff();
+}
+
+bool Scheduler::CanAppendToStickyStepBatchLocked(
+    const std::shared_ptr<PendingRequest> &pending,
+    const std::shared_ptr<LlamaCppBackend> &sticky_step_backend) const {
+  if (!pending || !sticky_step_backend || !pending->resolved_backend) {
+    return false;
+  }
+  const auto &inference = pending->inference;
+  return pending->resolved_backend.get() == sticky_step_backend.get() &&
+         HasValidUnifiedStepState(inference) &&
+         !inference.response_constraint.has_grammar &&
+         !inference.collect_logprobs && !inference.has_response_format &&
+         inference.response_format_supported;
+}
+
+std::size_t Scheduler::AppendCompatiblePendingDecodeLocked(
+    std::vector<std::shared_ptr<PendingRequest>> *batch,
+    const std::shared_ptr<LlamaCppBackend> &sticky_step_backend,
+    std::size_t max_batch_size) {
+  if (!batch || !sticky_step_backend || batch->size() >= max_batch_size ||
+      pending_decode_.empty()) {
+    return 0;
+  }
+
+  // Scan the whole decode queue so a request for another backend at the front
+  // does not prevent later compatible requests from joining the active sticky
+  // cohort. Preserve the relative order of compatible requests that do join.
+  std::size_t merged = 0;
+  for (auto it = pending_decode_.begin();
+       it != pending_decode_.end() && batch->size() < max_batch_size;) {
+    if (!CanAppendToStickyStepBatchLocked(*it, sticky_step_backend)) {
+      ++it;
+      continue;
+    }
+    batch->push_back(*it);
+    ++merged;
+    it = pending_decode_.erase(it);
+  }
+  if (merged > 0) {
+    GlobalMetrics().RecordDecodeWorkerStickyMerge(merged);
+  }
+  return merged;
+}
+
+std::size_t Scheduler::CountCompatiblePendingDecodeLocked(
+    const std::shared_ptr<LlamaCppBackend> &sticky_step_backend) const {
+  if (!sticky_step_backend || pending_decode_.empty()) {
+    return 0;
+  }
+  std::size_t compatible = 0;
+  for (const auto &pending : pending_decode_) {
+    if (CanAppendToStickyStepBatchLocked(pending, sticky_step_backend)) {
+      ++compatible;
+    }
+  }
+  return compatible;
 }
 
 void Scheduler::DecodeWorkerLoop() {
@@ -716,7 +781,7 @@ void Scheduler::DecodeWorkerLoop() {
   } live_guard{live_decode_workers_};
 
   std::vector<std::shared_ptr<PendingRequest>> batch;
-  std::shared_ptr<LlamaCPUBackend> sticky_step_backend;
+  std::shared_ptr<LlamaCppBackend> sticky_step_backend;
 
   while (true) {
     {
@@ -725,6 +790,8 @@ void Scheduler::DecodeWorkerLoop() {
           std::chrono::milliseconds(10);
       const std::size_t accumulation_target = std::max<std::size_t>(
           2, static_cast<std::size_t>(config_.min_batch_size));
+      const bool sticky_accumulation_wait_enabled =
+          StickyDecodeAccumulationWaitEnabled();
 
       // Batch accumulation for decode workers
       auto has_transport_work = [&] {
@@ -799,27 +866,54 @@ void Scheduler::DecodeWorkerLoop() {
       const std::size_t max_batch_size =
           static_cast<std::size_t>(config_.max_batch_size);
       if (batch.empty()) {
-        std::size_t n = std::min(pending_decode_.size(), max_batch_size);
+        const std::size_t ready_before = pending_decode_.size();
+        std::size_t n = std::min(ready_before, max_batch_size);
         batch.assign(pending_decode_.begin(),
                      pending_decode_.begin() + static_cast<std::ptrdiff_t>(n));
         pending_decode_.erase(pending_decode_.begin(),
                               pending_decode_.begin() +
                                   static_cast<std::ptrdiff_t>(n));
+        GlobalMetrics().RecordDecodeAssemblySnapshot(
+            "worker_initial", ready_before, batch.size(), 0, 0);
       } else if (batch.size() < max_batch_size && sticky_step_backend) {
-        while (batch.size() < max_batch_size && !pending_decode_.empty()) {
-          auto &next = pending_decode_.front();
-          if (!next || !next->resolved_backend ||
-              next->resolved_backend.get() != sticky_step_backend.get() ||
-              !HasValidUnifiedStepState(next->inference) ||
-              next->inference.response_constraint.has_grammar ||
-              next->inference.collect_logprobs ||
-              next->inference.has_response_format ||
-              !next->inference.response_format_supported) {
-            break;
+        const std::size_t ready_before = pending_decode_.size();
+        const std::size_t compatible_before =
+            CountCompatiblePendingDecodeLocked(sticky_step_backend);
+        std::size_t merged = AppendCompatiblePendingDecodeLocked(
+            &batch, sticky_step_backend, max_batch_size);
+        if (sticky_accumulation_wait_enabled && config_.batch_accumulation_ms > 0 &&
+            merged == 0 && batch.size() < max_batch_size &&
+            batch.size() < accumulation_target) {
+          auto compatible_pending_decode = [&]() {
+            return std::any_of(
+                pending_decode_.begin(), pending_decode_.end(),
+                [&](const std::shared_ptr<PendingRequest> &pending) {
+                  return CanAppendToStickyStepBatchLocked(pending,
+                                                          sticky_step_backend);
+                });
+          };
+          const auto deadline =
+              std::chrono::steady_clock::now() +
+              std::chrono::milliseconds(config_.batch_accumulation_ms);
+          while (!stop_ && !has_transport_work() &&
+                 !compatible_pending_decode() &&
+                 std::chrono::steady_clock::now() < deadline) {
+            if (queue_cv_.wait_until(lock, deadline) ==
+                std::cv_status::timeout) {
+              break;
+            }
           }
-          batch.push_back(next);
-          pending_decode_.erase(pending_decode_.begin());
+          if (!stop_ && batch.size() < max_batch_size) {
+            AppendCompatiblePendingDecodeLocked(&batch, sticky_step_backend,
+                                                max_batch_size);
+          }
         }
+        const std::size_t incompatible_before =
+            ready_before >= compatible_before ? ready_before - compatible_before
+                                              : 0;
+        GlobalMetrics().RecordDecodeAssemblySnapshot(
+            "worker_sticky", ready_before, batch.size(), compatible_before,
+            incompatible_before);
       }
       UpdateQueueDepthLocked();
     }
@@ -858,7 +952,7 @@ void Scheduler::DecodeWorkerLoop() {
 
           // Packet carries a serialised KV blob; hydrate it now.
           // (blob is currently empty for in-process path — no-op when empty.)
-          // kv_blob holds raw bytes from LlamaCPUBackend::SerializeSequence.
+          // kv_blob holds raw bytes from LlamaCppBackend::SerializeSequence.
           // Pass it directly to HydrateSequence — no cast or size adjustment.
           if (!pkt->kv_blob.empty() && pending->resolved_backend) {
             uint64_t seq_generation = 0;
@@ -932,11 +1026,11 @@ void Scheduler::DecodeWorkerLoop() {
         /*prefill_requests=*/0, /*decode_requests=*/batch.size());
 
     auto resolve_direct_step_backend =
-        [&]() -> std::shared_ptr<LlamaCPUBackend> {
+        [&]() -> std::shared_ptr<LlamaCppBackend> {
       if (config_.decode_burst_tokens != 0) {
         return nullptr;
       }
-      std::shared_ptr<LlamaCPUBackend> direct_backend;
+      std::shared_ptr<LlamaCppBackend> direct_backend;
       for (const auto &pending : batch) {
         if (!pending) {
           return nullptr;
@@ -1034,7 +1128,7 @@ void Scheduler::DecodeWorkerLoop() {
     RequestBatch exec_batch;
     exec_batch.batch_id =
         next_batch_id_.fetch_add(1, std::memory_order_relaxed);
-    std::vector<std::shared_ptr<LlamaCPUBackend>> overrides;
+    std::vector<std::shared_ptr<LlamaCppBackend>> overrides;
     std::vector<std::shared_ptr<PendingRequest>> exec_pending;
     overrides.reserve(batch.size());
     exec_pending.reserve(batch.size());
@@ -1110,7 +1204,7 @@ void Scheduler::DecodeWorkerLoop() {
       continue;
 
     bool use_stepwise_decode = config_.decode_burst_tokens == 0;
-    std::shared_ptr<LlamaCPUBackend> step_backend;
+    std::shared_ptr<LlamaCppBackend> step_backend;
     if (use_stepwise_decode) {
       for (std::size_t i = 0; i < exec_pending.size(); ++i) {
         auto *inference = &exec_pending[i]->inference;
@@ -1385,6 +1479,7 @@ void Scheduler::WorkerLoop() {
 
 Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
   BatchSelection selection;
+  const std::size_t decode_available_before = pending_decode_.size();
   if (pending_prefill_.empty() && pending_decode_.empty()) {
     return selection;
   }
@@ -1446,7 +1541,7 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
         continue;
       }
 
-      std::shared_ptr<LlamaCPUBackend> backend_hint =
+      std::shared_ptr<LlamaCppBackend> backend_hint =
           item.pending->resolved_backend;
       if (!backend_hint && router_) {
         ModelInfo *resolved = nullptr;
@@ -1508,6 +1603,7 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
   std::vector<std::size_t> to_remove_prefill;
   std::vector<std::size_t> to_remove_decode;
   std::size_t token_budget = 0;
+  std::size_t decode_selected = 0;
   for (std::size_t i = 0; i < queue_items.size(); ++i) {
     auto &item = queue_items[i].pending;
     std::size_t tokens = EstimateQueueTokenCost(
@@ -1535,6 +1631,7 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
     selection.total_tokens += tokens;
     if (queue_items[i].from_decode) {
       to_remove_decode.push_back(queue_items[i].index);
+      ++decode_selected;
     } else {
       to_remove_prefill.push_back(queue_items[i].index);
     }
@@ -1563,6 +1660,10 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
                           duplicate_remove_decode.end());
   erase_indices(&pending_prefill_, std::move(to_remove_prefill));
   erase_indices(&pending_decode_, std::move(to_remove_decode));
+  if (!decode_workers_own_decode && decode_available_before > 0) {
+    GlobalMetrics().RecordDecodeAssemblySnapshot("unified", decode_available_before,
+                                                 decode_selected, 0, 0);
+  }
   UpdateQueueDepthLocked();
   return selection;
 }
@@ -1823,7 +1924,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
             staged_decode_local.push_back(pending);
             queued_via_unified_prefill = true;
           } else {
-            LlamaCPUBackend::PrefillResult pr;
+            LlamaCppBackend::PrefillResult pr;
             bool copied_prefix = false;
             int prefill_start = 0;
             if (prefix_hit && matched_tokens > 0 && cached_seq_id >= 0) {
@@ -2058,7 +2159,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
 
   RequestBatch exec_batch;
   exec_batch.batch_id = selection.batch.batch_id;
-  std::vector<std::shared_ptr<LlamaCPUBackend>> overrides;
+  std::vector<std::shared_ptr<LlamaCppBackend>> overrides;
   std::vector<std::shared_ptr<PendingRequest>> exec_pending;
   overrides.reserve(selection.pending.size());
   exec_pending.reserve(selection.pending.size());
@@ -2389,7 +2490,7 @@ void Scheduler::PollDeferredSequenceRetirements() {
 }
 
 void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
-                            std::shared_ptr<LlamaCPUBackend> backend) {
+                            std::shared_ptr<LlamaCppBackend> backend) {
   if (slot < 0 || slot >= kMaxSequenceSlots) {
     return;
   }
@@ -2477,7 +2578,7 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
 
 void Scheduler::ReleaseSessionState(
     const scheduler::SessionHandleState &state,
-    std::shared_ptr<LlamaCPUBackend> backend_hint) {
+    std::shared_ptr<LlamaCppBackend> backend_hint) {
   if (state.sequence_id < 0 && state.block_table.empty()) {
     return;
   }

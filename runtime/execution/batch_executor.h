@@ -1,7 +1,7 @@
 #pragma once
 
 #include "model/tokenizer/simple_tokenizer.h"
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 #include "runtime/device_context.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/speculative/speculative_decoder.h"
@@ -40,7 +40,7 @@ public:
 
   std::vector<InferenceResult> ExecuteBatch(
       const RequestBatch &batch,
-      const std::vector<std::shared_ptr<LlamaCPUBackend>> &backend_overrides);
+      const std::vector<std::shared_ptr<LlamaCppBackend>> &backend_overrides);
 
   // Perform exactly one inference iteration (step) for the given batch.
   // This is the foundational block for step-wise batch execution.
@@ -48,7 +48,7 @@ public:
   // one token per request and returns.  The caller (Scheduler) must loop and
   // can insert new requests between calls.
   void ExecuteUnifiedBatchStep(RequestBatch &batch,
-                               std::shared_ptr<LlamaCPUBackend> backend);
+                               std::shared_ptr<LlamaCppBackend> backend);
 
 private:
   struct ExecutionOutcome {
@@ -59,7 +59,7 @@ private:
 
   ExecutionOutcome
   ExecuteRequest(InferenceRequest &inference,
-                 std::shared_ptr<LlamaCPUBackend> backend_override);
+                 std::shared_ptr<LlamaCppBackend> backend_override);
 
   // Multi-sequence batch decode for eligible phased-decode requests that share
   // the same backend.  Runs one llama_decode() per token step covering all N
@@ -68,16 +68,16 @@ private:
   // Returns one ExecutionOutcome per request in the same order as `eligible`.
   std::vector<ExecutionOutcome>
   ExecuteBatchDecodePhased(std::vector<InferenceRequest *> &eligible,
-                           std::shared_ptr<LlamaCPUBackend> backend);
+                           std::shared_ptr<LlamaCppBackend> backend);
 
   // Unified batch execution (§P1b): interleaves prefill tokens and decode
   // tokens in a single ExecuteUnifiedBatch() call to maximize compute density.
   // Eligibility: same as ExecuteBatchDecodePhased.
   std::vector<ExecutionOutcome>
   ExecuteUnifiedBatchPhased(std::vector<InferenceRequest *> &eligible,
-                            std::shared_ptr<LlamaCPUBackend> backend);
+                            std::shared_ptr<LlamaCppBackend> backend);
 
-  std::shared_ptr<LlamaCPUBackend>
+  std::shared_ptr<LlamaCppBackend>
   ResolveBackend(const std::string &requested_model, std::string *resolved_id);
 
   SimpleTokenizer *tokenizer_;

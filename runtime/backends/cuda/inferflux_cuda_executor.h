@@ -5,7 +5,7 @@
 #include "runtime/backends/cuda/native/native_bootstrap_config.h"
 #include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/strategy_registry.h"
-#include "runtime/backends/cuda/native_cuda_runtime.h"
+#include "runtime/backends/cuda/inferflux_cuda_runtime.h"
 #include "runtime/execution/unified_batch_lane_dispatcher.h"
 
 #ifdef INFERFLUX_HAS_CUDA
@@ -159,21 +159,21 @@ private:
 };
 
 /**
- * Native CUDA Kernel Executor
+ * InferFlux CUDA Executor
  *
- * Implements native CUDA inference using:
+ * Implements InferFlux CUDA inference using:
  * - Safetensors format (direct loading)
  * - Custom FlashAttention/PagedAttention kernels
  * - CUTLASS/cuBLAS for GEMM
  * - NO llama.cpp dependency
  */
-class NativeKernelExecutor final : public NativeCudaRuntime {
+class InferfluxCudaExecutor final : public InferfluxCudaRuntime {
 public:
-  NativeKernelExecutor();
-  ~NativeKernelExecutor() override;
+  InferfluxCudaExecutor();
+  ~InferfluxCudaExecutor() override;
 
-  // NativeCudaRuntime interface
-  std::string Name() const override { return "native_cuda"; }
+  // InferfluxCudaRuntime interface
+  std::string Name() const override { return "inferflux_cuda"; }
   bool IsFallback() const override { return fallback_mode_; }
   const std::string &FallbackReason() const override { return fallback_reason_; }
 
@@ -184,7 +184,7 @@ public:
                  const LlamaBackendConfig &config) override;
 
   /**
-   * Execute batch (to be implemented with native kernels)
+   * Execute batch (to be implemented with InferFlux CUDA kernels)
    */
   std::vector<UnifiedBatchOutput>
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override;
@@ -199,12 +199,12 @@ public:
       UnifiedBatchHandle handle,
       std::vector<UnifiedBatchOutput> *outputs) override;
 
-  std::shared_ptr<LlamaCPUBackend> BackendHandle() const override {
+  std::shared_ptr<LlamaCppBackend> BackendHandle() const override {
     return nullptr; // No llama backend!
   }
 
   // Native perf
-  NativePerfSnapshot NativeTakePerf() override;
+  PerfSnapshot NativeTakePerf() override;
 
   // Timing helper: 0 disables event timing, N>0 records every Nth native work
   // item (decode batch or prefill request). Exposed for contract tests.
@@ -215,16 +215,16 @@ public:
   int NativeTokenCount(const std::string &text) const override;
   bool NativeIsReady() const override;
   void NativeFreeSequence(int sequence_id) override;
-  LlamaCPUBackend::SequenceReleaseFence
+  LlamaCppBackend::SequenceReleaseFence
   NativeBeginFreeSequence(int sequence_id) override;
   bool NativePollFreeSequence(
-      const LlamaCPUBackend::SequenceReleaseFence &fence) override;
+      const LlamaCppBackend::SequenceReleaseFence &fence) override;
   void NativeCopySequencePrefix(int src_seq, int dst_seq,
                                 int n_tokens) override;
   std::vector<uint8_t> NativeSerializeSequence(int sequence_id) const override;
   bool NativeHydrateSequence(int dest_sequence_id,
                              const std::vector<uint8_t> &blob) override;
-  NativeChatResult NativeFormatChat(
+  ChatResult NativeFormatChat(
       const std::vector<std::pair<std::string, std::string>> &messages,
       bool add_assistant_prefix = true) const override;
   const ITokenizer *NativeGetTokenizer() const override;
@@ -320,6 +320,7 @@ private:
   };
 
   bool lane_overlap_ready_{false};
+  bool lane_overlap_init_attempted_{false};
   std::mutex shared_pipeline_mutex_;
   std::unique_ptr<ModelForward> decode_lane_forward_;
   std::unique_ptr<ModelForward> prefill_lane_forward_;
@@ -393,6 +394,7 @@ private:
   bool
   InitializeLaneOverlapResources(const SafetensorsLoader::ModelConfig &config,
                                  bool want_bf16, int max_batch);
+  bool EnsureLaneOverlapResources();
   void DestroyLaneOverlapResources();
   bool CanRunLaneOverlap() const;
   LaneExecutionResources PrimaryLaneResources();

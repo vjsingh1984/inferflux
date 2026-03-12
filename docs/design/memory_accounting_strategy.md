@@ -58,7 +58,7 @@ Implemented now:
 
 - `MemoryDomain` and `MemoryLifetime`
 - `ModelMemoryLedger`
-- startup accounting in native CUDA startup
+- startup accounting in InferFlux CUDA startup
 - live batch-ephemeral GGUF scratch accounting for quantized fallback paths
 - native KV slot-state accounting split into `active`, `prefix_retained`, and `free`
 - export through:
@@ -87,7 +87,7 @@ Startup wiring lives in:
 
 - [model_memory_ledger.h](/home/vsingh/code/inferflux/runtime/backends/cuda/native/model_memory_ledger.h)
 - [model_memory_ledger.cpp](/home/vsingh/code/inferflux/runtime/backends/cuda/native/model_memory_ledger.cpp)
-- [native_kernel_executor.cpp](/home/vsingh/code/inferflux/runtime/backends/cuda/native_kernel_executor.cpp)
+- [inferflux_cuda_executor.cpp](/home/vsingh/code/inferflux/runtime/backends/cuda/inferflux_cuda_executor.cpp)
 
 Workspace byte reporting is provided by:
 
@@ -110,11 +110,11 @@ That snapshot is exported in three ways:
 
 - startup log line from the native executor
 - Prometheus gauges in `/metrics`
-- JSON under `memory.native_model` and `memory.native_kv` in `GET /v1/admin/cache`
+- JSON under `memory.inferflux_cuda_model` and `memory.inferflux_cuda_kv` in `GET /v1/admin/cache`
 
 This makes the next optimization steps measurable:
 
 1. move remaining per-batch CUDA allocations into reusable arenas
-2. extend KV accounting from fixed-slot native CUDA into paged-KV ownership accounting
+2. extend KV accounting from fixed-slot InferFlux CUDA into paged-KV ownership accounting
 3. expose session metadata and per-batch arena high-water accounting
 4. tie future memory policies to the ledger instead of ad hoc logs

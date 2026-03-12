@@ -1,9 +1,10 @@
 #include "server/http/http_server.h"
 
 #include "model/model_format.h"
+#include "runtime/backends/backend_factory.h"
 #include "runtime/backends/backend_capabilities.h"
-#include "runtime/backends/cpu/llama_backend.h"
-#include "runtime/backends/cuda/native_cuda_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/cuda/inferflux_cuda_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "scheduler/model_selection.h"
 #include "server/logging/logger.h"
@@ -268,7 +269,10 @@ json BuildBackendExposureJson(const ModelInfo &info) {
   const std::string requested =
       info.requested_backend.empty() ? info.backend : info.requested_backend;
   const std::string provider =
-      info.backend_provider.empty() ? "llama_cpp" : info.backend_provider;
+      info.backend_provider.empty()
+          ? BackendFactory::ProviderLabel(BackendProvider::kLlamaCpp)
+          : BackendFactory::ProviderLabel(
+                BackendFactory::ParseProviderLabel(info.backend_provider));
   return json{
       {"requested_backend", requested},
       {"exposed_backend", info.backend},
@@ -306,7 +310,10 @@ json BuildAdminModelJson(const ModelInfo &info, const std::string &default_id) {
   model["requested_backend"] =
       info.requested_backend.empty() ? info.backend : info.requested_backend;
   model["backend_provider"] =
-      info.backend_provider.empty() ? "llama_cpp" : info.backend_provider;
+      info.backend_provider.empty()
+          ? BackendFactory::ProviderLabel(BackendProvider::kLlamaCpp)
+          : BackendFactory::ProviderLabel(
+                BackendFactory::ParseProviderLabel(info.backend_provider));
   model["default"] = (info.id == default_id);
   return model;
 }
@@ -2342,12 +2349,12 @@ void HttpServer::HandleClient(ClientSession &session) {
     auto *cache = scheduler_ ? scheduler_->PrefixCache() : nullptr;
     auto *paged_kv = scheduler_ ? scheduler_->Cache() : nullptr;
     auto cm = GlobalMetrics().GetCacheMetrics();
-    const auto native_model_memory =
-        metrics_ ? metrics_->GetNativeModelMemorySnapshot()
-                 : MetricsRegistry::NativeModelMemorySnapshot{};
-    const auto native_kv_memory =
-        metrics_ ? metrics_->GetNativeKvMemorySnapshot()
-                 : MetricsRegistry::NativeKvMemorySnapshot{};
+    const auto inferflux_cuda_model_memory =
+        metrics_ ? metrics_->GetInferfluxCudaModelMemorySnapshot()
+                 : MetricsRegistry::InferfluxCudaModelMemorySnapshot{};
+    const auto inferflux_cuda_kv_memory =
+        metrics_ ? metrics_->GetInferfluxCudaKvMemorySnapshot()
+                 : MetricsRegistry::InferfluxCudaKvMemorySnapshot{};
     const auto paged_kv_usage =
         paged_kv ? paged_kv->GetUsageSnapshot() : PagedKVCache::UsageSnapshot{};
     const auto prefix_memory =
@@ -2357,7 +2364,7 @@ void HttpServer::HandleClient(ClientSession &session) {
                                 static_cast<double>(cm.hits + cm.misses)
                           : 0.0;
     json memory_domains = json::object();
-    for (const auto &entry : native_model_memory.domains) {
+    for (const auto &entry : inferflux_cuda_model_memory.domains) {
       memory_domains[entry.first] = {
           {"reserved_bytes", static_cast<int64_t>(entry.second.reserved_bytes)},
           {"in_use_bytes", static_cast<int64_t>(entry.second.in_use_bytes)},
@@ -2378,31 +2385,36 @@ void HttpServer::HandleClient(ClientSession &session) {
         {"kv_reuse_count", static_cast<int64_t>(cm.kv_reuse_count)},
         {"kv_reuse_tokens", static_cast<int64_t>(cm.kv_reuse_tokens)},
         {"memory",
-         {{"native_model",
-           {{"model", native_model_memory.model_label},
+         {{"inferflux_cuda_model",
+           {{"model", inferflux_cuda_model_memory.model_label},
             {"reserved_bytes",
-             static_cast<int64_t>(native_model_memory.total.reserved_bytes)},
+             static_cast<int64_t>(
+                 inferflux_cuda_model_memory.total.reserved_bytes)},
             {"in_use_bytes",
-             static_cast<int64_t>(native_model_memory.total.in_use_bytes)},
+             static_cast<int64_t>(
+                 inferflux_cuda_model_memory.total.in_use_bytes)},
             {"high_water_bytes",
-             static_cast<int64_t>(native_model_memory.total.high_water_bytes)},
+             static_cast<int64_t>(
+                 inferflux_cuda_model_memory.total.high_water_bytes)},
             {"evictable_bytes",
-             static_cast<int64_t>(native_model_memory.total.evictable_bytes)},
+             static_cast<int64_t>(
+                 inferflux_cuda_model_memory.total.evictable_bytes)},
             {"domains", std::move(memory_domains)}}},
-          {"native_kv",
+          {"inferflux_cuda_kv",
            {{"total_bytes",
-             static_cast<int64_t>(native_kv_memory.total_bytes)},
+             static_cast<int64_t>(inferflux_cuda_kv_memory.total_bytes)},
             {"active_bytes",
-             static_cast<int64_t>(native_kv_memory.active_bytes)},
+             static_cast<int64_t>(inferflux_cuda_kv_memory.active_bytes)},
             {"prefix_retained_bytes",
-             static_cast<int64_t>(native_kv_memory.prefix_retained_bytes)},
+             static_cast<int64_t>(
+                 inferflux_cuda_kv_memory.prefix_retained_bytes)},
             {"free_bytes",
-             static_cast<int64_t>(native_kv_memory.free_bytes)},
-            {"active_sequences", native_kv_memory.active_sequences},
+             static_cast<int64_t>(inferflux_cuda_kv_memory.free_bytes)},
+            {"active_sequences", inferflux_cuda_kv_memory.active_sequences},
             {"prefix_retained_sequences",
-             native_kv_memory.prefix_retained_sequences},
-            {"free_sequences", native_kv_memory.free_sequences},
-            {"max_sequences", native_kv_memory.max_sequences}}},
+             inferflux_cuda_kv_memory.prefix_retained_sequences},
+            {"free_sequences", inferflux_cuda_kv_memory.free_sequences},
+            {"max_sequences", inferflux_cuda_kv_memory.max_sequences}}},
           {"paged_kv",
            {{"total_blocks",
              static_cast<int64_t>(paged_kv_usage.total_blocks)},
@@ -2549,7 +2561,7 @@ void HttpServer::HandleClient(ClientSession &session) {
 
     // Resolve backend with capability-aware fallback semantics.
     auto *router = scheduler_ ? scheduler_->Router() : nullptr;
-    std::shared_ptr<LlamaCPUBackend> embed_backend;
+    std::shared_ptr<LlamaCppBackend> embed_backend;
     std::string resolved_model = embed_model.empty() ? "default" : embed_model;
     if (router) {
       BackendFeatureRequirements requirements =
@@ -2617,7 +2629,7 @@ void HttpServer::HandleClient(ClientSession &session) {
     json data = json::array();
     int total_tokens = 0;
     auto native_backend =
-        std::dynamic_pointer_cast<NativeCudaBackend>(embed_backend);
+        std::dynamic_pointer_cast<InferfluxCudaBackend>(embed_backend);
     for (std::size_t idx = 0; idx < inputs.size(); ++idx) {
       std::vector<float> emb;
       if (native_backend) {

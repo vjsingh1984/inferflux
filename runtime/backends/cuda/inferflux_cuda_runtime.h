@@ -1,7 +1,7 @@
 #pragma once
 
 #include "runtime/backends/common/backend_types.h"
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 
 #include <filesystem>
 #include <memory>
@@ -13,7 +13,7 @@ namespace inferflux {
 
 class ITokenizer;
 
-class NativeCudaRuntime {
+class InferfluxCudaRuntime {
 public:
 #ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
   using UnifiedBatchHandle = ::inferflux::UnifiedBatchHandle;
@@ -21,13 +21,13 @@ public:
   using UnifiedBatchLane = ::inferflux::UnifiedBatchLane;
   using UnifiedBatchOutput = ::inferflux::UnifiedBatchOutput;
 #else
-  using UnifiedBatchHandle = LlamaCPUBackend::UnifiedBatchHandle;
-  using UnifiedBatchInput = LlamaCPUBackend::UnifiedBatchInput;
-  using UnifiedBatchLane = LlamaCPUBackend::UnifiedBatchLane;
-  using UnifiedBatchOutput = LlamaCPUBackend::UnifiedBatchOutput;
+  using UnifiedBatchHandle = LlamaCppBackend::UnifiedBatchHandle;
+  using UnifiedBatchInput = LlamaCppBackend::UnifiedBatchInput;
+  using UnifiedBatchLane = LlamaCppBackend::UnifiedBatchLane;
+  using UnifiedBatchOutput = LlamaCppBackend::UnifiedBatchOutput;
 #endif
 
-  virtual ~NativeCudaRuntime() = default;
+  virtual ~InferfluxCudaRuntime() = default;
 
   virtual std::string Name() const = 0;
   virtual bool IsFallback() const = 0;
@@ -44,15 +44,15 @@ public:
   virtual bool
   TryCollectUnifiedBatchAsync(UnifiedBatchHandle handle,
                               std::vector<UnifiedBatchOutput> *outputs) = 0;
-  virtual std::shared_ptr<LlamaCPUBackend> BackendHandle() const = 0;
+  virtual std::shared_ptr<LlamaCppBackend> BackendHandle() const = 0;
 
-  struct NativePerfSnapshot {
+  struct PerfSnapshot {
     double prefill_ms{0.0};
     double decode_ms{0.0};
     int32_t prompt_tokens{0};
     int32_t generated_tokens{0};
   };
-  virtual NativePerfSnapshot NativeTakePerf() { return {}; }
+  virtual PerfSnapshot NativeTakePerf() { return {}; }
 
   virtual std::vector<int> NativeTokenize(const std::string &prompt) const {
     auto backend = BackendHandle();
@@ -76,7 +76,7 @@ public:
     }
   }
 
-  virtual LlamaCPUBackend::SequenceReleaseFence
+  virtual LlamaCppBackend::SequenceReleaseFence
   NativeBeginFreeSequence(int sequence_id) {
     NativeFreeSequence(sequence_id);
     (void)sequence_id;
@@ -84,7 +84,7 @@ public:
   }
 
   virtual bool NativePollFreeSequence(
-      const LlamaCPUBackend::SequenceReleaseFence &fence) {
+      const LlamaCppBackend::SequenceReleaseFence &fence) {
     (void)fence;
     return true;
   }
@@ -109,12 +109,12 @@ public:
     return backend ? backend->HydrateSequence(dest_sequence_id, blob) : false;
   }
 
-  struct NativeChatResult {
+  struct ChatResult {
     std::string prompt;
     bool valid{false};
   };
 
-  virtual NativeChatResult NativeFormatChat(
+  virtual ChatResult NativeFormatChat(
       const std::vector<std::pair<std::string, std::string>> &messages,
       bool add_assistant_prefix = true) const {
     return {};
@@ -145,6 +145,6 @@ public:
   virtual int NativeEmbedDims() const { return 0; }
 };
 
-std::unique_ptr<NativeCudaRuntime> CreateNativeCudaRuntime();
+std::unique_ptr<InferfluxCudaRuntime> CreateInferfluxCudaRuntime();
 
 } // namespace inferflux

@@ -1,7 +1,7 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #include "runtime/backends/backend_utils.h"
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 #include "scheduler/request_batch.h"
 #include "scheduler/scheduler.h"
 
@@ -36,18 +36,18 @@ TEST_CASE("InferenceRequest sampling field defaults to SamplingParams{}",
 }
 
 // ---------------------------------------------------------------------------
-// LlamaCPUBackend sampler lifecycle (null-model / ForceReadyForTests)
+// LlamaCppBackend sampler lifecycle (null-model / ForceReadyForTests)
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SetupSampler no-op when model not loaded", "[sampling]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   // vocab_ is null — SetupSampler must not crash.
   REQUIRE_NOTHROW(backend.SetupSampler("", "root", {}));
 }
 
 TEST_CASE("TeardownSampler idempotent — double call does not crash",
           "[sampling]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   REQUIRE_NOTHROW(backend.TeardownSampler());
   REQUIRE_NOTHROW(backend.TeardownSampler());
 }
@@ -55,7 +55,7 @@ TEST_CASE("TeardownSampler idempotent — double call does not crash",
 TEST_CASE(
     "SetupSampler with temperature=0 (greedy) succeeds when model not loaded",
     "[sampling]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   SamplingParams sp;
   sp.temperature = 0.0f;
   // Guard: vocab_ null → early return without crash.
@@ -65,7 +65,7 @@ TEST_CASE(
 TEST_CASE("SetupSampler with temperature>0 (stochastic) succeeds when model "
           "not loaded",
           "[sampling]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   SamplingParams sp;
   sp.temperature = 0.8f;
   REQUIRE_NOTHROW(backend.SetupSampler("", "root", sp));
@@ -75,11 +75,11 @@ TEST_CASE("SamplerScope RAII: TeardownSampler called on scope exit",
           "[sampling]") {
   // Without a loaded model SetupSampler is a no-op, but TeardownSampler should
   // still be callable without error when the scope exits.
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   backend.ForceReadyForTests();
   InferenceRequest req;
   {
-    auto be = std::make_shared<LlamaCPUBackend>();
+    auto be = std::make_shared<LlamaCppBackend>();
     // Verify no crash during construction + destruction of SamplerScope-like
     // pattern using the public API.
     be->SetupSampler("", "root", req.sampling);
@@ -90,7 +90,7 @@ TEST_CASE("SamplerScope RAII: TeardownSampler called on scope exit",
 
 TEST_CASE("EnableGrammarConstraint / DisableGrammarConstraint backward compat",
           "[sampling]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   // Should delegate to SetupSampler / TeardownSampler without crashing.
   REQUIRE_NOTHROW(
       backend.EnableGrammarConstraint("root ::= \"hello\"", "root"));

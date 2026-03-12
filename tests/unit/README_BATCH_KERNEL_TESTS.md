@@ -6,7 +6,7 @@
 
 ## Overview
 
-This test harness validates whether the template-based batch processing approach (inspired by llama.cpp) provides performance benefits for cuda_native.
+This test harness validates whether the template-based batch processing approach (inspired by llama.cpp) provides performance benefits for inferflux_cuda.
 
 ### What It Tests
 

@@ -1,9 +1,9 @@
-#include "runtime/backends/cuda/native_cuda_backend.h"
+#include "runtime/backends/cuda/inferflux_cuda_backend.h"
 
 #include "model/model_format.h"
 #include "model/tokenizer.h"
 #include "runtime/backends/backend_utils.h"
-#include "runtime/backends/cuda/native_cuda_runtime.h"
+#include "runtime/backends/cuda/inferflux_cuda_runtime.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
 #include "server/logging/logger.h"
 
@@ -63,41 +63,41 @@ std::string NormalizeNativeOutputPiece(const ITokenizer *tokenizer,
 
 } // namespace
 
-std::atomic<int> NativeCudaBackend::next_ephemeral_sequence_id_{1 << 20};
+std::atomic<int> InferfluxCudaBackend::next_ephemeral_sequence_id_{1 << 20};
 
-NativeCudaBackend::NativeCudaBackend() : LlamaCPUBackend(false) {}
+InferfluxCudaBackend::InferfluxCudaBackend() : LlamaCppBackend(false) {}
 
-NativeCudaBackend::~NativeCudaBackend() = default;
+InferfluxCudaBackend::~InferfluxCudaBackend() = default;
 
-bool NativeCudaBackend::LoadModel(const std::filesystem::path &model_path,
-                                  const LlamaBackendConfig &config) {
+bool InferfluxCudaBackend::LoadModel(const std::filesystem::path &model_path,
+                                     const LlamaBackendConfig &config) {
 #ifdef INFERFLUX_HAS_CUDA
   const bool strict_native_execution =
-      ParseBoolEnv("INFERFLUX_NATIVE_CUDA_STRICT", false);
+      ParseBoolEnv("INFERFLUX_CUDA_STRICT", false);
   loaded_model_path_ = model_path;
   loaded_config_ = config;
   parity_delegate_enabled_ =
-      !ParseBoolEnv("INFERFLUX_NATIVE_DISABLE_PARITY_DELEGATE", false);
+      !ParseBoolEnv("INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE", false);
   parity_delegate_available_ = false;
   parity_delegate_init_attempted_ = false;
   parity_backend_.reset();
   parity_load_path_.clear();
 
   if (!NativeKernelsReady()) {
-    log::Error("native_cuda_backend",
-               "native CUDA backend requested but native kernels are not "
+    log::Error("inferflux_cuda_backend",
+               "InferFlux CUDA backend requested but InferFlux CUDA kernels are not "
                "ready");
     return false;
   }
 
-  runtime_ = CreateNativeCudaRuntime();
+  runtime_ = CreateInferfluxCudaRuntime();
   if (!runtime_) {
-    log::Error("native_cuda_backend", "failed to create native CUDA runtime");
+    log::Error("inferflux_cuda_backend", "failed to create InferFlux CUDA runtime");
     return false;
   }
 
   if (!runtime_->LoadModel(model_path, config)) {
-    log::Error("native_cuda_backend",
+    log::Error("inferflux_cuda_backend",
                "failed to load model using runtime '" + runtime_->Name() + "'");
     return false;
   }
@@ -108,14 +108,16 @@ bool NativeCudaBackend::LoadModel(const std::filesystem::path &model_path,
   if (strict_native_execution && fallback_mode_) {
     std::string strict_reason =
         fallback_reason_.empty()
-            ? "native CUDA strict mode rejected runtime '" + runtime_kind_ + "'"
+            ? "InferFlux CUDA strict mode rejected runtime '" + runtime_kind_ +
+                  "'"
             : fallback_reason_;
-    log::Error("native_cuda_backend",
-               "native CUDA strict mode rejected model load: " + strict_reason);
+    log::Error("inferflux_cuda_backend",
+               "InferFlux CUDA strict mode rejected model load: " +
+                   strict_reason);
     return false;
   }
   if (fallback_mode_ && !fallback_reason_.empty()) {
-    log::Warn("native_cuda_backend",
+    log::Warn("inferflux_cuda_backend",
               fallback_reason_ + " (runtime=" + runtime_kind_ + ")");
   }
   if (parity_delegate_enabled_) {
@@ -127,7 +129,7 @@ bool NativeCudaBackend::LoadModel(const std::filesystem::path &model_path,
       parity_load_path_ = parity_path;
       parity_delegate_available_ = true;
     } else {
-      log::Info("native_cuda_backend",
+      log::Info("inferflux_cuda_backend",
                 "Native parity delegate unavailable for model path '" +
                     model_path.string() +
                     "' (no GGUF-compatible artifact detected)");
@@ -137,18 +139,18 @@ bool NativeCudaBackend::LoadModel(const std::filesystem::path &model_path,
 #else
   (void)model_path;
   (void)config;
-  log::Error("native_cuda_backend",
-             "native CUDA backend requested but binary was built without CUDA "
+  log::Error("inferflux_cuda_backend",
+             "InferFlux CUDA backend requested but binary was built without CUDA "
              "support");
   return false;
 #endif
 }
 
-bool NativeCudaBackend::NativeKernelsReady() {
+bool InferfluxCudaBackend::NativeKernelsReady() {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
 #ifdef INFERFLUX_HAS_CUDA
   // Allow explicit opt-out for emergency fallback operation.
-  if (ParseBoolValue(std::getenv("INFERFLUX_DISABLE_NATIVE_CUDA"))) {
+  if (ParseBoolValue(std::getenv("INFERFLUX_DISABLE_INFERFLUX_CUDA"))) {
     return false;
   }
 
@@ -158,8 +160,8 @@ bool NativeCudaBackend::NativeKernelsReady() {
       return;
     }
     logged = true;
-    log::Warn("native_cuda_backend",
-              std::string("Native CUDA readiness probe failed at ") + stage +
+    log::Warn("inferflux_cuda_backend",
+              std::string("InferFlux CUDA readiness probe failed at ") + stage +
                   ": " + cudaGetErrorString(err));
   };
 
@@ -171,7 +173,7 @@ bool NativeCudaBackend::NativeKernelsReady() {
 
   // Some hosts report a transient/runtime-init failure on the first probe even
   // though CUDA execution is available for the process. Force a lightweight
-  // runtime init and retry once before declaring native CUDA unavailable.
+  // Runtime init and retry once before declaring InferFlux CUDA unavailable.
   const cudaError_t init_err = cudaFree(nullptr);
   if (init_err != cudaSuccess && init_err != cudaErrorCudartUnloading) {
     log_probe_failure("cudaFree(0)", init_err);
@@ -192,8 +194,8 @@ bool NativeCudaBackend::NativeKernelsReady() {
 #endif
 }
 
-std::vector<LlamaCPUBackend::UnifiedBatchOutput>
-NativeCudaBackend::ExecuteUnifiedBatch(
+std::vector<LlamaCppBackend::UnifiedBatchOutput>
+InferfluxCudaBackend::ExecuteUnifiedBatch(
     const std::vector<UnifiedBatchInput> &inputs) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (!runtime_) {
@@ -202,7 +204,7 @@ NativeCudaBackend::ExecuteUnifiedBatch(
   return runtime_->ExecuteUnifiedBatch(inputs);
 }
 
-bool NativeCudaBackend::SupportsAsyncUnifiedBatch() const {
+bool InferfluxCudaBackend::SupportsAsyncUnifiedBatch() const {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (!runtime_) {
     return false;
@@ -210,15 +212,15 @@ bool NativeCudaBackend::SupportsAsyncUnifiedBatch() const {
   return runtime_->SupportsAsyncUnifiedBatch();
 }
 
-bool NativeCudaBackend::SupportsSplitPrefillDecodeHandoff() const {
+bool InferfluxCudaBackend::SupportsSplitPrefillDecodeHandoff() const {
   return runtime_ != nullptr && !fallback_mode_;
 }
 
-bool NativeCudaBackend::SupportsProcessLocalSequenceTransfer() const {
+bool InferfluxCudaBackend::SupportsProcessLocalSequenceTransfer() const {
   return runtime_ != nullptr && !fallback_mode_;
 }
 
-LlamaCPUBackend::UnifiedBatchHandle NativeCudaBackend::SubmitUnifiedBatchAsync(
+LlamaCppBackend::UnifiedBatchHandle InferfluxCudaBackend::SubmitUnifiedBatchAsync(
     const std::vector<UnifiedBatchInput> &inputs, UnifiedBatchLane lane) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (!runtime_) {
@@ -227,7 +229,7 @@ LlamaCPUBackend::UnifiedBatchHandle NativeCudaBackend::SubmitUnifiedBatchAsync(
   return runtime_->SubmitUnifiedBatchAsync(inputs, lane);
 }
 
-bool NativeCudaBackend::TryCollectUnifiedBatchAsync(
+bool InferfluxCudaBackend::TryCollectUnifiedBatchAsync(
     UnifiedBatchHandle handle, std::vector<UnifiedBatchOutput> *outputs) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (!runtime_) {
@@ -236,16 +238,16 @@ bool NativeCudaBackend::TryCollectUnifiedBatchAsync(
   return runtime_->TryCollectUnifiedBatchAsync(handle, outputs);
 }
 
-int NativeCudaBackend::UnifiedBatchTokenCapacity() const {
+int InferfluxCudaBackend::UnifiedBatchTokenCapacity() const {
   auto backend = DelegateBackend();
   if (!backend) {
-    return LlamaCPUBackend::UnifiedBatchTokenCapacity();
+    return LlamaCppBackend::UnifiedBatchTokenCapacity();
   }
   return backend->UnifiedBatchTokenCapacity();
 }
 
-LlamaCPUBackend::PrefillResult
-NativeCudaBackend::Prefill(const std::string &prompt, int sequence_id) {
+LlamaCppBackend::PrefillResult
+InferfluxCudaBackend::Prefill(const std::string &prompt, int sequence_id) {
   auto backend = DelegateBackend();
   if (!backend) {
     return {};
@@ -253,9 +255,9 @@ NativeCudaBackend::Prefill(const std::string &prompt, int sequence_id) {
   return backend->Prefill(prompt, sequence_id);
 }
 
-LlamaCPUBackend::PrefillResult
-NativeCudaBackend::PrefillPartial(const std::string &prompt, int sequence_id,
-                                  int n_past_start) {
+LlamaCppBackend::PrefillResult
+InferfluxCudaBackend::PrefillPartial(const std::string &prompt, int sequence_id,
+                                     int n_past_start) {
   auto backend = DelegateBackend();
   if (!backend) {
     return {};
@@ -263,33 +265,33 @@ NativeCudaBackend::PrefillPartial(const std::string &prompt, int sequence_id,
   return backend->PrefillPartial(prompt, sequence_id, n_past_start);
 }
 
-void NativeCudaBackend::CopySequencePrefix(int src_seq, int dst_seq,
-                                           int n_tokens) {
+void InferfluxCudaBackend::CopySequencePrefix(int src_seq, int dst_seq,
+                                              int n_tokens) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     runtime_->NativeCopySequencePrefix(src_seq, dst_seq, n_tokens);
   }
 }
 
-void NativeCudaBackend::FreeSequence(int sequence_id) {
+void InferfluxCudaBackend::FreeSequence(int sequence_id) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     runtime_->NativeFreeSequence(sequence_id);
   }
 }
 
-LlamaCPUBackend::SequenceReleaseFence
-NativeCudaBackend::BeginFreeSequence(int sequence_id) {
+LlamaCppBackend::SequenceReleaseFence
+InferfluxCudaBackend::BeginFreeSequence(int sequence_id) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     return runtime_->NativeBeginFreeSequence(sequence_id);
   }
   auto backend = DelegateBackend();
   return backend ? backend->BeginFreeSequence(sequence_id)
-                 : LlamaCPUBackend::SequenceReleaseFence{};
+                 : LlamaCppBackend::SequenceReleaseFence{};
 }
 
-bool NativeCudaBackend::PollFreeSequence(const SequenceReleaseFence &fence) {
+bool InferfluxCudaBackend::PollFreeSequence(const SequenceReleaseFence &fence) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     return runtime_->NativePollFreeSequence(fence);
@@ -298,7 +300,7 @@ bool NativeCudaBackend::PollFreeSequence(const SequenceReleaseFence &fence) {
   return backend ? backend->PollFreeSequence(fence) : true;
 }
 
-std::vector<uint8_t> NativeCudaBackend::SerializeSequence(int sequence_id) {
+std::vector<uint8_t> InferfluxCudaBackend::SerializeSequence(int sequence_id) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     auto blob = runtime_->NativeSerializeSequence(sequence_id);
@@ -313,8 +315,8 @@ std::vector<uint8_t> NativeCudaBackend::SerializeSequence(int sequence_id) {
   return backend->SerializeSequence(sequence_id);
 }
 
-bool NativeCudaBackend::HydrateSequence(int dest_sequence_id,
-                                        const std::vector<uint8_t> &blob) {
+bool InferfluxCudaBackend::HydrateSequence(int dest_sequence_id,
+                                           const std::vector<uint8_t> &blob) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_ && runtime_->NativeHydrateSequence(dest_sequence_id, blob)) {
     return true;
@@ -326,7 +328,7 @@ bool NativeCudaBackend::HydrateSequence(int dest_sequence_id,
   return backend->HydrateSequence(dest_sequence_id, blob);
 }
 
-std::string NativeCudaBackend::Decode(
+std::string InferfluxCudaBackend::Decode(
     int n_past, int sequence_id, int max_tokens,
     const std::function<bool(const std::string &, const TokenLogprob *)>
         &on_chunk,
@@ -353,7 +355,7 @@ std::string NativeCudaBackend::Decode(
   const SamplingParams sampling = SnapshotSamplingParams();
   const ITokenizer *tokenizer = runtime_->NativeGetTokenizer();
   if (first_token < 0 || tokenizer == nullptr) {
-    log::Warn("native_cuda_backend",
+    log::Warn("inferflux_cuda_backend",
               "native decode requires first_token and tokenizer");
     return {};
   }
@@ -415,7 +417,7 @@ std::string NativeCudaBackend::Decode(
                                                    step.front().piece);
     if (!IsVisibleNativePiece(piece)) {
       if (++non_emitting_steps >= max_non_emitting_steps) {
-        log::Warn("native_cuda_backend",
+        log::Warn("inferflux_cuda_backend",
                   "native decode aborted after too many non-emitting tokens");
         break;
       }
@@ -450,7 +452,7 @@ std::string NativeCudaBackend::Decode(
   return output;
 }
 
-std::string NativeCudaBackend::Generate(
+std::string InferfluxCudaBackend::Generate(
     const std::string &prompt, int max_tokens,
     const std::function<bool(const std::string &, const TokenLogprob *)>
         &on_chunk,
@@ -485,7 +487,7 @@ std::string NativeCudaBackend::Generate(
 
   // Scope guard: always release the temporary sequence.
   struct SequenceReleaser final {
-    NativeCudaRuntime *runtime{nullptr};
+    InferfluxCudaRuntime *runtime{nullptr};
     int sequence_id{-1};
     ~SequenceReleaser() {
       if (runtime && sequence_id >= 0) {
@@ -572,7 +574,7 @@ std::string NativeCudaBackend::Generate(
                                                    step.front().piece);
     if (!IsVisibleNativePiece(piece)) {
       if (++non_emitting_steps >= max_non_emitting_steps) {
-        log::Warn("native_cuda_backend",
+        log::Warn("inferflux_cuda_backend",
                   "native generate aborted after too many non-emitting "
                   "tokens");
         break;
@@ -607,9 +609,9 @@ std::string NativeCudaBackend::Generate(
   return output;
 }
 
-void NativeCudaBackend::SetupSampler(const std::string &grammar,
-                                     const std::string &root,
-                                     const SamplingParams &sp) {
+void InferfluxCudaBackend::SetupSampler(const std::string &grammar,
+                                        const std::string &root,
+                                        const SamplingParams &sp) {
   if (auto backend = DelegateBackend()) {
     backend->SetupSampler(grammar, root, sp);
   }
@@ -620,7 +622,7 @@ void NativeCudaBackend::SetupSampler(const std::string &grammar,
   }
   if (!grammar.empty()) {
     if (!IsParityDelegateAvailable()) {
-      log::Warn("native_cuda_backend",
+      log::Warn("inferflux_cuda_backend",
                 "native sampler grammar constraints are unavailable (no parity "
                 "delegate backend)");
     }
@@ -631,7 +633,7 @@ void NativeCudaBackend::SetupSampler(const std::string &grammar,
   structured_constraint_sampler_active_ = !grammar.empty();
 }
 
-void NativeCudaBackend::TeardownSampler() {
+void InferfluxCudaBackend::TeardownSampler() {
   if (auto backend = DelegateBackend()) {
     backend->TeardownSampler();
   }
@@ -647,7 +649,7 @@ void NativeCudaBackend::TeardownSampler() {
   structured_constraint_sampler_active_ = false;
 }
 
-LlamaCPUBackend::PerfSnapshot NativeCudaBackend::TakePerf() {
+LlamaCppBackend::PerfSnapshot InferfluxCudaBackend::TakePerf() {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   auto backend = DelegateBackend();
   if (backend) {
@@ -666,7 +668,7 @@ LlamaCPUBackend::PerfSnapshot NativeCudaBackend::TakePerf() {
   return {};
 }
 
-LlamaCPUBackend::ChatTemplateResult NativeCudaBackend::FormatChatMessages(
+LlamaCppBackend::ChatTemplateResult InferfluxCudaBackend::FormatChatMessages(
     const std::vector<std::pair<std::string, std::string>> &messages,
     bool add_assistant_prefix) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
@@ -688,7 +690,7 @@ LlamaCPUBackend::ChatTemplateResult NativeCudaBackend::FormatChatMessages(
   return backend->FormatChatMessages(messages, add_assistant_prefix);
 }
 
-int NativeCudaBackend::TokenCount(const std::string &text) const {
+int InferfluxCudaBackend::TokenCount(const std::string &text) const {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     return runtime_->NativeTokenCount(text);
@@ -697,7 +699,7 @@ int NativeCudaBackend::TokenCount(const std::string &text) const {
 }
 
 std::vector<int>
-NativeCudaBackend::TokenizeForCache(const std::string &prompt) const {
+InferfluxCudaBackend::TokenizeForCache(const std::string &prompt) const {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     return runtime_->NativeTokenize(prompt);
@@ -705,7 +707,7 @@ NativeCudaBackend::TokenizeForCache(const std::string &prompt) const {
   return {};
 }
 
-bool NativeCudaBackend::IsReady() const {
+bool InferfluxCudaBackend::IsReady() const {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     return runtime_->NativeIsReady();
@@ -713,28 +715,28 @@ bool NativeCudaBackend::IsReady() const {
   return false;
 }
 
-bool NativeCudaBackend::SupportsSpeculativeDecodingContract() const {
+bool InferfluxCudaBackend::SupportsSpeculativeDecodingContract() const {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   return runtime_ && runtime_->NativeIsReady() &&
          runtime_->NativeGetTokenizer() != nullptr;
 }
 
-bool NativeCudaBackend::SupportsLogprobsContract() const { return true; }
+bool InferfluxCudaBackend::SupportsLogprobsContract() const { return true; }
 
-bool NativeCudaBackend::SupportsStructuredOutputContract() const {
+bool InferfluxCudaBackend::SupportsStructuredOutputContract() const {
   return IsParityDelegateAvailable();
 }
 
-bool NativeCudaBackend::SupportsEmbeddingsContract() const { return true; }
+bool InferfluxCudaBackend::SupportsEmbeddingsContract() const { return true; }
 
-bool NativeCudaBackend::IsParityDelegateAvailable() const {
+bool InferfluxCudaBackend::IsParityDelegateAvailable() const {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   return runtime_ && runtime_->NativeIsReady() && parity_delegate_enabled_ &&
          parity_delegate_available_;
 }
 
-std::shared_ptr<LlamaCPUBackend>
-NativeCudaBackend::EnsureParityBackend() const {
+std::shared_ptr<LlamaCppBackend>
+InferfluxCudaBackend::EnsureParityBackend() const {
   if (!IsParityDelegateAvailable()) {
     return nullptr;
   }
@@ -748,11 +750,11 @@ NativeCudaBackend::EnsureParityBackend() const {
   }
   parity_delegate_init_attempted_ = true;
 
-  auto backend = std::make_shared<LlamaCPUBackend>();
+  auto backend = std::make_shared<LlamaCppBackend>();
   const auto tuned_cfg =
       TuneLlamaBackendConfig(LlamaBackendTarget::kCuda, loaded_config_);
   if (!backend->LoadModel(parity_load_path_, tuned_cfg)) {
-    log::Warn("native_cuda_backend",
+    log::Warn("inferflux_cuda_backend",
               "Failed to initialize parity delegate backend from '" +
                   parity_load_path_.string() +
                   "'; structured-output/embeddings remain "
@@ -762,27 +764,26 @@ NativeCudaBackend::EnsureParityBackend() const {
   }
 
   parity_backend_ = std::move(backend);
-  log::Info("native_cuda_backend",
+  log::Info("inferflux_cuda_backend",
             "Initialized native parity delegate backend from '" +
                 parity_load_path_.string() + "'");
   return parity_backend_;
 }
 
-std::shared_ptr<LlamaCPUBackend> NativeCudaBackend::DelegateBackend() const {
+std::shared_ptr<LlamaCppBackend> InferfluxCudaBackend::DelegateBackend() const {
   if (!runtime_) {
     return nullptr;
   }
   return runtime_->BackendHandle();
 }
 
-bool NativeCudaBackend::UsesStructuredConstraintSampler() const {
+bool InferfluxCudaBackend::UsesStructuredConstraintSampler() const {
   std::lock_guard<std::mutex> lock(sampling_mutex_);
   return structured_constraint_sampler_active_;
 }
 
-TokenLogprob NativeCudaBackend::CollectNativeLogprob(int token_id,
-                                                     const std::string &piece,
-                                                     int top_n) {
+TokenLogprob InferfluxCudaBackend::CollectNativeLogprob(
+    int token_id, const std::string &piece, int top_n) {
   const int vocab = runtime_->NativeVocabSize();
   if (vocab <= 0) {
     return {};
@@ -801,7 +802,8 @@ TokenLogprob NativeCudaBackend::CollectNativeLogprob(int token_id,
                         });
 }
 
-std::vector<float> NativeCudaBackend::EmbedForParity(const std::string &text) {
+std::vector<float> InferfluxCudaBackend::EmbedForParity(
+    const std::string &text) {
   // Try native embedding first.
   std::lock_guard<std::recursive_mutex> runtime_lock(runtime_mutex_);
   if (runtime_ && runtime_->NativeEmbedDims() > 0) {
@@ -818,7 +820,7 @@ std::vector<float> NativeCudaBackend::EmbedForParity(const std::string &text) {
   return backend->Embed(text);
 }
 
-int NativeCudaBackend::EmbedDimsForParity() const {
+int InferfluxCudaBackend::EmbedDimsForParity() const {
   // Try native first.
   std::lock_guard<std::recursive_mutex> runtime_lock(runtime_mutex_);
   if (runtime_) {
@@ -835,7 +837,7 @@ int NativeCudaBackend::EmbedDimsForParity() const {
   return backend->EmbedDims();
 }
 
-SamplingParams NativeCudaBackend::SnapshotSamplingParams() const {
+SamplingParams InferfluxCudaBackend::SnapshotSamplingParams() const {
   std::lock_guard<std::mutex> lock(sampling_mutex_);
   if (!sampling_active_) {
     return {};
@@ -843,7 +845,7 @@ SamplingParams NativeCudaBackend::SnapshotSamplingParams() const {
   return active_sampling_;
 }
 
-int NativeCudaBackend::AcquireEphemeralSequenceId() {
+int InferfluxCudaBackend::AcquireEphemeralSequenceId() {
   int seq = next_ephemeral_sequence_id_.fetch_add(1, std::memory_order_relaxed);
   if (seq < 0) {
     next_ephemeral_sequence_id_.store(1 << 20, std::memory_order_relaxed);

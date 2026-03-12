@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 #include "runtime/device_context.h"
 #include <memory>
 #include <string>
@@ -20,7 +20,7 @@ namespace inferflux {
  * - Reuses llama.cpp's ggml-hip backend
  * - Compatible with ROCm 6.1+
  */
-class RocmBackend : public LlamaCPUBackend {
+class RocmBackend : public LlamaCppBackend {
 public:
   RocmBackend();
   ~RocmBackend() override;

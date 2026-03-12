@@ -50,7 +50,7 @@ NativeBootstrapConfig
 NativeBootstrapConfig::FromEnv(const std::string &kv_precision_hint) {
   NativeBootstrapConfig config;
 
-  if (const char *dtype_override = std::getenv("INFERFLUX_NATIVE_DTYPE")) {
+  if (const char *dtype_override = std::getenv("INFERFLUX_CUDA_DTYPE")) {
     config.dtype_override = inferflux::ToLower(dtype_override);
   }
 
@@ -58,14 +58,14 @@ NativeBootstrapConfig::FromEnv(const std::string &kv_precision_hint) {
   if (config.kv_precision_choice.empty()) {
     config.kv_precision_choice = "auto";
   }
-  if (const char *env_kv_precision = std::getenv("INFERFLUX_NATIVE_KV_DTYPE")) {
+  if (const char *env_kv_precision = std::getenv("INFERFLUX_CUDA_KV_DTYPE")) {
     config.kv_precision_choice = inferflux::ToLower(env_kv_precision);
     if (config.kv_precision_choice.empty()) {
       config.kv_precision_choice = "auto";
     }
   }
 
-  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_MAX_BATCH")) {
+  if (const char *env = std::getenv("INFERFLUX_CUDA_KV_MAX_BATCH")) {
     int val = 0;
     if (ParsePositiveIntSetting(env, &val) && val <= 128) {
       config.kv_max_batch = val;
@@ -74,7 +74,7 @@ NativeBootstrapConfig::FromEnv(const std::string &kv_precision_hint) {
     }
   }
 
-  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_MAX_SEQ")) {
+  if (const char *env = std::getenv("INFERFLUX_CUDA_KV_MAX_SEQ")) {
     int val = 0;
     if (ParsePositiveIntSetting(env, &val) && val <= 131072) {
       config.kv_max_seq = val;
@@ -84,11 +84,11 @@ NativeBootstrapConfig::FromEnv(const std::string &kv_precision_hint) {
     }
   }
 
-  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_AUTO_TUNE")) {
+  if (const char *env = std::getenv("INFERFLUX_CUDA_KV_AUTO_TUNE")) {
     config.kv_auto_tune = ParseBoolSetting(env, true);
   }
 
-  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_BUDGET_MB")) {
+  if (const char *env = std::getenv("INFERFLUX_CUDA_KV_BUDGET_MB")) {
     int budget_mb = 0;
     if (ParsePositiveIntSetting(env, &budget_mb)) {
       config.kv_budget_bytes = static_cast<std::size_t>(budget_mb) * 1024U *
@@ -98,7 +98,7 @@ NativeBootstrapConfig::FromEnv(const std::string &kv_precision_hint) {
     }
   }
 
-  if (const char *env = std::getenv("INFERFLUX_NATIVE_KV_FREE_MEM_RATIO")) {
+  if (const char *env = std::getenv("INFERFLUX_CUDA_KV_FREE_MEM_RATIO")) {
     double parsed = 0.0;
     if (ParsePositiveDoubleSetting(env, &parsed) && parsed <= 1.0) {
       config.kv_budget_ratio = parsed;

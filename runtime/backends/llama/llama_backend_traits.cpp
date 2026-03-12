@@ -39,7 +39,10 @@ std::string NormalizeCudaAttentionKernel(const std::string &value) {
 
 LlamaBackendTarget ParseLlamaBackendTarget(const std::string &hint) {
   const std::string lowered = NormalizeHint(hint);
-  if (lowered == "cuda") {
+  if (lowered == "cuda" || lowered == "inferflux_cuda" ||
+      lowered == "llama_cpp_cuda" || lowered == "cuda_native" ||
+      lowered == "native_cuda" || lowered == "cuda_llama_cpp" ||
+      lowered == "cuda_llama") {
     return LlamaBackendTarget::kCuda;
   }
   if (lowered == "mps") {

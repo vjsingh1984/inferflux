@@ -1,13 +1,13 @@
 #pragma once
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 
 #include <filesystem>
 #include <string>
 
 namespace inferflux {
 
-class CudaBackend : public LlamaCPUBackend {
+class CudaBackend : public LlamaCppBackend {
 public:
   CudaBackend() = default;
 
@@ -15,7 +15,7 @@ public:
                  const LlamaBackendConfig &config = {}) override;
 
 #ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
-  std::string Name() const override { return "cuda_llama_cpp"; }
+  std::string Name() const override { return "llama_cpp_cuda"; }
 #endif
 };
 

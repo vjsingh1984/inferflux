@@ -62,9 +62,9 @@ sequenceDiagram
 | Request admission | HTTP-layer async admission into scheduler queues; optional fail-closed policy on degraded distributed transport |
 | Throughput core | Sync-first batched execution inside the runtime |
 | Phase model | Prefill and decode remain explicit |
-| Mixed workloads | Prefill/decode overlap exists for native CUDA in the sync path |
+| Mixed workloads | Prefill/decode overlap exists for InferFlux CUDA in the sync path |
 | Batch quality | Prefix-affinity scoring and mixed-step knobs influence batch construction |
-| Async backend API | Native CUDA intentionally returns `SupportsAsyncUnifiedBatch()==false` today because the sync path preserves throughput better |
+| Async backend API | InferFlux CUDA intentionally returns `SupportsAsyncUnifiedBatch()==false` today because the sync path preserves throughput better |
 | Decode-worker mode | Optional for split prefill/decode deployments |
 | Cancellation/streaming | Request-scoped cancellation and SSE token callbacks are preserved through decode |
 
@@ -84,7 +84,7 @@ sequenceDiagram
 |---|---|
 | `requested_backend` | backend hint from config/admin intent |
 | `exposed_backend` | backend actually selected |
-| `provider` | runtime provider path (`native` or `llama_cpp`) |
+| `provider` | runtime provider path (`inferflux` or `llama_cpp`) |
 | `fallback` | `true` when routing/policy changed the selected backend |
 | `fallback_reason` | machine-visible reason for changed selection |
 
@@ -94,15 +94,15 @@ This contract is reflected in `/v1/models`, `/v1/models/{id}`, and `inferctl mod
 
 ```mermaid
 flowchart LR
-    A[cuda request] --> B{native ready + policy allows?}
-    B -->|yes| C[native_cuda]
-    B -->|no| D[cuda_llama_cpp]
+    A[cuda request] --> B{inferflux ready + policy allows?}
+    B -->|yes| C[inferflux_cuda]
+    B -->|no| D[llama_cpp_cuda]
 ```
 
-| Axis | `native_cuda` provider | `cuda_llama_cpp` provider |
+| Axis | `inferflux_cuda` provider | `llama_cpp_cuda` provider |
 |---|---|---|
 | Primary value | Throughput/control path owned by InferFlux | Stable compatibility baseline and deterministic fallback |
-| Runtime core | `NativeCudaRuntime` + native loaders + native metrics | llama.cpp runtime behind InferFlux control plane |
+| Runtime core | `InferfluxCudaRuntime` + InferFlux CUDA loaders + metrics | llama.cpp runtime behind InferFlux control plane |
 | Strong today | Native safetensors path, GGUF loader detection, memory-first dequant policy, KV auto-tune metrics, explicit provider identity | Mature GGUF behavior, lower operational risk, broad compatibility |
 | Current limits | Async unified batch intentionally off; quantized GGUF throughput and native-owned parity are still maturing | Lower headroom for first-party kernel/runtime innovation |
 | Operational role | Preferred when native is ready and policy allows | Compatibility/safety net when policy permits fallback |
@@ -115,7 +115,7 @@ flowchart LR
 | Model weights | Loaded once per model instance; treated as shared runtime state |
 | Dequantized projections | Policy-scoped as `none`, `batch`, or `model`; native quantized path defaults to memory-first `none` |
 | KV cache | Separate lifecycle from weights; precision is fixed at model-load scope |
-| KV sizing | Native CUDA can auto-tune max sequence length against a VRAM budget and exports planning metrics |
+| KV sizing | InferFlux CUDA can auto-tune max sequence length against a VRAM budget and exports planning metrics |
 | Prefix reuse | Token-aligned reuse with balanced acquire/release accounting |
 | Session reuse | Optional `session_id` lease layer with TTL; disabled in decode-worker mode today |
 

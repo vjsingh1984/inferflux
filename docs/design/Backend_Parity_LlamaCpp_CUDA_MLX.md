@@ -6,9 +6,9 @@ target-specific optimization paths and minimizing duplicated control logic.
 
 ## Current Parity Snapshot (March 9, 2026)
 
-| Area | llama.cpp provider path (`cuda_llama_cpp`) | native provider path (`native_cuda`) | MLX path |
+| Area | llama.cpp provider path (`llama_cpp_cuda`) | InferFlux provider path (`inferflux_cuda`) | MLX path |
 | --- | --- | --- | --- |
-| Model load lifecycle | Shared in `LlamaCPUBackend` | Native runtime via `NativeCudaRuntime` + strict-native policy hooks | Separate MLX-native loader/engine |
+| Model load lifecycle | Shared in `LlamaCppBackend` | InferFlux CUDA runtime via `InferfluxCudaRuntime` + strict-inferflux policy hooks | Separate MLX-native loader/engine |
 | Phased prefill/decode APIs | Supported | Supported (sync batched path + decode/prefill overlap path) | Supported (native overrides) |
 | Unified batch async lanes | Supported | Contract intentionally disabled today (`SupportsAsyncUnifiedBatch()==false`) | Supported (native overrides) |
 | GGUF quantized overlap safety | N/A (llama.cpp path) | Active lane-local quantized map/adapter ownership (no hard GGUF overlap disablement) | N/A |
@@ -33,8 +33,8 @@ target-specific optimization paths and minimizing duplicated control logic.
 
 | Backend | What it gives today | Why it stays |
 | --- | --- | --- |
-| `native_cuda` | InferFlux-owned runtime control, strict provider identity, sync-first batched overlap path, and explicit memory-policy controls | Throughput and architecture headroom |
-| `cuda_llama_cpp` | Stable compatibility baseline with mature feature surface and broad GGUF behavior | Production safety net and fallback path |
+| `inferflux_cuda` | InferFlux-owned runtime control, strict provider identity, sync-first batched overlap path, and explicit memory-policy controls | Throughput and architecture headroom |
+| `llama_cpp_cuda` | Stable compatibility baseline with mature feature surface and broad GGUF behavior | Production safety net and fallback path |
 
 ## Current Gaps to Close
 

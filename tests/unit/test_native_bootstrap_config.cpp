@@ -41,13 +41,13 @@ private:
 
 TEST_CASE("NativeBootstrapConfig: uses hinted KV precision and default sizing",
           "[native_bootstrap]") {
-  ScopedEnvVar dtype("INFERFLUX_NATIVE_DTYPE", nullptr);
-  ScopedEnvVar kv_dtype("INFERFLUX_NATIVE_KV_DTYPE", nullptr);
-  ScopedEnvVar kv_batch("INFERFLUX_NATIVE_KV_MAX_BATCH", nullptr);
-  ScopedEnvVar kv_seq("INFERFLUX_NATIVE_KV_MAX_SEQ", nullptr);
-  ScopedEnvVar kv_auto("INFERFLUX_NATIVE_KV_AUTO_TUNE", nullptr);
-  ScopedEnvVar kv_budget("INFERFLUX_NATIVE_KV_BUDGET_MB", nullptr);
-  ScopedEnvVar kv_ratio("INFERFLUX_NATIVE_KV_FREE_MEM_RATIO", nullptr);
+  ScopedEnvVar dtype("INFERFLUX_CUDA_DTYPE", nullptr);
+  ScopedEnvVar kv_dtype("INFERFLUX_CUDA_KV_DTYPE", nullptr);
+  ScopedEnvVar kv_batch("INFERFLUX_CUDA_KV_MAX_BATCH", nullptr);
+  ScopedEnvVar kv_seq("INFERFLUX_CUDA_KV_MAX_SEQ", nullptr);
+  ScopedEnvVar kv_auto("INFERFLUX_CUDA_KV_AUTO_TUNE", nullptr);
+  ScopedEnvVar kv_budget("INFERFLUX_CUDA_KV_BUDGET_MB", nullptr);
+  ScopedEnvVar kv_ratio("INFERFLUX_CUDA_KV_FREE_MEM_RATIO", nullptr);
 
   const auto config = NativeBootstrapConfig::FromEnv("bf16");
   REQUIRE(config.dtype_override.empty());
@@ -62,13 +62,13 @@ TEST_CASE("NativeBootstrapConfig: uses hinted KV precision and default sizing",
 
 TEST_CASE("NativeBootstrapConfig: records valid overrides and invalid raw values",
           "[native_bootstrap]") {
-  ScopedEnvVar dtype("INFERFLUX_NATIVE_DTYPE", "FP16");
-  ScopedEnvVar kv_dtype("INFERFLUX_NATIVE_KV_DTYPE", "bf16");
-  ScopedEnvVar kv_batch("INFERFLUX_NATIVE_KV_MAX_BATCH", "bad");
-  ScopedEnvVar kv_seq("INFERFLUX_NATIVE_KV_MAX_SEQ", "8192");
-  ScopedEnvVar kv_auto("INFERFLUX_NATIVE_KV_AUTO_TUNE", "0");
-  ScopedEnvVar kv_budget("INFERFLUX_NATIVE_KV_BUDGET_MB", "256");
-  ScopedEnvVar kv_ratio("INFERFLUX_NATIVE_KV_FREE_MEM_RATIO", "bad");
+  ScopedEnvVar dtype("INFERFLUX_CUDA_DTYPE", "FP16");
+  ScopedEnvVar kv_dtype("INFERFLUX_CUDA_KV_DTYPE", "bf16");
+  ScopedEnvVar kv_batch("INFERFLUX_CUDA_KV_MAX_BATCH", "bad");
+  ScopedEnvVar kv_seq("INFERFLUX_CUDA_KV_MAX_SEQ", "8192");
+  ScopedEnvVar kv_auto("INFERFLUX_CUDA_KV_AUTO_TUNE", "0");
+  ScopedEnvVar kv_budget("INFERFLUX_CUDA_KV_BUDGET_MB", "256");
+  ScopedEnvVar kv_ratio("INFERFLUX_CUDA_KV_FREE_MEM_RATIO", "bad");
 
   const auto config = NativeBootstrapConfig::FromEnv("auto");
   REQUIRE(config.dtype_override == "fp16");

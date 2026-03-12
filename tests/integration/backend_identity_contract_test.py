@@ -29,11 +29,11 @@ class BackendIdentityContractTests(unittest.TestCase):
         self.log_file.write_text("[server] native runtime ready\n", encoding="utf-8")
         self.model = {
             "id": "bench-model",
-            "backend": "cuda",
+            "backend": "inferflux_cuda",
             "backend_exposure": {
-                "requested_backend": "cuda_native",
-                "exposed_backend": "cuda",
-                "provider": "native",
+                "requested_backend": "inferflux_cuda",
+                "exposed_backend": "inferflux_cuda",
+                "provider": "inferflux",
                 "fallback": False,
                 "fallback_reason": "",
             },
@@ -51,9 +51,9 @@ class BackendIdentityContractTests(unittest.TestCase):
                     "--model-id",
                     "bench-model",
                     "--expected-provider",
-                    "native",
+                    "inferflux",
                     "--expected-backend",
-                    "cuda",
+                    "inferflux_cuda",
                     "--log-file",
                     str(self.log_file),
                     "--forbid-log-pattern",

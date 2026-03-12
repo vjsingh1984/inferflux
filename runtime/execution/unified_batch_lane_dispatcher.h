@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -20,9 +20,9 @@ namespace inferflux {
 // It provides bounded submit/collect semantics keyed by UnifiedBatchHandle.
 class UnifiedBatchLaneDispatcher {
 public:
-  using UnifiedBatchInput = LlamaCPUBackend::UnifiedBatchInput;
-  using UnifiedBatchOutput = LlamaCPUBackend::UnifiedBatchOutput;
-  using UnifiedBatchHandle = LlamaCPUBackend::UnifiedBatchHandle;
+  using UnifiedBatchInput = LlamaCppBackend::UnifiedBatchInput;
+  using UnifiedBatchOutput = LlamaCppBackend::UnifiedBatchOutput;
+  using UnifiedBatchHandle = LlamaCppBackend::UnifiedBatchHandle;
 
   struct Config {
     std::size_t max_pending_per_lane{64};

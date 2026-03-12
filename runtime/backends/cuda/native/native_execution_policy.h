@@ -9,7 +9,7 @@
 namespace inferflux {
 
 struct NativeExecutionPolicy {
-  bool enable_batched_decode{false};
+  bool enable_batched_decode{true};
   bool disable_cuda_graph{false};
   bool phase_timing_enabled{false};
   bool force_cublas{false};
@@ -30,7 +30,8 @@ struct NativeExecutionPolicy {
   bool enable_experimental_q81_downproj_hot_fixed{false};
   bool enable_experimental_q81_downproj_rowpair_hot_fixed{false};
   bool enable_experimental_q81_grouped_hot_q4k{true};
-  bool enable_experimental_q81_grouped_rowpair_w4{false};
+  bool enable_experimental_q81_grouped_rowpair_w4{true};
+  bool enable_experimental_q81_grouped_rowquad_m4{false};
   bool enable_downproj_mmq{false};
   int downproj_mmq_min_batch_override{-1};
   bool use_vectorized_loads{false};
@@ -38,11 +39,11 @@ struct NativeExecutionPolicy {
   static NativeExecutionPolicy FromEnv() {
     NativeExecutionPolicy policy;
     policy.enable_batched_decode =
-        ParseBoolEnv("INFERFLUX_ENABLE_BATCHED_DECODE", false);
+        ParseBoolEnv("INFERFLUX_ENABLE_BATCHED_DECODE", true);
     policy.disable_cuda_graph =
         ParseBoolEnv("INFERFLUX_DISABLE_CUDA_GRAPH", false);
     policy.phase_timing_enabled =
-        ParseBoolEnv("INFERFLUX_NATIVE_PHASE_TIMING", false);
+        ParseBoolEnv("INFERFLUX_CUDA_PHASE_TIMING", false);
     policy.force_cublas = ParseBoolEnv("INFERFLUX_FORCE_CUBLAS", false);
     policy.disable_prepacked_activations =
         ParseBoolEnv("INFERFLUX_DISABLE_PREPACKED_ACTIVATIONS", false);
@@ -51,29 +52,29 @@ struct NativeExecutionPolicy {
     policy.disable_fused_gemv =
         ParseBoolEnv("INFERFLUX_DISABLE_FUSED_GEMV", false);
     policy.debug_decode_mapping =
-        ParseBoolEnv("INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING", false);
+        ParseBoolEnv("INFERFLUX_CUDA_DEBUG_DECODE_MAPPING", false);
     policy.debug_decode_mapping_limit =
-        ParseIntEnv("INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING_LIMIT", 32, 1,
+        ParseIntEnv("INFERFLUX_CUDA_DEBUG_DECODE_MAPPING_LIMIT", 32, 1,
                     std::numeric_limits<int>::max());
     policy.debug_logits = ParseBoolEnv("INFERFLUX_DEBUG_LOGITS", false);
     policy.debug_logits_limit =
         ParseIntEnv("INFERFLUX_DEBUG_LOGITS_LIMIT", 64, 1,
                     std::numeric_limits<int>::max());
     policy.debug_operator_selection =
-        ParseBoolEnv("INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION", false);
+        ParseBoolEnv("INFERFLUX_CUDA_DEBUG_OPERATOR_SELECTION", false);
     policy.debug_operator_selection_limit =
-        ParseIntEnv("INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION_LIMIT", 64, 1,
+        ParseIntEnv("INFERFLUX_CUDA_DEBUG_OPERATOR_SELECTION_LIMIT", 64, 1,
                     std::numeric_limits<int>::max());
     policy.timing_sample_rate =
-        ParseIntEnv("INFERFLUX_NATIVE_TIMING_SAMPLE_RATE", 0, 0,
+        ParseIntEnv("INFERFLUX_CUDA_TIMING_SAMPLE_RATE", 0, 0,
                     std::numeric_limits<int>::max());
-    if (std::getenv("INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL")) {
+    if (std::getenv("INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL")) {
       policy.require_fused_quantized_matmul_override = true;
       policy.require_fused_quantized_matmul =
-          ParseBoolEnv("INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL", false);
+          ParseBoolEnv("INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL", false);
     }
     if (const char *dequant_override =
-            std::getenv("INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY")) {
+            std::getenv("INFERFLUX_CUDA_DEQUANT_CACHE_POLICY")) {
       policy.dequantized_cache_policy_override = dequant_override;
     }
     policy.enable_experimental_q81_triple_rowpair = ParseBoolEnv(
@@ -86,7 +87,9 @@ struct NativeExecutionPolicy {
     policy.enable_experimental_q81_grouped_hot_q4k = ParseBoolEnv(
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", true);
     policy.enable_experimental_q81_grouped_rowpair_w4 = ParseBoolEnv(
-        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4", false);
+        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4", true);
+    policy.enable_experimental_q81_grouped_rowquad_m4 = ParseBoolEnv(
+        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWQUAD_M4", false);
     policy.enable_downproj_mmq =
         ParseBoolEnv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", false);
     policy.downproj_mmq_min_batch_override =

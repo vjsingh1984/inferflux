@@ -44,17 +44,17 @@ struct LlamaBackendConfig {
   // SerializeSequence/HydrateSequence. Disabled by default because it increases
   // memory footprint.
   bool cuda_phase_overlap_prefill_replica{false};
-  // KV cache precision policy for native CUDA runtime:
+  // KV cache precision policy for InferFlux CUDA runtime:
   // auto | fp16 | bf16 | int8 | fp8
   // `auto` keeps current behavior (match inference dtype).
-  std::string native_kv_cache_dtype{"auto"};
-  // Dequantized GGUF weight cache lifecycle in native CUDA runtime:
+  std::string inferflux_cuda_kv_cache_dtype{"auto"};
+  // Dequantized GGUF weight cache lifecycle in InferFlux CUDA runtime:
   // none (no caching) | batch (batch-boundary cleanup) |
   // model (persist for model lifetime; highest VRAM use).
-  std::string native_dequantized_cache_policy{"none"};
+  std::string inferflux_cuda_dequantized_cache_policy{"none"};
   // When true, quantized GGUF model-load fails unless fused dequant-tile GEMM
   // strategy is selected for this GPU/runtime capability set.
-  bool native_require_fused_quantized_matmul{false};
+  bool inferflux_cuda_require_fused_quantized_matmul{false};
   std::string
       mmproj_path; // Path to multimodal projector; empty = vision disabled.
   // Maximum number of KV-cache sequences that can be live simultaneously.
@@ -67,21 +67,21 @@ struct LlamaBackendConfig {
   int pp_degree{1}; // Pipeline Parallel degree
 };
 
-// When INFERFLUX_USE_COMMON_BACKEND_TYPES is enabled, LlamaCPUBackend
+// When INFERFLUX_USE_COMMON_BACKEND_TYPES is enabled, LlamaCppBackend
 // inherits from BackendInterface and uses common types. When disabled,
 // it maintains backward compatibility with nested types.
 #ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
-class LlamaCPUBackend : public BackendInterface {
+class LlamaCppBackend : public BackendInterface {
 #else
-class LlamaCPUBackend {
+class LlamaCppBackend {
 #endif
 public:
-  LlamaCPUBackend();
-  virtual ~LlamaCPUBackend();
+  LlamaCppBackend();
+  virtual ~LlamaCppBackend();
 
 #ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
   // Type aliases for backward compatibility with code that references
-  // LlamaCPUBackend::UnifiedBatchInput, etc.
+  // LlamaCppBackend::UnifiedBatchInput, etc.
   using UnifiedBatchInput = ::inferflux::UnifiedBatchInput;
   using UnifiedBatchOutput = ::inferflux::UnifiedBatchOutput;
   using UnifiedBatchLane = ::inferflux::UnifiedBatchLane;
@@ -337,7 +337,7 @@ public:
 #endif
 
 protected:
-  explicit LlamaCPUBackend(bool acquire_backend);
+  explicit LlamaCppBackend(bool acquire_backend);
   struct llama_sampler *active_sampler_{nullptr};
   std::shared_ptr<EPDispatch> ep_dispatch_;
   int tp_rank_{0};
@@ -374,5 +374,9 @@ private:
 #endif
   bool vision_ready_{false};
 };
+
+// Transitional alias while the active codebase migrates from the older
+// CPU-centric class name to the canonical llama.cpp engine name.
+using LlamaCppBackend = LlamaCppBackend;
 
 } // namespace inferflux

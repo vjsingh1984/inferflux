@@ -89,7 +89,7 @@ public:
   // ========================================================================
 
   /// Human-readable name of this backend (e.g., "llama_cpp_cpu",
-  /// "native_cuda").
+  /// "inferflux_cuda").
   virtual std::string Name() const = 0;
 
   /// Whether this backend is a fallback (degraded mode).

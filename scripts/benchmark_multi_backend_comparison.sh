@@ -2,7 +2,7 @@
 #
 # Multi-Backend Comparison Benchmark
 #
-# Benchmarks cuda_native, cuda_llama_cpp, Ollama, and LM Studio backends.
+# Benchmarks inferflux_cuda, llama_cpp_cuda, Ollama, and LM Studio backends.
 # Measures throughput, latency percentiles, and GPU memory consumption across
 # multiple concurrency levels to generate scaling curves.
 #
@@ -22,10 +22,13 @@
 #   SKIP_OLLAMA           - Skip Ollama benchmark (default: false)
 #   SKIP_LMSTUDIO         - Skip LM Studio benchmark (default: false)
 #   BUILD_DIR             - Build directory (default: auto-detect ./build or ./build-cuda)
-#   PORT_NATIVE           - Port for cuda_native (default: 18090)
-#   PORT_LLAMA            - Port for cuda_llama_cpp (default: 18091)
+#   PORT_NATIVE           - Port for inferflux_cuda (default: 18090)
+#   PORT_LLAMA            - Port for llama_cpp_cuda (default: 18091)
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_PROMPT_SUITE="$SCRIPT_DIR/../tests/data/benchmarks/prompt_suite_32.json"
 
 # ============================================================================
 # Configuration
@@ -46,6 +49,7 @@ CONCURRENCY_LEVELS="${CONCURRENCY_LEVELS:-1,2,4,8,16}"
 NUM_REQUESTS="${NUM_REQUESTS:-32}"
 MAX_TOKENS="${MAX_TOKENS:-64}"
 API_KEY="${API_KEY:-dev-key-123}"
+PROMPT_SUITE_PATH="${INFERFLUX_BENCH_PROMPT_SUITE:-$DEFAULT_PROMPT_SUITE}"
 
 # Backend ports
 PORT_NATIVE="${PORT_NATIVE:-18090}"
@@ -104,17 +108,168 @@ gpu_utilization() {
     nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '
 }
 
-# ============================================================================
-# Test Prompts (deterministic, temperature=0)
-# ============================================================================
+port_has_listener() {
+    local port=$1
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnH "sport = :$port" 2>/dev/null | grep -q LISTEN
+        return $?
+    fi
 
-PROMPTS=(
-    "Explain what a hash table is in two sentences."
-    "Write a Python function that returns the nth Fibonacci number."
-    "What is the capital of France? Answer in one word."
-    "Translate 'hello world' to Spanish."
-    "List three prime numbers greater than 10."
-)
+    python3 - "$port" <<'PYEOF'
+import socket
+import sys
+
+port = int(sys.argv[1])
+try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.2)
+    sys.exit(0 if sock.connect_ex(("127.0.0.1", port)) == 0 else 1)
+except PermissionError:
+    sys.exit(1)
+finally:
+    try:
+        sock.close()
+    except Exception:
+        pass
+PYEOF
+}
+
+wait_for_port_free() {
+    local port=$1
+    local waited=0
+    while [ $waited -lt 15 ]; do
+        if ! port_has_listener "$port"; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+require_port_free() {
+    local backend=$1 port=$2
+    if port_has_listener "$port"; then
+        log_err "$backend cannot start: port $port already has a listener"
+        log_err "Free the port or override PORT_NATIVE/PORT_LLAMA before rerunning."
+        return 1
+    fi
+    return 0
+}
+
+stop_stale_benchmark_inferflux_servers() {
+    # Only target benchmark-generated configs, not general manual server configs.
+    pkill -f 'inferfluxd --config .*config_inferflux_cuda.yaml' 2>/dev/null || true
+    pkill -f 'inferfluxd --config .*config_llama_cpp_cuda.yaml' 2>/dev/null || true
+}
+
+load_prompt_suite() {
+    local suite_path=$1
+    python3 - "$suite_path" <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    suite = json.load(f)
+for entry in suite.get("prompts", []):
+    prompt = entry.get("prompt", "")
+    if prompt:
+        print(prompt)
+PYEOF
+}
+
+write_prompt_suite_artifacts() {
+    local suite_copy="$OUTPUT_DIR/prompt_suite.json"
+    local summary_file="$OUTPUT_DIR/prompt_suite_summary.json"
+    if [ -n "${INFERFLUX_BENCH_SINGLE_PROMPT:-}" ]; then
+        python3 - "$summary_file" <<'PYEOF'
+import json
+import sys
+
+summary = {
+    "suite_id": "single_prompt_override",
+    "prompt_count": 1,
+    "categories": {"override": 1},
+    "output_modes": {"text": 1},
+    "length_buckets": {"custom": 1},
+}
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2, sort_keys=True)
+PYEOF
+        return 0
+    fi
+
+    cp "$PROMPT_SUITE_PATH" "$suite_copy"
+    python3 - "$PROMPT_SUITE_PATH" "$summary_file" <<'PYEOF'
+import collections
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    suite = json.load(f)
+prompts = suite.get("prompts", [])
+summary = {
+    "suite_id": suite.get("suite_id", "unknown"),
+    "prompt_count": len(prompts),
+    "categories": dict(collections.Counter(p.get("category", "unknown") for p in prompts)),
+    "output_modes": dict(collections.Counter(p.get("output_mode", "unknown") for p in prompts)),
+    "length_buckets": dict(collections.Counter(p.get("prompt_length_bucket", "unknown") for p in prompts)),
+}
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2, sort_keys=True)
+PYEOF
+}
+
+write_prompt_rotation_plan() {
+    local backend=$1 concurrency=$2
+    local plan_file="$OUTPUT_DIR/prompt_plan_${backend}_c${concurrency}.json"
+    if [ -n "${INFERFLUX_BENCH_SINGLE_PROMPT:-}" ]; then
+        python3 - "$plan_file" "$NUM_REQUESTS" <<'PYEOF'
+import json
+import sys
+
+count = int(sys.argv[2])
+plan = [{
+    "request_index": i,
+    "prompt_id": "single_prompt_override",
+    "category": "override",
+    "prompt_length_bucket": "custom",
+    "output_mode": "text",
+} for i in range(count)]
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump(plan, f, indent=2)
+PYEOF
+        return 0
+    fi
+
+    python3 - "$PROMPT_SUITE_PATH" "$NUM_REQUESTS" "$plan_file" <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    prompts = json.load(f).get("prompts", [])
+count = int(sys.argv[2])
+plan = []
+for i in range(count):
+    entry = prompts[i % len(prompts)]
+    plan.append({
+        "request_index": i,
+        "prompt_id": entry.get("id", f"prompt_{i}"),
+        "category": entry.get("category", "unknown"),
+        "prompt_length_bucket": entry.get("prompt_length_bucket", "unknown"),
+        "output_mode": entry.get("output_mode", "unknown"),
+    })
+with open(sys.argv[3], "w", encoding="utf-8") as f:
+    json.dump(plan, f, indent=2)
+PYEOF
+}
+
+# Deterministic benchmark prompts
+if [ -n "${INFERFLUX_BENCH_SINGLE_PROMPT:-}" ]; then
+    PROMPTS=("$INFERFLUX_BENCH_SINGLE_PROMPT")
+else
+    mapfile -t PROMPTS < <(load_prompt_suite "$PROMPT_SUITE_PATH")
+fi
 
 # ============================================================================
 # InferFlux Server Management
@@ -147,8 +302,8 @@ runtime:
     phase_overlap:
       enabled: true
   backend_exposure:
-    prefer_native: $([ "$backend" = "cuda_native" ] && echo "true" || echo "false")
-    allow_llama_cpp_fallback: $([ "$backend" = "cuda_native" ] && echo "false" || echo "true")
+    prefer_inferflux: $([ "$backend" = "inferflux_cuda" ] && echo "true" || echo "false")
+    allow_llama_cpp_fallback: $([ "$backend" = "inferflux_cuda" ] && echo "false" || echo "true")
   scheduler:
     max_batch_size: 32
     max_batch_tokens: 16384
@@ -156,7 +311,7 @@ runtime:
     batch_accumulation_ms: 2
   disaggregated:
     prefill_pool_size: ${INFERFLUX_SCHED_PREFILL_POOL_SIZE:-1}
-    decode_pool_size: ${INFERFLUX_SCHED_DECODE_POOL_SIZE:-0}
+    decode_pool_size: ${INFERFLUX_SCHED_DECODE_POOL_SIZE:-1}
   paged_kv:
     cpu_pages: 4096
     eviction: lru
@@ -181,21 +336,32 @@ start_inferflux_server() {
     local config_file="$OUTPUT_DIR/config_${backend}.yaml"
     local log_file="$OUTPUT_DIR/server_${backend}.log"
 
+    stop_inferflux_server "$backend" >/dev/null 2>&1 || true
+    if ! wait_for_port_free "$port"; then
+        log_err "$backend cannot start: port $port did not become free after cleanup"
+        return 1
+    fi
+    if ! require_port_free "$backend" "$port"; then
+        return 1
+    fi
+
     write_inferflux_config "$backend" "$port" "$config_file"
 
     log "Starting $backend on port $port..."
 
     # Set environment variables for native backend
-    local kv_batch="${INFERFLUX_NATIVE_KV_MAX_BATCH:-16}"
-    local kv_seq="${INFERFLUX_NATIVE_KV_MAX_SEQ:-2048}"
-    local strict="$([ "$backend" = "cuda_native" ] && echo "1" || echo "0")"
+    local kv_batch="${INFERFLUX_CUDA_KV_MAX_BATCH:-16}"
+    local kv_seq="${INFERFLUX_CUDA_KV_MAX_SEQ:-2048}"
+    local strict="$([ "$backend" = "inferflux_cuda" ] && echo "1" || echo "0")"
+    local enable_batched_decode="${INFERFLUX_ENABLE_BATCHED_DECODE:-1}"
 
     INFERFLUX_PORT_OVERRIDE=$port INFERCTL_API_KEY=$API_KEY \
         INFERFLUX_LOG_LEVEL=warning \
-        INFERFLUX_NATIVE_KV_MAX_BATCH=$kv_batch \
-        INFERFLUX_NATIVE_KV_MAX_SEQ=$kv_seq \
-        INFERFLUX_NATIVE_CUDA_STRICT=$strict \
-        INFERFLUX_NATIVE_DISABLE_PARITY_DELEGATE=$strict \
+        INFERFLUX_ENABLE_BATCHED_DECODE=$enable_batched_decode \
+        INFERFLUX_CUDA_KV_MAX_BATCH=$kv_batch \
+        INFERFLUX_CUDA_KV_MAX_SEQ=$kv_seq \
+        INFERFLUX_CUDA_STRICT=$strict \
+        INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE=$strict \
         "$BUILD_DIR/inferfluxd" --config "$config_file" \
         > "$log_file" 2>&1 &
     local pid=$!
@@ -211,6 +377,12 @@ start_inferflux_server() {
         fi
         if curl -sf -H "Authorization: Bearer $API_KEY" \
             "http://127.0.0.1:$port/livez" >/dev/null 2>&1; then
+            sleep 1
+            if ! kill -0 $pid 2>/dev/null; then
+                log_err "$backend exited immediately after readiness. Last log lines:"
+                tail -20 "$log_file"
+                return 1
+            fi
             log_ok "$backend ready (PID $pid)"
             return 0
         fi
@@ -227,6 +399,11 @@ start_inferflux_server() {
 stop_inferflux_server() {
     local backend=$1
     local pidfile="$OUTPUT_DIR/${backend}.pid"
+    local port=""
+    case "$backend" in
+        inferflux_cuda) port="$PORT_NATIVE" ;;
+        llama_cpp_cuda) port="$PORT_LLAMA" ;;
+    esac
     if [ -f "$pidfile" ]; then
         local pid=$(cat "$pidfile")
         if kill -0 "$pid" 2>/dev/null; then
@@ -236,6 +413,18 @@ stop_inferflux_server() {
         fi
         rm -f "$pidfile"
     fi
+    if [ -n "$port" ]; then
+        if ! wait_for_port_free "$port"; then
+            log_warn "$backend port $port is still busy after shutdown"
+            return 1
+        fi
+    fi
+    local log_file="$OUTPUT_DIR/server_${backend}.log"
+    if has_fatal_runtime_signature "$log_file"; then
+        log_err "$backend log contains fatal runtime signature; treat this backend result as invalid"
+        return 1
+    fi
+    return 0
 }
 
 reset_benchmark_artifacts() {
@@ -243,7 +432,41 @@ reset_benchmark_artifacts() {
     rm -rf "$OUTPUT_DIR/responses_${backend}/c${concurrency}"
     rm -f "$OUTPUT_DIR/stats_${backend}_c${concurrency}.json" \
           "$OUTPUT_DIR/mem_trace_${backend}_c${concurrency}.txt" \
-          "$OUTPUT_DIR/admin_cache_${backend}_c${concurrency}.json"
+          "$OUTPUT_DIR/admin_cache_${backend}_c${concurrency}.json" \
+          "$OUTPUT_DIR/metrics_${backend}_c${concurrency}.txt" \
+          "$OUTPUT_DIR/inferflux_cuda_bucket_winners_${backend}_c${concurrency}.json"
+}
+
+capture_inferflux_metrics_snapshot() {
+    local backend=$1 port=$2 concurrency=$3
+    local metrics_file="$OUTPUT_DIR/metrics_${backend}_c${concurrency}.txt"
+
+    if ! curl -sf -H "Authorization: Bearer $API_KEY" \
+        "http://127.0.0.1:$port/metrics" > "$metrics_file" 2>/dev/null; then
+        log_warn "  Failed to capture metrics snapshot for $backend @ c=$concurrency"
+        return 1
+    fi
+    return 0
+}
+
+capture_inferflux_cuda_bucket_winners() {
+    local backend=$1 concurrency=$2
+    local metrics_file="$OUTPUT_DIR/metrics_${backend}_c${concurrency}.txt"
+    local summary_file="$OUTPUT_DIR/inferflux_cuda_bucket_winners_${backend}_c${concurrency}.json"
+    local stats_file="$OUTPUT_DIR/stats_${backend}_c${concurrency}.json"
+
+    if [ "$backend" != "inferflux_cuda" ] || [ ! -f "$metrics_file" ] || [ ! -f "$stats_file" ]; then
+        return 0
+    fi
+
+    python3 scripts/extract_native_dispatch_winners.py \
+        "$metrics_file" "$summary_file" --stats "$stats_file"
+}
+
+has_fatal_runtime_signature() {
+    local log_file=$1
+    [ -f "$log_file" ] || return 1
+    grep -Eqi 'double free|corruption \(|segmentation fault|addresssanitizer|terminate called after throwing|fatal glibc error|aborted \(core dumped\)' "$log_file"
 }
 
 capture_inferflux_admin_cache_snapshot() {
@@ -283,15 +506,18 @@ stats["memory_snapshot"] = memory
 with open(stats_path, "w") as f:
     json.dump(stats, f, indent=2)
 
-native_model = memory.get("native_model", {})
-native_kv = memory.get("native_kv", {})
+inferflux_cuda_model = memory.get("inferflux_cuda_model", {})
+inferflux_cuda_kv = memory.get("inferflux_cuda_kv", {})
 paged_kv = memory.get("paged_kv", {})
 
-print("native_model_reserved_bytes=" + str(native_model.get("reserved_bytes", 0)))
-print("native_model_in_use_bytes=" + str(native_model.get("in_use_bytes", 0)))
-print("native_kv_active_bytes=" + str(native_kv.get("active_bytes", 0)))
-print("native_kv_prefix_retained_bytes=" +
-      str(native_kv.get("prefix_retained_bytes", 0)))
+print("inferflux_cuda_model_reserved_bytes=" +
+      str(inferflux_cuda_model.get("reserved_bytes", 0)))
+print("inferflux_cuda_model_in_use_bytes=" +
+      str(inferflux_cuda_model.get("in_use_bytes", 0)))
+print("inferflux_cuda_kv_active_bytes=" +
+      str(inferflux_cuda_kv.get("active_bytes", 0)))
+print("inferflux_cuda_kv_prefix_retained_bytes=" +
+      str(inferflux_cuda_kv.get("prefix_retained_bytes", 0)))
 print("paged_kv_used_bytes=" + str(paged_kv.get("used_bytes", 0)))
 print("paged_kv_prefix_retained_bytes=" +
       str(paged_kv.get("prefix_retained_bytes", 0)))
@@ -469,6 +695,7 @@ run_benchmark() {
 
     local results_dir="$OUTPUT_DIR/responses_${backend}/c${concurrency}"
     mkdir -p "$results_dir"
+    write_prompt_rotation_plan "$backend" "$concurrency"
 
     # Warmup
     log "  Warmup (2 requests)..."
@@ -613,6 +840,7 @@ EOF
 
     local memory_summary=""
     if [ "$backend_kind" = "inferflux" ]; then
+        capture_inferflux_metrics_snapshot "$backend" "$port_or_url" "$concurrency" >/dev/null 2>&1 || true
         memory_summary=$(capture_inferflux_admin_cache_snapshot \
             "$backend" "$port_or_url" "$concurrency" 2>/dev/null || true)
     fi
@@ -622,10 +850,114 @@ EOF
         log "  Memory snapshot:"
         printf '%s\n' "$memory_summary" | sed 's/^/    /'
     fi
+    if [ "$backend" = "inferflux_cuda" ]; then
+        local bucket_winner_summary=""
+        bucket_winner_summary=$(capture_inferflux_cuda_bucket_winners "$backend" "$concurrency" 2>/dev/null || true)
+        if [ -n "${bucket_winner_summary:-}" ]; then
+            log "  Native dispatch bucket winners:"
+            printf '%s\n' "$bucket_winner_summary" | sed 's/^/    /'
+        fi
+    fi
 
     if [ $success_count -lt $NUM_REQUESTS ]; then
         return 1
     fi
+}
+
+# ============================================================================
+# Response Similarity
+# ============================================================================
+
+compare_responses() {
+    python3 - "$OUTPUT_DIR" "$CONCURRENCY_LEVELS" <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+results_dir = sys.argv[1]
+concurrency_levels = [int(x) for x in sys.argv[2].split(',')]
+backends = ["llama_cpp_cuda", "inferflux_cuda"]
+
+def tokenize(text):
+    return re.findall(r'\w+', text.lower())
+
+def jaccard(a, b):
+    sa, sb = set(a), set(b)
+    union = sa | sb
+    return len(sa & sb) / len(union) if union else 1.0
+
+def overlap(a, b):
+    sa, sb = set(a), set(b)
+    total = len(sa) + len(sb)
+    return 2.0 * len(sa & sb) / total if total else 1.0
+
+for concurrency in concurrency_levels:
+    responses = {}
+    for backend in backends:
+        resp_dir = os.path.join(results_dir, f"responses_{backend}", f"c{concurrency}")
+        if not os.path.isdir(resp_dir):
+            continue
+        responses[backend] = {}
+        for name in sorted(os.listdir(resp_dir)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                idx = int(name.split("_")[1].split(".")[0])
+                with open(os.path.join(resp_dir, name), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                responses[backend][idx] = data.get("text", "")
+            except Exception:
+                continue
+
+    if len(responses) < 2:
+        continue
+
+    lhs = responses[backends[0]]
+    rhs = responses[backends[1]]
+    common = sorted(set(lhs.keys()) & set(rhs.keys()))
+    if not common:
+        continue
+
+    exact = 0
+    jaccards = []
+    overlaps = []
+    for idx in common:
+        ta, tb = lhs[idx], rhs[idx]
+        if ta == tb:
+            exact += 1
+        toks_a = tokenize(ta)
+        toks_b = tokenize(tb)
+        jaccards.append(jaccard(toks_a, toks_b))
+        overlaps.append(overlap(toks_a, toks_b))
+
+    comp = {
+        "concurrency": concurrency,
+        "backends": backends,
+        "num_compared": len(common),
+        "exact_match_rate": exact / len(common),
+        "mean_jaccard": sum(jaccards) / len(jaccards),
+        "mean_overlap": sum(overlaps) / len(overlaps),
+    }
+
+    sim_path = os.path.join(results_dir, f"similarity_c{concurrency}.json")
+    with open(sim_path, "w", encoding="utf-8") as f:
+        json.dump(comp, f, indent=2)
+
+    for backend, peer in ((backends[0], backends[1]), (backends[1], backends[0])):
+        stats_path = os.path.join(results_dir, f"stats_{backend}_c{concurrency}.json")
+        if not os.path.exists(stats_path):
+            continue
+        with open(stats_path, "r", encoding="utf-8") as f:
+            stats = json.load(f)
+        stats["comparison_backend"] = peer
+        stats["compared_responses"] = comp["num_compared"]
+        stats["exact_match_rate"] = comp["exact_match_rate"]
+        stats["mean_jaccard"] = comp["mean_jaccard"]
+        stats["mean_overlap"] = comp["mean_overlap"]
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
+PYEOF
 }
 
 # ============================================================================
@@ -646,6 +978,9 @@ main() {
     echo ""
 
     mkdir -p "$OUTPUT_DIR"
+    write_prompt_suite_artifacts
+    stop_stale_benchmark_inferflux_servers
+    sleep 1
 
     # Validate model
     if [ ! -f "$MODEL_PATH" ]; then
@@ -668,6 +1003,8 @@ main() {
 
     local mem_baseline=$(gpu_mem_mb)
     log "GPU baseline memory: ${mem_baseline} MB"
+    log "InferFlux backends will run one at a time."
+    log "Each backend is torn down before the next one starts."
 
     # Convert comma-separated concurrency levels to array
     IFS=',' read -ra CONCURRENCY_ARRAY <<< "$CONCURRENCY_LEVELS"
@@ -677,11 +1014,13 @@ main() {
     declare -A BACKEND_KIND
     declare -A BACKEND_AVAILABLE
 
-    BACKEND_PORTS[cuda_native]=$PORT_NATIVE
-    BACKEND_KIND[cuda_native]=inferflux
+    BACKEND_PORTS[inferflux_cuda]=$PORT_NATIVE
+    BACKEND_KIND[inferflux_cuda]=inferflux
+    BACKEND_AVAILABLE[inferflux_cuda]=true
 
-    BACKEND_PORTS[cuda_llama_cpp]=$PORT_LLAMA
-    BACKEND_KIND[cuda_llama_cpp]=inferflux
+    BACKEND_PORTS[llama_cpp_cuda]=$PORT_LLAMA
+    BACKEND_KIND[llama_cpp_cuda]=inferflux
+    BACKEND_AVAILABLE[llama_cpp_cuda]=true
 
     BACKEND_PORTS[ollama]="$OLLAMA_HOST"
     BACKEND_KIND[ollama]=ollama
@@ -689,7 +1028,7 @@ main() {
     BACKEND_PORTS[lmstudio]="$LMSTUDIO_HOST"
     BACKEND_KIND[lmstudio]=lmstudio
 
-    for backend in cuda_native cuda_llama_cpp ollama lmstudio; do
+    for backend in inferflux_cuda llama_cpp_cuda ollama lmstudio; do
         for concurrency in "${CONCURRENCY_ARRAY[@]}"; do
             reset_benchmark_artifacts "$backend" "$concurrency"
         done
@@ -714,31 +1053,31 @@ main() {
         BACKEND_AVAILABLE[lmstudio]=false
     fi
 
-    # Start InferFlux servers
-    for backend in cuda_native cuda_llama_cpp; do
-        local port=${BACKEND_PORTS[$backend]}
-        echo ""
-        header "Starting: $backend"
-        if start_inferflux_server "$backend" "$port"; then
-            BACKEND_AVAILABLE[$backend]=true
-        else
-            log_err "Failed to start $backend"
-            BACKEND_AVAILABLE[$backend]=false
-        fi
-    done
-
     # Run benchmarks for all backends and concurrency levels
-    for backend in cuda_native cuda_llama_cpp ollama lmstudio; do
+    for backend in inferflux_cuda llama_cpp_cuda ollama lmstudio; do
         if [ "${BACKEND_AVAILABLE[$backend]}" != "true" ]; then
             continue
+        fi
+
+        local port_or_url="${BACKEND_PORTS[$backend]}"
+        local backend_kind="${BACKEND_KIND[$backend]}"
+
+        if [ "$backend_kind" = "inferflux" ]; then
+            echo ""
+            header "Starting: $backend"
+            local mem_before_start=$(gpu_mem_mb)
+            if ! start_inferflux_server "$backend" "$port_or_url"; then
+                log_err "Failed to start $backend"
+                continue
+            fi
+            local mem_after_start=$(gpu_mem_mb)
+            local mem_for_model=$((mem_after_start - mem_before_start))
+            log "GPU memory after $backend startup: ${mem_after_start} MB (delta: +${mem_for_model} MB)"
         fi
 
         for concurrency in "${CONCURRENCY_ARRAY[@]}"; do
             echo ""
             header "Benchmarking: $backend @ concurrency=$concurrency"
-
-            local port_or_url="${BACKEND_PORTS[$backend]}"
-            local backend_kind="${BACKEND_KIND[$backend]}"
 
             if ! run_benchmark "$backend" "$concurrency" "$port_or_url" "$backend_kind"; then
                 log_warn "  Some requests failed for $backend @ c=$concurrency"
@@ -747,14 +1086,20 @@ main() {
             # Let GPU memory settle between runs
             sleep 2
         done
+
+        if [ "$backend_kind" = "inferflux" ]; then
+            local mem_before_stop=$(gpu_mem_mb)
+            if ! stop_inferflux_server "$backend"; then
+                log_warn "  $backend shutdown reported a fatal runtime signature"
+            fi
+            sleep 3
+            local mem_after_stop=$(gpu_mem_mb)
+            local mem_freed=$((mem_before_stop - mem_after_stop))
+            log "GPU memory after stopping $backend: ${mem_after_stop} MB (freed: ${mem_freed} MB)"
+        fi
     done
 
-    # Stop servers
-    echo ""
-    log "Stopping servers..."
-    stop_inferflux_server cuda_native 2>/dev/null || true
-    stop_inferflux_server cuda_llama_cpp 2>/dev/null || true
-    sleep 2
+    compare_responses
 
     # Generate comparison report
     echo ""
@@ -778,7 +1123,7 @@ import json, os, sys
 output_dir = sys.argv[1]
 concurrency_levels = sys.argv[2].split(',')
 
-backends = ['cuda_native', 'cuda_llama_cpp', 'ollama', 'lmstudio']
+backends = ['inferflux_cuda', 'llama_cpp_cuda', 'ollama', 'lmstudio']
 
 # Load all results
 results = {}
@@ -837,6 +1182,20 @@ for backend in backends:
                 print(f"c={c}={mem:.0f}MB ({mem_ratio:.2f}x)  ", end='')
         print()
 
+print()
+print("Similarity (inferflux_cuda vs llama_cpp_cuda):")
+print("-" * 60)
+for c in sorted([int(x) for x in concurrency_levels]):
+    sim_file = os.path.join(output_dir, f"similarity_c{c}.json")
+    if not os.path.exists(sim_file):
+        continue
+    with open(sim_file) as f:
+        sim = json.load(f)
+    print(f"c={c:<2} exact={sim.get('exact_match_rate', 0.0):.3f}  "
+          f"jaccard={sim.get('mean_jaccard', 0.0):.3f}  "
+          f"overlap={sim.get('mean_overlap', 0.0):.3f}  "
+          f"compared={sim.get('num_compared', 0)}")
+
 PYEOF
 }
 
@@ -852,7 +1211,7 @@ output_dir = sys.argv[1]
 concurrency_levels = sys.argv[2].split(',')
 model_path = sys.argv[3]
 
-backends = ['cuda_native', 'cuda_llama_cpp', 'ollama', 'lmstudio']
+backends = ['inferflux_cuda', 'llama_cpp_cuda', 'ollama', 'lmstudio']
 
 combined = {
     'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
@@ -860,7 +1219,8 @@ combined = {
     'num_requests': int(os.environ.get('NUM_REQUESTS', 32)),
     'max_tokens': int(os.environ.get('MAX_TOKENS', 64)),
     'concurrency_levels': [int(c) for c in concurrency_levels],
-    'backends': {}
+    'backends': {},
+    'similarity': {}
 }
 
 for backend in backends:
@@ -870,6 +1230,12 @@ for backend in backends:
         if os.path.exists(stats_file):
             with open(stats_file) as f:
                 combined['backends'][backend][int(c)] = json.load(f)
+
+for c in concurrency_levels:
+    sim_file = os.path.join(output_dir, f"similarity_c{c}.json")
+    if os.path.exists(sim_file):
+        with open(sim_file) as f:
+            combined['similarity'][int(c)] = json.load(f)
 
 output_file = os.path.join(output_dir, f"combined_results_{time.strftime('%Y%m%d_%H%M%S')}.json")
 with open(output_file, 'w') as f:
@@ -881,7 +1247,7 @@ print(f"Combined results saved to: {output_file}")
 csv_file = os.path.join(output_dir, f"scaling_curves_{time.strftime('%Y%m%d_%H%M%S')}.csv")
 with open(csv_file, 'w') as f:
     f.write("backend,concurrency,tok_per_sec,avg_latency_ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,gpu_mem_peak_mb,gpu_util_peak_percent,")
-    f.write("native_model_reserved_bytes,native_model_in_use_bytes,native_kv_active_bytes,native_kv_prefix_retained_bytes,")
+    f.write("inferflux_cuda_model_reserved_bytes,inferflux_cuda_model_in_use_bytes,inferflux_cuda_kv_active_bytes,inferflux_cuda_kv_prefix_retained_bytes,")
     f.write("paged_kv_used_bytes,paged_kv_prefix_retained_bytes\n")
     for backend in backends:
         for c in concurrency_levels:
@@ -889,13 +1255,13 @@ with open(csv_file, 'w') as f:
             if ci in combined['backends'].get(backend, {}):
                 r = combined['backends'][backend][ci]
                 memory = r.get('memory_snapshot', {})
-                native_model = memory.get('native_model', {})
-                native_kv = memory.get('native_kv', {})
+                inferflux_cuda_model = memory.get('inferflux_cuda_model', {})
+                inferflux_cuda_kv = memory.get('inferflux_cuda_kv', {})
                 paged_kv = memory.get('paged_kv', {})
                 f.write(f"{backend},{c},{r['tok_per_sec']},{r['avg_latency_ms']},{r['p50_latency_ms']},")
                 f.write(f"{r['p95_latency_ms']},{r['p99_latency_ms']},{r['gpu_mem_peak_mb']},{r['gpu_util_peak_percent']},")
-                f.write(f"{native_model.get('reserved_bytes', 0)},{native_model.get('in_use_bytes', 0)},")
-                f.write(f"{native_kv.get('active_bytes', 0)},{native_kv.get('prefix_retained_bytes', 0)},")
+                f.write(f"{inferflux_cuda_model.get('reserved_bytes', 0)},{inferflux_cuda_model.get('in_use_bytes', 0)},")
+                f.write(f"{inferflux_cuda_kv.get('active_bytes', 0)},{inferflux_cuda_kv.get('prefix_retained_bytes', 0)},")
                 f.write(f"{paged_kv.get('used_bytes', 0)},{paged_kv.get('prefix_retained_bytes', 0)}\n")
 
 print(f"CSV for plotting saved to: {csv_file}")
@@ -908,8 +1274,17 @@ PYEOF
 # ============================================================================
 
 cleanup() {
-    stop_inferflux_server cuda_native 2>/dev/null || true
-    stop_inferflux_server cuda_llama_cpp 2>/dev/null || true
+    log "Running cleanup..."
+    local mem_before=$(gpu_mem_mb 2>/dev/null || echo "0")
+    stop_inferflux_server inferflux_cuda 2>/dev/null || true
+    stop_inferflux_server llama_cpp_cuda 2>/dev/null || true
+    stop_stale_benchmark_inferflux_servers
+    sleep 2
+    local mem_after=$(gpu_mem_mb 2>/dev/null || echo "0")
+    local mem_freed=$((mem_before - mem_after))
+    if [ $mem_before -gt 0 ] && [ $mem_after -ge 0 ]; then
+        log "Cleanup: GPU memory ${mem_before} MB → ${mem_after} MB (freed: ${mem_freed} MB)"
+    fi
 }
 
 trap cleanup EXIT

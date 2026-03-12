@@ -8,7 +8,7 @@
 flowchart LR
     A[GGUF artifact] --> B[Loader detection]
     B --> C[Quantization metadata]
-    C --> D[native CUDA or llama.cpp compatibility path]
+    C --> D[InferFlux CUDA or llama.cpp compatibility path]
     D --> E[metrics + smoke validation]
 ```
 
@@ -17,7 +17,7 @@ flowchart LR
 | Area | Current contract |
 |---|---|
 | Format detection | Loader selection is based on artifact structure/metadata, not filename conventions |
-| Runtime paths | `native_cuda` and `cuda_llama_cpp` both accept GGUF artifacts |
+| Runtime paths | `inferflux_cuda` and `llama_cpp_cuda` both accept GGUF artifacts |
 | Quantization metadata | GGUF tensor types drive handler/strategy selection |
 | Alias handling | `q4_k_m`, `q6_k_m`, and `q8_k_m` aliases resolve to their canonical GGUF tensor families |
 | Memory policy | Native quantized path defaults to memory-first `dequant_cache_policy=none` |
@@ -27,8 +27,8 @@ flowchart LR
 
 | Path | What it is best at today | Current caution |
 |---|---|---|
-| `native_cuda` | First-party runtime control, native metrics, memory policy control, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp) with Q8_1/dp4a/RmsNorm fusion, batched decode default-on, adaptive dispatch geometry, native logprobs, native embeddings, execution policy refactor | Single-sequence throughput gap vs llama.cpp (~0.35-0.76x); v2 cooperative-warp GEMV targeting ≥55% bandwidth utilization |
-| `cuda_llama_cpp` | Stable GGUF compatibility and lower operational risk, higher single-sequence throughput today | Lower ceiling for InferFlux-specific runtime innovation |
+| `inferflux_cuda` | First-party runtime control, native metrics, memory policy control, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp) with Q8_1/dp4a/RmsNorm fusion, batched decode default-on, adaptive dispatch geometry, native logprobs, native embeddings, execution policy refactor | Single-sequence throughput gap vs llama.cpp compatibility path (~0.35-0.76x); v2 cooperative-warp GEMV targeting ≥55% bandwidth utilization |
+| `llama_cpp_cuda` | Stable GGUF compatibility and lower operational risk, higher single-sequence throughput today | Lower ceiling for InferFlux-specific runtime innovation |
 
 ## 3) Runtime Components
 
@@ -39,7 +39,7 @@ flowchart LR
 | GGUF loader | `runtime/backends/cuda/native/gguf_model_loader.{h,cpp}` |
 | Quantization registry/handlers | `runtime/backends/cuda/native/quantization_handler.{h,cpp}` |
 | Quantized weight map | `runtime/backends/cuda/native/quantized_weight_map.{h,cpp}` |
-| Native execution core | `runtime/backends/cuda/native_kernel_executor.cpp` |
+| InferFlux CUDA execution core | `runtime/backends/cuda/inferflux_cuda_executor.cpp` |
 
 ## 4) Supported Native GGUF Families
 
@@ -87,7 +87,7 @@ Benchmark harness tuning knobs:
 - `INFERFLUX_BENCH_BATCH_ACCUMULATION_MS`
 - `INFERFLUX_BENCH_DECODE_BURST_TOKENS`
 - `INFERFLUX_BENCH_NATIVE_TIMING_SAMPLE_RATE`
-  Use `0` for pure throughput runs; use `N>1` to sample native CUDA timing every `N`th work item without timing every prefill request.
+  Use `0` for pure throughput runs; use `N>1` to sample InferFlux CUDA timing every `N`th work item without timing every prefill request.
   The harness default for `INFERFLUX_BENCH_DECODE_BURST_TOKENS` is now `0`.
   `>1` remains an explicit experiment only until native batched decode parity is closed.
 
@@ -101,8 +101,8 @@ Current evidence:
 
 | Goal | Recommended path |
 |---|---|
-| Validate strict native behavior | Use `backend=cuda` with strict-native policy and inspect provider metadata |
-| Lowest compatibility risk on GGUF | Use `cuda_llama_cpp` |
+| Validate strict InferFlux behavior | Use `backend=cuda` with strict-native policy and inspect provider metadata |
+| Lowest compatibility risk on GGUF | Use `llama_cpp_cuda` |
 | Memory-constrained native experimentation | Keep native quantized dequant policy on `none` and let KV auto-tune protect VRAM |
 
 ## 7) Validation Commands
@@ -116,8 +116,8 @@ ctest --test-dir build -R GGUFMemoryContractTests --output-on-failure
 Runtime checks:
 
 ```bash
-curl -s http://127.0.0.1:8080/metrics | grep inferflux_native_forward_passes_total
-curl -s http://127.0.0.1:8080/metrics | grep inferflux_native_kv_
+curl -s http://127.0.0.1:8080/metrics | grep inferflux_cuda_forward_passes_total
+curl -s http://127.0.0.1:8080/metrics | grep inferflux_cuda_kv_
 ./build/inferctl models --json --api-key dev-key-123
 ```
 

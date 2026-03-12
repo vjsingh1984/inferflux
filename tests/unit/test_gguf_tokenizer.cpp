@@ -2,7 +2,7 @@
 
 #include "model/gguf_tokenizer.h"
 #include "model/llama_tokenizer.h"
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
 
 #include <filesystem>
@@ -125,7 +125,7 @@ TEST_CASE("GGUFTokenizer matches llama tokenizer on local Qwen GGUF prompts",
   }
 }
 
-TEST_CASE("LlamaCPUBackend treats GGUF end-of-generation tokens as terminal",
+TEST_CASE("LlamaCppBackend treats GGUF end-of-generation tokens as terminal",
           "[gguf][tokenizer_factory][local_model]") {
   const std::string model_path =
       "models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf";
@@ -140,7 +140,7 @@ TEST_CASE("LlamaCPUBackend treats GGUF end-of-generation tokens as terminal",
   GGUFTokenizer gguf_tok;
   REQUIRE(gguf_tok.Load(model_path));
 
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   LlamaBackendConfig config;
   config.gpu_layers = 0;
   REQUIRE(backend.LoadModel(model_path, config));

@@ -39,20 +39,20 @@ add_library(inferflux_core
   runtime/tensors/tensor.h
   runtime/backends/cpu/cpu_backend.cpp
   runtime/backends/cpu/cpu_backend.h
-  runtime/backends/cpu/llama_backend.cpp
-  runtime/backends/cpu/llama_backend.h
+  runtime/backends/cpu/llama_cpp_backend.cpp
+  runtime/backends/cpu/llama_cpp_backend.h
   runtime/backends/cuda/cuda_device_context.cpp
   runtime/backends/cuda/cuda_device_context.h
   runtime/backends/cuda/cuda_backend.cpp
   runtime/backends/cuda/cuda_backend.h
-  runtime/backends/cuda/native_cuda_runtime.cpp
-  runtime/backends/cuda/native_cuda_runtime.h
-  runtime/backends/cuda/native_cuda_backend.cpp
-  runtime/backends/cuda/native_cuda_backend.h
+  runtime/backends/cuda/inferflux_cuda_runtime.cpp
+  runtime/backends/cuda/inferflux_cuda_runtime.h
+  runtime/backends/cuda/inferflux_cuda_backend.cpp
+  runtime/backends/cuda/inferflux_cuda_backend.h
   runtime/backends/cuda/native/safetensors_parser.cpp
   runtime/backends/cuda/native/safetensors_parser.h
-  runtime/backends/cuda/native_kernel_executor.cpp
-  runtime/backends/cuda/native_kernel_executor.h
+  runtime/backends/cuda/inferflux_cuda_executor.cpp
+  runtime/backends/cuda/inferflux_cuda_executor.h
   runtime/backends/cuda/native/native_bootstrap_config.cpp
   model/tokenizer_factory.cpp
   model/tokenizer_factory.h
@@ -220,6 +220,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   # Add native CUDA C++ sources to inferflux_core
   target_sources(inferflux_core PRIVATE
     runtime/backends/cuda/native/cublas_gemm.cpp
+    runtime/backends/cuda/native/native_dispatch_registry.cpp
     runtime/backends/cuda/native/native_dispatch_policy.cpp
     runtime/backends/cuda/native/weight_map.cpp
     runtime/backends/cuda/native/model_forward_factory.cpp

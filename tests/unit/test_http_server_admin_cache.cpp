@@ -70,18 +70,18 @@ TEST_CASE("HttpServer admin cache endpoint includes memory payload",
   total.in_use_bytes = 2048;
   total.high_water_bytes = 4096;
   total.evictable_bytes = 512;
-  metrics.SetNativeModelMemorySnapshot(
+  metrics.SetInferfluxCudaModelMemorySnapshot(
       "qwen2.5-3b", total,
       {{"kv_cache", {1024, 1024, 1024, 0}},
        {"batch_ephemeral", {0, 0, 512, 0}}});
-  metrics.SetNativeKvMemoryBytes(/*total_bytes=*/2048,
-                                 /*active_bytes=*/1024,
-                                 /*prefix_retained_bytes=*/512,
-                                 /*free_bytes=*/512,
-                                 /*active_sequences=*/2,
-                                 /*prefix_retained_sequences=*/1,
-                                 /*free_sequences=*/1,
-                                 /*max_sequences=*/4);
+  metrics.SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/2048,
+                                        /*active_bytes=*/1024,
+                                        /*prefix_retained_bytes=*/512,
+                                        /*free_bytes=*/512,
+                                        /*active_sequences=*/2,
+                                        /*prefix_retained_sequences=*/1,
+                                        /*free_sequences=*/1,
+                                        /*max_sequences=*/4);
 
   auto auth = std::make_shared<ApiKeyAuth>();
   auth->AddKey("admin-key", {"admin", "read", "generate"});
@@ -116,18 +116,21 @@ TEST_CASE("HttpServer admin cache endpoint includes memory payload",
   REQUIRE(body_pos != std::string::npos);
 
   const json body = json::parse(response.substr(body_pos + 4));
-  REQUIRE(body["memory"].contains("native_model"));
-  REQUIRE(body["memory"].contains("native_kv"));
+  REQUIRE(body["memory"].contains("inferflux_cuda_model"));
+  REQUIRE(body["memory"].contains("inferflux_cuda_kv"));
   REQUIRE(body["memory"].contains("paged_kv"));
 
-  REQUIRE(body["memory"]["native_model"]["model"] == "qwen2.5-3b");
-  REQUIRE(body["memory"]["native_model"]["reserved_bytes"] == 4096);
-  REQUIRE(body["memory"]["native_model"]["domains"]["kv_cache"]["reserved_bytes"] ==
-          1024);
+  REQUIRE(body["memory"]["inferflux_cuda_model"]["model"] == "qwen2.5-3b");
+  REQUIRE(body["memory"]["inferflux_cuda_model"]["reserved_bytes"] == 4096);
+  REQUIRE(
+      body["memory"]["inferflux_cuda_model"]["domains"]["kv_cache"]
+          ["reserved_bytes"] == 1024);
 
-  REQUIRE(body["memory"]["native_kv"]["total_bytes"] == 2048);
-  REQUIRE(body["memory"]["native_kv"]["prefix_retained_bytes"] == 512);
-  REQUIRE(body["memory"]["native_kv"]["prefix_retained_sequences"] == 1);
+  REQUIRE(body["memory"]["inferflux_cuda_kv"]["total_bytes"] == 2048);
+  REQUIRE(
+      body["memory"]["inferflux_cuda_kv"]["prefix_retained_bytes"] == 512);
+  REQUIRE(body["memory"]["inferflux_cuda_kv"]["prefix_retained_sequences"] ==
+          1);
 
   REQUIRE(body["memory"]["paged_kv"]["total_blocks"] == 16);
   REQUIRE(body["memory"]["paged_kv"]["used_blocks"] == 2);

@@ -206,7 +206,7 @@ bool RocmBackend::LoadModel(const std::filesystem::path &model_path,
       TuneLlamaBackendConfig(LlamaBackendTarget::kRocm, config);
 
   // Load model using base class (which will use llama.cpp HIP backend)
-  if (!LlamaCPUBackend::LoadModel(model_path, tuned)) {
+  if (!LlamaCppBackend::LoadModel(model_path, tuned)) {
     log::Error("rocm_backend", "Failed to load model with ROCm backend");
     return false;
   }
@@ -226,7 +226,7 @@ bool RocmBackend::LoadModel(const std::filesystem::path &model_path,
 
 bool RocmBackend::IsReady() const {
 #ifdef INFERFLUX_HAS_ROCM
-  return hip_initialized_ && LlamaCPUBackend::IsReady();
+  return hip_initialized_ && LlamaCppBackend::IsReady();
 #else
   return false;
 #endif

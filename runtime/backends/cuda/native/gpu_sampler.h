@@ -38,6 +38,9 @@ public:
    */
   int Sample(const float *d_logits, float temperature, int top_k, float top_p,
              uint32_t seed = UINT32_MAX);
+  void EnqueueSample(const float *d_logits, float temperature, int top_k,
+                     float top_p, uint32_t seed = UINT32_MAX);
+  int CollectSample();
 
   /**
    * Copy last-position logits from device to a host buffer.
@@ -67,6 +70,12 @@ public:
                    const std::vector<float> &top_ps,
                    const std::vector<uint32_t> &seeds,
                    std::vector<int> *out_tokens);
+  void EnqueueSampleBatch(const float *d_logits, int batch_size,
+                          const std::vector<float> &temperatures,
+                          const std::vector<int> &top_ks,
+                          const std::vector<float> &top_ps,
+                          const std::vector<uint32_t> &seeds);
+  void CollectSampleBatch(std::vector<int> *out_tokens);
 
   std::size_t DeviceWorkspaceBytes() const;
   std::size_t HostWorkspaceBytes() const;
@@ -107,6 +116,9 @@ private:
   curandGenerator_t rng_{nullptr};
   float *d_uniform_{nullptr}; // [1] random uniform
   bool rng_initialized_{false};
+  cudaEvent_t completion_event_{nullptr};
+  bool completion_pending_{false};
+  int pending_batch_size_{0};
 };
 
 } // namespace inferflux

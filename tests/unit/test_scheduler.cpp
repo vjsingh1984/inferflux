@@ -1,6 +1,6 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 #include "runtime/disaggregated/kv_channel.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "scheduler/fairness_controller.h"
@@ -18,6 +18,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 
@@ -66,19 +67,20 @@ int64_t ReadDisaggTicketStageTotal(const std::string &stage) {
 
 int64_t ReadScalarMetric(const std::string &key) {
   const std::string output = GlobalMetrics().RenderPrometheus();
-  auto pos = output.find(key);
-  if (pos == std::string::npos) {
-    return 0;
+  std::istringstream stream(output);
+  std::string line;
+  while (std::getline(stream, line)) {
+    if (line.rfind(key, 0) != 0) {
+      continue;
+    }
+    const std::string value = line.substr(key.size());
+    try {
+      return std::stoll(value);
+    } catch (const std::exception &) {
+      return 0;
+    }
   }
-  pos += key.size();
-  auto line_end = output.find('\n', pos);
-  const std::string value = output.substr(
-      pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
-  try {
-    return std::stoll(value);
-  } catch (const std::exception &) {
-    return 0;
-  }
+  return 0;
 }
 
 bool WaitForCondition(
@@ -94,7 +96,7 @@ bool WaitForCondition(
   return predicate();
 }
 
-class ReadyStubBackend : public LlamaCPUBackend {
+class ReadyStubBackend : public LlamaCppBackend {
 public:
   explicit ReadyStubBackend(std::string output) : output_(std::move(output)) {}
 
@@ -335,7 +337,7 @@ private:
   static std::atomic<int> global_submission_ticket_;
 };
 
-class PromptRecordingSliceBackend final : public LlamaCPUBackend {
+class PromptRecordingSliceBackend final : public LlamaCppBackend {
 public:
   explicit PromptRecordingSliceBackend(std::vector<std::string> outputs)
       : outputs_(std::move(outputs)) {}
@@ -540,7 +542,7 @@ private:
 class CountingRouter final : public ModelRouter {
 public:
   void AddModel(const ModelInfo &info,
-                std::shared_ptr<LlamaCPUBackend> backend) {
+                std::shared_ptr<LlamaCppBackend> backend) {
     models_[info.id] = info;
     backends_[info.id] = std::move(backend);
     if (default_model_id_.empty()) {
@@ -584,7 +586,7 @@ public:
     return it == models_.end() ? nullptr : &it->second;
   }
 
-  std::shared_ptr<LlamaCPUBackend>
+  std::shared_ptr<LlamaCppBackend>
   GetBackend(const std::string &model_id) override {
     auto it = backends_.find(model_id);
     return it == backends_.end() ? nullptr : it->second;
@@ -607,7 +609,7 @@ public:
 
 private:
   std::unordered_map<std::string, ModelInfo> models_;
-  std::unordered_map<std::string, std::shared_ptr<LlamaCPUBackend>> backends_;
+  std::unordered_map<std::string, std::shared_ptr<LlamaCppBackend>> backends_;
   std::string default_model_id_;
   std::atomic<int> resolve_calls_{0};
 };
@@ -1052,6 +1054,71 @@ TEST_CASE("Scheduler decode worker rebuilds stepwise decode cohorts",
   REQUIRE(general_after - general_before == 0);
 }
 
+TEST_CASE("Scheduler sticky decode fill skips incompatible queue head",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+
+  Scheduler scheduler(tokenizer, device, cache, router);
+
+  auto backend_a = std::make_shared<AsyncLaneStubBackend>("a");
+  auto backend_b = std::make_shared<AsyncLaneStubBackend>("b");
+
+  auto make_pending = [](int id, int sequence_id,
+                         const std::shared_ptr<LlamaCppBackend> &backend) {
+    auto pending = std::make_shared<Scheduler::PendingRequest>();
+    pending->inference.id = id;
+    pending->inference.model = "sticky-model";
+    pending->inference.resolved_model = "sticky-model";
+    pending->inference.prompt = "sticky decode";
+    pending->inference.phase = RequestPhase::kDecode;
+    pending->inference.sequence_id = sequence_id;
+    pending->inference.sequence_generation = 1;
+    pending->inference.n_past = 4;
+    pending->inference.first_token = 101;
+    pending->inference.response_format_supported = true;
+    pending->resolved_backend = backend;
+    return pending;
+  };
+
+  auto active = make_pending(1, 11, backend_a);
+  auto incompatible = make_pending(2, 12, backend_b);
+  auto compatible_one = make_pending(3, 13, backend_a);
+  auto compatible_two = make_pending(4, 14, backend_a);
+
+  std::vector<std::shared_ptr<Scheduler::PendingRequest>> batch{active};
+  const int64_t sticky_merge_events_before = ReadScalarMetric(
+      "inferflux_scheduler_decode_worker_sticky_merge_total{merged=\"2\"} ");
+  const int64_t sticky_merged_requests_before = ReadScalarMetric(
+      "inferflux_scheduler_decode_worker_sticky_merged_requests_total ");
+
+  {
+    std::lock_guard<std::mutex> lock(scheduler.queue_mutex_);
+    scheduler.pending_decode_ = {incompatible, compatible_one, compatible_two};
+    const std::size_t merged =
+        scheduler.AppendCompatiblePendingDecodeLocked(&batch, backend_a, 3);
+    REQUIRE(merged == 2);
+  }
+
+  REQUIRE(batch.size() == 3);
+  REQUIRE(batch[0] == active);
+  REQUIRE(batch[1] == compatible_one);
+  REQUIRE(batch[2] == compatible_two);
+  REQUIRE(scheduler.pending_decode_.size() == 1);
+  REQUIRE(scheduler.pending_decode_[0] == incompatible);
+  REQUIRE(ReadScalarMetric(
+              "inferflux_scheduler_decode_worker_sticky_merge_total{merged=\"2\"} ") -
+              sticky_merge_events_before ==
+          1);
+  REQUIRE(ReadScalarMetric(
+              "inferflux_scheduler_decode_worker_sticky_merged_requests_total ") -
+              sticky_merged_requests_before ==
+          2);
+}
+
 TEST_CASE("Scheduler preserves bound backend for in-flight decode requests",
           "[scheduler]") {
   SimpleTokenizer tokenizer;
@@ -1195,6 +1262,53 @@ TEST_CASE("Scheduler token budget accounts decode slices, not full prompts",
 
   const int64_t skips_after = ReadBatchTokenBudgetSkipsTotal();
   REQUIRE(skips_after == skips_before);
+}
+
+TEST_CASE("Scheduler unified mode records decode assembly selection metrics",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+
+  Scheduler scheduler(tokenizer, device, cache, router);
+
+  auto make_pending = [&](int id) {
+    auto pending = std::make_shared<Scheduler::PendingRequest>();
+    pending->inference.id = id;
+    pending->inference.prompt = "decode assembly";
+    pending->inference.prompt_tokens = tokenizer.Encode(pending->inference.prompt);
+    pending->inference.phase = RequestPhase::kDecode;
+    pending->inference.n_past = 4;
+    pending->priority = 0;
+    pending->priority_level = 0;
+    pending->sequence = static_cast<uint64_t>(id);
+    pending->enqueue_time = std::chrono::steady_clock::now();
+    return pending;
+  };
+
+  const int64_t ready_before = ReadScalarMetric(
+      "inferflux_scheduler_decode_assembly_ready_total{mode=\"unified\",bucket=\"2\"} ");
+  const int64_t selected_before = ReadScalarMetric(
+      "inferflux_scheduler_decode_assembly_selected_total{mode=\"unified\",bucket=\"2\"} ");
+
+  {
+    std::lock_guard<std::mutex> lock(scheduler.queue_mutex_);
+    scheduler.pending_decode_.push_back(make_pending(1));
+    scheduler.pending_decode_.push_back(make_pending(2));
+    auto selection = scheduler.BuildBatchLocked();
+    REQUIRE(selection.pending.size() == 2);
+  }
+
+  REQUIRE(ReadScalarMetric(
+              "inferflux_scheduler_decode_assembly_ready_total{mode=\"unified\",bucket=\"2\"} ") -
+              ready_before ==
+          1);
+  REQUIRE(ReadScalarMetric(
+              "inferflux_scheduler_decode_assembly_selected_total{mode=\"unified\",bucket=\"2\"} ") -
+              selected_before ==
+          1);
 }
 
 TEST_CASE("Scheduler session handles preserve sequence until lease release",

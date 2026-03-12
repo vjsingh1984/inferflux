@@ -66,7 +66,7 @@ bool ExecuteNativeGroupedProjectionStage(TryQ81Fn &&try_q81_group,
 }
 
 template <typename TryQ81Fn, typename TryPackedFn, typename FallbackFn>
-bool ExecuteNativeFfnProjectionStage(
+bool ExecuteInferfluxCudaFfnProjectionStage(
     FusedQuantGemm::FfnProjOperator selected_op, const char *phase,
     const std::string &quant_label, int quant_type, int batch_rows,
     int intermediate_size, int hidden_size, TryQ81Fn &&try_q81_group,
@@ -76,7 +76,8 @@ bool ExecuteNativeFfnProjectionStage(
 
   if (selected_op == FusedQuantGemm::FfnProjOperator::kQ81Group ||
       selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K ||
-      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4) {
+      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4 ||
+      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4) {
     local_summary.used_q81 = std::forward<TryQ81Fn>(try_q81_group)();
     if (local_summary.used_q81) {
       local_summary.actual_op = selected_op;
@@ -98,13 +99,13 @@ bool ExecuteNativeFfnProjectionStage(
 
   const char *metric_op = FusedQuantGemm::FfnProjOperatorMetricName(
       local_summary.actual_op, quant_type, hidden_size);
-  GlobalMetrics().RecordNativeFfnProjOperator(phase, metric_op);
-  GlobalMetrics().RecordNativeFfnProjGeometry(
+  GlobalMetrics().RecordInferfluxCudaFfnProjOperator(phase, metric_op);
+  GlobalMetrics().RecordInferfluxCudaFfnProjGeometry(
       phase, metric_op, quant_label, batch_rows, intermediate_size, hidden_size,
       /*grouped_outputs=*/2);
   if (local_summary.actual_op ==
       FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4) {
-    GlobalMetrics().RecordNativeRowPairSelection(phase, metric_op, batch_rows);
+    GlobalMetrics().RecordInferfluxCudaRowPairSelection(phase, metric_op, batch_rows);
   }
 
   if (summary) {
@@ -127,7 +128,7 @@ struct NativeDownProjExecutionSummary {
 
 template <typename TryMmqFn, typename TryQ81Fn, typename TryPackedFn,
           typename FallbackFn, typename LogFn>
-bool ExecuteNativeDownProjStage(
+bool ExecuteInferfluxCudaDownProjStage(
     FusedQuantGemm::DownProjOperator selected_op, const char *phase,
     const std::string &quant_label, int quant_type, int batch_rows,
     int hidden_size, int intermediate_size, TryMmqFn &&try_mmq,
@@ -175,14 +176,14 @@ bool ExecuteNativeDownProjStage(
 
   const char *metric_op = FusedQuantGemm::DownProjOperatorMetricName(
       local_summary.actual_op, quant_type, batch_rows, intermediate_size);
-  GlobalMetrics().RecordNativeDownProjOperator(phase, metric_op);
-  GlobalMetrics().RecordNativeDownProjGeometry(
+  GlobalMetrics().RecordInferfluxCudaDownProjOperator(phase, metric_op);
+  GlobalMetrics().RecordInferfluxCudaDownProjGeometry(
       phase, metric_op, quant_label, batch_rows, hidden_size, intermediate_size);
   if (local_summary.actual_op ==
           FusedQuantGemm::DownProjOperator::kQ81GemvRowPair ||
       local_summary.actual_op ==
           FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed) {
-    GlobalMetrics().RecordNativeRowPairSelection(phase, metric_op, batch_rows);
+    GlobalMetrics().RecordInferfluxCudaRowPairSelection(phase, metric_op, batch_rows);
   }
 
   if (local_summary.actual_op != FusedQuantGemm::DownProjOperator::kFallback) {

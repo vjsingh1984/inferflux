@@ -16,7 +16,7 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_err() { echo -e "${RED}[ERR]${NC} $1"; }
 header() { echo -e "\n${BOLD}$1${NC}"; echo "$(printf '=%.0s' $(seq 1 ${#1}))"; }
 
-BACKEND_INPUT="${1:-cuda_native}"
+BACKEND_INPUT="${1:-inferflux_cuda}"
 MODEL_PATH="${2:-models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf}"
 OUTPUT_DIR="${3:-./nsys_backend_profile_${BACKEND_INPUT}_$(date +%Y%m%d_%H%M%S)}"
 BUILD_DIR="${BUILD_DIR:-./build-cuda}"
@@ -46,24 +46,24 @@ NSYS_SESSION_NAME=""
 
 normalize_backend() {
   case "$BACKEND_INPUT" in
-    native|cuda_native)
-      BACKEND_ID="cuda_native"
+    native|inferflux|inferflux_cuda|cuda_native|native_cuda)
+      BACKEND_ID="inferflux_cuda"
       BACKEND_PORT_DEFAULT=18088
-      PREFER_NATIVE="true"
+      PREFER_INFERFLUX="true"
       ALLOW_LLAMA_FALLBACK="false"
       STRICT_NATIVE="1"
       DISABLE_PARITY_DELEGATE="1"
       ;;
-    llamacpp|llama_cpp|cuda_llama_cpp)
-      BACKEND_ID="cuda_llama_cpp"
+    llamacpp|llama_cpp|llama_cpp_cuda|cuda_llama_cpp|cuda_llama)
+      BACKEND_ID="llama_cpp_cuda"
       BACKEND_PORT_DEFAULT=18089
-      PREFER_NATIVE="false"
+      PREFER_INFERFLUX="false"
       ALLOW_LLAMA_FALLBACK="true"
       STRICT_NATIVE="0"
       DISABLE_PARITY_DELEGATE="0"
       ;;
     *)
-      log_err "Unknown backend '$BACKEND_INPUT' (use cuda_native or cuda_llama_cpp)"
+      log_err "Unknown backend '$BACKEND_INPUT' (use inferflux_cuda or llama_cpp_cuda)"
       exit 1
       ;;
   esac
@@ -103,7 +103,7 @@ runtime:
     phase_overlap:
       enabled: true
   backend_exposure:
-    prefer_native: $PREFER_NATIVE
+    prefer_inferflux: $PREFER_INFERFLUX
     allow_llama_cpp_fallback: $ALLOW_LLAMA_FALLBACK
   scheduler:
     max_batch_size: 32
@@ -205,8 +205,8 @@ start_profiled_server() {
       INFERCTL_API_KEY="$API_KEY" \
       INFERFLUX_LOG_LEVEL="$BENCH_LOG_LEVEL" \
       INFERFLUX_ENABLE_BATCHED_DECODE="$ENABLE_BATCHED_DECODE" \
-      INFERFLUX_NATIVE_CUDA_STRICT="$STRICT_NATIVE" \
-      INFERFLUX_NATIVE_DISABLE_PARITY_DELEGATE="$DISABLE_PARITY_DELEGATE" \
+      INFERFLUX_CUDA_STRICT="$STRICT_NATIVE" \
+      INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE="$DISABLE_PARITY_DELEGATE" \
       nsys launch \
         --session-new "$NSYS_SESSION_NAME" \
         --trace cuda,nvtx,osrt \
@@ -221,8 +221,8 @@ start_profiled_server() {
       INFERCTL_API_KEY="$API_KEY" \
       INFERFLUX_LOG_LEVEL="$BENCH_LOG_LEVEL" \
       INFERFLUX_ENABLE_BATCHED_DECODE="$ENABLE_BATCHED_DECODE" \
-      INFERFLUX_NATIVE_CUDA_STRICT="$STRICT_NATIVE" \
-      INFERFLUX_NATIVE_DISABLE_PARITY_DELEGATE="$DISABLE_PARITY_DELEGATE" \
+      INFERFLUX_CUDA_STRICT="$STRICT_NATIVE" \
+      INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE="$DISABLE_PARITY_DELEGATE" \
       nsys profile \
         --output "$profile_prefix" \
         --force-overwrite=true \
@@ -439,7 +439,7 @@ main() {
   export_reports
   summarize_profile
 
-  if [ "$BACKEND_ID" = "cuda_native" ]; then
+  if [ "$BACKEND_ID" = "inferflux_cuda" ]; then
     if reset_cuda_device; then
       log_ok "CUDA device reset"
     else

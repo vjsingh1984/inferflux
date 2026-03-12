@@ -5,7 +5,7 @@
 namespace inferflux {
 
 const NativeExecutionPolicy &
-ResolveNativeExecutionPolicy(const NativeExecutionPolicy *policy) {
+ResolveInferfluxCudaExecutionPolicy(const NativeExecutionPolicy *policy) {
   if (policy) {
     return *policy;
   }
@@ -71,44 +71,71 @@ bool ProjectionHasGraphSafeKernel(const QuantizedWeightInfo &raw,
   return true;
 }
 
-FusedQuantGemm::DownProjOperator
-SelectNativeDownProjOperator(const QuantizedWeightInfo &raw,
-                             const MmqWeightInfo &mmq_weight,
-                             const FusedDispatchGeometry &geometry,
-                             bool allow_fused_quantized_matmul,
-                             const NativeExecutionPolicy &policy) {
+FusedQuantGemm::DownProjOperator SelectInferfluxCudaDownProjOperator(
+    const QuantizedWeightInfo &raw, const MmqWeightInfo &mmq_weight,
+    InferfluxCudaDispatchPhase phase, const FusedDispatchGeometry &geometry,
+    bool allow_fused_quantized_matmul, const NativeExecutionPolicy &policy) {
   if (ForceCublasRequested(policy) || !allow_fused_quantized_matmul) {
     return FusedQuantGemm::DownProjOperator::kFallback;
   }
 
-  const bool allow_q81 = !Q81ActivationsDisabled(policy);
-  const bool allow_packed = !PackedActivationsDisabled(policy);
-  const bool allow_mmq =
-      mmq_weight.data != nullptr && FusedQuantGemm::IsDownProjMmqEnabled(&policy);
-  return FusedQuantGemm::SelectDownProjOperator(
-      raw.quant_type, geometry, allow_q81, allow_packed, allow_mmq, &policy);
+  const FusedDispatchGeometry single_geometry{
+      geometry.M, geometry.N, geometry.K, 1, true, false};
+  const bool q81_ready =
+      !Q81ActivationsDisabled(policy) &&
+      FusedQuantGemm::SupportsQ8_1Activations(raw.quant_type) &&
+      FusedQuantGemm::ShouldUseFusedPath(raw.quant_type, single_geometry);
+  const bool packed_ready =
+      !PackedActivationsDisabled(policy) &&
+      FusedQuantGemm::SupportsPackedActivations(raw.quant_type) &&
+      FusedQuantGemm::ShouldUseFusedPath(raw.quant_type, single_geometry);
+  const bool mmq_ready =
+      mmq_weight.data != nullptr &&
+      FusedQuantGemm::IsDownProjMmqEnabled(&policy) &&
+      FusedQuantGemm::SupportsDownProjMmq(raw.quant_type) &&
+      geometry.M >= FusedQuantGemm::GetDownProjMmqThreshold(
+                        raw.quant_type, geometry.M, geometry.N, geometry.K);
+  const auto profile = BuildInferfluxCudaDownProjDispatchProfile(
+      phase, raw.quant_type, geometry, q81_ready, packed_ready, mmq_ready);
+  return SelectInferfluxCudaDownProjDispatchDecision(profile, policy).op;
 }
 
-FusedQuantGemm::FfnProjOperator
-SelectNativeFfnProjOperator(const QuantizedWeightInfo &gate_raw,
-                            const QuantizedWeightInfo &up_raw,
-                            const FusedDispatchGeometry &geometry,
-                            bool allow_fused_quantized_matmul,
-                            const NativeExecutionPolicy &policy) {
+FusedQuantGemm::FfnProjOperator SelectInferfluxCudaFfnProjOperator(
+    const QuantizedWeightInfo &gate_raw, const QuantizedWeightInfo &up_raw,
+    InferfluxCudaDispatchPhase phase, const FusedDispatchGeometry &geometry,
+    bool allow_fused_quantized_matmul, const NativeExecutionPolicy &policy) {
   if (ForceCublasRequested(policy) || !allow_fused_quantized_matmul) {
     return FusedQuantGemm::FfnProjOperator::kFallback;
   }
-
-  return FusedQuantGemm::SelectFfnProjOperator(
-      gate_raw.quant_type, up_raw.quant_type, geometry,
-      !Q81ActivationsDisabled(policy), !PackedActivationsDisabled(policy),
-      &policy);
+  const FusedDispatchGeometry single_geometry{geometry.M,
+                                              geometry.N,
+                                              geometry.K,
+                                              1,
+                                              geometry.packed_activation,
+                                              geometry.includes_rmsnorm};
+  const bool q81_ready =
+      !Q81ActivationsDisabled(policy) &&
+      FusedQuantGemm::SupportsQ8_1Activations(gate_raw.quant_type) &&
+      FusedQuantGemm::SupportsQ8_1Activations(up_raw.quant_type) &&
+      FusedQuantGemm::ShouldUseFusedPath(gate_raw.quant_type,
+                                         single_geometry) &&
+      FusedQuantGemm::ShouldUseFusedPath(up_raw.quant_type, single_geometry);
+  const bool packed_ready =
+      !PackedActivationsDisabled(policy) &&
+      FusedQuantGemm::SupportsPackedActivations(gate_raw.quant_type) &&
+      FusedQuantGemm::SupportsPackedActivations(up_raw.quant_type) &&
+      FusedQuantGemm::ShouldUseFusedPath(gate_raw.quant_type,
+                                         single_geometry) &&
+      FusedQuantGemm::ShouldUseFusedPath(up_raw.quant_type, single_geometry);
+  const auto profile = BuildInferfluxCudaFfnDispatchProfile(
+      phase, gate_raw.quant_type, up_raw.quant_type, geometry, q81_ready,
+      packed_ready);
+  return SelectInferfluxCudaFfnDispatchDecision(profile, policy).op;
 }
 
 bool DecodeGraphCaptureSafe(const WeightMap *weights, int num_layers, int M,
                             int hidden_size, int num_heads, int num_kv_heads,
-                            int head_dim, int intermediate_size,
-                            int vocab_size,
+                            int head_dim, int intermediate_size, int vocab_size,
                             bool allow_fused_quantized_matmul,
                             const NativeExecutionPolicy &policy) {
   if (!weights || !weights->HasQuantizedWeights()) {
@@ -133,8 +160,8 @@ bool DecodeGraphCaptureSafe(const WeightMap *weights, int num_layers, int M,
             allow_fused_quantized_matmul, policy) ||
         !ProjectionHasGraphSafeKernel(
             weights->LayerOProjRaw(layer),
-            FusedDispatchGeometry{M, hidden_size, num_heads * head_dim, 1,
-                                  true, false},
+            FusedDispatchGeometry{M, hidden_size, num_heads * head_dim, 1, true,
+                                  false},
             allow_fused_quantized_matmul, policy) ||
         !ProjectionHasGraphSafeKernel(
             weights->LayerGateProjRaw(layer),
@@ -146,11 +173,11 @@ bool DecodeGraphCaptureSafe(const WeightMap *weights, int num_layers, int M,
             FusedDispatchGeometry{M, intermediate_size, hidden_size, 1, true,
                                   true},
             allow_fused_quantized_matmul, policy) ||
-        !ProjectionHasGraphSafeKernel(
-            weights->LayerDownProjRaw(layer),
-            FusedDispatchGeometry{M, hidden_size, intermediate_size, 1, true,
-                                  false},
-            allow_fused_quantized_matmul, policy)) {
+        !ProjectionHasGraphSafeKernel(weights->LayerDownProjRaw(layer),
+                                      FusedDispatchGeometry{M, hidden_size,
+                                                            intermediate_size,
+                                                            1, true, false},
+                                      allow_fused_quantized_matmul, policy)) {
       return false;
     }
   }

@@ -1,4 +1,4 @@
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/cpu/llama_cpp_backend.h"
 #include "runtime/backends/backend_utils.h"
 #include "runtime/execution/parallel_context.h"
 #include "server/logging/logger.h"
@@ -240,16 +240,16 @@ void LlamaBackendRelease() {
 }
 } // namespace
 
-LlamaCPUBackend::LlamaCPUBackend() : LlamaCPUBackend(true) {}
+LlamaCppBackend::LlamaCppBackend() : LlamaCppBackend(true) {}
 
-LlamaCPUBackend::LlamaCPUBackend(bool acquire_backend)
+LlamaCppBackend::LlamaCppBackend(bool acquire_backend)
     : llama_backend_acquired_(acquire_backend) {
   if (llama_backend_acquired_) {
     LlamaBackendAcquire();
   }
 }
 
-LlamaCPUBackend::~LlamaCPUBackend() {
+LlamaCppBackend::~LlamaCppBackend() {
   TeardownSamplerImpl();
 #ifdef INFERFLUX_HAS_MTMD
   if (mtmd_ctx_) {
@@ -275,7 +275,7 @@ LlamaCPUBackend::~LlamaCPUBackend() {
   }
 }
 
-bool LlamaCPUBackend::LoadModel(const std::filesystem::path &model_path,
+bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
                                 const LlamaBackendConfig &config) {
   BackendStateLock lock(backend_state_mutex_);
   test_ready_ = false;
@@ -344,19 +344,19 @@ bool LlamaCPUBackend::LoadModel(const std::filesystem::path &model_path,
   return true;
 }
 
-int LlamaCPUBackend::TokenCount(const std::string &text) const {
+int LlamaCppBackend::TokenCount(const std::string &text) const {
   auto tokens = Tokenize(text, /*add_bos=*/false);
   return static_cast<int>(tokens.size());
 }
 
 std::vector<int>
-LlamaCPUBackend::TokenizeForCache(const std::string &prompt) const {
+LlamaCppBackend::TokenizeForCache(const std::string &prompt) const {
   // Returns the BPE token sequence (with BOS) for use in the KV prefix store.
   // Returns empty when no model is loaded so the caller can skip prefix reuse.
   return Tokenize(prompt, /*add_bos=*/true);
 }
 
-std::vector<int> LlamaCPUBackend::Tokenize(const std::string &prompt,
+std::vector<int> LlamaCppBackend::Tokenize(const std::string &prompt,
                                            bool add_bos) const {
   if (!model_) {
     return {};
@@ -388,7 +388,7 @@ std::vector<int> LlamaCPUBackend::Tokenize(const std::string &prompt,
   return {tokens.begin(), tokens.end()};
 }
 
-void LlamaCPUBackend::SetupSampler(const std::string &grammar,
+void LlamaCppBackend::SetupSampler(const std::string &grammar,
                                    const std::string &root,
                                    const SamplingParams &sp) {
   BackendStateLock lock(backend_state_mutex_);
@@ -455,19 +455,19 @@ void LlamaCPUBackend::SetupSampler(const std::string &grammar,
   active_sampler_ = chain;
 }
 
-void LlamaCPUBackend::TeardownSampler() {
+void LlamaCppBackend::TeardownSampler() {
   BackendStateLock lock(backend_state_mutex_);
   TeardownSamplerImpl();
 }
 
-void LlamaCPUBackend::TeardownSamplerImpl() {
+void LlamaCppBackend::TeardownSamplerImpl() {
   if (active_sampler_) {
     llama_sampler_free(active_sampler_);
     active_sampler_ = nullptr;
   }
 }
 
-std::string LlamaCPUBackend::TokenToString(int token) const {
+std::string LlamaCppBackend::TokenToString(int token) const {
   if (!vocab_) {
     return {};
   }
@@ -494,14 +494,14 @@ std::string LlamaCPUBackend::TokenToString(int token) const {
   return buf;
 }
 
-bool LlamaCPUBackend::IsTerminalGeneratedToken(int token) const {
+bool LlamaCppBackend::IsTerminalGeneratedToken(int token) const {
   if (token < 0 || !vocab_) {
     return token < 0;
   }
   return llama_vocab_is_eog(vocab_, static_cast<llama_token>(token));
 }
 
-std::string LlamaCPUBackend::Generate(
+std::string LlamaCppBackend::Generate(
     const std::string &prompt, int max_tokens,
     const std::function<bool(const std::string &, const TokenLogprob *)>
         &on_chunk,
@@ -728,7 +728,7 @@ std::string LlamaCPUBackend::Generate(
   return output;
 }
 
-bool LlamaCPUBackend::LoadMmproj(const std::filesystem::path &mmproj_path) {
+bool LlamaCppBackend::LoadMmproj(const std::filesystem::path &mmproj_path) {
   BackendStateLock lock(backend_state_mutex_);
 #ifdef INFERFLUX_HAS_MTMD
   if (!model_) {
@@ -763,7 +763,7 @@ bool LlamaCPUBackend::LoadMmproj(const std::filesystem::path &mmproj_path) {
 #endif
 }
 
-std::string LlamaCPUBackend::GenerateWithImages(
+std::string LlamaCppBackend::GenerateWithImages(
     const std::string &prompt, const std::vector<DecodedImage> &images,
     int max_tokens,
     const std::function<bool(const std::string &, const TokenLogprob *)>
@@ -876,8 +876,8 @@ std::string LlamaCPUBackend::GenerateWithImages(
 #endif
 }
 
-LlamaCPUBackend::PrefillResult
-LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
+LlamaCppBackend::PrefillResult
+LlamaCppBackend::Prefill(const std::string &prompt, int sequence_id) {
   BackendStateLock lock(backend_state_mutex_);
   if (!context_ || !vocab_) {
     return {};
@@ -939,7 +939,7 @@ LlamaCPUBackend::Prefill(const std::string &prompt, int sequence_id) {
   return result;
 }
 
-void LlamaCPUBackend::CopySequencePrefix(int src_seq, int dst_seq,
+void LlamaCppBackend::CopySequencePrefix(int src_seq, int dst_seq,
                                          int n_tokens) {
   BackendStateLock lock(backend_state_mutex_);
   if (!context_)
@@ -963,8 +963,8 @@ void LlamaCPUBackend::CopySequencePrefix(int src_seq, int dst_seq,
 
 // Legacy API shape retained for backend compatibility.
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-LlamaCPUBackend::PrefillResult
-LlamaCPUBackend::PrefillPartial(const std::string &prompt, int sequence_id,
+LlamaCppBackend::PrefillResult
+LlamaCppBackend::PrefillPartial(const std::string &prompt, int sequence_id,
                                 int n_past_start) {
   BackendStateLock lock(backend_state_mutex_);
   if (!context_ || !vocab_)
@@ -1023,7 +1023,7 @@ LlamaCPUBackend::PrefillPartial(const std::string &prompt, int sequence_id,
   return result;
 }
 
-std::string LlamaCPUBackend::Decode(
+std::string LlamaCppBackend::Decode(
     int n_past, int sequence_id, int max_tokens,
     const std::function<bool(const std::string &, const TokenLogprob *)>
         &on_chunk,
@@ -1152,8 +1152,8 @@ std::string LlamaCPUBackend::Decode(
 }
 // NOLINTEND(bugprone-easily-swappable-parameters)
 
-std::vector<LlamaCPUBackend::BatchDecodeOutput>
-LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
+std::vector<LlamaCppBackend::BatchDecodeOutput>
+LlamaCppBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
   BackendStateLock lock(backend_state_mutex_);
   if (!context_ || !vocab_ || inputs.empty()) {
     return {};
@@ -1215,13 +1215,13 @@ LlamaCPUBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
   return results;
 }
 
-bool LlamaCPUBackend::SupportsAsyncUnifiedBatch() const { return false; }
+bool LlamaCppBackend::SupportsAsyncUnifiedBatch() const { return false; }
 
-int LlamaCPUBackend::UnifiedBatchTokenCapacity() const {
+int LlamaCppBackend::UnifiedBatchTokenCapacity() const {
   return EffectiveBatchTokenCap(context_, config_.batch_size);
 }
 
-LlamaCPUBackend::UnifiedBatchHandle LlamaCPUBackend::SubmitUnifiedBatchAsync(
+LlamaCppBackend::UnifiedBatchHandle LlamaCppBackend::SubmitUnifiedBatchAsync(
     const std::vector<UnifiedBatchInput> &inputs, UnifiedBatchLane /*lane*/) {
   auto outputs = ExecuteUnifiedBatch(inputs);
   std::lock_guard<std::mutex> lock(async_results_mutex_);
@@ -1230,7 +1230,7 @@ LlamaCPUBackend::UnifiedBatchHandle LlamaCPUBackend::SubmitUnifiedBatchAsync(
   return handle;
 }
 
-bool LlamaCPUBackend::TryCollectUnifiedBatchAsync(
+bool LlamaCppBackend::TryCollectUnifiedBatchAsync(
     UnifiedBatchHandle handle, std::vector<UnifiedBatchOutput> *outputs) {
   if (!outputs || handle == 0) {
     return false;
@@ -1245,8 +1245,8 @@ bool LlamaCPUBackend::TryCollectUnifiedBatchAsync(
   return true;
 }
 
-std::vector<LlamaCPUBackend::UnifiedBatchOutput>
-LlamaCPUBackend::ExecuteUnifiedBatch(
+std::vector<LlamaCppBackend::UnifiedBatchOutput>
+LlamaCppBackend::ExecuteUnifiedBatch(
     const std::vector<UnifiedBatchInput> &inputs) {
   BackendStateLock lock(backend_state_mutex_);
   log::Debug("llama_backend", "ExecuteUnifiedBatch called with " +
@@ -1410,7 +1410,7 @@ LlamaCPUBackend::ExecuteUnifiedBatch(
   return results;
 }
 
-void LlamaCPUBackend::FreeSequence(int sequence_id) {
+void LlamaCppBackend::FreeSequence(int sequence_id) {
   BackendStateLock lock(backend_state_mutex_);
   if (!context_)
     return;
@@ -1418,19 +1418,19 @@ void LlamaCPUBackend::FreeSequence(int sequence_id) {
                       static_cast<llama_seq_id>(sequence_id), -1, -1);
 }
 
-LlamaCPUBackend::SequenceReleaseFence
-LlamaCPUBackend::BeginFreeSequence(int sequence_id) {
+LlamaCppBackend::SequenceReleaseFence
+LlamaCppBackend::BeginFreeSequence(int sequence_id) {
   FreeSequence(sequence_id);
   (void)sequence_id;
   return {};
 }
 
-bool LlamaCPUBackend::PollFreeSequence(const SequenceReleaseFence &fence) {
+bool LlamaCppBackend::PollFreeSequence(const SequenceReleaseFence &fence) {
   (void)fence;
   return true;
 }
 
-std::vector<uint8_t> LlamaCPUBackend::SerializeSequence(int sequence_id) {
+std::vector<uint8_t> LlamaCppBackend::SerializeSequence(int sequence_id) {
   BackendStateLock lock(backend_state_mutex_);
   if (!context_)
     return {};
@@ -1447,7 +1447,7 @@ std::vector<uint8_t> LlamaCPUBackend::SerializeSequence(int sequence_id) {
   return buf;
 }
 
-bool LlamaCPUBackend::HydrateSequence(int dest_sequence_id,
+bool LlamaCppBackend::HydrateSequence(int dest_sequence_id,
                                       const std::vector<uint8_t> &blob) {
   BackendStateLock lock(backend_state_mutex_);
   if (!context_ || blob.empty())
@@ -1458,9 +1458,9 @@ bool LlamaCPUBackend::HydrateSequence(int dest_sequence_id,
   return read > 0;
 }
 
-bool LlamaCPUBackend::IsMoE() const { return ExpertCount() > 0; }
+bool LlamaCppBackend::IsMoE() const { return ExpertCount() > 0; }
 
-int LlamaCPUBackend::ExpertCount() const {
+int LlamaCppBackend::ExpertCount() const {
   if (!model_)
     return 0;
   char buf[32] = {};
@@ -1471,7 +1471,7 @@ int LlamaCPUBackend::ExpertCount() const {
   return std::atoi(buf);
 }
 
-int LlamaCPUBackend::ActiveExperts() const {
+int LlamaCppBackend::ActiveExperts() const {
   if (!model_)
     return 0;
   char buf[32] = {};
@@ -1482,21 +1482,21 @@ int LlamaCPUBackend::ActiveExperts() const {
   return std::atoi(buf);
 }
 
-LlamaCPUBackend::PerfSnapshot LlamaCPUBackend::TakePerf() {
+LlamaCppBackend::PerfSnapshot LlamaCppBackend::TakePerf() {
   BackendStateLock lock(backend_state_mutex_);
   auto snap = last_perf_;
   last_perf_ = {};
   return snap;
 }
 
-void LlamaCPUBackend::EnableGrammarConstraint(const std::string &grammar,
+void LlamaCppBackend::EnableGrammarConstraint(const std::string &grammar,
                                               const std::string &root) {
   SetupSampler(grammar, root, {});
 }
 
-void LlamaCPUBackend::DisableGrammarConstraint() { TeardownSampler(); }
+void LlamaCppBackend::DisableGrammarConstraint() { TeardownSampler(); }
 
-TokenLogprob LlamaCPUBackend::CollectLogprob(int token_id,
+TokenLogprob LlamaCppBackend::CollectLogprob(int token_id,
                                              const std::string &token_str,
                                              int top_n) const {
   const float *logits = llama_get_logits(context_);
@@ -1512,7 +1512,7 @@ TokenLogprob LlamaCPUBackend::CollectLogprob(int token_id,
 // Qwen 2/2.5, Hermes, DeepSeek, Phi-3, ChatML, and others in the predefined
 // list; for unsupported models it returns valid=false and the caller falls
 // back to the plain text preamble.
-LlamaCPUBackend::ChatTemplateResult LlamaCPUBackend::FormatChatMessages(
+LlamaCppBackend::ChatTemplateResult LlamaCppBackend::FormatChatMessages(
     const std::vector<std::pair<std::string, std::string>> &messages,
     bool add_assistant_prefix) {
   ChatTemplateResult result;
@@ -1561,7 +1561,7 @@ LlamaCPUBackend::ChatTemplateResult LlamaCPUBackend::FormatChatMessages(
   return result;
 }
 
-bool LlamaCPUBackend::EnsureEmbedCtx() {
+bool LlamaCppBackend::EnsureEmbedCtx() {
   if (embed_ctx_)
     return true;
   if (!model_)
@@ -1574,13 +1574,13 @@ bool LlamaCPUBackend::EnsureEmbedCtx() {
   return embed_ctx_ != nullptr;
 }
 
-int LlamaCPUBackend::EmbedDims() const {
+int LlamaCppBackend::EmbedDims() const {
   if (!model_)
     return 0;
   return llama_model_n_embd(model_);
 }
 
-std::vector<float> LlamaCPUBackend::Embed(const std::string &text) {
+std::vector<float> LlamaCppBackend::Embed(const std::string &text) {
   BackendStateLock lock(backend_state_mutex_);
   if (!EnsureEmbedCtx())
     return {};
@@ -1626,7 +1626,7 @@ std::vector<float> LlamaCPUBackend::Embed(const std::string &text) {
 }
 
 #ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
-std::string LlamaCPUBackend::Name() const { return "llama_cpu"; }
+std::string LlamaCppBackend::Name() const { return "llama_cpu"; }
 #endif
 
 } // namespace inferflux

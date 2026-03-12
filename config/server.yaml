@@ -52,9 +52,9 @@ runtime:
 
   # Backend exposure policy
   backend_exposure:
-    prefer_native: true             # Prefer native implementations (native CUDA, MLX)
+    prefer_inferflux: true             # Prefer InferFlux implementations when available
     allow_llama_cpp_fallback: true  # Allow fallback to llama.cpp backends
-    strict_native_request: false    # Fail explicit cuda_native when native kernels are not ready
+    strict_inferflux_request: false    # Fail explicit inferflux_cuda when native kernels are not ready
 
   # Capability routing for graceful degradation
   capability_routing:
@@ -141,6 +141,6 @@ registry:
 # Environment variable overrides:
 # INFERFLUX_MODEL_PATH              - Override default model path
 # INFERFLUX_MODELS                  - Multi-model config string
-# INFERFLUX_NATIVE_CUDA_STRICT      - fail if native runtime reports fallback
+# INFERFLUX_CUDA_STRICT      - fail if InferFlux CUDA runtime reports fallback
 # INFERFLUX_BACKEND_PRIORITY        - Override backend selection order
 # INFERFLUX_DISABLE_STARTUP_ADVISOR - Disable recommendation logging

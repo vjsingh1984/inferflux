@@ -187,34 +187,39 @@ public:
                                        const std::string &to_kernel);
   void RecordDecodeWorkerBatchSize(std::size_t batch_size);
   void RecordDecodeWorkerExecutionPath(std::string_view path);
+  void RecordDecodeWorkerStickyMerge(std::size_t merged_requests);
+  void RecordDecodeAssemblySnapshot(std::string_view mode, std::size_t ready,
+                                    std::size_t selected,
+                                    std::size_t compatible,
+                                    std::size_t incompatible);
 
-  // Native CUDA backend metrics
-  void RecordNativeForwardShape(bool is_decode, int batch_size);
-  void RecordNativeForwardLatency(double forward_ms);
-  void RecordNativeForwardPass(bool is_decode, int batch_size,
+  // InferFlux CUDA backend metrics
+  void RecordInferfluxCudaForwardShape(bool is_decode, int batch_size);
+  void RecordInferfluxCudaForwardLatency(double forward_ms);
+  void RecordInferfluxCudaForwardPass(bool is_decode, int batch_size,
                                double forward_ms);
-  void RecordNativeSampling(int batch_size, double sampling_ms);
-  void RecordNativeBatchDecode(int batch_size, double total_ms);
-  void RecordNativeForwardBatchSize(std::string_view phase, int batch_size);
-  void RecordNativeFfnProjOperator(std::string_view phase,
+  void RecordInferfluxCudaSampling(int batch_size, double sampling_ms);
+  void RecordInferfluxCudaBatchDecode(int batch_size, double total_ms);
+  void RecordInferfluxCudaForwardBatchSize(std::string_view phase, int batch_size);
+  void RecordInferfluxCudaFfnProjOperator(std::string_view phase,
                                    std::string_view op);
-  void RecordNativeFfnProjGeometry(std::string_view phase,
+  void RecordInferfluxCudaFfnProjGeometry(std::string_view phase,
                                    std::string_view op,
                                    std::string_view quant, int batch_size, int n,
                                    int k, int grouped_outputs);
-  void RecordNativeDownProjOperator(std::string_view phase,
+  void RecordInferfluxCudaDownProjOperator(std::string_view phase,
                                     std::string_view op);
-  void RecordNativeDownProjGeometry(std::string_view phase,
+  void RecordInferfluxCudaDownProjGeometry(std::string_view phase,
                                     std::string_view op,
                                     std::string_view quant, int batch_size,
                                     int n, int k);
-  void RecordNativeRowPairSelection(std::string_view phase,
+  void RecordInferfluxCudaRowPairSelection(std::string_view phase,
                                     std::string_view op, int batch_rows);
-  void RecordNativeKvAutoTunePlan(int requested_max_seq, int planned_max_seq,
+  void RecordInferfluxCudaKvAutoTunePlan(int requested_max_seq, int planned_max_seq,
                                   std::size_t requested_bytes,
                                   std::size_t planned_bytes,
                                   std::size_t budget_bytes);
-  void SetNativeKvCacheOccupancy(int active_sequences, int max_sequences);
+  void SetInferfluxCudaKvCacheOccupancy(int active_sequences, int max_sequences);
   int GetQueueDepth() const { return queue_depth_.load(std::memory_order_relaxed); }
   int GetPrefillQueueDepth() const {
     return prefill_queue_depth_.load(std::memory_order_relaxed);
@@ -251,13 +256,13 @@ public:
     uint64_t evictable_bytes{0};
   };
 
-  struct NativeModelMemorySnapshot {
+  struct InferfluxCudaModelMemorySnapshot {
     std::string model_label;
     MemoryUsageMetrics total;
     std::unordered_map<std::string, MemoryUsageMetrics> domains;
   };
 
-  struct NativeKvMemorySnapshot {
+  struct InferfluxCudaKvMemorySnapshot {
     uint64_t total_bytes{0};
     uint64_t active_bytes{0};
     uint64_t prefix_retained_bytes{0};
@@ -268,22 +273,22 @@ public:
     int max_sequences{0};
   };
 
-  void SetNativeModelMemorySnapshot(
+  void SetInferfluxCudaModelMemorySnapshot(
       std::string model_label, MemoryUsageMetrics total,
       std::unordered_map<std::string, MemoryUsageMetrics> domains);
-  NativeModelMemorySnapshot GetNativeModelMemorySnapshot() const;
+  InferfluxCudaModelMemorySnapshot GetInferfluxCudaModelMemorySnapshot() const;
 
-  void SetNativeKvMemoryBytes(uint64_t total_bytes, uint64_t active_bytes,
+  void SetInferfluxCudaKvMemoryBytes(uint64_t total_bytes, uint64_t active_bytes,
                               uint64_t prefix_retained_bytes,
                               uint64_t free_bytes, int active_sequences,
                               int prefix_retained_sequences,
                               int free_sequences, int max_sequences);
-  NativeKvMemorySnapshot GetNativeKvMemorySnapshot() const;
-  int GetNativeKvMaxSequences() const {
-    return native_kv_max_sequences_.load(std::memory_order_relaxed);
+  InferfluxCudaKvMemorySnapshot GetInferfluxCudaKvMemorySnapshot() const;
+  int GetInferfluxCudaKvMaxSequences() const {
+    return inferflux_cuda_kv_max_sequences_.load(std::memory_order_relaxed);
   }
-  uint64_t GetNativeKvPlannedBytes() const {
-    return native_kv_planned_bytes_.load(std::memory_order_relaxed);
+  uint64_t GetInferfluxCudaKvPlannedBytes() const {
+    return inferflux_cuda_kv_planned_bytes_.load(std::memory_order_relaxed);
   }
 
   std::string RenderPrometheus() const;
@@ -398,6 +403,16 @@ private:
       scheduler_decode_worker_batch_size_counts_;
   std::unordered_map<std::string, uint64_t>
       scheduler_decode_worker_execution_path_counts_;
+  std::unordered_map<std::string, uint64_t>
+      scheduler_decode_worker_sticky_merge_counts_;
+  std::unordered_map<std::string, uint64_t> scheduler_decode_assembly_ready_;
+  std::unordered_map<std::string, uint64_t> scheduler_decode_assembly_selected_;
+  std::unordered_map<std::string, uint64_t>
+      scheduler_decode_assembly_compatible_;
+  std::unordered_map<std::string, uint64_t>
+      scheduler_decode_assembly_incompatible_;
+  std::atomic<uint64_t> scheduler_decode_worker_sticky_merged_requests_total_{
+      0};
   std::atomic<uint64_t> cuda_lane_overlap_events_{0};
   std::atomic<uint64_t> cuda_lane_overlap_duration_us_{0};
   std::atomic<int> cuda_decode_lane_inflight_{0};
@@ -419,42 +434,42 @@ private:
   mutable std::mutex cuda_attention_switch_mutex_;
   std::unordered_map<std::string, uint64_t> cuda_attention_switch_counts_;
 
-  // Native CUDA backend metrics
-  std::atomic<uint64_t> native_forward_prefill_total_{0};
-  std::atomic<uint64_t> native_forward_decode_total_{0};
-  std::atomic<uint64_t> native_forward_batch_tokens_total_{0};
-  LatencyHistogram native_forward_latency_;
-  LatencyHistogram native_sampling_latency_;
-  mutable std::mutex native_forward_batch_size_mutex_;
-  std::unordered_map<std::string, uint64_t> native_forward_batch_size_counts_;
-  mutable std::mutex native_ffn_proj_operator_mutex_;
-  std::unordered_map<std::string, uint64_t> native_ffn_proj_operator_counts_;
-  mutable std::mutex native_ffn_proj_geometry_mutex_;
-  std::unordered_map<std::string, uint64_t> native_ffn_proj_geometry_counts_;
-  mutable std::mutex native_down_proj_operator_mutex_;
-  std::unordered_map<std::string, uint64_t> native_down_proj_operator_counts_;
-  mutable std::mutex native_down_proj_geometry_mutex_;
-  std::unordered_map<std::string, uint64_t> native_down_proj_geometry_counts_;
-  mutable std::mutex native_rowpair_selection_mutex_;
+  // InferFlux CUDA backend metrics
+  std::atomic<uint64_t> inferflux_cuda_forward_prefill_total_{0};
+  std::atomic<uint64_t> inferflux_cuda_forward_decode_total_{0};
+  std::atomic<uint64_t> inferflux_cuda_forward_batch_tokens_total_{0};
+  LatencyHistogram inferflux_cuda_forward_latency_;
+  LatencyHistogram inferflux_cuda_sampling_latency_;
+  mutable std::mutex inferflux_cuda_forward_batch_size_mutex_;
+  std::unordered_map<std::string, uint64_t> inferflux_cuda_forward_batch_size_counts_;
+  mutable std::mutex inferflux_cuda_ffn_proj_operator_mutex_;
+  std::unordered_map<std::string, uint64_t> inferflux_cuda_ffn_proj_operator_counts_;
+  mutable std::mutex inferflux_cuda_ffn_proj_geometry_mutex_;
+  std::unordered_map<std::string, uint64_t> inferflux_cuda_ffn_proj_geometry_counts_;
+  mutable std::mutex inferflux_cuda_down_proj_operator_mutex_;
+  std::unordered_map<std::string, uint64_t> inferflux_cuda_down_proj_operator_counts_;
+  mutable std::mutex inferflux_cuda_down_proj_geometry_mutex_;
+  std::unordered_map<std::string, uint64_t> inferflux_cuda_down_proj_geometry_counts_;
+  mutable std::mutex inferflux_cuda_rowpair_selection_mutex_;
   std::unordered_map<std::string, uint64_t>
-      native_rowpair_selection_counts_;
-  std::atomic<int> native_kv_active_sequences_{0};
-  std::atomic<int> native_kv_max_sequences_{0};
-  std::atomic<uint64_t> native_kv_autotune_events_total_{0};
-  std::atomic<int> native_kv_requested_max_seq_{0};
-  std::atomic<int> native_kv_planned_max_seq_{0};
-  std::atomic<uint64_t> native_kv_requested_bytes_{0};
-  std::atomic<uint64_t> native_kv_planned_bytes_{0};
-  std::atomic<uint64_t> native_kv_budget_bytes_{0};
-  std::atomic<uint64_t> native_kv_memory_total_bytes_{0};
-  std::atomic<uint64_t> native_kv_memory_active_bytes_{0};
-  std::atomic<uint64_t> native_kv_memory_prefix_retained_bytes_{0};
-  std::atomic<uint64_t> native_kv_memory_free_bytes_{0};
-  std::atomic<int> native_kv_memory_active_sequences_{0};
-  std::atomic<int> native_kv_memory_prefix_retained_sequences_{0};
-  std::atomic<int> native_kv_memory_free_sequences_{0};
-  mutable std::mutex native_model_memory_mutex_;
-  NativeModelMemorySnapshot native_model_memory_snapshot_{};
+      inferflux_cuda_rowpair_selection_counts_;
+  std::atomic<int> inferflux_cuda_kv_active_sequences_{0};
+  std::atomic<int> inferflux_cuda_kv_max_sequences_{0};
+  std::atomic<uint64_t> inferflux_cuda_kv_autotune_events_total_{0};
+  std::atomic<int> inferflux_cuda_kv_requested_max_seq_{0};
+  std::atomic<int> inferflux_cuda_kv_planned_max_seq_{0};
+  std::atomic<uint64_t> inferflux_cuda_kv_requested_bytes_{0};
+  std::atomic<uint64_t> inferflux_cuda_kv_planned_bytes_{0};
+  std::atomic<uint64_t> inferflux_cuda_kv_budget_bytes_{0};
+  std::atomic<uint64_t> inferflux_cuda_kv_memory_total_bytes_{0};
+  std::atomic<uint64_t> inferflux_cuda_kv_memory_active_bytes_{0};
+  std::atomic<uint64_t> inferflux_cuda_kv_memory_prefix_retained_bytes_{0};
+  std::atomic<uint64_t> inferflux_cuda_kv_memory_free_bytes_{0};
+  std::atomic<int> inferflux_cuda_kv_memory_active_sequences_{0};
+  std::atomic<int> inferflux_cuda_kv_memory_prefix_retained_sequences_{0};
+  std::atomic<int> inferflux_cuda_kv_memory_free_sequences_{0};
+  mutable std::mutex inferflux_cuda_model_memory_mutex_;
+  InferfluxCudaModelMemorySnapshot inferflux_cuda_model_memory_snapshot_{};
 
   struct ModelStats {
     std::string backend;

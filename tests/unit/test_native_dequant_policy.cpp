@@ -1,7 +1,7 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #define private public
-#include "runtime/backends/cuda/native_kernel_executor.h"
+#include "runtime/backends/cuda/inferflux_cuda_executor.h"
 #undef private
 
 namespace inferflux {
@@ -53,9 +53,9 @@ private:
 
 } // namespace
 
-TEST_CASE("NativeKernelExecutor dequant policy parser uses none as default",
+TEST_CASE("InferfluxCudaExecutor dequant policy parser uses none as default",
           "[native_forward][dequant_policy]") {
-  NativeKernelExecutor executor;
+  InferfluxCudaExecutor executor;
 
   REQUIRE(executor.ConfigureDequantizedCachePolicy(""));
   CHECK(executor.dequantized_cache_policy_ ==
@@ -68,9 +68,9 @@ TEST_CASE("NativeKernelExecutor dequant policy parser uses none as default",
   CHECK(executor.dequantized_cache_policy_hint_ == "none");
 }
 
-TEST_CASE("NativeKernelExecutor dequant policy parser accepts none batch model",
+TEST_CASE("InferfluxCudaExecutor dequant policy parser accepts none batch model",
           "[native_forward][dequant_policy]") {
-  NativeKernelExecutor executor;
+  InferfluxCudaExecutor executor;
 
   REQUIRE(executor.ConfigureDequantizedCachePolicy("none"));
   CHECK(executor.dequantized_cache_policy_ ==
@@ -85,10 +85,10 @@ TEST_CASE("NativeKernelExecutor dequant policy parser accepts none batch model",
         runtime::cuda::native::DequantizedCachePolicy::kModelLifetime);
 }
 
-TEST_CASE("NativeKernelExecutor releases dequant cache for non-model policies "
+TEST_CASE("InferfluxCudaExecutor releases dequant cache for non-model policies "
           "on GGUF loaders",
           "[native_forward][dequant_policy]") {
-  NativeKernelExecutor executor;
+  InferfluxCudaExecutor executor;
 
   // kNone: request-boundary cleanup clears dequantized cache
   auto *none_loader = new MockDequantPolicyLoader("gguf");
@@ -107,10 +107,10 @@ TEST_CASE("NativeKernelExecutor releases dequant cache for non-model policies "
   CHECK(batch_loader->clear_calls() == 1);
 }
 
-TEST_CASE("NativeKernelExecutor retains dequant cache for model policy and "
+TEST_CASE("InferfluxCudaExecutor retains dequant cache for model policy and "
           "non-GGUF loaders",
           "[native_forward][dequant_policy]") {
-  NativeKernelExecutor executor;
+  InferfluxCudaExecutor executor;
 
   auto *model_loader = new MockDequantPolicyLoader("gguf");
   executor.model_loader_.reset(model_loader);

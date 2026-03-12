@@ -21,7 +21,7 @@ graph LR
 
 **Model**: Qwen2.5-3B-Instruct Q4_K_M | **GPU**: RTX 4000 Ada (20GB)
 
-| Metric | InferFlux cuda_llama_cpp | Ollama | Advantage |
+| Metric | InferFlux `llama_cpp_cuda` | Ollama | Advantage |
 |--------|-------------------------|--------|-----------|
 | **16 concurrent agents** | **277 tok/s** | 76 tok/s | **up to 3.7x faster** ✅ |
 | 8 concurrent agents | 206 tok/s | 80 tok/s | **2.6x faster** ✅ |
@@ -35,7 +35,7 @@ graph LR
 - ✅ **Memory efficient**: 27% less GPU memory through efficient server architecture
 - ✅ **Additional baseline check**: same-hardware LM Studio was throughput-competitive, but used materially more VRAM
 
-> **Note**: Results use `backend: cuda_llama_cpp` which leverages llama.cpp's mature batched inference. See [Benchmark Details](docs/benchmarks.md) for complete analysis including `cuda_native` backend characteristics.
+> **Note**: Results use `backend: llama_cpp_cuda` which leverages llama.cpp's mature batched inference. See [Benchmark Details](docs/benchmarks.md) for complete analysis including `inferflux_cuda` backend characteristics.
 
 ---
 
@@ -56,7 +56,7 @@ graph LR
 | Strong today | API/admin/CLI contracts, backend/provider identity, policy-visible fallback, and operator observability |
 | **Proven advantage** | **3.7x faster than Ollama for concurrent workloads; horizontal scaling validated** |
 | Foundation now | Native memory-first GGUF policy, KV auto-tune, optional session leases, distributed transport-health semantics |
-| Still open | Quantized native throughput, graph maturity, distributed ownership cleanup, required GPU/provider CI lane, **cuda_native horizontal scaling** |
+| Still open | Quantized InferFlux-engine throughput, graph maturity, distributed ownership cleanup, required GPU/provider CI lane, **inferflux_cuda horizontal scaling** |
 
 ## Modern Runtime Stance
 
@@ -66,7 +66,7 @@ graph LR
 | Async | Useful for admission/collection only if it preserves batch quality |
 | Quantized GGUF | Should stay quantized and memory-first, not silently devolve into persistent full dequant |
 | Distributed runtime | Readiness/admin/admission can react to degraded transport, but ownership maturity is still open |
-| **Backend selection** | **cuda_llama_cpp for concurrent workloads; cuda_native for single-request optimization** |
+| **Backend selection** | **llama_cpp_cuda for concurrent workloads; inferflux_cuda for single-request optimization** |
 
 ## 3-Minute Bring-Up
 
@@ -127,7 +127,7 @@ Start here: [Docs Index](docs/INDEX.md)
 - [Monitoring & Tuning](docs/MONITORING.md) — Observability signals and optimization workflow
 
 **Architecture**:
-- [GEMV Kernel Architecture](docs/GEMV_KERNEL_ARCHITECTURE.md) — Native CUDA kernel design and dispatch
+- [GEMV Kernel Architecture](docs/GEMV_KERNEL_ARCHITECTURE.md) — InferFlux CUDA kernel design and dispatch
 - [Native GGUF Runtime](docs/GGUF_NATIVE_KERNEL_IMPLEMENTATION.md) — First-party CUDA implementation guide
 
 ## Project Status
@@ -136,7 +136,7 @@ Start here: [Docs Index](docs/INDEX.md)
 - ✅ Multi-backend runtime (CPU, CUDA, ROCm, MPS, Vulkan, MLX)
 - ✅ Operator-grade features (auth, RBAC, metrics, audit logging)
 - ✅ **Validated: 3.7x faster than Ollama for concurrent AI workloads**
-- 🚧 Native CUDA throughput optimization (see [Roadmap](docs/TechDebt_and_Competitive_Roadmap.md))
+- 🚧 InferFlux CUDA throughput optimization (see [Roadmap](docs/TechDebt_and_Competitive_Roadmap.md))
 - 🚧 Distributed runtime ownership maturity
 
 ## Quick Links

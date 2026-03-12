@@ -1,4 +1,4 @@
-#include "runtime/backends/cuda/native_kernel_executor.h"
+#include "runtime/backends/cuda/inferflux_cuda_executor.h"
 #include "model/gguf_tokenizer.h"
 #include "model/tokenizer_factory.h"
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
@@ -13,6 +13,7 @@
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
 #include "runtime/backends/cuda/native/cublas_gemm.h"
+#include "runtime/backends/cuda/native/cuda_sync_trace.h"
 #include "runtime/backends/cuda/native/gpu_sampler.h"
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
 #include "runtime/backends/cuda/native/model_forward.h"
@@ -199,7 +200,7 @@ void LogNativeTopLogits(std::string_view stage, const float *d_logits_row,
           ? std::string()
           : "client_request_id=" + std::string(client_request_id) + ", ";
   inferflux::log::Info(
-      "native_kernel_executor",
+      "inferflux_cuda_executor",
       "debug_logits[" + std::string(stage) + "]: " + client_prefix +
           "request_id=" +
           std::to_string(request_id) + ", sequence_id=" +
@@ -223,7 +224,7 @@ void LogSampleMapping(std::string_view stage, int input_idx, int64_t request_id,
       (tokenizer && token_id >= 0) ? tokenizer->TokenToString(token_id)
                                    : std::string();
   inferflux::log::Info(
-      "native_kernel_executor",
+      "inferflux_cuda_executor",
       std::string(stage) + ": input_idx=" + std::to_string(input_idx) + ", " +
           (client_request_id.empty()
                ? std::string()
@@ -780,12 +781,12 @@ bool SafetensorsLoader::ParseConfig(const std::string &) { return false; }
 #endif // INFERFLUX_HAS_CUDA
 
 //==============================================================================
-// NativeKernelExecutor Implementation
+// InferfluxCudaExecutor Implementation
 //==============================================================================
 
-NativeKernelExecutor::NativeKernelExecutor() = default;
+InferfluxCudaExecutor::InferfluxCudaExecutor() = default;
 
-NativeKernelExecutor::~NativeKernelExecutor() {
+InferfluxCudaExecutor::~InferfluxCudaExecutor() {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   for (auto &pending : pending_sequence_releases_) {
     if (pending.compute_done) {
@@ -810,7 +811,7 @@ NativeKernelExecutor::~NativeKernelExecutor() {
   quantized_weight_map_.reset();
   if (d_logits_) {
     if (cudaFree(d_logits_) != cudaSuccess) {
-      log::Warn("native_kernel_executor", "cudaFree(d_logits_) failed");
+      log::Warn("inferflux_cuda_executor", "cudaFree(d_logits_) failed");
     }
     d_logits_ = nullptr;
   }
@@ -851,7 +852,7 @@ bool CheckCudaStatus(cudaError_t status, const std::string &operation) {
   if (status == cudaSuccess) {
     return true;
   }
-  log::Error("native_kernel_executor",
+  log::Error("inferflux_cuda_executor",
              operation + " failed: " + cudaGetErrorString(status));
   return false;
 }
@@ -871,7 +872,7 @@ bool CheckBF16Support() {
 
 bool WaitForLaneHandle(
     UnifiedBatchLaneDispatcher *dispatcher, UnifiedBatchHandle handle,
-    std::vector<LlamaCPUBackend::UnifiedBatchOutput> *outputs,
+    std::vector<LlamaCppBackend::UnifiedBatchOutput> *outputs,
     bool *decode_lane, std::string *error, double *elapsed_ms = nullptr,
     bool *timed_out = nullptr,
     std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
@@ -911,17 +912,17 @@ bool WaitForLaneHandle(
 
 } // namespace
 
-bool NativeKernelExecutor::InitializeCUDA() {
+bool InferfluxCudaExecutor::InitializeCUDA() {
   cudaError_t err = cudaGetDevice(&device_id_);
   if (err != cudaSuccess) {
-    log::Error("native_kernel_executor",
+    log::Error("inferflux_cuda_executor",
                "cudaGetDevice failed: " + std::string(cudaGetErrorString(err)));
     return false;
   }
 
   err = cudaStreamCreateWithFlags(&compute_stream_, cudaStreamNonBlocking);
   if (err != cudaSuccess) {
-    log::Error("native_kernel_executor",
+    log::Error("inferflux_cuda_executor",
                "cudaStreamCreate failed: " +
                    std::string(cudaGetErrorString(err)));
     return false;
@@ -929,22 +930,22 @@ bool NativeKernelExecutor::InitializeCUDA() {
 
   err = cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking);
   if (err != cudaSuccess) {
-    log::Error("native_kernel_executor",
+    log::Error("inferflux_cuda_executor",
                "cudaStreamCreate failed: " +
                    std::string(cudaGetErrorString(err)));
     return false;
   }
 
-  log::Info("native_kernel_executor",
+  log::Info("inferflux_cuda_executor",
             "CUDA initialized on device " + std::to_string(device_id_));
   return true;
 }
 
-void NativeKernelExecutor::FreeDeviceMemory() {
+void InferfluxCudaExecutor::FreeDeviceMemory() {
   // GPU memory is managed by SafetensorsLoader and native components
 }
 
-void NativeKernelExecutor::RefreshMemoryLedger() {
+void InferfluxCudaExecutor::RefreshMemoryLedger() {
   memory_ledger_.Clear();
   if (!loaded_model_path_.empty()) {
     memory_ledger_.SetModelLabel(loaded_model_path_.filename().string());
@@ -1085,11 +1086,11 @@ void NativeKernelExecutor::RefreshMemoryLedger() {
     usage.evictable_bytes = summary.usage.evictable_bytes;
     domains.emplace(runtime::cuda::native::ToString(summary.domain), usage);
   }
-  GlobalMetrics().SetNativeModelMemorySnapshot(memory_ledger_.ModelLabel(),
+  GlobalMetrics().SetInferfluxCudaModelMemorySnapshot(memory_ledger_.ModelLabel(),
                                                total, std::move(domains));
 }
 
-bool NativeKernelExecutor::ConfigureDequantizedCachePolicy(
+bool InferfluxCudaExecutor::ConfigureDequantizedCachePolicy(
     const std::string &raw_policy) {
   std::string policy = ToLowerAscii(raw_policy);
   if (policy.empty()) {
@@ -1099,7 +1100,7 @@ bool NativeKernelExecutor::ConfigureDequantizedCachePolicy(
   runtime::cuda::native::DequantizedCachePolicy parsed =
       runtime::cuda::native::DequantizedCachePolicy::kNone;
   if (!runtime::cuda::native::ParseDequantizedCachePolicy(policy, &parsed)) {
-    log::Warn("native_kernel_executor", "Invalid dequantized cache policy '" +
+    log::Warn("inferflux_cuda_executor", "Invalid dequantized cache policy '" +
                                             policy + "'; falling back to none");
     parsed = runtime::cuda::native::DequantizedCachePolicy::kNone;
     policy = "none";
@@ -1113,7 +1114,7 @@ bool NativeKernelExecutor::ConfigureDequantizedCachePolicy(
   return true;
 }
 
-void NativeKernelExecutor::ReleaseBatchScopedDequantizedCache() {
+void InferfluxCudaExecutor::ReleaseBatchScopedDequantizedCache() {
   if (dequantized_cache_policy_ ==
       runtime::cuda::native::DequantizedCachePolicy::kModelLifetime) {
     return;
@@ -1156,7 +1157,7 @@ void NativeKernelExecutor::ReleaseBatchScopedDequantizedCache() {
 }
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-void NativeKernelExecutor::DestroyLaneOverlapResources() {
+void InferfluxCudaExecutor::DestroyLaneOverlapResources() {
   lane_overlap_ready_ = false;
   decode_lane_forward_.reset();
   prefill_lane_forward_.reset();
@@ -1170,19 +1171,19 @@ void NativeKernelExecutor::DestroyLaneOverlapResources() {
   prefill_lane_quantized_weight_map_.reset();
   if (d_decode_logits_) {
     if (cudaFree(d_decode_logits_) != cudaSuccess) {
-      log::Warn("native_kernel_executor", "cudaFree(d_decode_logits_) failed");
+      log::Warn("inferflux_cuda_executor", "cudaFree(d_decode_logits_) failed");
     }
     d_decode_logits_ = nullptr;
   }
   if (d_prefill_logits_) {
     if (cudaFree(d_prefill_logits_) != cudaSuccess) {
-      log::Warn("native_kernel_executor", "cudaFree(d_prefill_logits_) failed");
+      log::Warn("inferflux_cuda_executor", "cudaFree(d_prefill_logits_) failed");
     }
     d_prefill_logits_ = nullptr;
   }
 }
 
-bool NativeKernelExecutor::CanRunLaneOverlap() const {
+bool InferfluxCudaExecutor::CanRunLaneOverlap() const {
   if (!lane_overlap_ready_ || !decode_lane_forward_ || !prefill_lane_forward_ ||
       !decode_lane_sampler_ || !prefill_lane_sampler_ || !decode_lane_gemm_ ||
       !prefill_lane_gemm_ || !d_decode_logits_ || !d_prefill_logits_) {
@@ -1198,8 +1199,8 @@ bool NativeKernelExecutor::CanRunLaneOverlap() const {
   return true;
 }
 
-NativeKernelExecutor::LaneExecutionResources
-NativeKernelExecutor::PrimaryLaneResources() {
+InferfluxCudaExecutor::LaneExecutionResources
+InferfluxCudaExecutor::PrimaryLaneResources() {
   LaneExecutionResources resources;
   resources.forward = model_forward_.get();
   resources.sampler = sampler_.get();
@@ -1210,8 +1211,8 @@ NativeKernelExecutor::PrimaryLaneResources() {
   return resources;
 }
 
-NativeKernelExecutor::LaneExecutionResources
-NativeKernelExecutor::GetLaneResources(bool decode_lane) {
+InferfluxCudaExecutor::LaneExecutionResources
+InferfluxCudaExecutor::GetLaneResources(bool decode_lane) {
   if (CanRunLaneOverlap()) {
     LaneExecutionResources lane_resources;
     lane_resources.forward =
@@ -1234,7 +1235,7 @@ NativeKernelExecutor::GetLaneResources(bool decode_lane) {
   return PrimaryLaneResources();
 }
 
-bool NativeKernelExecutor::InitializeLaneOverlapResources(
+bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
     const SafetensorsLoader::ModelConfig &config, bool want_bf16,
     int max_batch) {
   DestroyLaneOverlapResources();
@@ -1260,7 +1261,7 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
   prefill_lane_gemm_ = std::make_unique<CublasGemm>();
   if (!decode_lane_gemm_->Initialize(decode_stream_) ||
       !prefill_lane_gemm_->Initialize(prefill_stream_)) {
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "Failed to initialize lane-overlap cuBLAS handles");
     DestroyLaneOverlapResources();
     return false;
@@ -1280,7 +1281,7 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
     prefill_lane_forward_ = CreateModelForward(config.model_type);
   }
   if (!decode_lane_forward_ || !prefill_lane_forward_) {
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "Failed to create lane-overlap forward replicas");
     DestroyLaneOverlapResources();
     return false;
@@ -1293,7 +1294,7 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
             model_loader_.get(), model_info_, decode_stream_) ||
         !prefill_lane_quantized_weight_map_->Build(
             model_loader_.get(), model_info_, prefill_stream_)) {
-      log::Warn("native_kernel_executor",
+      log::Warn("inferflux_cuda_executor",
                 "Failed to build GGUF lane-local quantized maps");
       DestroyLaneOverlapResources();
       return false;
@@ -1322,7 +1323,7 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
         !prefill_lane_forward_->Initialize(
             gguf_config, *prefill_lane_quantized_weight_adapter_,
             kv_cache_.get(), prefill_lane_gemm_.get(), prefill_stream_)) {
-      log::Warn("native_kernel_executor",
+      log::Warn("inferflux_cuda_executor",
                 "Failed to initialize GGUF lane-overlap forward replicas");
       DestroyLaneOverlapResources();
       return false;
@@ -1336,7 +1337,7 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
         !prefill_lane_forward_->Initialize(
             config, *weight_map_, kv_cache_.get(), prefill_lane_gemm_.get(),
             prefill_stream_)) {
-      log::Warn("native_kernel_executor",
+      log::Warn("inferflux_cuda_executor",
                 "Failed to initialize lane-overlap forward replicas");
       DestroyLaneOverlapResources();
       return false;
@@ -1349,7 +1350,7 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
   prefill_lane_sampler_ = std::make_unique<GpuSampler>();
   if (!decode_lane_sampler_->Initialize(config.vocab_size, decode_stream_) ||
       !prefill_lane_sampler_->Initialize(config.vocab_size, prefill_stream_)) {
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "Failed to initialize lane-overlap samplers");
     DestroyLaneOverlapResources();
     return false;
@@ -1361,7 +1362,7 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
                       static_cast<std::size_t>(config.vocab_size),
                       &logits_elements) ||
       !CheckedMulSize(logits_elements, sizeof(float), &logits_bytes)) {
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "Lane-overlap logits allocation overflow");
     DestroyLaneOverlapResources();
     return false;
@@ -1370,7 +1371,7 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
                        "cudaMalloc(d_decode_logits_)") ||
       !CheckCudaStatus(cudaMalloc(&d_prefill_logits_, logits_bytes),
                        "cudaMalloc(d_prefill_logits_)")) {
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "Failed to allocate lane-overlap logits buffers");
     DestroyLaneOverlapResources();
     return false;
@@ -1380,29 +1381,55 @@ bool NativeKernelExecutor::InitializeLaneOverlapResources(
   const std::string overlap_mode =
       is_gguf_path ? " (GGUF lane-local quantized maps)" : "";
   log::Info(
-      "native_kernel_executor",
+      "inferflux_cuda_executor",
       "Lane-overlap replicas initialized (decode/prefill forward + sampler + "
       "logits)" +
           overlap_mode);
   return true;
 }
 
-bool NativeKernelExecutor::InitializeNativePipeline() {
+bool InferfluxCudaExecutor::EnsureLaneOverlapResources() {
+  if (!overlap_enabled_) {
+    return false;
+  }
+  if (lane_overlap_ready_) {
+    return true;
+  }
+  if (lane_overlap_init_attempted_) {
+    return false;
+  }
+
+  lane_overlap_init_attempted_ = true;
+  const bool want_bf16 = (inference_dtype_ == InferenceDtype::kBF16);
+  if (!InitializeLaneOverlapResources(model_config_, want_bf16,
+                                      active_max_batch_)) {
+    log::Warn("inferflux_cuda_executor",
+              "Lane-overlap resources unavailable; mixed workloads will use "
+              "single-lane execution");
+    RefreshMemoryLedger();
+    return false;
+  }
+
+  RefreshMemoryLedger();
+  return true;
+}
+
+bool InferfluxCudaExecutor::InitializeNativePipeline() {
   const auto &config = model_config_;
 
   // Detect inference dtype from model config (overridable via bootstrap env).
   bool want_bf16 = (config.torch_dtype == "bfloat16");
   if (bootstrap_config_.ForceFp16()) {
     want_bf16 = false;
-    log::Info("native_kernel_executor",
-              "INFERFLUX_NATIVE_DTYPE=fp16 override: forcing FP16 pipeline");
+    log::Info("inferflux_cuda_executor",
+              "INFERFLUX_CUDA_DTYPE=fp16 override: forcing FP16 pipeline");
   } else if (bootstrap_config_.ForceBf16()) {
     want_bf16 = true;
-    log::Info("native_kernel_executor",
-              "INFERFLUX_NATIVE_DTYPE=bf16 override: forcing BF16 pipeline");
+    log::Info("inferflux_cuda_executor",
+              "INFERFLUX_CUDA_DTYPE=bf16 override: forcing BF16 pipeline");
   }
   if (want_bf16 && !CheckBF16Support()) {
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "BF16 requested but GPU SM < 80; falling back to FP16");
     want_bf16 = false;
   }
@@ -1415,7 +1442,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
                               : runtime::cuda::native::KvPrecision::kFp16;
   } else if (!runtime::cuda::native::ParseKvPrecision(kv_precision_choice,
                                                       &kv_precision_)) {
-    log::Warn("native_kernel_executor", "Invalid KV precision '" +
+    log::Warn("inferflux_cuda_executor", "Invalid KV precision '" +
                                             kv_precision_choice +
                                             "', falling back to auto");
     kv_precision_ = want_bf16 ? runtime::cuda::native::KvPrecision::kBf16
@@ -1424,20 +1451,20 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
 
   if (kv_precision_ == runtime::cuda::native::KvPrecision::kBf16 &&
       !CheckBF16Support()) {
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "BF16 KV cache requested but GPU SM < 80; using FP16 KV cache");
     kv_precision_ = runtime::cuda::native::KvPrecision::kFp16;
   }
   if (kv_precision_ == runtime::cuda::native::KvPrecision::kInt8 ||
       kv_precision_ == runtime::cuda::native::KvPrecision::kFp8) {
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "KV precision '" +
                   runtime::cuda::native::KvPrecisionToString(kv_precision_) +
                   "' is not implemented yet; using FP16 KV cache");
     kv_precision_ = runtime::cuda::native::KvPrecision::kFp16;
   }
 
-  log::Info("native_kernel_executor",
+  log::Info("inferflux_cuda_executor",
             "Inference dtype: " + std::string(want_bf16 ? "bf16" : "fp16") +
                 " (torch_dtype=" + config.torch_dtype + "), kv_dtype=" +
                 runtime::cuda::native::KvPrecisionToString(kv_precision_));
@@ -1445,7 +1472,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   // 1. Initialize cuBLAS wrapper
   gemm_ = std::make_unique<CublasGemm>();
   if (!gemm_->Initialize(compute_stream_)) {
-    log::Error("native_kernel_executor", "Failed to initialize cuBLAS");
+    log::Error("inferflux_cuda_executor", "Failed to initialize cuBLAS");
     return false;
   }
 
@@ -1456,28 +1483,28 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   int max_seq = bootstrap_config_.kv_max_seq;
   bool max_seq_overridden = bootstrap_config_.kv_max_seq_overridden;
   if (!bootstrap_config_.invalid_kv_max_batch.empty()) {
-    log::Warn("native_kernel_executor",
-              "Ignoring invalid INFERFLUX_NATIVE_KV_MAX_BATCH='" +
+    log::Warn("inferflux_cuda_executor",
+              "Ignoring invalid INFERFLUX_CUDA_KV_MAX_BATCH='" +
                   bootstrap_config_.invalid_kv_max_batch + "'");
   } else if (max_batch != 16) {
-    log::Info("native_kernel_executor",
+    log::Info("inferflux_cuda_executor",
               "KV cache max_batch overridden to " + std::to_string(max_batch));
   }
   // Scheduler allocates sequence slot IDs 0..15, so KV cache needs ≥16 slots.
   constexpr int kMinKvBatch = 16;
   if (max_batch < kMinKvBatch) {
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "KV max_batch=" + std::to_string(max_batch) +
                   " < scheduler slots (" + std::to_string(kMinKvBatch) +
                   "), clamping to " + std::to_string(kMinKvBatch));
     max_batch = kMinKvBatch;
   }
   if (!bootstrap_config_.invalid_kv_max_seq.empty()) {
-    log::Warn("native_kernel_executor",
-              "Ignoring invalid INFERFLUX_NATIVE_KV_MAX_SEQ='" +
+    log::Warn("inferflux_cuda_executor",
+              "Ignoring invalid INFERFLUX_CUDA_KV_MAX_SEQ='" +
                   bootstrap_config_.invalid_kv_max_seq + "'");
   } else if (max_seq_overridden) {
-    log::Info("native_kernel_executor",
+    log::Info("inferflux_cuda_executor",
               "KV cache max_seq overridden to " + std::to_string(max_seq));
   }
   if (config.max_position_embeddings > 0 &&
@@ -1488,15 +1515,15 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   const bool kv_auto_tune = bootstrap_config_.kv_auto_tune;
   const std::size_t kv_budget_bytes = bootstrap_config_.kv_budget_bytes;
   if (!bootstrap_config_.invalid_kv_budget_mb.empty()) {
-    log::Warn("native_kernel_executor",
-              "Ignoring invalid INFERFLUX_NATIVE_KV_BUDGET_MB='" +
+    log::Warn("inferflux_cuda_executor",
+              "Ignoring invalid INFERFLUX_CUDA_KV_BUDGET_MB='" +
                   bootstrap_config_.invalid_kv_budget_mb + "'");
   }
 
   const double kv_budget_ratio = bootstrap_config_.kv_budget_ratio;
   if (!bootstrap_config_.invalid_kv_free_mem_ratio.empty()) {
-    log::Warn("native_kernel_executor",
-              "Ignoring invalid INFERFLUX_NATIVE_KV_FREE_MEM_RATIO='" +
+    log::Warn("inferflux_cuda_executor",
+              "Ignoring invalid INFERFLUX_CUDA_KV_FREE_MEM_RATIO='" +
                   bootstrap_config_.invalid_kv_free_mem_ratio + "'");
   }
 
@@ -1506,7 +1533,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     const cudaError_t mem_info_status =
         cudaMemGetInfo(&free_bytes, &total_bytes);
     if (mem_info_status != cudaSuccess) {
-      log::Warn("native_kernel_executor",
+      log::Warn("inferflux_cuda_executor",
                 "cudaMemGetInfo failed for KV auto-tuning: " +
                     std::string(cudaGetErrorString(mem_info_status)));
       free_bytes = 0;
@@ -1532,7 +1559,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   kv_plan_input.budget_ratio = kv_budget_ratio;
 
   const auto kv_plan = runtime::cuda::native::PlanKvCache(kv_plan_input);
-  GlobalMetrics().RecordNativeKvAutoTunePlan(
+  GlobalMetrics().RecordInferfluxCudaKvAutoTunePlan(
       kv_plan_input.requested_max_seq, kv_plan.max_seq, kv_plan.requested_bytes,
       kv_plan.planned_bytes, kv_plan.budget_bytes);
   max_batch = kv_plan.max_batch;
@@ -1542,7 +1569,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
 
   if (kv_plan.auto_tuned_seq) {
     log::Info(
-        "native_kernel_executor",
+        "inferflux_cuda_executor",
         "KV auto-tune reduced max_seq to " + std::to_string(max_seq) +
             " (requested_bytes=" +
             std::to_string(kv_plan.requested_bytes / kMiB) +
@@ -1558,7 +1585,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     const std::string budget_source =
         kv_budget_bytes > 0 ? "explicit"
                             : (free_bytes > 0 ? "free_mem" : "none");
-    log::Info("native_kernel_executor",
+    log::Info("inferflux_cuda_executor",
               "KV allocation plan: max_batch=" + std::to_string(max_batch) +
                   ", max_seq=" + std::to_string(max_seq) + ", estimated=" +
                   std::to_string(kv_plan.planned_bytes / kMiB) +
@@ -1574,7 +1601,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     auto cache = std::make_unique<KvCacheGpuTyped<__nv_bfloat16>>();
     if (!cache->Allocate(config.num_hidden_layers, config.num_key_value_heads,
                          config.head_dim, max_seq, max_batch)) {
-      log::Error("native_kernel_executor", "Failed to allocate BF16 KV cache");
+      log::Error("inferflux_cuda_executor", "Failed to allocate BF16 KV cache");
       return false;
     }
     kv_cache_ = std::move(cache);
@@ -1582,12 +1609,12 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     auto cache = std::make_unique<KvCacheGpu>();
     if (!cache->Allocate(config.num_hidden_layers, config.num_key_value_heads,
                          config.head_dim, max_seq, max_batch)) {
-      log::Error("native_kernel_executor", "Failed to allocate FP16 KV cache");
+      log::Error("inferflux_cuda_executor", "Failed to allocate FP16 KV cache");
       return false;
     }
     kv_cache_ = std::move(cache);
   }
-  GlobalMetrics().SetNativeKvCacheOccupancy(/*active_sequences=*/0,
+  GlobalMetrics().SetInferfluxCudaKvCacheOccupancy(/*active_sequences=*/0,
                                             /*max_sequences=*/max_batch);
 
   // 2.5. Strategy selection (foundation layer for native quantized runtime).
@@ -1617,7 +1644,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
         quantized_matmul_mode_ = selection.matmul->Mode();
         quantized_matmul_strategy_id_ = selection.matmul->Id();
         const auto mode = quantized_matmul_mode_;
-        log::Info("native_kernel_executor",
+        log::Info("inferflux_cuda_executor",
                   "Selected GGUF strategies: layout=" +
                       selection.weight_layout->Id() + ", matmul=" +
                       selection.matmul->Id() + " (" + MatmulModeToString(mode) +
@@ -1626,7 +1653,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
         if (require_fused_quantized_matmul_ && is_quantized_model &&
             mode != runtime::cuda::native::MatmulExecutionMode::
                         kFusedDequantTileGemm) {
-          log::Error("native_kernel_executor",
+          log::Error("inferflux_cuda_executor",
                      "Strict quantized runtime policy rejected startup: "
                      "fused dequant-tile GEMM required but selected matmul '" +
                          selection.matmul->Id() + "' (" +
@@ -1637,31 +1664,31 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
         const std::string reason =
             "Incomplete GGUF strategy selection: " + selection.reason;
         if (require_fused_quantized_matmul_ && is_quantized_model) {
-          log::Error("native_kernel_executor",
+          log::Error("inferflux_cuda_executor",
                      "Strict quantized runtime policy rejected startup: " +
                          reason);
           return false;
         }
-        log::Warn("native_kernel_executor", reason);
+        log::Warn("inferflux_cuda_executor", reason);
       }
     } else if (is_quantized_model) {
       const std::string reason =
           "Quantized GGUF model loaded but quantization type '" +
           quantization_type + "' is unknown; strategy selection skipped";
       if (require_fused_quantized_matmul_) {
-        log::Error("native_kernel_executor",
+        log::Error("inferflux_cuda_executor",
                    "Strict quantized runtime policy rejected startup: " +
                        reason);
         return false;
       }
-      log::Warn("native_kernel_executor", reason);
+      log::Warn("inferflux_cuda_executor", reason);
     }
   }
 
   const bool allow_fused_quantized_matmul =
       quantized_matmul_mode_ ==
       runtime::cuda::native::MatmulExecutionMode::kFusedDequantTileGemm;
-  log::Info("native_kernel_executor",
+  log::Info("inferflux_cuda_executor",
             "Quantized matmul execution mode: " +
                 MatmulModeToString(quantized_matmul_mode_) + ", strategy_id=" +
                 quantized_matmul_strategy_id_ + ", allow_fused=" +
@@ -1672,7 +1699,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     quantized_weight_map_ = std::make_unique<QuantizedWeightMap>();
     if (!quantized_weight_map_->Build(model_loader_.get(), model_info_,
                                       compute_stream_)) {
-      log::Error("native_kernel_executor",
+      log::Error("inferflux_cuda_executor",
                  "Failed to build quantized weight map");
       return false;
     }
@@ -1683,7 +1710,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     // GGUF always dequantizes to FP16, so use LlamaForwardTyped<half>
     model_forward_ = CreateModelForward(config.model_type);
     if (!model_forward_) {
-      log::Error("native_kernel_executor",
+      log::Error("inferflux_cuda_executor",
                  "Failed to create forward for model_type: " +
                      config.model_type);
       return false;
@@ -1692,7 +1719,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     if (!model_forward_->Initialize(gguf_config, *quantized_weight_adapter_,
                                     kv_cache_.get(), gemm_.get(),
                                     compute_stream_)) {
-      log::Error("native_kernel_executor",
+      log::Error("inferflux_cuda_executor",
                  "Failed to initialize forward pass for GGUF model");
       return false;
     }
@@ -1700,7 +1727,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   } else {
     weight_map_ = std::make_unique<WeightMap>();
     if (!weight_map_->Build(*loader_, config)) {
-      log::Error("native_kernel_executor", "Failed to build weight map");
+      log::Error("inferflux_cuda_executor", "Failed to build weight map");
       return false;
     }
     if (want_bf16) {
@@ -1710,13 +1737,13 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
       model_forward_ = CreateModelForward(config.model_type);
     }
     if (!model_forward_) {
-      log::Error("native_kernel_executor",
+      log::Error("inferflux_cuda_executor",
                  "Unsupported model_type: " + config.model_type);
       return false;
     }
     if (!model_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
                                     gemm_.get(), compute_stream_)) {
-      log::Error("native_kernel_executor", "Failed to initialize forward pass");
+      log::Error("inferflux_cuda_executor", "Failed to initialize forward pass");
       return false;
     }
     model_forward_->SetExecutionPolicy(execution_policy_);
@@ -1725,13 +1752,13 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   // 4. Initialize GPU sampler
   sampler_ = std::make_unique<GpuSampler>();
   if (!sampler_->Initialize(config.vocab_size, compute_stream_)) {
-    log::Error("native_kernel_executor", "Failed to initialize GPU sampler");
+    log::Error("inferflux_cuda_executor", "Failed to initialize GPU sampler");
     return false;
   }
 
   // 5. Allocate device logits buffer (sized for batched decode)
   if (config.vocab_size <= 0) {
-    log::Error("native_kernel_executor",
+    log::Error("inferflux_cuda_executor",
                "Invalid vocab_size for logits buffer");
     return false;
   }
@@ -1741,12 +1768,12 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
                       static_cast<std::size_t>(config.vocab_size),
                       &logits_elements) ||
       !CheckedMulSize(logits_elements, sizeof(float), &logits_bytes)) {
-    log::Error("native_kernel_executor", "Logits buffer size overflow");
+    log::Error("inferflux_cuda_executor", "Logits buffer size overflow");
     return false;
   }
   cudaError_t err = cudaMalloc(&d_logits_, logits_bytes);
   if (err != cudaSuccess) {
-    log::Error("native_kernel_executor", "Failed to allocate logits buffer");
+    log::Error("inferflux_cuda_executor", "Failed to allocate logits buffer");
     return false;
   }
 
@@ -1766,13 +1793,13 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
               gguf_loader->TokenizerAddBosToken(),
               gguf_loader->TokenizerChatTemplate())) {
         tokenizer_ = std::move(gguf_tokenizer);
-        log::Info("native_kernel_executor",
+        log::Info("inferflux_cuda_executor",
                   "Initialized GGUF metadata tokenizer");
       } else {
         fallback_mode_ = true;
         fallback_reason_ =
             "native GGUF tokenizer unavailable; using llama.cpp tokenizer";
-        log::Warn("native_kernel_executor", fallback_reason_);
+        log::Warn("inferflux_cuda_executor", fallback_reason_);
       }
     }
     const std::string tokenizer_path =
@@ -1783,7 +1810,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
       tokenizer_ = CreateTokenizer(tokenizer_path, model_format);
     }
     if (!tokenizer_) {
-      log::Error("native_kernel_executor",
+      log::Error("inferflux_cuda_executor",
                  "Failed to initialize tokenizer for model path: " +
                      tokenizer_path);
       return false;
@@ -1794,7 +1821,7 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
   //    0 → disable event recording entirely (max throughput).
   //    N > 0 → record events every Nth batch.
   timing_sample_rate_ = execution_policy_.timing_sample_rate;
-  log::Info("native_kernel_executor",
+  log::Info("inferflux_cuda_executor",
             "Timing sample rate: " + std::to_string(timing_sample_rate_) +
                 (timing_sample_rate_ <= 0 ? " (disabled)" : ""));
 
@@ -1822,32 +1849,25 @@ bool NativeKernelExecutor::InitializeNativePipeline() {
     return false;
   }
 
-  if (!InitializeLaneOverlapResources(config, want_bf16, max_batch) &&
-      overlap_enabled_) {
-    log::Warn("native_kernel_executor",
-              "Lane-overlap resources unavailable; mixed workloads will use "
-              "single-lane execution");
-  }
-
   RefreshMemoryLedger();
-  log::Info("native_kernel_executor", memory_ledger_.Describe());
+  log::Info("inferflux_cuda_executor", memory_ledger_.Describe());
 
-  log::Info("native_kernel_executor",
+  log::Info("inferflux_cuda_executor",
             "Native inference pipeline initialized successfully");
   return true;
 }
 #else
-bool NativeKernelExecutor::InitializeNativePipeline() {
-  log::Warn("native_kernel_executor",
+bool InferfluxCudaExecutor::InitializeNativePipeline() {
+  log::Warn("inferflux_cuda_executor",
             "Native kernels not compiled; pipeline unavailable");
   return false;
 }
 #endif
 
-bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
+bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
                                      const LlamaBackendConfig &config) {
-  log::Info("native_kernel_executor",
-            "Loading native CUDA model from: " + model_path.string());
+  log::Info("inferflux_cuda_executor",
+            "Loading InferFlux CUDA model from: " + model_path.string());
   loaded_model_path_ = model_path;
   memory_ledger_.Clear();
   active_max_batch_ = 0;
@@ -1867,11 +1887,13 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   // Initialize phase overlap settings from config
   overlap_enabled_ = config.cuda_phase_overlap_scaffold;
   min_prefill_tokens_ = config.cuda_phase_overlap_min_prefill_tokens;
-  dequantized_cache_policy_hint_ = config.native_dequantized_cache_policy;
+  lane_overlap_init_attempted_ = false;
+  dequantized_cache_policy_hint_ =
+      config.inferflux_cuda_dequantized_cache_policy;
   bootstrap_config_ =
-      NativeBootstrapConfig::FromEnv(config.native_kv_cache_dtype);
+      NativeBootstrapConfig::FromEnv(config.inferflux_cuda_kv_cache_dtype);
   require_fused_quantized_matmul_ =
-      config.native_require_fused_quantized_matmul;
+      config.inferflux_cuda_require_fused_quantized_matmul;
   execution_policy_ = NativeExecutionPolicy::FromEnv();
   quantized_matmul_mode_ =
       runtime::cuda::native::MatmulExecutionMode::kFusedDequantTileGemm;
@@ -1886,7 +1908,7 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   }
   ConfigureDequantizedCachePolicy(dequantized_cache_policy_hint_);
   log::Info(
-      "native_kernel_executor",
+      "inferflux_cuda_executor",
       "Phase overlap: " +
           std::string(overlap_enabled_ ? "enabled" : "disabled") +
           ", min_prefill_tokens=" + std::to_string(min_prefill_tokens_) +
@@ -1902,7 +1924,7 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
 
   auto detected_loader = runtime::cuda::native::CreateModelLoader(model_path);
   if (!detected_loader) {
-    log::Error("native_kernel_executor",
+    log::Error("inferflux_cuda_executor",
                "Failed to detect model loader for path: " +
                    model_path.string());
     return false;
@@ -1915,14 +1937,14 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
     // feature-parity validated for BF16/FP16 conversion controls.
     loader_ = std::make_unique<SafetensorsLoader>();
     if (!loader_->LoadModel(model_path.string())) {
-      log::Error("native_kernel_executor", "Failed to load safetensors model");
+      log::Error("inferflux_cuda_executor", "Failed to load safetensors model");
       return false;
     }
     model_config_ = loader_->GetConfig();
 
     // Decide whether to skip BF16→FP16 conversion
     // If model is BF16 and GPU supports it, keep BF16 for native pipeline
-    // Env var INFERFLUX_NATIVE_DTYPE=fp16 forces FP16 conversion
+    // Env var INFERFLUX_CUDA_DTYPE=fp16 forces FP16 conversion
     bool skip_bf16 = false;
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
     {
@@ -1931,35 +1953,35 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
           !force_fp16) {
         skip_bf16 = true;
         log::Info(
-            "native_kernel_executor",
+            "inferflux_cuda_executor",
             "BF16 model detected with SM >= 80; uploading weights as BF16");
       } else if (model_config_.torch_dtype == "bfloat16" && force_fp16) {
-        log::Info("native_kernel_executor",
+        log::Info("inferflux_cuda_executor",
                   "BF16 model with FP16 override; converting BF16→FP16 on CPU");
       }
     }
 #endif
 
     // Upload weights to GPU
-    log::Info("native_kernel_executor", "Uploading weights to GPU...");
+    log::Info("inferflux_cuda_executor", "Uploading weights to GPU...");
     if (!loader_->UploadToGPU(compute_stream_, skip_bf16)) {
-      log::Error("native_kernel_executor", "Failed to upload weights to GPU");
+      log::Error("inferflux_cuda_executor", "Failed to upload weights to GPU");
       return false;
     }
   } else {
     model_loader_ = std::move(detected_loader);
     model_loader_->SetDequantizedCachePolicy(dequantized_cache_policy_);
     if (!model_loader_->Load(model_path)) {
-      log::Error("native_kernel_executor",
+      log::Error("inferflux_cuda_executor",
                  "Failed to load model via loader: " + detected_format);
       return false;
     }
     model_info_ = model_loader_->GetModelInfo();
     model_config_ = ConvertModelInfo(model_info_);
-    log::Info("native_kernel_executor", "Uploading model weights to GPU via " +
+    log::Info("inferflux_cuda_executor", "Uploading model weights to GPU via " +
                                             detected_format + " loader...");
     if (!model_loader_->UploadToGPU(compute_stream_)) {
-      log::Error("native_kernel_executor",
+      log::Error("inferflux_cuda_executor",
                  "Failed to upload model weights via " + detected_format +
                      " loader");
       return false;
@@ -1968,7 +1990,7 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
 
   // Initialize native inference pipeline
   if (!InitializeNativePipeline()) {
-    log::Error("native_kernel_executor",
+    log::Error("inferflux_cuda_executor",
                "Native pipeline initialization failed");
     return false;
   }
@@ -1976,7 +1998,8 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
   // Report native backend uses FA2 attention kernel
   GlobalMetrics().SetCudaAttentionKernel("fa2");
 
-  log::Info("native_kernel_executor", "Native CUDA model loaded successfully");
+  log::Info("inferflux_cuda_executor",
+            "InferFlux CUDA model loaded successfully");
   model_loaded_ = true;
   return true;
 }
@@ -1987,13 +2010,13 @@ bool NativeKernelExecutor::LoadModel(const std::filesystem::path &model_path,
 // Phase Overlap Helper Methods
 // ==========================================================================
 
-bool NativeKernelExecutor::IsPrefillLikeInput(
+bool InferfluxCudaExecutor::IsPrefillLikeInput(
     const UnifiedBatchInput &input) const {
   // Prefill requests have multiple tokens or don't request logits
   return input.tokens.size() > 1 || !input.request_logits;
 }
 
-bool NativeKernelExecutor::HasMixedWorkload(
+bool InferfluxCudaExecutor::HasMixedWorkload(
     const std::vector<UnifiedBatchInput> &inputs) const {
   if (!overlap_enabled_) {
     return false;
@@ -2016,7 +2039,7 @@ bool NativeKernelExecutor::HasMixedWorkload(
   return false;
 }
 
-void NativeKernelExecutor::SplitBatchByType(
+void InferfluxCudaExecutor::SplitBatchByType(
     const std::vector<UnifiedBatchInput> &inputs,
     std::vector<size_t> &prefill_indices,
     std::vector<size_t> &decode_indices) const {
@@ -2032,8 +2055,8 @@ void NativeKernelExecutor::SplitBatchByType(
   }
 }
 
-NativeKernelExecutor::LaneExecutionResult
-NativeKernelExecutor::ExecuteLaneBatch(
+InferfluxCudaExecutor::LaneExecutionResult
+InferfluxCudaExecutor::ExecuteLaneBatch(
     const std::vector<UnifiedBatchInput> &inputs,
     const LaneExecutionResources &resources) {
   LaneExecutionResult result;
@@ -2044,7 +2067,7 @@ NativeKernelExecutor::ExecuteLaneBatch(
   }
   if (!resources.forward || !resources.sampler || !resources.gemm ||
       !resources.logits || !resources.stream) {
-    log::Error("native_kernel_executor",
+    log::Error("inferflux_cuda_executor",
                "ExecuteLaneBatch invoked without valid lane resources");
     for (auto &output : result.outputs) {
       output.ok = false;
@@ -2135,7 +2158,7 @@ NativeKernelExecutor::ExecuteLaneBatch(
               .count();
 
       if (!fwd_ok) {
-        log::Error("native_kernel_executor", "Lane BatchForward failed");
+        log::Error("inferflux_cuda_executor", "Lane BatchForward failed");
         for (int b = 0; b < B; ++b) {
           const auto &entry = decode_group[offset + static_cast<size_t>(b)];
           auto &output = result.outputs[entry.input_idx];
@@ -2157,7 +2180,7 @@ NativeKernelExecutor::ExecuteLaneBatch(
               .count();
 
       if (DecodeMappingDebugEnabled(execution_policy_)) {
-        log::Info("native_kernel_executor",
+        log::Info("inferflux_cuda_executor",
                   "decode_mapping[lane]: batch_size=" + std::to_string(B) +
                       ", batch_offset=" + std::to_string(offset));
         for (int b = 0; b < B; ++b) {
@@ -2170,7 +2193,7 @@ NativeKernelExecutor::ExecuteLaneBatch(
               (tokenizer_ && token_id >= 0)
                   ? tokenizer_->TokenToString(token_id)
                   : std::string();
-          log::Info("native_kernel_executor",
+          log::Info("inferflux_cuda_executor",
                     "decode_mapping[lane]: input_idx=" +
                         std::to_string(entry.input_idx) + ", " +
                         (entry.client_request_id.empty()
@@ -2212,6 +2235,7 @@ NativeKernelExecutor::ExecuteLaneBatch(
   double prefill_ms_total = 0.0;
   int prompt_tokens_total = 0;
   int sampled_prefill_total = 0;
+  bool requires_lane_stream_drain = false;
   for (int idx : prefill_indices) {
     const auto &input = inputs[static_cast<size_t>(idx)];
     auto &output = result.outputs[static_cast<size_t>(idx)];
@@ -2223,7 +2247,7 @@ NativeKernelExecutor::ExecuteLaneBatch(
     const auto forward_start = std::chrono::steady_clock::now();
     if (!resources.forward->Forward(input.tokens, input.n_past,
                                     input.sequence_id, resources.logits)) {
-      log::Error("native_kernel_executor", "Lane Forward failed");
+      log::Error("inferflux_cuda_executor", "Lane Forward failed");
       continue;
     }
     const auto forward_end = std::chrono::steady_clock::now();
@@ -2234,9 +2258,12 @@ NativeKernelExecutor::ExecuteLaneBatch(
 
     if (input.request_logits) {
       const auto sample_start = std::chrono::steady_clock::now();
-      const int token_id = resources.sampler->Sample(
-          resources.logits, input.sampling.temperature, input.sampling.top_k,
-          input.sampling.top_p, input.sampling.seed);
+      resources.sampler->EnqueueSample(resources.logits,
+                                       input.sampling.temperature,
+                                       input.sampling.top_k,
+                                       input.sampling.top_p,
+                                       input.sampling.seed);
+      const int token_id = resources.sampler->CollectSample();
       const auto sample_end = std::chrono::steady_clock::now();
       sample_ms_total +=
           std::chrono::duration<double, std::milli>(sample_end - sample_start)
@@ -2258,13 +2285,19 @@ NativeKernelExecutor::ExecuteLaneBatch(
           perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
         }
       }
+    } else {
+      requires_lane_stream_drain = true;
     }
 
     output.ok = true;
   }
 
-  if (!CheckCudaStatus(cudaStreamSynchronize(resources.stream),
-                       "cudaStreamSynchronize(lane_execution)")) {
+  if (requires_lane_stream_drain &&
+      !CheckCudaStatus(
+          runtime::cuda::native::TracedCudaStreamSynchronize(
+              runtime::cuda::native::SyncTraceSite::kLaneExecutionDrain,
+              resources.stream),
+          "cudaStreamSynchronize(lane_execution)")) {
     for (auto &output : result.outputs) {
       output.ok = false;
       output.token = -1;
@@ -2273,14 +2306,14 @@ NativeKernelExecutor::ExecuteLaneBatch(
   }
 
   if (decode_tokens_total > 0) {
-    GlobalMetrics().RecordNativeForwardPass(
+    GlobalMetrics().RecordInferfluxCudaForwardPass(
         /*is_decode=*/true, decode_tokens_total, decode_ms_total);
     perf_accum_.decode_ms.store(
         perf_accum_.decode_ms.load(std::memory_order_relaxed) + decode_ms_total,
         std::memory_order_relaxed);
   }
   if (prompt_tokens_total > 0) {
-    GlobalMetrics().RecordNativeForwardPass(
+    GlobalMetrics().RecordInferfluxCudaForwardPass(
         /*is_decode=*/false, prompt_tokens_total, prefill_ms_total);
     perf_accum_.prefill_ms.store(
         perf_accum_.prefill_ms.load(std::memory_order_relaxed) +
@@ -2291,7 +2324,7 @@ NativeKernelExecutor::ExecuteLaneBatch(
   }
   if (decode_tokens_total + sampled_prefill_total > 0 &&
       sample_ms_total > 0.0) {
-    GlobalMetrics().RecordNativeSampling(
+    GlobalMetrics().RecordInferfluxCudaSampling(
         decode_tokens_total + sampled_prefill_total, sample_ms_total);
   }
 
@@ -2308,8 +2341,8 @@ NativeKernelExecutor::ExecuteLaneBatch(
   return result;
 }
 
-NativeKernelExecutor::LaneExecutionResult
-NativeKernelExecutor::ExecuteLaneBatchForAsync(
+InferfluxCudaExecutor::LaneExecutionResult
+InferfluxCudaExecutor::ExecuteLaneBatchForAsync(
     const std::vector<UnifiedBatchInput> &inputs, bool decode_lane) {
   LaneExecutionResult result;
   if (inputs.empty()) {
@@ -2345,7 +2378,7 @@ NativeKernelExecutor::ExecuteLaneBatchForAsync(
   return result;
 }
 
-bool NativeKernelExecutor::EnsureLaneDispatcherStarted() {
+bool InferfluxCudaExecutor::EnsureLaneDispatcherStarted() {
   std::lock_guard<std::mutex> lock(lane_dispatcher_mutex_);
   if (lane_dispatcher_.IsRunning()) {
     return true;
@@ -2367,13 +2400,13 @@ bool NativeKernelExecutor::EnsureLaneDispatcherStarted() {
   return started;
 }
 
-void NativeKernelExecutor::StopLaneDispatcher() {
+void InferfluxCudaExecutor::StopLaneDispatcher() {
   std::lock_guard<std::mutex> lock(lane_dispatcher_mutex_);
   lane_dispatcher_.Stop();
 }
 
-std::vector<LlamaCPUBackend::UnifiedBatchOutput>
-NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
+std::vector<LlamaCppBackend::UnifiedBatchOutput>
+InferfluxCudaExecutor::ExecuteUnifiedBatchWithOverlap(
     const std::vector<UnifiedBatchInput> &inputs) {
   std::vector<UnifiedBatchOutput> outputs;
   outputs.resize(inputs.size());
@@ -2392,7 +2425,7 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
   if (total_prefill_tokens < min_prefill_tokens_ || prefill_indices.empty() ||
       decode_indices.empty()) {
     // Fall back to standard execution
-    log::Info("native_kernel_executor",
+    log::Info("inferflux_cuda_executor",
               "Skipping overlap: prefill_tokens=" +
                   std::to_string(total_prefill_tokens) +
                   ", min=" + std::to_string(min_prefill_tokens_) +
@@ -2401,13 +2434,13 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
     return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
   }
 
-  if (!CanRunLaneOverlap()) {
-    log::Info("native_kernel_executor",
+  if (!EnsureLaneOverlapResources() || !CanRunLaneOverlap()) {
+    log::Info("inferflux_cuda_executor",
               "Skipping overlap: lane replicas unavailable");
     return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
   }
 
-  log::Info("native_kernel_executor",
+  log::Info("inferflux_cuda_executor",
             "Using async overlap for mixed batch (prefill=" +
                 std::to_string(prefill_indices.size()) +
                 ", decode=" + std::to_string(decode_indices.size()) +
@@ -2426,7 +2459,7 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
   }
 
   if (!EnsureLaneDispatcherStarted()) {
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "Lane dispatcher unavailable; falling back to single-lane "
               "execution");
     return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
@@ -2439,7 +2472,7 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
     GlobalMetrics().SetCudaLaneQueueDepth(
         /*decode_lane=*/true,
         static_cast<int>(lane_dispatcher_.PendingCount(/*decode_lane=*/true)));
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "Decode lane submission rejected; falling back to single-lane "
               "execution");
     return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
@@ -2469,7 +2502,7 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
     GlobalMetrics().SetCudaLaneQueueDepth(
         /*decode_lane=*/true,
         static_cast<int>(lane_dispatcher_.PendingCount(/*decode_lane=*/true)));
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "Prefill lane submission rejected; falling back to single-lane "
               "execution");
     return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
@@ -2509,14 +2542,14 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
       if (decode_timed_out) {
         GlobalMetrics().RecordCudaLaneCollectTimeout(decode_lane);
       }
-      log::Error("native_kernel_executor",
+      log::Error("inferflux_cuda_executor",
                  "Decode lane overlap execution failed: " + decode_error);
     }
     if (!prefill_ok) {
       if (prefill_timed_out) {
         GlobalMetrics().RecordCudaLaneCollectTimeout(prefill_lane);
       }
-      log::Error("native_kernel_executor",
+      log::Error("inferflux_cuda_executor",
                  "Prefill lane overlap execution failed: " + prefill_error);
     }
     return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/false);
@@ -2546,7 +2579,7 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
         total_sequential_ms > 0.0
             ? static_cast<int>((100.0 * overlap_ms) / total_sequential_ms)
             : 0;
-    log::Info("native_kernel_executor",
+    log::Info("inferflux_cuda_executor",
               "Phase overlap: " + std::to_string(overlap_ms) + "ms saved (" +
                   std::to_string(reduction_pct) + "% reduction)");
   }
@@ -2556,29 +2589,29 @@ NativeKernelExecutor::ExecuteUnifiedBatchWithOverlap(
 
 #endif // INFERFLUX_NATIVE_KERNELS_READY
 
-std::vector<LlamaCPUBackend::UnifiedBatchOutput>
-NativeKernelExecutor::ExecuteUnifiedBatch(
-    const std::vector<LlamaCPUBackend::UnifiedBatchInput> &inputs) {
+std::vector<LlamaCppBackend::UnifiedBatchOutput>
+InferfluxCudaExecutor::ExecuteUnifiedBatch(
+    const std::vector<LlamaCppBackend::UnifiedBatchInput> &inputs) {
   return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/true);
 }
 
-std::vector<LlamaCPUBackend::UnifiedBatchOutput>
-NativeKernelExecutor::ExecuteUnifiedBatch(
-    const std::vector<LlamaCPUBackend::UnifiedBatchInput> &inputs,
+std::vector<LlamaCppBackend::UnifiedBatchOutput>
+InferfluxCudaExecutor::ExecuteUnifiedBatch(
+    const std::vector<LlamaCppBackend::UnifiedBatchInput> &inputs,
     bool allow_overlap) {
   if (!model_loaded_) {
-    log::Error("native_kernel_executor", "Model not loaded");
+    log::Error("inferflux_cuda_executor", "Model not loaded");
     return {};
   }
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!model_forward_) {
-    log::Warn("native_kernel_executor", "Native pipeline not initialized");
+    log::Warn("inferflux_cuda_executor", "InferFlux CUDA pipeline not initialized");
     return {};
   }
 
   struct ScopedDequantCacheCleanup {
-    NativeKernelExecutor *executor{nullptr};
+    InferfluxCudaExecutor *executor{nullptr};
     ~ScopedDequantCacheCleanup() {
       if (executor) {
         executor->ReleaseBatchScopedDequantizedCache();
@@ -2691,7 +2724,7 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       }
 
       if (!fwd_ok) {
-        log::Error("native_kernel_executor", "BatchForward failed");
+        log::Error("inferflux_cuda_executor", "BatchForward failed");
         for (int b = 0; b < B; ++b) {
           const auto &entry = decode_group[offset + static_cast<size_t>(b)];
           outputs[entry.input_idx].ok = false;
@@ -2700,8 +2733,9 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         continue;
       }
 
-      sampler_->SampleBatch(d_logits_, B, batch_temps, batch_top_ks,
-                            batch_top_ps, batch_seeds, &sampled_tokens);
+      sampler_->EnqueueSampleBatch(d_logits_, B, batch_temps, batch_top_ks,
+                                   batch_top_ps, batch_seeds);
+      sampler_->CollectSampleBatch(&sampled_tokens);
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
       if (NativeLogitsDebugEnabled(execution_policy_)) {
@@ -2718,7 +2752,7 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
 #endif
 
       if (DecodeMappingDebugEnabled(execution_policy_)) {
-        log::Info("native_kernel_executor",
+        log::Info("inferflux_cuda_executor",
                   "decode_mapping[primary]: batch_size=" + std::to_string(B) +
                       ", batch_offset=" + std::to_string(offset));
         for (int b = 0; b < B; ++b) {
@@ -2731,7 +2765,7 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
               (tokenizer_ && token_id >= 0)
                   ? tokenizer_->TokenToString(token_id)
                   : std::string();
-          log::Info("native_kernel_executor",
+          log::Info("inferflux_cuda_executor",
                     "decode_mapping[primary]: input_idx=" +
                         std::to_string(entry.input_idx) + ", " +
                         (entry.client_request_id.empty()
@@ -2749,14 +2783,13 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
         }
       }
 
-      // SampleBatch already synchronized the stream.
-      GlobalMetrics().RecordNativeForwardShape(/*is_decode=*/true, B);
+      GlobalMetrics().RecordInferfluxCudaForwardShape(/*is_decode=*/true, B);
       if (record_timing) {
         float fwd_ms = 0.0f;
         if (CheckCudaStatus(
                 cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
                 "cudaEventElapsedTime(forward,decode_batch)")) {
-          GlobalMetrics().RecordNativeForwardLatency(fwd_ms);
+          GlobalMetrics().RecordInferfluxCudaForwardLatency(fwd_ms);
           perf_accum_.decode_ms.store(
               perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
               std::memory_order_relaxed);
@@ -2802,25 +2835,29 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       }
       if (!model_forward_->Forward(input.tokens, input.n_past,
                                    input.sequence_id, d_logits_)) {
-        log::Error("native_kernel_executor", "Forward pass failed");
+        log::Error("inferflux_cuda_executor", "Forward pass failed");
       }
       if (record_prefill_timing) {
         cudaEventRecord(forward_stop_, compute_stream_);
-        cudaEventSynchronize(forward_stop_);
-        GlobalMetrics().RecordNativeForwardShape(is_decode, batch_tokens);
+        runtime::cuda::native::TracedCudaEventSynchronize(
+            runtime::cuda::native::SyncTraceSite::kTimingForwardReady,
+            forward_stop_);
+        GlobalMetrics().RecordInferfluxCudaForwardShape(is_decode, batch_tokens);
         float fwd_ms = 0.0f;
         if (CheckCudaStatus(
                 cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
                 "cudaEventElapsedTime(forward,prefill_no_logits)")) {
-          GlobalMetrics().RecordNativeForwardLatency(fwd_ms);
+          GlobalMetrics().RecordInferfluxCudaForwardLatency(fwd_ms);
           perf_accum_.prefill_ms.store(
               perf_accum_.prefill_ms.load(std::memory_order_relaxed) + fwd_ms,
               std::memory_order_relaxed);
         }
       } else {
         // No timing — just sync stream to ensure forward completes
-        cudaStreamSynchronize(compute_stream_);
-        GlobalMetrics().RecordNativeForwardShape(is_decode, batch_tokens);
+        runtime::cuda::native::TracedCudaStreamSynchronize(
+            runtime::cuda::native::SyncTraceSite::kPrefillForwardDrain,
+            compute_stream_);
+        GlobalMetrics().RecordInferfluxCudaForwardShape(is_decode, batch_tokens);
       }
       perf_accum_.prompt_tokens.fetch_add(batch_tokens,
                                           std::memory_order_relaxed);
@@ -2836,7 +2873,7 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       }
       if (!model_forward_->Forward(input.tokens, input.n_past,
                                    input.sequence_id, d_logits_)) {
-        log::Error("native_kernel_executor", "Forward pass failed");
+        log::Error("inferflux_cuda_executor", "Forward pass failed");
         continue;
       }
       if (record_prefill_timing) {
@@ -2850,10 +2887,10 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       if (record_prefill_timing) {
         cudaEventRecord(sampling_start_, compute_stream_);
       }
-      int token_id = sampler_->Sample(
-          d_logits_, input.sampling.temperature, input.sampling.top_k,
-          input.sampling.top_p, input.sampling.seed);
-      // Sample() already synchronizes the stream before returning
+      sampler_->EnqueueSample(d_logits_, input.sampling.temperature,
+                              input.sampling.top_k, input.sampling.top_p,
+                              input.sampling.seed);
+      int token_id = sampler_->CollectSample();
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
       LogNativeTopLogits("primary_prefill", d_logits_,
                          model_config_.vocab_size, input.request_id,
@@ -2866,13 +2903,13 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
       }
 
       // Deferred timing: compute elapsed from already-completed events
-      GlobalMetrics().RecordNativeForwardShape(is_decode, batch_tokens);
+      GlobalMetrics().RecordInferfluxCudaForwardShape(is_decode, batch_tokens);
       if (record_prefill_timing) {
         float fwd_ms = 0.0f;
         if (CheckCudaStatus(
                 cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
                 "cudaEventElapsedTime(forward,prefill_logits)")) {
-          GlobalMetrics().RecordNativeForwardLatency(fwd_ms);
+          GlobalMetrics().RecordInferfluxCudaForwardLatency(fwd_ms);
           if (is_decode) {
             perf_accum_.decode_ms.store(
                 perf_accum_.decode_ms.load(std::memory_order_relaxed) + fwd_ms,
@@ -2886,12 +2923,15 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
           }
         }
         float samp_ms = 0.0f;
-        if (CheckCudaStatus(cudaEventSynchronize(sampling_stop_),
+        if (CheckCudaStatus(runtime::cuda::native::TracedCudaEventSynchronize(
+                                runtime::cuda::native::SyncTraceSite::
+                                    kTimingSamplingReady,
+                                sampling_stop_),
                             "cudaEventSynchronize(sampling_stop_)") &&
             CheckCudaStatus(
                 cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_),
                 "cudaEventElapsedTime(sampling,prefill_logits)")) {
-          GlobalMetrics().RecordNativeSampling(1, samp_ms);
+          GlobalMetrics().RecordInferfluxCudaSampling(1, samp_ms);
         }
       } // end if (record_prefill_timing)
 
@@ -2917,13 +2957,13 @@ NativeKernelExecutor::ExecuteUnifiedBatch(
   RefreshMemoryLedger();
   return outputs;
 #else
-  log::Warn("native_kernel_executor",
+  log::Warn("inferflux_cuda_executor",
             "Native inference not compiled (INFERFLUX_NATIVE_KERNELS_READY=0)");
   return {};
 #endif
 }
 
-bool NativeKernelExecutor::SupportsAsyncUnifiedBatch() const {
+bool InferfluxCudaExecutor::SupportsAsyncUnifiedBatch() const {
   // Disable async dispatch to use the synchronous ExecuteUnifiedBatch path
   // which supports true batching (BatchForward + SampleBatch). The async
   // path routes every decode step through the lane dispatcher, adding
@@ -2934,7 +2974,7 @@ bool NativeKernelExecutor::SupportsAsyncUnifiedBatch() const {
   return false;
 }
 
-UnifiedBatchHandle NativeKernelExecutor::SubmitUnifiedBatchAsync(
+UnifiedBatchHandle InferfluxCudaExecutor::SubmitUnifiedBatchAsync(
     const std::vector<UnifiedBatchInput> &inputs, UnifiedBatchLane lane) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!model_forward_ || inputs.empty()) {
@@ -2971,7 +3011,7 @@ UnifiedBatchHandle NativeKernelExecutor::SubmitUnifiedBatchAsync(
 #endif
 }
 
-bool NativeKernelExecutor::TryCollectUnifiedBatchAsync(
+bool InferfluxCudaExecutor::TryCollectUnifiedBatchAsync(
     UnifiedBatchHandle handle, std::vector<UnifiedBatchOutput> *outputs) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (handle == 0) {
@@ -2991,7 +3031,7 @@ bool NativeKernelExecutor::TryCollectUnifiedBatchAsync(
       decode_lane,
       static_cast<int>(lane_dispatcher_.PendingCount(decode_lane)));
   if (status == UnifiedBatchLaneDispatcher::CollectStatus::kFailed) {
-    log::Error("native_kernel_executor",
+    log::Error("inferflux_cuda_executor",
                "Async lane execution failed: " + error);
     return false;
   }
@@ -3003,7 +3043,7 @@ bool NativeKernelExecutor::TryCollectUnifiedBatchAsync(
 #endif
 }
 
-bool NativeKernelExecutor::RunNativeInference(
+bool InferfluxCudaExecutor::RunNativeInference(
     const std::vector<UnifiedBatchInput> &inputs,
     std::vector<UnifiedBatchOutput> *outputs) {
   auto results = ExecuteUnifiedBatch(inputs);
@@ -3016,42 +3056,42 @@ bool NativeKernelExecutor::RunNativeInference(
 
 #else // !INFERFLUX_HAS_CUDA
 
-// CPU-only stubs for NativeKernelExecutor CUDA-dependent methods.
-bool NativeKernelExecutor::LoadModel(const std::filesystem::path &,
+// CPU-only stubs for InferfluxCudaExecutor CUDA-dependent methods.
+bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &,
                                      const LlamaBackendConfig &) {
-  log::Error("native_kernel_executor", "CUDA not available");
+  log::Error("inferflux_cuda_executor", "CUDA not available");
   return false;
 }
 
-std::vector<LlamaCPUBackend::UnifiedBatchOutput>
-NativeKernelExecutor::ExecuteUnifiedBatch(
-    const std::vector<LlamaCPUBackend::UnifiedBatchInput> &) {
+std::vector<LlamaCppBackend::UnifiedBatchOutput>
+InferfluxCudaExecutor::ExecuteUnifiedBatch(
+    const std::vector<LlamaCppBackend::UnifiedBatchInput> &) {
   return {};
 }
 
-bool NativeKernelExecutor::SupportsAsyncUnifiedBatch() const { return false; }
+bool InferfluxCudaExecutor::SupportsAsyncUnifiedBatch() const { return false; }
 
-UnifiedBatchHandle NativeKernelExecutor::SubmitUnifiedBatchAsync(
+UnifiedBatchHandle InferfluxCudaExecutor::SubmitUnifiedBatchAsync(
     const std::vector<UnifiedBatchInput> &, UnifiedBatchLane) {
   return 0;
 }
 
-bool NativeKernelExecutor::TryCollectUnifiedBatchAsync(
+bool InferfluxCudaExecutor::TryCollectUnifiedBatchAsync(
     UnifiedBatchHandle, std::vector<UnifiedBatchOutput> *) {
   return false;
 }
 
-bool NativeKernelExecutor::RunNativeInference(
+bool InferfluxCudaExecutor::RunNativeInference(
     const std::vector<UnifiedBatchInput> &, std::vector<UnifiedBatchOutput> *) {
   return false;
 }
 
-bool NativeKernelExecutor::ConfigureDequantizedCachePolicy(
+bool InferfluxCudaExecutor::ConfigureDequantizedCachePolicy(
     const std::string &) {
   return false;
 }
 
-void NativeKernelExecutor::ReleaseBatchScopedDequantizedCache() {}
+void InferfluxCudaExecutor::ReleaseBatchScopedDequantizedCache() {}
 
 #endif // INFERFLUX_HAS_CUDA
 
@@ -3059,8 +3099,8 @@ void NativeKernelExecutor::ReleaseBatchScopedDequantizedCache() {}
 // NativeTakePerf (works on all build paths)
 // ==========================================================================
 
-NativeCudaRuntime::NativePerfSnapshot NativeKernelExecutor::NativeTakePerf() {
-  NativePerfSnapshot snap;
+InferfluxCudaRuntime::PerfSnapshot InferfluxCudaExecutor::NativeTakePerf() {
+  PerfSnapshot snap;
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   snap.prefill_ms = perf_accum_.prefill_ms.exchange(0.0);
   snap.decode_ms = perf_accum_.decode_ms.exchange(0.0);
@@ -3070,7 +3110,7 @@ NativeCudaRuntime::NativePerfSnapshot NativeKernelExecutor::NativeTakePerf() {
   return snap;
 }
 
-bool NativeKernelExecutor::ShouldRecordTimingSample(int sample_rate,
+bool InferfluxCudaExecutor::ShouldRecordTimingSample(int sample_rate,
                                                     int *counter) {
   if (sample_rate <= 0 || !counter) {
     return false;
@@ -3084,23 +3124,23 @@ bool NativeKernelExecutor::ShouldRecordTimingSample(int sample_rate,
 // ==========================================================================
 
 std::vector<int>
-NativeKernelExecutor::NativeTokenize(const std::string &prompt) const {
+InferfluxCudaExecutor::NativeTokenize(const std::string &prompt) const {
   if (tokenizer_) {
     return tokenizer_->Tokenize(prompt);
   }
   return {};
 }
 
-int NativeKernelExecutor::NativeTokenCount(const std::string &text) const {
+int InferfluxCudaExecutor::NativeTokenCount(const std::string &text) const {
   if (tokenizer_) {
     return static_cast<int>(tokenizer_->Tokenize(text).size());
   }
   return 0;
 }
 
-bool NativeKernelExecutor::NativeIsReady() const { return model_loaded_; }
+bool InferfluxCudaExecutor::NativeIsReady() const { return model_loaded_; }
 
-void NativeKernelExecutor::NativeFreeSequence(int sequence_id) {
+void InferfluxCudaExecutor::NativeFreeSequence(int sequence_id) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!kv_cache_ || sequence_id < 0) {
     return;
@@ -3124,8 +3164,8 @@ void NativeKernelExecutor::NativeFreeSequence(int sequence_id) {
 #endif
 }
 
-LlamaCPUBackend::SequenceReleaseFence
-NativeKernelExecutor::NativeBeginFreeSequence(int sequence_id) {
+LlamaCppBackend::SequenceReleaseFence
+InferfluxCudaExecutor::NativeBeginFreeSequence(int sequence_id) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!kv_cache_ || sequence_id < 0) {
     return {};
@@ -3180,7 +3220,7 @@ NativeKernelExecutor::NativeBeginFreeSequence(int sequence_id) {
   }
 
   pending_sequence_releases_.push_back(pending);
-  LlamaCPUBackend::SequenceReleaseFence fence;
+  LlamaCppBackend::SequenceReleaseFence fence;
   fence.token = pending.token;
   fence.pending = true;
   return fence;
@@ -3190,8 +3230,8 @@ NativeKernelExecutor::NativeBeginFreeSequence(int sequence_id) {
 #endif
 }
 
-bool NativeKernelExecutor::NativePollFreeSequence(
-    const LlamaCPUBackend::SequenceReleaseFence &fence) {
+bool InferfluxCudaExecutor::NativePollFreeSequence(
+    const LlamaCppBackend::SequenceReleaseFence &fence) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!fence.pending || fence.token == 0) {
     return true;
@@ -3208,7 +3248,7 @@ bool NativeKernelExecutor::NativePollFreeSequence(
     if (err == cudaErrorNotReady) {
       return false;
     }
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "cudaEventQuery failed during sequence release poll: " +
                   std::string(label) + " err=" +
                   std::string(cudaGetErrorString(err)));
@@ -3249,7 +3289,7 @@ bool NativeKernelExecutor::NativePollFreeSequence(
 #endif
 }
 
-void NativeKernelExecutor::NativeCopySequencePrefix(int src_seq, int dst_seq,
+void InferfluxCudaExecutor::NativeCopySequencePrefix(int src_seq, int dst_seq,
                                                     int n_tokens) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!kv_cache_ || n_tokens <= 0 || src_seq < 0 || dst_seq < 0) {
@@ -3260,7 +3300,7 @@ void NativeKernelExecutor::NativeCopySequencePrefix(int src_seq, int dst_seq,
   }
   if (!kv_cache_->CopySequencePrefix(src_seq, dst_seq, n_tokens,
                                      compute_stream_)) {
-    log::Warn("native_kernel_executor",
+    log::Warn("inferflux_cuda_executor",
               "NativeCopySequencePrefix failed (src=" +
                   std::to_string(src_seq) + ", dst=" + std::to_string(dst_seq) +
                   ", tokens=" + std::to_string(n_tokens) + ")");
@@ -3273,7 +3313,7 @@ void NativeKernelExecutor::NativeCopySequencePrefix(int src_seq, int dst_seq,
 }
 
 std::vector<uint8_t>
-NativeKernelExecutor::NativeSerializeSequence(int sequence_id) const {
+InferfluxCudaExecutor::NativeSerializeSequence(int sequence_id) const {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!kv_cache_ || sequence_id < 0) {
     return {};
@@ -3289,7 +3329,7 @@ NativeKernelExecutor::NativeSerializeSequence(int sequence_id) const {
 #endif
 }
 
-bool NativeKernelExecutor::NativeHydrateSequence(
+bool InferfluxCudaExecutor::NativeHydrateSequence(
     int dest_sequence_id, const std::vector<uint8_t> &blob) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!kv_cache_ || dest_sequence_id < 0 || blob.empty()) {
@@ -3303,10 +3343,10 @@ bool NativeKernelExecutor::NativeHydrateSequence(
 #endif
 }
 
-NativeCudaRuntime::NativeChatResult NativeKernelExecutor::NativeFormatChat(
+InferfluxCudaRuntime::ChatResult InferfluxCudaExecutor::NativeFormatChat(
     const std::vector<std::pair<std::string, std::string>> &messages,
     bool add_assistant_prefix) const {
-  NativeChatResult result;
+  ChatResult result;
   if (!tokenizer_) {
     return result;
   }
@@ -3316,19 +3356,19 @@ NativeCudaRuntime::NativeChatResult NativeKernelExecutor::NativeFormatChat(
   return result;
 }
 
-const ITokenizer *NativeKernelExecutor::NativeGetTokenizer() const {
+const ITokenizer *InferfluxCudaExecutor::NativeGetTokenizer() const {
   return tokenizer_.get();
 }
 
-int NativeKernelExecutor::NativeVocabSize() const {
+int InferfluxCudaExecutor::NativeVocabSize() const {
   return model_config_.vocab_size;
 }
 
-int NativeKernelExecutor::NativeEmbedDims() const {
+int InferfluxCudaExecutor::NativeEmbedDims() const {
   return model_config_.hidden_size;
 }
 
-std::vector<float> NativeKernelExecutor::NativeEmbed(const std::string &text) {
+std::vector<float> InferfluxCudaExecutor::NativeEmbed(const std::string &text) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!model_forward_ || !tokenizer_ || model_config_.hidden_size <= 0) {
     return {};
@@ -3344,7 +3384,7 @@ std::vector<float> NativeKernelExecutor::NativeEmbed(const std::string &text) {
   float *d_embed = nullptr;
   cudaError_t err = cudaMalloc(&d_embed, hidden * sizeof(float));
   if (err != cudaSuccess) {
-    log::Error("native_kernel_executor",
+    log::Error("inferflux_cuda_executor",
                "NativeEmbed: cudaMalloc failed for embedding buffer");
     return {};
   }
@@ -3371,7 +3411,7 @@ std::vector<float> NativeKernelExecutor::NativeEmbed(const std::string &text) {
 #endif
 }
 
-int NativeKernelExecutor::CopyLastLogitsToHost(float *host_buf, int buf_size) {
+int InferfluxCudaExecutor::CopyLastLogitsToHost(float *host_buf, int buf_size) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!d_logits_ || !sampler_ || model_config_.vocab_size <= 0) {
     return 0;

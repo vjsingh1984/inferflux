@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-Using timing instrumentation (`INFERFLUX_NATIVE_TIMING_SAMPLE_RATE=1`), I profiled the native CUDA backend with 4 concurrent requests. The original signal suggested the system was processing decode mostly one sequence at a time. Follow-up privileged runs on March 11, 2026 refined that conclusion: **the decode queue can form multi-request cohorts, but the active decode loop keeps those cohorts closed instead of continuously merging newly ready sequences**.
+Using timing instrumentation (`INFERFLUX_CUDA_TIMING_SAMPLE_RATE=1`), I profiled the InferFlux CUDA backend with 4 concurrent requests. The original signal suggested the system was processing decode mostly one sequence at a time. Follow-up privileged runs on March 11, 2026 refined that conclusion: **the decode queue can form multi-request cohorts, but the active decode loop keeps those cohorts closed instead of continuously merging newly ready sequences**.
 
 ---
 
@@ -38,7 +38,7 @@ Using timing instrumentation (`INFERFLUX_NATIVE_TIMING_SAMPLE_RATE=1`), I profil
 
 ### Forward Pass Timing
 
-From `inferflux_native_forward_duration_ms` histogram:
+From `inferflux_cuda_forward_duration_ms` histogram:
 - **Total forward passes**: 87
 - **Total forward time**: 6500ms
 - **Average per pass**: 74.7ms
@@ -217,8 +217,8 @@ decode operator cost rather than more decode-worker restructuring.
    - File: `runtime/backends/cuda/native/transformer_forward.cu`
    - Function: `BatchedDecode()` or decode loop
 
-2. **Test with decode workers disabled**:
-   - Set `INFERFLUX_NATIVE_DISABLE_DECODE_WORKERS=1`
+2. **Test with the dedicated decode lane disabled**:
+   - Set `INFERFLUX_DECODE_POOL_SIZE=0`
    - Measure batch distribution and throughput
 
 3. **Profile request arrival timing**:
