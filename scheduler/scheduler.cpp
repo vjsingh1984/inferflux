@@ -135,8 +135,9 @@ namespace {
 constexpr double kFairnessAgingDivisorMs =
     2000.0; // every 2s of wait adds +1 to effective priority
 // Number of distinct KV sequence slots available for phased prefill/decode.
-// Must exceed typical in-flight batch width.
-constexpr int kMaxSequenceSlots = 16;
+// Must exceed typical in-flight batch width.  Previous value of 16 caused
+// "No free slots available" crashes at concurrency >= 2 with batch_size > 8.
+constexpr int kMaxSequenceSlots = 128;
 // Warm KV prefix store capacity (dedicated sequence slots for cached prefixes).
 constexpr int kPrefixStoreCap = 4;
 // Minimum prompt token count to be eligible for prefix store donation.

@@ -800,14 +800,18 @@ TEST_CASE("Scheduler defers slot reuse until backend free fence is ready",
   scheduler.FreeSeqSlot(slot, generation, backend);
   REQUIRE(slot_manager->GetRetiringSlotCount() == 1);
   REQUIRE(slot_manager->GetUsedSlotCount() == 0);
-  REQUIRE(slot_manager->GetFreeSlotCount() == 15);
+  // Free = max_slots - retiring(1).  Retiring slots are not counted as free.
+  const int remaining_free =
+      static_cast<int>(slot_manager->GetMaxSlots()) - 1;
+  REQUIRE(slot_manager->GetFreeSlotCount() ==
+          static_cast<size_t>(remaining_free));
   REQUIRE(GlobalMetrics().GetSchedulerDeferredSequenceRetirements() == 1);
   REQUIRE(backend->BeginCalls() == 1);
   REQUIRE(backend->LastSequenceId() == slot);
 
   std::vector<std::pair<int, uint64_t>> held_slots;
-  held_slots.reserve(15);
-  for (int i = 0; i < 15; ++i) {
+  held_slots.reserve(remaining_free);
+  for (int i = 0; i < remaining_free; ++i) {
     uint64_t held_generation = 0;
     const int held_slot = scheduler.AllocSeqSlot(7100 + i, &held_generation);
     REQUIRE(held_slot >= 0);

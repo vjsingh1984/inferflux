@@ -788,7 +788,12 @@ InferfluxCudaExecutor::InferfluxCudaExecutor() = default;
 
 InferfluxCudaExecutor::~InferfluxCudaExecutor() {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-  for (auto &pending : pending_sequence_releases_) {
+  std::vector<PendingSequenceRelease> pending_sequence_releases;
+  {
+    std::lock_guard<std::mutex> lock(pending_sequence_releases_mutex_);
+    pending_sequence_releases.swap(pending_sequence_releases_);
+  }
+  for (auto &pending : pending_sequence_releases) {
     if (pending.compute_done) {
       cudaEventDestroy(pending.compute_done);
     }
@@ -799,7 +804,6 @@ InferfluxCudaExecutor::~InferfluxCudaExecutor() {
       cudaEventDestroy(pending.prefill_done);
     }
   }
-  pending_sequence_releases_.clear();
   StopLaneDispatcher();
   DestroyLaneOverlapResources();
   model_forward_.reset();
@@ -1158,6 +1162,11 @@ void InferfluxCudaExecutor::ReleaseBatchScopedDequantizedCache() {
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
 void InferfluxCudaExecutor::DestroyLaneOverlapResources() {
+  std::lock_guard<std::mutex> lock(lane_overlap_mutex_);
+  DestroyLaneOverlapResourcesUnlocked();
+}
+
+void InferfluxCudaExecutor::DestroyLaneOverlapResourcesUnlocked() {
   lane_overlap_ready_ = false;
   decode_lane_forward_.reset();
   prefill_lane_forward_.reset();
@@ -1238,7 +1247,7 @@ InferfluxCudaExecutor::GetLaneResources(bool decode_lane) {
 bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
     const SafetensorsLoader::ModelConfig &config, bool want_bf16,
     int max_batch) {
-  DestroyLaneOverlapResources();
+  DestroyLaneOverlapResourcesUnlocked();
   if (!overlap_enabled_) {
     return false;
   }
@@ -1346,6 +1355,21 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
     prefill_lane_forward_->SetExecutionPolicy(execution_policy_);
   }
 
+  // CUDA graphs are unsafe with lane overlap: decode and prefill workers run
+  // on separate threads with varying batch sizes, causing graph
+  // destroy/capture races on shared stream state.  Disable graphs on all
+  // lane-specific forward instances and on the primary forward to prevent
+  // "double free or corruption" crashes during batch-size transitions.
+  {
+    NativeExecutionPolicy lane_policy = execution_policy_;
+    lane_policy.disable_cuda_graph = true;
+    decode_lane_forward_->SetExecutionPolicy(lane_policy);
+    prefill_lane_forward_->SetExecutionPolicy(lane_policy);
+    model_forward_->SetExecutionPolicy(lane_policy);
+    log::Info("inferflux_cuda_executor",
+              "CUDA graphs disabled (lane overlap active)");
+  }
+
   decode_lane_sampler_ = std::make_unique<GpuSampler>();
   prefill_lane_sampler_ = std::make_unique<GpuSampler>();
   if (!decode_lane_sampler_->Initialize(config.vocab_size, decode_stream_) ||
@@ -1389,6 +1413,7 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
 }
 
 bool InferfluxCudaExecutor::EnsureLaneOverlapResources() {
+  std::lock_guard<std::mutex> lock(lane_overlap_mutex_);
   if (!overlap_enabled_) {
     return false;
   }
@@ -2373,8 +2398,9 @@ InferfluxCudaExecutor::ExecuteLaneBatchForAsync(
   }
 
   result = ExecuteLaneBatch(inputs, lane_resources);
-  RefreshMemoryLedger();
-  ReleaseBatchScopedDequantizedCache();
+  // Mixed-workload overlap batches are cleaned up once by the outer sync path
+  // after both lane handles complete. Doing that here would let decode/prefill
+  // workers race on shared GGUF dequant cache and scratch ownership.
   return result;
 }
 
@@ -3172,8 +3198,11 @@ InferfluxCudaExecutor::NativeBeginFreeSequence(int sequence_id) {
   }
 
   PendingSequenceRelease pending;
-  pending.token = next_sequence_release_token_++;
   pending.sequence_id = sequence_id;
+  {
+    std::lock_guard<std::mutex> lock(pending_sequence_releases_mutex_);
+    pending.token = next_sequence_release_token_++;
+  }
 
   auto record_event = [&](cudaStream_t stream, const char *label,
                           cudaEvent_t *event_out) -> bool {
@@ -3219,7 +3248,10 @@ InferfluxCudaExecutor::NativeBeginFreeSequence(int sequence_id) {
     return {};
   }
 
-  pending_sequence_releases_.push_back(pending);
+  {
+    std::lock_guard<std::mutex> lock(pending_sequence_releases_mutex_);
+    pending_sequence_releases_.push_back(pending);
+  }
   LlamaCppBackend::SequenceReleaseFence fence;
   fence.token = pending.token;
   fence.pending = true;
@@ -3256,32 +3288,54 @@ bool InferfluxCudaExecutor::NativePollFreeSequence(
     return true;
   };
 
-  auto it = std::find_if(pending_sequence_releases_.begin(),
-                         pending_sequence_releases_.end(),
-                         [&](const PendingSequenceRelease &pending) {
-                           return pending.token == fence.token;
-                         });
-  if (it == pending_sequence_releases_.end()) {
-    return true;
+  PendingSequenceRelease pending;
+  {
+    std::lock_guard<std::mutex> lock(pending_sequence_releases_mutex_);
+    auto it = std::find_if(pending_sequence_releases_.begin(),
+                           pending_sequence_releases_.end(),
+                           [&](const PendingSequenceRelease &candidate) {
+                             return candidate.token == fence.token;
+                           });
+    if (it == pending_sequence_releases_.end()) {
+      return true;
+    }
+    pending = *it;
   }
 
-  if (!ready(it->compute_done, "compute") ||
-      !ready(it->decode_done, "decode") ||
-      !ready(it->prefill_done, "prefill")) {
+  if (!ready(pending.compute_done, "compute") ||
+      !ready(pending.decode_done, "decode") ||
+      !ready(pending.prefill_done, "prefill")) {
     return false;
   }
 
-  kv_cache_->ClearSequence(it->sequence_id);
-  if (it->compute_done) {
-    cudaEventDestroy(it->compute_done);
+  bool erased = false;
+  {
+    std::lock_guard<std::mutex> lock(pending_sequence_releases_mutex_);
+    auto it = std::find_if(pending_sequence_releases_.begin(),
+                           pending_sequence_releases_.end(),
+                           [&](const PendingSequenceRelease &candidate) {
+                             return candidate.token == fence.token;
+                           });
+    if (it != pending_sequence_releases_.end()) {
+      pending = *it;
+      pending_sequence_releases_.erase(it);
+      erased = true;
+    }
   }
-  if (it->decode_done) {
-    cudaEventDestroy(it->decode_done);
+  if (!erased) {
+    return true;
   }
-  if (it->prefill_done) {
-    cudaEventDestroy(it->prefill_done);
+
+  kv_cache_->ClearSequence(pending.sequence_id);
+  if (pending.compute_done) {
+    cudaEventDestroy(pending.compute_done);
   }
-  pending_sequence_releases_.erase(it);
+  if (pending.decode_done) {
+    cudaEventDestroy(pending.decode_done);
+  }
+  if (pending.prefill_done) {
+    cudaEventDestroy(pending.prefill_done);
+  }
   return true;
 #else
   (void)fence;
