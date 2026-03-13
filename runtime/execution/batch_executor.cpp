@@ -106,10 +106,10 @@ void LogUnifiedAssemblyState(std::string_view stage, const InferenceRequest &req
           json(DebugSnippet(completion)).dump());
 }
 
-LlamaCPUBackend::UnifiedBatchInput
+LlamaCppBackend::UnifiedBatchInput
 MakeUnifiedBatchInput(const InferenceRequest &req, int n_past,
                       std::vector<int> tokens, bool request_logits) {
-  LlamaCPUBackend::UnifiedBatchInput input;
+  LlamaCppBackend::UnifiedBatchInput input;
   input.sequence_id = req.sequence_id;
   input.n_past = n_past;
   input.tokens = std::move(tokens);
@@ -127,7 +127,7 @@ MakeUnifiedBatchInput(const InferenceRequest &req, int n_past,
 class SamplerScope {
 public:
   SamplerScope(const InferenceRequest &req,
-               const std::shared_ptr<LlamaCPUBackend> &backend)
+               const std::shared_ptr<LlamaCppBackend> &backend)
       : backend_(backend ? backend.get() : nullptr) {
     if (!backend_)
       return;
@@ -139,7 +139,7 @@ public:
 
   // Alternate constructor for unified batch phased execution where grammar and
   // sampling params are provided directly (not via InferenceRequest).
-  SamplerScope(LlamaCPUBackend *backend, const std::string &grammar,
+  SamplerScope(LlamaCppBackend *backend, const std::string &grammar,
                const std::string &root, const SamplingParams &sp)
       : backend_(backend) {
     if (!backend_)
@@ -158,13 +158,13 @@ public:
   }
 
 private:
-  LlamaCPUBackend *backend_{nullptr};
+  LlamaCppBackend *backend_{nullptr};
   bool active_{false};
 };
 
 bool WaitForUnifiedBatchAsync(
-    LlamaCPUBackend *backend, LlamaCPUBackend::UnifiedBatchHandle handle,
-    std::vector<LlamaCPUBackend::UnifiedBatchOutput> *outputs,
+    LlamaCppBackend *backend, LlamaCppBackend::UnifiedBatchHandle handle,
+    std::vector<LlamaCppBackend::UnifiedBatchOutput> *outputs,
     std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
   if (!backend || !outputs || handle == 0) {
     return false;
@@ -232,7 +232,7 @@ BatchExecutor::BatchExecutor(
 
 std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
     const RequestBatch &batch,
-    const std::vector<std::shared_ptr<LlamaCPUBackend>> &backend_overrides) {
+    const std::vector<std::shared_ptr<LlamaCppBackend>> &backend_overrides) {
   std::size_t n = batch.requests.size();
   std::vector<InferenceResult> results(n);
   std::vector<bool> handled(n, false);
@@ -247,11 +247,11 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
   // Grammar uses per-backend grammar_sampler_ — not safe to interleave across
   // backends.
   struct EligibleGroup {
-    std::shared_ptr<LlamaCPUBackend> backend;
+    std::shared_ptr<LlamaCppBackend> backend;
     std::vector<std::size_t> indices;
   };
   std::vector<EligibleGroup> eligible_groups;
-  std::unordered_map<LlamaCPUBackend *, std::size_t> group_index_by_backend;
+  std::unordered_map<LlamaCppBackend *, std::size_t> group_index_by_backend;
 
   for (std::size_t i = 0; i < n; ++i) {
     auto *req = batch.requests[i];
@@ -294,7 +294,7 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
     if (handled[i])
       continue;
     auto *request = batch.requests[i];
-    std::shared_ptr<LlamaCPUBackend> backend_override;
+    std::shared_ptr<LlamaCppBackend> backend_override;
     if (i < backend_overrides.size()) {
       backend_override = backend_overrides[i];
     }
@@ -315,7 +315,7 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
 
 BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
     InferenceRequest &inference,
-    std::shared_ptr<LlamaCPUBackend> backend_override) {
+    std::shared_ptr<LlamaCppBackend> backend_override) {
   ExecutionOutcome outcome;
   auto &response = outcome.result;
   response.prompt_tokens = static_cast<int>(inference.prompt_tokens.size());
@@ -619,7 +619,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
 std::vector<BatchExecutor::ExecutionOutcome>
 BatchExecutor::ExecuteBatchDecodePhased(
     std::vector<InferenceRequest *> &eligible,
-    std::shared_ptr<LlamaCPUBackend> backend) {
+    std::shared_ptr<LlamaCppBackend> backend) {
   std::size_t n = eligible.size();
   std::vector<ExecutionOutcome> outcomes(n);
 
@@ -698,7 +698,7 @@ BatchExecutor::ExecuteBatchDecodePhased(
 
   // Multi-sequence decode loop: one llama_decode() per token step.
   while (true) {
-    std::vector<LlamaCPUBackend::BatchDecodeInput> batch_inputs;
+    std::vector<LlamaCppBackend::BatchDecodeInput> batch_inputs;
     std::vector<std::size_t> active_idx;
 
     for (std::size_t i = 0; i < n; ++i) {
@@ -820,7 +820,7 @@ BatchExecutor::ExecuteBatchDecodePhased(
 std::vector<BatchExecutor::ExecutionOutcome>
 BatchExecutor::ExecuteUnifiedBatchPhased(
     std::vector<InferenceRequest *> &eligible,
-    std::shared_ptr<LlamaCPUBackend> backend) {
+    std::shared_ptr<LlamaCppBackend> backend) {
   std::size_t n = eligible.size();
   std::vector<ExecutionOutcome> outcomes(n);
 
@@ -919,7 +919,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
       break;
     }
 
-    std::vector<LlamaCPUBackend::UnifiedBatchInput> batch_inputs;
+    std::vector<LlamaCppBackend::UnifiedBatchInput> batch_inputs;
     std::vector<std::size_t> active_idx;
 
     int active_prefill_reqs = 0;
@@ -992,11 +992,11 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
       break;
     ++decode_step_loops;
 
-    std::vector<LlamaCPUBackend::UnifiedBatchOutput> step;
+    std::vector<LlamaCppBackend::UnifiedBatchOutput> step;
     bool step_ok = true;
     if (backend->SupportsAsyncUnifiedBatch()) {
-      std::vector<LlamaCPUBackend::UnifiedBatchInput> decode_inputs;
-      std::vector<LlamaCPUBackend::UnifiedBatchInput> prefill_inputs;
+      std::vector<LlamaCppBackend::UnifiedBatchInput> decode_inputs;
+      std::vector<LlamaCppBackend::UnifiedBatchInput> prefill_inputs;
       std::vector<std::size_t> decode_positions;
       std::vector<std::size_t> prefill_positions;
       decode_inputs.reserve(batch_inputs.size());
@@ -1016,12 +1016,12 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
       }
 
       step.resize(batch_inputs.size());
-      LlamaCPUBackend::UnifiedBatchHandle decode_handle = 0;
-      LlamaCPUBackend::UnifiedBatchHandle prefill_handle = 0;
+      LlamaCppBackend::UnifiedBatchHandle decode_handle = 0;
+      LlamaCppBackend::UnifiedBatchHandle prefill_handle = 0;
 
       if (!decode_inputs.empty()) {
         decode_handle = backend->SubmitUnifiedBatchAsync(
-            decode_inputs, LlamaCPUBackend::UnifiedBatchLane::kDecode);
+            decode_inputs, LlamaCppBackend::UnifiedBatchLane::kDecode);
         if (decode_handle == 0) {
           step_ok = false;
         }
@@ -1030,14 +1030,14 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
         // Submit both lanes before waiting so async backends can overlap
         // decode/pre-fill execution in the same scheduler step.
         prefill_handle = backend->SubmitUnifiedBatchAsync(
-            prefill_inputs, LlamaCPUBackend::UnifiedBatchLane::kPrefill);
+            prefill_inputs, LlamaCppBackend::UnifiedBatchLane::kPrefill);
         if (prefill_handle == 0) {
           step_ok = false;
         }
       }
 
       if (decode_handle != 0) {
-        std::vector<LlamaCPUBackend::UnifiedBatchOutput> decode_outputs;
+        std::vector<LlamaCppBackend::UnifiedBatchOutput> decode_outputs;
         if (!WaitForUnifiedBatchAsync(backend.get(), decode_handle,
                                       &decode_outputs) ||
             decode_outputs.size() != decode_positions.size()) {
@@ -1050,7 +1050,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
       }
 
       if (prefill_handle != 0) {
-        std::vector<LlamaCPUBackend::UnifiedBatchOutput> prefill_outputs;
+        std::vector<LlamaCppBackend::UnifiedBatchOutput> prefill_outputs;
         if (!WaitForUnifiedBatchAsync(backend.get(), prefill_handle,
                                       &prefill_outputs) ||
             prefill_outputs.size() != prefill_positions.size()) {
@@ -1218,7 +1218,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
   return outcomes;
 }
 
-std::shared_ptr<LlamaCPUBackend>
+std::shared_ptr<LlamaCppBackend>
 BatchExecutor::ResolveBackend(const std::string &requested_model,
                               std::string *resolved_id) {
   if (!router_) {
@@ -1235,7 +1235,7 @@ BatchExecutor::ResolveBackend(const std::string &requested_model,
 }
 
 void BatchExecutor::ExecuteUnifiedBatchStep(
-    RequestBatch &batch, std::shared_ptr<LlamaCPUBackend> backend) {
+    RequestBatch &batch, std::shared_ptr<LlamaCppBackend> backend) {
   if (!backend || batch.empty())
     return;
 
@@ -1260,7 +1260,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
   const int prefill_chunk_cap = ComputePrefillChunkCap(
       backend_step_token_cap, active_decode_reqs, active_prefill_reqs, tuning_);
 
-  std::vector<LlamaCPUBackend::UnifiedBatchInput> batch_inputs;
+  std::vector<LlamaCppBackend::UnifiedBatchInput> batch_inputs;
   std::vector<InferenceRequest *> active_reqs;
 
   for (auto *req : batch.requests) {
@@ -1311,10 +1311,10 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
   }
   GlobalMetrics().RecordDecodeStepLoops("unified_step", 1);
 
-  std::vector<LlamaCPUBackend::UnifiedBatchOutput> step_outputs;
+  std::vector<LlamaCppBackend::UnifiedBatchOutput> step_outputs;
   if (backend->SupportsAsyncUnifiedBatch()) {
-    std::vector<LlamaCPUBackend::UnifiedBatchInput> decode_inputs;
-    std::vector<LlamaCPUBackend::UnifiedBatchInput> prefill_inputs;
+    std::vector<LlamaCppBackend::UnifiedBatchInput> decode_inputs;
+    std::vector<LlamaCppBackend::UnifiedBatchInput> prefill_inputs;
     std::vector<std::size_t> decode_positions;
     std::vector<std::size_t> prefill_positions;
     decode_inputs.reserve(batch_inputs.size());
@@ -1334,26 +1334,26 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
 
     step_outputs.resize(batch_inputs.size());
     bool step_ok = true;
-    LlamaCPUBackend::UnifiedBatchHandle decode_handle = 0;
-    LlamaCPUBackend::UnifiedBatchHandle prefill_handle = 0;
+    LlamaCppBackend::UnifiedBatchHandle decode_handle = 0;
+    LlamaCppBackend::UnifiedBatchHandle prefill_handle = 0;
 
     if (!decode_inputs.empty()) {
       decode_handle = backend->SubmitUnifiedBatchAsync(
-          decode_inputs, LlamaCPUBackend::UnifiedBatchLane::kDecode);
+          decode_inputs, LlamaCppBackend::UnifiedBatchLane::kDecode);
       if (decode_handle == 0) {
         step_ok = false;
       }
     }
     if (step_ok && !prefill_inputs.empty()) {
       prefill_handle = backend->SubmitUnifiedBatchAsync(
-          prefill_inputs, LlamaCPUBackend::UnifiedBatchLane::kPrefill);
+          prefill_inputs, LlamaCppBackend::UnifiedBatchLane::kPrefill);
       if (prefill_handle == 0) {
         step_ok = false;
       }
     }
 
     if (decode_handle != 0) {
-      std::vector<LlamaCPUBackend::UnifiedBatchOutput> decode_outputs;
+      std::vector<LlamaCppBackend::UnifiedBatchOutput> decode_outputs;
       if (!WaitForUnifiedBatchAsync(backend.get(), decode_handle,
                                     &decode_outputs) ||
           decode_outputs.size() != decode_positions.size()) {
@@ -1366,7 +1366,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     }
 
     if (prefill_handle != 0) {
-      std::vector<LlamaCPUBackend::UnifiedBatchOutput> prefill_outputs;
+      std::vector<LlamaCppBackend::UnifiedBatchOutput> prefill_outputs;
       if (!WaitForUnifiedBatchAsync(backend.get(), prefill_handle,
                                     &prefill_outputs) ||
           prefill_outputs.size() != prefill_positions.size()) {

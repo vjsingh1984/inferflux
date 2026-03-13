@@ -204,7 +204,7 @@ int main() {
   std::puts("========================================");
 
 #ifndef INFERFLUX_HAS_CUDA
-  std::puts("benchmark_downproj_q81 requires native CUDA kernels");
+  std::puts("benchmark_downproj_q81 requires InferFlux CUDA kernels");
   return 0;
 #else
   int device_count = 0;

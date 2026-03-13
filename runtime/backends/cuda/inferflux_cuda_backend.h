@@ -1,8 +1,7 @@
 #pragma once
 
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 
-#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -76,6 +75,7 @@ public:
       bool add_assistant_prefix = true) override;
   std::vector<float> EmbedForParity(const std::string &text);
   int EmbedDimsForParity() const;
+  std::vector<TopLogitEntry> TopLogitsForParity(int top_n) override;
   int TokenCount(const std::string &text) const override;
   std::vector<int> TokenizeForCache(const std::string &prompt) const override;
   bool IsReady() const override;
@@ -100,7 +100,6 @@ private:
   std::shared_ptr<LlamaCppBackend> DelegateBackend() const;
   bool UsesStructuredConstraintSampler() const;
   SamplingParams SnapshotSamplingParams() const;
-  static int AcquireEphemeralSequenceId();
 
   std::unique_ptr<InferfluxCudaRuntime> runtime_;
   std::filesystem::path loaded_model_path_;
@@ -119,7 +118,6 @@ private:
   SamplingParams active_sampling_{};
   bool sampling_active_{false};
   bool structured_constraint_sampler_active_{false};
-  static std::atomic<int> next_ephemeral_sequence_id_;
 
   // Host-side logits buffer for native logprob computation.
   // Lazy-allocated on first logprob request.

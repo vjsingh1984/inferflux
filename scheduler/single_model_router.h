@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "scheduler/model_router.h"
 
 #include <chrono>

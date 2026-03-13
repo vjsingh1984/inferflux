@@ -151,6 +151,10 @@ class NativeMetricsStubTests(unittest.TestCase):
             body,
         )
         self.assertIn(
+            'inferflux_cuda_forward_batch_size_total{phase="prefill",bucket="17_32"}',
+            body,
+        )
+        self.assertIn(
             'inferflux_cuda_forward_batch_size_total{phase="decode",bucket="5_8"}',
             body,
         )
@@ -190,7 +194,7 @@ class NativeMetricsStubTests(unittest.TestCase):
             body,
         )
         self.assertIn(
-            'inferflux_cuda_ffn_proj_operator_total{phase="prefill",operator="q8_1_group"}',
+            'inferflux_cuda_ffn_proj_operator_total{phase="prefill",operator="q8_1_group_generic"}',
             body,
         )
         self.assertIn(

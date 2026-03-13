@@ -102,7 +102,7 @@ struct InferenceRequest {
       false}; // True when the last slice yielded for fairness.
   bool json_mode{false};
   // Phased prefill/decode state (§2.5 Option A).
-  // Set by Scheduler::ProcessBatch after calling LlamaCPUBackend::Prefill().
+  // Set by Scheduler::ProcessBatch after calling LlamaCppBackend::Prefill().
   // BatchExecutor::ExecuteRequest() calls Decode() when n_past >= 0 instead of
   // Generate().
   int n_past{-1}; // KV position after prefill; -1 = use legacy Generate() path.
@@ -116,7 +116,7 @@ struct InferenceRequest {
   // CopySequencePrefix.
   int prompt_bpe_tokens{-1};
   int prefill_offset{0}; // Progress through chunked prefill (§P1d).
-  // BPE token IDs produced by LlamaCPUBackend::TokenizeForCache() during the
+  // BPE token IDs produced by LlamaCppBackend::TokenizeForCache() during the
   // prefill block.  Used by LookupKVPrefix / DonateKVPrefix instead of
   // prompt_tokens (SimpleTokenizer) to ensure prefix matching is done in the
   // same BPE-token space as the KV cache, avoiding the boundary mismatch that

@@ -261,7 +261,8 @@ prefill = summary.get("prefill", {})
 decode = summary.get("decode", {})
 ops = ("q8_1_group_hot_q4k", "q8_1_group_row_pair_w4",
        "q8_1_group_row_quad_m4", "q8_1_group_v2",
-       "q8_1_group", "packed_group", "fallback")
+       "q8_1_group_generic", "q8_1_group_row_pair",
+       "q8_1_group_row_quad", "packed_group", "fallback")
 print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ops))
 print("decode=" + ",".join(f"{k}:{decode.get(k, 0)}" for k in ops))
 PYEOF
@@ -296,9 +297,13 @@ with open(metrics_path) as f:
 with open(out_path, "w") as f:
     json.dump(summary, f, indent=2, sort_keys=True)
 
-order = ("1", "2", "3_4", "5_8", "9_16", "17_plus")
+orders = {
+    "prefill": ("1", "2", "3_4", "5_8", "9_16", "17_32", "33_64", "65_128", "129_plus"),
+    "decode": ("1", "2", "3_4", "5_8", "9_16", "17_plus"),
+}
 for phase in ("prefill", "decode"):
     phase_summary = summary.get(phase, {})
+    order = orders[phase]
     print(phase + "=" + ",".join(f"{k}:{phase_summary.get(k, 0)}" for k in order))
 PYEOF
 }
@@ -976,7 +981,11 @@ compare_responses() {
         echo ""
         echo -e "  ${BOLD}Concurrency = $concurrency${NC}"
         python3 - "$OUTPUT_DIR" "$concurrency" <<'PYEOF'
-import json, os, re, sys
+import collections
+import json
+import os
+import re
+import sys
 
 results_dir, concurrency = sys.argv[1], sys.argv[2]
 backends = ["llama_cpp_cuda", "inferflux_cuda"]
@@ -993,6 +1002,9 @@ def overlap(a, b):
     sa, sb = set(a), set(b)
     total = len(sa) + len(sb)
     return 2.0 * len(sa & sb) / total if total else 1.0
+
+def normalize(text):
+    return re.sub(r"\W+", " ", text.lower()).strip()
 
 # Load responses per backend
 responses = {}
@@ -1026,26 +1038,60 @@ if not common:
     print("  No matching requests to compare")
     sys.exit(0)
 
+prompt_meta = {}
+plan_path = os.path.join(results_dir, f"prompt_plan_inferflux_cuda_c{concurrency}.json")
+if os.path.exists(plan_path):
+    with open(plan_path, "r", encoding="utf-8") as f:
+        for entry in json.load(f):
+            prompt_meta[int(entry.get("request_index", -1))] = entry
+
 exact = 0
+normalized_exact = 0
 jaccards = []
 overlaps = []
 comparisons = []
+details = []
+category_summary = collections.defaultdict(lambda: {"count": 0, "exact": 0, "normalized_exact": 0})
 
 for idx in common:
     ta, tb = a_resp[idx], b_resp[idx]
     is_exact = ta == tb
+    is_normalized_exact = normalize(ta) == normalize(tb)
     if is_exact:
         exact += 1
+    if is_normalized_exact:
+        normalized_exact += 1
     toks_a, toks_b = tokenize(ta), tokenize(tb)
     j = jaccard(toks_a, toks_b)
     o = overlap(toks_a, toks_b)
     jaccards.append(j)
     overlaps.append(o)
     comparisons.append((idx, is_exact, j, o, ta[:60], tb[:60]))
+    meta = prompt_meta.get(idx, {})
+    category = meta.get("category", "unknown")
+    category_summary[category]["count"] += 1
+    if is_exact:
+        category_summary[category]["exact"] += 1
+    if is_normalized_exact:
+        category_summary[category]["normalized_exact"] += 1
+    details.append({
+        "request_index": idx,
+        "prompt_id": meta.get("prompt_id", f"prompt_{idx}"),
+        "category": category,
+        "prompt_length_bucket": meta.get("prompt_length_bucket", "unknown"),
+        "output_mode": meta.get("output_mode", "unknown"),
+        "exact": is_exact,
+        "normalized_exact": is_normalized_exact,
+        "jaccard": j,
+        "overlap": o,
+        "llama_cpp_cuda_text": ta,
+        "inferflux_cuda_text": tb,
+    })
 
 n = len(common)
 print(f"  Compared: {n} request pairs")
 print(f"  Exact match rate: {exact}/{n} ({100*exact/n:.0f}%)")
+print(f"  Normalized exact: {normalized_exact}/{n} ({100*normalized_exact/n:.0f}%)")
 print(f"  Mean Jaccard:     {sum(jaccards)/n:.3f}")
 print(f"  Mean overlap:     {sum(overlaps)/n:.3f}")
 print()
@@ -1063,11 +1109,15 @@ comp_data = {
     "concurrency": int(concurrency),
     "num_compared": n,
     "exact_match_rate": exact / n,
+    "normalized_exact_match_rate": normalized_exact / n,
     "mean_jaccard": sum(jaccards) / n,
     "mean_overlap": sum(overlaps) / n,
+    "category_summary": dict(category_summary),
 }
 with open(os.path.join(results_dir, f"similarity_c{concurrency}.json"), "w") as f:
     json.dump(comp_data, f, indent=2)
+with open(os.path.join(results_dir, f"similarity_details_c{concurrency}.json"), "w") as f:
+    json.dump(details, f, indent=2)
 
 PYEOF
     done

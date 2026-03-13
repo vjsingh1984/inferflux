@@ -4,7 +4,7 @@
 #include "runtime/backends/backend_factory.h"
 #include "runtime/backends/backend_manager.h"
 #include "runtime/backends/cpu/cpu_backend.h"
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/disaggregated/kv_channel.h"
 #include "runtime/disaggregated/shm_kv_transport.h"
 #include "runtime/execution/parallel_context.h"

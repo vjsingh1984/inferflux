@@ -3,7 +3,7 @@
 **Last updated**: March 10, 2026
 **Model**: Qwen2.5-3B-Instruct Q4_K_M
 **GPU**: NVIDIA RTX 4000 Ada (20GB)
-**Benchmark tool**: `scripts/benchmark_multi_backend_comparison.sh`
+**Benchmark tool**: `scripts/benchmark.sh multi-backend`
 
 ---
 
@@ -11,7 +11,7 @@
 
 InferFlux delivers **up to 3.7x higher throughput** than Ollama for concurrent AI workloads, using 26-36% less GPU memory in the measured runs. A later four-way run on the same RTX 4000 Ada added LM Studio to the comparison and showed that LM Studio is a strong throughput baseline, but it does so with materially higher VRAM usage than InferFlux.
 
-| Metric | InferFlux cuda_llama_cpp | Ollama | InferFlux Advantage |
+| Metric | InferFlux `llama_cpp_cuda` | Ollama | InferFlux Advantage |
 |--------|-------------------------|--------|-------------------|
 | **16 concurrent agents** | **277 tok/s** | 76 tok/s | **+266%** ✅ |
 | 8 concurrent agents | 206 tok/s | 80 tok/s | +158% ✅ |
@@ -33,7 +33,7 @@ InferFlux delivers **up to 3.7x higher throughput** than Ollama for concurrent A
 ### Throughput Comparison
 
 ```
-Concurrency    cuda_llama_cpp    cuda_native    Ollama
+Concurrency    llama_cpp_cuda    inferflux_cuda    Ollama
 ─────────────   ────────────────   ─────────────   ──────
 c=1 (1 agent)       107.0            83.4         52.2  tok/s
 c=4 (4 agents)      175.5            91.1         79.5  tok/s
@@ -47,44 +47,44 @@ Follow-up run on the same RTX 4000 Ada with LM Studio added:
 
 | Backend | c=1 | c=4 | c=8 | c=16 | Peak GPU memory |
 |---------|-----|-----|-----|------|-----------------|
-| cuda_native | 81.0 | 89.5 | 86.7 | 89.5 | 10.6 GB |
-| cuda_llama_cpp | 104.9 | 162.6 | 198.7 | 245.2 | 10.6 GB |
+| inferflux_cuda | 81.0 | 89.5 | 86.7 | 89.5 | 10.6 GB |
+| llama_cpp_cuda | 104.9 | 162.6 | 198.7 | 245.2 | 10.6 GB |
 | Ollama | 50.2 | 71.8 | 76.2 | 75.0 | 14.2 GB |
 | LM Studio | 98.1 | 190.9 | 224.0 | 213.5 | 16.6 GB |
 
 **Interpretation**:
-- `cuda_llama_cpp` remains the best balanced backend in this repo for concurrent throughput plus memory efficiency.
+- `llama_cpp_cuda` remains the best balanced backend in this repo for concurrent throughput plus memory efficiency.
 - LM Studio is competitive on throughput, especially at `c=4` and `c=8`, but it uses substantially more VRAM.
-- `cuda_native` still plateaus early and remains the backend that needs focused scaling work.
+- `inferflux_cuda` still plateaus early and remains the backend that needs focused scaling work.
 
 ### Scaling Efficiency (Speedup from Baseline)
 
 | Backend | c=2 | c=4 | c=8 | c=16 | Verdict |
 |---------|-----|-----|-----|------|---------|
-| **cuda_llama_cpp** | 1.21x | **1.64x** | **1.92x** | **2.59x** | ✅ Excellent scaling |
-| cuda_native | 1.08x | 1.09x | 1.11x | 1.11x | ⚠️ No meaningful scaling |
+| **llama_cpp_cuda** | 1.21x | **1.64x** | **1.92x** | **2.59x** | ✅ Excellent scaling |
+| inferflux_cuda | 1.08x | 1.09x | 1.11x | 1.11x | ⚠️ No meaningful scaling |
 | Ollama | 1.31x | 1.52x | 1.52x | 1.45x | ❌ Plateaus then regresses |
 
 **Scaling efficiency formula**: `(throughput @ c=N) / (throughput @ c=1 × N)`
 - 100% = perfect linear scaling
-- cuda_llama_cpp achieves 16% efficiency at c=16 (scales sublinearly but consistently)
-- cuda_native achieves 7% efficiency at c=16 (no meaningful improvement)
+- llama_cpp_cuda achieves 16% efficiency at c=16 (scales sublinearly but consistently)
+- inferflux_cuda achieves 7% efficiency at c=16 (no meaningful improvement)
 - Ollama achieves 9% efficiency at c=16 (regresses from c=8)
 
 ### Latency Analysis
 
 | Backend | c=1 Avg | c=4 P50 | c=16 P50 | Verdict |
 |---------|---------|---------|----------|---------|
-| cuda_llama_cpp | 448ms | 1,099ms | 2,706ms | ✅ Predictable |
-| cuda_native | 581ms | 1,958ms | 8,669ms | ⚠️ High variance |
+| llama_cpp_cuda | 448ms | 1,099ms | 2,706ms | ✅ Predictable |
+| inferflux_cuda | 581ms | 1,958ms | 8,669ms | ⚠️ High variance |
 | Ollama | 357ms | 912ms | 2,520ms | ✅ Predictable |
 
 ### GPU Memory Usage
 
 | Backend | Model + KV Cache | Total Memory | vs Ollama |
 |---------|------------------|--------------|-----------|
-| cuda_native | 8.5 GB | 9.7 GB | **-27%** ✅ |
-| cuda_llama_cpp | 8.6 GB | 9.8 GB | **-26%** ✅ |
+| inferflux_cuda | 8.5 GB | 9.7 GB | **-27%** ✅ |
+| llama_cpp_cuda | 8.6 GB | 9.8 GB | **-26%** ✅ |
 | Ollama | 12.1 GB | 13.3 GB | baseline |
 
 **Breakdown** (baseline: 1.1 GB GPU system memory):
@@ -103,9 +103,9 @@ The four-way run showed LM Studio at **16.6 GB** peak GPU memory on the same har
 
 ## Backend Comparison
 
-### cuda_llama_cpp vs Ollama
+### llama_cpp_cuda vs Ollama
 
-| Aspect | cuda_llama_cpp | Ollama | Winner |
+| Aspect | llama_cpp_cuda | Ollama | Winner |
 |--------|----------------|--------|--------|
 | Single-request throughput | 107 tok/s | 52 tok/s | **InferFlux 2.0x** ✅ |
 | Concurrent throughput (c=16) | 277 tok/s | 76 tok/s | **InferFlux 3.7x** ✅ |
@@ -113,11 +113,11 @@ The four-way run showed LM Studio at **16.6 GB** peak GPU memory on the same har
 | GPU memory | 9.8 GB | 13.3 GB | **InferFlux -36%** ✅ |
 | Latency predictability | Consistent P50/P95 | Consistent P50/P95 | Tie |
 
-**Verdict**: **InferFlux cuda_llama_cpp dominates across all metrics.**
+**Verdict**: **InferFlux `llama_cpp_cuda` dominates across all metrics.**
 
-### cuda_native Characteristics
+### inferflux_cuda Characteristics
 
-| Aspect | cuda_native | Assessment |
+| Aspect | inferflux_cuda | Assessment |
 |--------|-------------|------------|
 | Single-request throughput | 83.4 tok/s | ✅ 1.6x faster than Ollama |
 | Concurrent throughput (c=16) | 92.8 tok/s | ⚠️ Only 1.2x faster than Ollama |
@@ -125,16 +125,16 @@ The four-way run showed LM Studio at **16.6 GB** peak GPU memory on the same har
 | GPU utilization @ c=1 | 97% | ⚠️ Already saturated |
 | GPU memory | 9.7 GB | ✅ 36% less than Ollama |
 
-**When to use cuda_native**:
+**When to use inferflux_cuda**:
 - ✅ Single-request workloads (1.6x faster than Ollama)
-- ❌ Concurrent workloads (use cuda_llama_cpp instead)
+- ❌ Concurrent workloads (use llama_cpp_cuda instead)
 
-**Why cuda_native doesn't scale**:
+**Why inferflux_cuda doesn't scale**:
 The GPU kernels are optimized for single-request throughput with large GEMV operations. GPU is already at 97% utilization at c=1, leaving no headroom for concurrent requests. The kernels do not benefit from batching efficiency like llama.cpp's mature batched inference implementation.
 
-### cuda_llama_cpp vs LM Studio
+### llama_cpp_cuda vs LM Studio
 
-| Aspect | cuda_llama_cpp | LM Studio | Winner |
+| Aspect | llama_cpp_cuda | LM Studio | Winner |
 |--------|----------------|-----------|--------|
 | Single-request throughput | 104.9 tok/s | 98.1 tok/s | **InferFlux** |
 | c=4 throughput | 162.6 tok/s | 190.9 tok/s | **LM Studio** |
@@ -170,11 +170,11 @@ runtime:
     batch_accumulation_ms: 2    # Increased from default 0
 ```
 
-### Native CUDA Configuration
+### InferFlux CUDA Configuration
 
 ```bash
-INFERFLUX_NATIVE_KV_MAX_BATCH=16   # KV cache batch capacity
-INFERFLUX_NATIVE_KV_MAX_SEQ=2048    # Max sequence length
+INFERFLUX_CUDA_KV_MAX_BATCH=16   # KV cache batch capacity
+INFERFLUX_CUDA_KV_MAX_SEQ=2048    # Max sequence length
 ```
 
 ### Test Prompts
@@ -210,14 +210,42 @@ cmake --build build-cuda -j
 
 ```bash
 # Basic benchmark (single model)
-BUILD_DIR=./build-cuda ./scripts/benchmark_multi_backend_comparison.sh \
+BUILD_DIR=./build-cuda ./scripts/benchmark.sh multi-backend \
   models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf
 
 # Custom concurrency levels
 CONCURRENCY_LEVELS="1,2,4,8,16,32" \
 BUILD_DIR=./build-cuda \
-./scripts/benchmark_multi_backend_comparison.sh model.gguf
+./scripts/benchmark.sh multi-backend model.gguf
+
+# Safetensors benchmark (only safetensors-capable backends will run)
+BUILD_DIR=./build-cuda \
+./scripts/benchmark.sh multi-backend models/qwen2.5-3b-instruct-safetensors
 ```
+
+### Local vLLM / SGLang safetensors benchmark
+
+To include local `vllm` and `sglang` in the same matrix, pass a safetensors model path to the harness and let it auto-filter incompatible backends:
+
+```bash
+AUTOSTART_VLLM=true \
+AUTOSTART_SGLANG=true \
+VLLM_MODEL_PATH=models/qwen2.5-3b-instruct-safetensors \
+SGLANG_MODEL_PATH=models/qwen2.5-3b-instruct-safetensors \
+VLLM_LAUNCH_ARGS="--dtype half --max-model-len 2048" \
+SGLANG_LAUNCH_ARGS="--dtype half --context-length 2048" \
+BUILD_DIR=./build-cuda \
+./scripts/benchmark.sh multi-backend \
+  models/qwen2.5-3b-instruct-safetensors
+```
+
+The harness now uses the supplied model format as the contract:
+
+* GGUF inputs skip `vllm` / `sglang`.
+* Safetensors inputs skip `llama_cpp_cuda` / `ollama`.
+* `inferflux_cuda` stays in both paths because it supports both formats.
+
+LM Studio remains included when available because it can front either family depending on the loaded model.
 
 ### Expected Output
 
@@ -259,14 +287,14 @@ Ollama uses Go's goroutine-based per-request model. While Go excels at concurren
 
 | Use Case | Recommended Backend | Rationale |
 |----------|-------------------|-----------|
-| **Multi-agent AI systems** | **cuda_llama_cpp** | 3.7x faster than Ollama, scales 2.59x |
-| **Single-request API** | cuda_llama_cpp | Highest throughput (107 vs 83 tok/s) |
-| **Edge deployment with many agents** | **cuda_llama_cpp** | Scales horizontally, 36% less memory |
-| **Low-latency single request** | cuda_native | Acceptable for single-request (1.6x vs Ollama) |
+| **Multi-agent AI systems** | **llama_cpp_cuda** | 3.7x faster than Ollama, scales 2.59x |
+| **Single-request API** | llama_cpp_cuda | Highest throughput (107 vs 83 tok/s) |
+| **Edge deployment with many agents** | **llama_cpp_cuda** | Scales horizontally, 36% less memory |
+| **Low-latency single request** | inferflux_cuda | Acceptable for single-request (1.6x vs Ollama) |
 
 ### Configuration Recommendations
 
-**For concurrent workloads (cuda_llama_cpp)**:
+**For concurrent workloads (llama_cpp_cuda)**:
 ```yaml
 runtime:
   scheduler:
@@ -274,24 +302,24 @@ runtime:
     max_batch_tokens: 16384
     batch_accumulation_ms: 2     # Small wait for batch accumulation
   backend_exposure:
-    prefer_native: false        # Use llama.cpp for now
+    prefer_inferflux: false        # Use llama.cpp for now
 ```
 
-**For single-request workloads (cuda_native)**:
+**For single-request workloads (inferflux_cuda)**:
 ```yaml
 runtime:
   scheduler:
     max_batch_size: 4           # Smaller batches OK for sequential
     batch_accumulation_ms: 0     # No waiting
   backend_exposure:
-    prefer_native: true         # Use native when available
+    prefer_inferflux: true         # Use InferFlux provider when available
 ```
 
 ---
 
 ## Future Work
 
-### cuda_native Scaling Improvements
+### inferflux_cuda Scaling Improvements
 
 **Status**: Under investigation
 
@@ -303,7 +331,7 @@ runtime:
 3. Investigate batched GEMV kernels for concurrent sequences
 4. Explore wave-level scheduling for better GPU utilization
 
-See: [cuda_native Scaling Roadmap](#cuda_native-scaling-roadmap)
+See archived throughput investigations under [ARCHIVE_INDEX](ARCHIVE_INDEX.md).
 
 ### Additional Benchmarks Needed
 
@@ -321,13 +349,13 @@ See: [cuda_native Scaling Roadmap](#cuda_native-scaling-roadmap)
 ### Prior Benchmarks (Memory Update)
 
 **Sequential parity (March 2026)**:
-- cuda_native achieved 0.83x parity with llama.cpp on Qwen2.5-3B
+- inferflux_cuda achieved 0.83x parity with llama.cpp on Qwen2.5-3B
 - Target: 0.8x sequential parity ✅ MET
 - Remaining gap: Concurrent scaling (0.50x at concurrency=4)
 
 **Current status (March 2026, post-investigation)**:
-- cuda_llama_cpp achieves **3.7x vs Ollama** at concurrency=16
-- cuda_native shows **1.11x scaling** (no meaningful improvement)
+- llama_cpp_cuda achieves **3.7x vs Ollama** at concurrency=16
+- inferflux_cuda shows **1.11x scaling** (no meaningful improvement)
 - Root cause identified: GPU kernel design, not scheduler configuration
 
 See archived investigation notes under [archive/evidence/2026-03-10-ollama-benchmark](archive/evidence/2026-03-10-ollama-benchmark).
@@ -350,12 +378,12 @@ Generated file: `multi_backend_benchmark_results/scaling_curves_*.csv`
 
 ```csv
 backend,concurrency,tok_per_sec,avg_latency_ms,p50_latency_ms,p95_latency_ms,gpu_mem_peak_mb,gpu_util_peak_percent
-cuda_native,1,83.4,581,705,722,9701,95
-cuda_native,4,91.1,1877,1958,2647,9713,97
-cuda_native,16,92.8,6438,8669,8720,9713,98
-cuda_llama_cpp,1,107.0,448,543,565,9759,92
-cuda_llama_cpp,4,175.5,1028,1099,1277,9754,90
-cuda_llama_cpp,16,277.4,2598,2706,3082,9754,92
+inferflux_cuda,1,83.4,581,705,722,9701,95
+inferflux_cuda,4,91.1,1877,1958,2647,9713,97
+inferflux_cuda,16,92.8,6438,8669,8720,9713,98
+llama_cpp_cuda,1,107.0,448,543,565,9759,92
+llama_cpp_cuda,4,175.5,1028,1099,1277,9754,90
+llama_cpp_cuda,16,277.4,2598,2706,3082,9754,92
 ollama,1,52.2,357,317,638,13262,89
 ollama,4,79.5,874,912,1135,13262,91
 ollama,16,75.7,2532,2520,4064,13262,87

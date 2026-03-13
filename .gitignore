@@ -5,6 +5,7 @@ build-*/
 .DS_Store
 models/
 logs/
+Testing/
 server.log
 *.gguf
 .env.local
@@ -41,4 +42,5 @@ multi_backend_benchmark_results/
 cuda_native_profile_*/
 llama_cpp_profile_*/
 concurrent_fix_validation_*/
+docs/archive/evidence/local-artifacts/generated/
 *.old

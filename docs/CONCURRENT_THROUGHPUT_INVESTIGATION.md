@@ -138,7 +138,7 @@ preserves correct request affinity and removes redundant per-step routing work,
 but the short live probe did **not** produce a meaningful throughput win:
 
 - Native throughput: `110.6 tok/s`
-- `cuda_llama_cpp`: `153.0 tok/s`
+- `llama_cpp_cuda`: `153.0 tok/s`
 - Exact match: `6/8`
 
 Most importantly, the new scheduler metric still matched the native forward
@@ -174,7 +174,7 @@ The short privileged probe showed that this fast path dominated execution:
 Yet throughput remained behind:
 
 - Native throughput: `101.7 tok/s`
-- `cuda_llama_cpp`: `131.0 tok/s`
+- `llama_cpp_cuda`: `131.0 tok/s`
 - Exact match: `6/8`
 
 That closes the scheduler-side investigation for this path. The remaining gap is
@@ -193,10 +193,10 @@ That justified a narrow promotion: enable the exact-shape `Q4_K` hot kernels by
 default while keeping `Q6_K` behind the existing experimental env gates.
 
 The end-to-end short probe with those kernels enabled moved native much closer
-to `cuda_llama_cpp` without additional accuracy drift:
+to `llama_cpp_cuda` without additional accuracy drift:
 
 - Native throughput: `121.4 tok/s`
-- `cuda_llama_cpp`: `129.1 tok/s`
+- `llama_cpp_cuda`: `129.1 tok/s`
 - Exact match: `6/8`
 - Native/llama throughput ratio: `0.94x`
 
@@ -204,6 +204,44 @@ This is the first backend-side change in the current pass that materially
 improves the native gap. The next optimization target remains decode FFN/down-
 proj, but it should now focus on the still-dominant grouped FFN path rather
 than more scheduler work.
+
+### March 11 Follow-up 6: sticky decode accumulation wait remains benchmark-only
+
+The scheduler-side sticky accumulation wait experiment was retained behind
+`INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT=1` for broader workload
+coverage, but it is still not strong enough to become default behavior.
+
+Prompt-heavy Qwen2.5-3B Q4_K_M matrix on Ada RTX 4000 (`16` requests, `64`
+tokens, concurrency `1/4/8`) after repairing the multi-concurrency benchmark
+harness produced:
+
+- `wait=0`
+  - `c=1`: native `81.6 tok/s`, llama.cpp `111.6 tok/s` (`0.73x`)
+  - `c=4`: native `139.9 tok/s`, llama.cpp `208.2 tok/s` (`0.67x`)
+  - `c=8`: native `158.7 tok/s`, llama.cpp `312.0 tok/s` (`0.51x`)
+- `wait=1`
+  - `c=1`: native `81.9 tok/s`, llama.cpp `108.6 tok/s` (`0.75x`)
+  - `c=4`: native `142.6 tok/s`, llama.cpp `203.1 tok/s` (`0.70x`)
+  - `c=8`: native `163.2 tok/s`, llama.cpp `305.0 tok/s` (`0.54x`)
+
+Two conclusions hold at the same time:
+
+1. `wait=1` is not universally regressive; on this heavier prompt set it was
+   slightly better than `wait=0`.
+2. The gain is small and does not change the scaling story. Native still loses
+   more ground as concurrency rises, so the dominant problem remains backend
+   cost plus insufficient effective decode batching, not the absence of this
+   host-side wait.
+
+The wait should therefore stay:
+
+- available for benchmark sweeps across models / prompt envelopes
+- disabled by default in serving policy
+- treated as an experimental scheduler knob, not a recommended runtime default
+
+The benchmark harness now supports isolated per-concurrency artifacts (`c=1`,
+`c=4`, `c=8`) plus cleanup/reset hooks, so future matrices can compare this
+knob safely without contaminating later backend runs.
 
 ### Finding 3: Lower Batch Count is Correlated with Higher Throughput
 

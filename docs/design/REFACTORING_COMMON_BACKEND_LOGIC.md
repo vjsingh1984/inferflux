@@ -19,13 +19,13 @@ flowchart LR
 | Shared types | `runtime/backends/common/backend_types.h` exists |
 | Shared interface | `runtime/backends/common/backend_interface.h` exists |
 | Shared batch helpers | `runtime/backends/common/batching_utils.h` exists |
-| Backend inheritance | `LlamaCPUBackend` implements the common backend interface |
+| Backend inheritance | `LlamaCppBackend` implements the common backend interface |
 
 ## 3) What Is Still Incomplete
 
 | Gap | Why it is still deferred |
 |---|---|
-| Residual `LlamaCPUBackend` type coupling in some runtime/execution paths | Untangling it is broad churn with limited near-term throughput value |
+| Residual `LlamaCppBackend` type coupling in some runtime/execution paths | Untangling it is broad churn with limited near-term throughput value |
 | Cleaner native/runtime interface boundaries | Current priority is native quantized hot-path maturity, not hierarchy surgery |
 | Full removal of compatibility aliases | Safe once batch execution and backend contracts settle further |
 

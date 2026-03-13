@@ -1,5 +1,5 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
 
 #include <algorithm>

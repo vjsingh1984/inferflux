@@ -1,12 +1,12 @@
 # Maintenance Review
 
-> Rear-view-mirror pass after the native CUDA, scheduler, distributed-runtime, and benchmark-control work. Focus: reduce accidental complexity without removing required serving capabilities.
+> Rear-view-mirror pass after the InferFlux CUDA, scheduler, distributed-runtime, and benchmark-control work. Focus: reduce accidental complexity without removing required serving capabilities.
 
 ## 1) Keep vs Simplify
 
 | Area | Keep | Why |
 |---|---|---|
-| Dual CUDA backends (`native_cuda`, `cuda_llama_cpp`) | Keep | They serve different purposes: native owns long-term runtime architecture; llama.cpp is the compatibility/perf baseline. |
+| Dual CUDA backends (`inferflux_cuda`, `llama_cpp_cuda`) | Keep | They serve different purposes: native owns long-term runtime architecture; llama.cpp is the compatibility/perf baseline. |
 | Sequence slots + generation leases | Keep | They are required for KV ownership, prefix reuse, and bounded GPU memory. The problem was stale reuse semantics, not the concept. |
 | Optional `session_id` layer | Keep optional | Stateless API by default is correct; sticky reuse should remain opt-in and isolated from baseline OpenAI-compatible flows. |
 
@@ -20,7 +20,7 @@
 | P1 | Batch executor mixes request lifecycle, fairness slicing, prompt/decode assembly, and backend orchestration. | [batch_executor.cpp](../runtime/execution/batch_executor.cpp) | Split into `single_request_executor`, `phased_batch_executor`, and `output_assembly` helpers. Keep `BatchExecutor` as orchestration only. |
 | P1 | Benchmark harness is a shell orchestrator that now also acts like a metrics parser and experiment controller. | [run_gguf_comparison_benchmark.sh](../scripts/run_gguf_comparison_benchmark.sh), [classify_benchmark_response.py](../scripts/classify_benchmark_response.py), [compare_decode_traces.py](../scripts/compare_decode_traces.py) | Move orchestration to Python and keep shell only as a thin wrapper or remove it entirely. Existing Python helpers already show the direction. |
 | P1 | Config/bootstrap parsing is monolithic and hard to reason about. | [server/main.cpp](../server/main.cpp) | Extract config loading + env normalization into a dedicated server config loader. `main()` should build and run, not parse every knob directly. |
-| P2 | Metrics registry is one large monolith with unrelated domains coupled together. | [metrics.cpp](../server/metrics/metrics.cpp) | Split metrics recording/exposition by domain: request, scheduler, native CUDA, distributed transport, admin/readiness. |
+| P2 | Metrics registry is one large monolith with unrelated domains coupled together. | [metrics.cpp](../server/metrics/metrics.cpp) | Split metrics recording/exposition by domain: request, scheduler, InferFlux CUDA, distributed transport, admin/readiness. |
 
 ## 3) Most Important Architectural Cleanup
 

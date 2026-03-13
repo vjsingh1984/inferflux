@@ -46,9 +46,9 @@ inline std::size_t EstimateKvCacheBytes(int max_batch, int max_seq,
 }
 
 struct KvCachePlanInput {
-  int requested_max_batch{16};
+  int requested_max_batch{32};
   int requested_max_seq{4096};
-  int min_max_batch{16};
+  int min_max_batch{32};
   int min_max_seq{128};
   int model_max_position_embeddings{0};
   std::size_t bytes_per_token_per_sequence{0};

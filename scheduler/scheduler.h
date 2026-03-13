@@ -63,10 +63,10 @@ public:
     };
 
     // Default batch limits optimized for concurrent throughput.
-    // max_batch_size=16 allows GPU to process more concurrent requests without
+    // max_batch_size=32 allows GPU to process more concurrent requests without
     // queueing. See docs/concurrent_throughput_investigation.md for rationale.
     Config()
-        : max_batch_size(16), max_batch_tokens(16384), min_batch_size(1),
+        : max_batch_size(32), max_batch_tokens(16384), min_batch_size(1),
           batch_accumulation_ms(2) {}
     int max_batch_size;
     int max_batch_tokens;
@@ -125,7 +125,7 @@ public:
   // non-worker-loop context.
   int AllocSeqSlot(int64_t request_id = -1, uint64_t *generation_out = nullptr);
   void FreeSeqSlot(int slot, uint64_t generation = 0,
-                   std::shared_ptr<LlamaCPUBackend> backend = nullptr);
+                   std::shared_ptr<LlamaCppBackend> backend = nullptr);
 
   // Sequence slot manager for universal KV cache slot tracking.
   scheduler::SequenceSlotManager *SlotManager() { return slot_manager_.get(); }
@@ -141,7 +141,7 @@ private:
     int priority{0};
     int priority_level{0};
     uint64_t sequence{0};
-    std::shared_ptr<LlamaCPUBackend> resolved_backend;
+    std::shared_ptr<LlamaCppBackend> resolved_backend;
   };
 
   struct BatchSelection {
@@ -161,18 +161,27 @@ private:
   ResolveBackends(const std::vector<std::shared_ptr<PendingRequest>> &batch);
   bool RequestUsesSessionHandle(const InferenceRequest &request) const;
   void ReleaseSessionState(const scheduler::SessionHandleState &state,
-                           std::shared_ptr<LlamaCPUBackend> backend_hint);
+                           std::shared_ptr<LlamaCppBackend> backend_hint);
   void FinalizeSessionLease(PendingRequest *pending, bool commit_state);
   bool BackendUsesSplitDecodeWorkers(
-      const std::shared_ptr<LlamaCPUBackend> &backend) const;
+      const std::shared_ptr<LlamaCppBackend> &backend) const;
+  bool CanAppendToStickyStepBatchLocked(
+      const std::shared_ptr<PendingRequest> &pending,
+      const std::shared_ptr<LlamaCppBackend> &sticky_step_backend) const;
+  std::size_t AppendCompatiblePendingDecodeLocked(
+      std::vector<std::shared_ptr<PendingRequest>> *batch,
+      const std::shared_ptr<LlamaCppBackend> &sticky_step_backend,
+      std::size_t max_batch_size);
+  std::size_t CountCompatiblePendingDecodeLocked(
+      const std::shared_ptr<LlamaCppBackend> &sticky_step_backend) const;
   void PollDeferredSequenceRetirements();
   void RefreshNativeKvMemoryMetrics() const;
   void SyncSequenceSlotProgress(const InferenceRequest &request) const;
 
   struct DeferredSequenceRetirement {
-    std::shared_ptr<LlamaCPUBackend> backend;
+    std::shared_ptr<LlamaCppBackend> backend;
     scheduler::SequenceLease lease;
-    LlamaCPUBackend::SequenceReleaseFence fence;
+    LlamaCppBackend::SequenceReleaseFence fence;
     std::chrono::steady_clock::time_point retired_at;
   };
 

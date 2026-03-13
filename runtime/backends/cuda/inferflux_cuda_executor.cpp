@@ -1515,8 +1515,8 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
     log::Info("inferflux_cuda_executor",
               "KV cache max_batch overridden to " + std::to_string(max_batch));
   }
-  // Scheduler allocates sequence slot IDs 0..15, so KV cache needs ≥16 slots.
-  constexpr int kMinKvBatch = 16;
+  // Scheduler allocates sequence slot IDs 0..31, so KV cache needs ≥32 slots.
+  constexpr int kMinKvBatch = 32;
   if (max_batch < kMinKvBatch) {
     log::Warn("inferflux_cuda_executor",
               "KV max_batch=" + std::to_string(max_batch) +

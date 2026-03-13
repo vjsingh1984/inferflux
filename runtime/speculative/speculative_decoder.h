@@ -2,7 +2,7 @@
 
 #include "model/tokenizer/simple_tokenizer.h"
 #include "runtime/backends/cpu/cpu_backend.h"
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 
 #include <functional>
 #include <memory>

@@ -3,7 +3,7 @@
 #include "model/model_format.h"
 #include "runtime/backends/backend_factory.h"
 #include "runtime/backends/backend_capabilities.h"
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/backends/cuda/inferflux_cuda_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "scheduler/model_selection.h"

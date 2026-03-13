@@ -36,6 +36,42 @@ std::string NativeForwardBatchSizeBucket(int batch_size) {
   return "17_plus";
 }
 
+std::string InferfluxCudaPrefillBatchSizeBucket(int batch_size) {
+  if (batch_size <= 1) {
+    return "1";
+  }
+  if (batch_size == 2) {
+    return "2";
+  }
+  if (batch_size <= 4) {
+    return "3_4";
+  }
+  if (batch_size <= 8) {
+    return "5_8";
+  }
+  if (batch_size <= 16) {
+    return "9_16";
+  }
+  if (batch_size <= 32) {
+    return "17_32";
+  }
+  if (batch_size <= 64) {
+    return "33_64";
+  }
+  if (batch_size <= 128) {
+    return "65_128";
+  }
+  return "129_plus";
+}
+
+std::string InferfluxCudaBatchSizeBucket(std::string_view phase, int batch_size) {
+  const std::string phase_label = NormalizeNativePhase(phase);
+  if (phase_label == "prefill") {
+    return InferfluxCudaPrefillBatchSizeBucket(batch_size);
+  }
+  return NativeForwardBatchSizeBucket(batch_size);
+}
+
 std::string SchedulerDecodeCountBucket(std::size_t count) {
   if (count == 0) {
     return "0";
@@ -760,7 +796,8 @@ void MetricsRegistry::RecordInferfluxCudaBatchDecode(int batch_size, double tota
 void MetricsRegistry::RecordInferfluxCudaForwardBatchSize(std::string_view phase,
                                                    int batch_size) {
   const std::string key =
-      NormalizeNativePhase(phase) + "|" + NativeForwardBatchSizeBucket(batch_size);
+      NormalizeNativePhase(phase) + "|" +
+      InferfluxCudaBatchSizeBucket(phase, batch_size);
   std::lock_guard<std::mutex> lock(inferflux_cuda_forward_batch_size_mutex_);
   inferflux_cuda_forward_batch_size_counts_[key] += 1;
 }
@@ -773,7 +810,10 @@ void MetricsRegistry::RecordInferfluxCudaFfnProjOperator(std::string_view phase,
       : op == "q8_1_group_row_pair_w4" ? "q8_1_group_row_pair_w4"
       : op == "q8_1_group_row_quad_m4" ? "q8_1_group_row_quad_m4"
       : op == "q8_1_group_v2"    ? "q8_1_group_v2"
-      : op == "q8_1_group"       ? "q8_1_group"
+      : op == "q8_1_group_generic" ? "q8_1_group_generic"
+      : op == "q8_1_group_row_pair" ? "q8_1_group_row_pair"
+      : op == "q8_1_group_row_quad" ? "q8_1_group_row_quad"
+      : op == "q8_1_group"       ? "q8_1_group_generic"
       : op == "packed_group"     ? "packed_group"
       : op == "fallback"         ? "fallback"
                                   : "unknown";
@@ -789,7 +829,8 @@ void MetricsRegistry::RecordInferfluxCudaFfnProjGeometry(std::string_view phase,
                                                   int grouped_outputs) {
   const std::string key =
       NormalizeNativePhase(phase) + "|" + std::string(op) + "|" +
-      NormalizeNativeQuant(quant) + "|" + NativeForwardBatchSizeBucket(batch_size) +
+      NormalizeNativeQuant(quant) + "|" +
+      InferfluxCudaBatchSizeBucket(phase, batch_size) +
       "|" + std::to_string(std::max(0, n)) + "|" +
       NativeLinearDimBucket(n) + "|" + std::to_string(std::max(0, k)) + "|" +
       NativeLinearDimBucket(k) + "|" +
@@ -825,7 +866,8 @@ void MetricsRegistry::RecordInferfluxCudaDownProjGeometry(std::string_view phase
                                                    int k) {
   const std::string key =
       NormalizeNativePhase(phase) + "|" + std::string(op) + "|" +
-      NormalizeNativeQuant(quant) + "|" + NativeForwardBatchSizeBucket(batch_size) +
+      NormalizeNativeQuant(quant) + "|" +
+      InferfluxCudaBatchSizeBucket(phase, batch_size) +
       "|" + std::to_string(std::max(0, n)) + "|" +
       NativeLinearDimBucket(n) + "|" + std::to_string(std::max(0, k)) + "|" +
       NativeLinearDimBucket(k);
@@ -841,7 +883,7 @@ void MetricsRegistry::RecordInferfluxCudaRowPairSelection(std::string_view phase
   }
   const std::string key =
       NormalizeNativePhase(phase) + "|" + std::string(op) + "|" +
-      NativeForwardBatchSizeBucket(batch_rows);
+      InferfluxCudaBatchSizeBucket(phase, batch_rows);
   std::lock_guard<std::mutex> lock(inferflux_cuda_rowpair_selection_mutex_);
   inferflux_cuda_rowpair_selection_counts_[key] += 1;
 }
@@ -1904,19 +1946,35 @@ std::string MetricsRegistry::RenderPrometheus() const {
          "batch-size distribution by phase\n";
   out << "# TYPE inferflux_cuda_forward_batch_size_total counter\n";
   {
-    static constexpr const char *kPhases[] = {"prefill", "decode"};
-    static constexpr const char *kBuckets[] = {"1", "2", "3_4", "5_8",
-                                               "9_16", "17_plus"};
+    static constexpr const char *kPrefillBuckets[] = {
+        "1", "2", "3_4", "5_8", "9_16", "17_32", "33_64", "65_128",
+        "129_plus"};
+    static constexpr const char *kDecodeBuckets[] = {"1", "2", "3_4", "5_8",
+                                                      "9_16", "17_plus"};
     std::lock_guard<std::mutex> lock(inferflux_cuda_forward_batch_size_mutex_);
-    for (const char *phase : kPhases) {
-      for (const char *bucket : kBuckets) {
-        const std::string key = std::string(phase) + "|" + bucket;
-        const auto it = inferflux_cuda_forward_batch_size_counts_.find(key);
-        const uint64_t count =
-            it == inferflux_cuda_forward_batch_size_counts_.end() ? 0 : it->second;
-        out << "inferflux_cuda_forward_batch_size_total{phase=\"" << phase
-            << "\",bucket=\"" << bucket << "\"} " << count << "\n";
-      }
+    for (const char *bucket : kPrefillBuckets) {
+      const std::string key = std::string("prefill|") + bucket;
+      const auto it = inferflux_cuda_forward_batch_size_counts_.find(key);
+      const uint64_t count =
+          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0 : it->second;
+      out << "inferflux_cuda_forward_batch_size_total{phase=\"prefill\",bucket=\""
+          << bucket << "\"} " << count << "\n";
+    }
+    for (const char *bucket : kDecodeBuckets) {
+      const std::string key = std::string("decode|") + bucket;
+      const auto it = inferflux_cuda_forward_batch_size_counts_.find(key);
+      const uint64_t count =
+          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0 : it->second;
+      out << "inferflux_cuda_forward_batch_size_total{phase=\"decode\",bucket=\""
+          << bucket << "\"} " << count << "\n";
+    }
+    for (const char *bucket : kDecodeBuckets) {
+      const std::string key = std::string("unknown|") + bucket;
+      const auto it = inferflux_cuda_forward_batch_size_counts_.find(key);
+      const uint64_t count =
+          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0 : it->second;
+      out << "inferflux_cuda_forward_batch_size_total{phase=\"unknown\",bucket=\""
+          << bucket << "\"} " << count << "\n";
     }
   }
 
@@ -1928,7 +1986,10 @@ std::string MetricsRegistry::RenderPrometheus() const {
     static constexpr const char *kOps[] = {"q8_1_group_hot_q4k",
                                            "q8_1_group_row_pair_w4",
                                            "q8_1_group_row_quad_m4",
-                                           "q8_1_group_v2", "q8_1_group",
+                                           "q8_1_group_v2",
+                                           "q8_1_group_generic",
+                                           "q8_1_group_row_pair",
+                                           "q8_1_group_row_quad",
                                            "packed_group", "fallback"};
     std::lock_guard<std::mutex> lock(inferflux_cuda_ffn_proj_operator_mutex_);
     for (const char *phase : kPhases) {
@@ -2037,16 +2098,22 @@ std::string MetricsRegistry::RenderPrometheus() const {
   static constexpr const char *kRowPairPhases[] = {"prefill", "decode"};
   static constexpr const char *kRowPairOps[] = {
       "q8_1_group_row_pair_w4",
+      "q8_1_group_row_pair",
       "q8_1_gemv_row_pair",
       "q8_1_gemv_row_pair_v2",
       "q8_1_gemv_row_pair_hot_fixed",
   };
-  static constexpr const char *kBuckets[] = {"1", "2", "3_4", "5_8",
-                                             "9_16", "17_plus"};
   std::lock_guard<std::mutex> rowpair_lock(inferflux_cuda_rowpair_selection_mutex_);
   for (const char *phase : kRowPairPhases) {
+    const std::vector<const char *> buckets =
+        std::string_view(phase) == "prefill"
+            ? std::vector<const char *>{"1", "2", "3_4", "5_8", "9_16",
+                                        "17_32", "33_64", "65_128",
+                                        "129_plus"}
+            : std::vector<const char *>{"1", "2", "3_4", "5_8", "9_16",
+                                        "17_plus"};
     for (const char *op : kRowPairOps) {
-      for (const char *bucket : kBuckets) {
+      for (const char *bucket : buckets) {
         const std::string key = std::string(phase) + "|" + op + "|" + bucket;
         const auto it = inferflux_cuda_rowpair_selection_counts_.find(key);
         const uint64_t count =

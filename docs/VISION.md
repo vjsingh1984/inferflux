@@ -16,7 +16,7 @@ flowchart LR
 |---|---|
 | API compatibility | Core request/admin surfaces remain OpenAI-style and scriptable |
 | Operator control plane | Auth, policy, routing, audit, metrics, and admin APIs are part of the product, not sidecars |
-| Dual CUDA strategy | `native_cuda` is the headroom path; `cuda_llama_cpp` is the compatibility/safety path |
+| Dual CUDA strategy | `inferflux_cuda` is the headroom path; `llama_cpp_cuda` is the compatibility/safety path |
 | Memory economy | Shared weights, separate KV lifecycle, prefix reuse, and explicit memory policy knobs |
 | Stateless default | Baseline API stays stateless; `session_id` reuse is optional and bounded |
 | Honest scale path | Single-node rigor first, distributed claims only when lifecycle and failure contracts exist |

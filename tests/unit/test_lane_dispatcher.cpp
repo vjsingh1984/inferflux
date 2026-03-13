@@ -9,9 +9,9 @@
 
 namespace {
 
-inferflux::LlamaCPUBackend::UnifiedBatchInput
+inferflux::LlamaCppBackend::UnifiedBatchInput
 MakeInput(int sequence_id, int n_past, std::vector<int> tokens) {
-  inferflux::LlamaCPUBackend::UnifiedBatchInput input;
+  inferflux::LlamaCppBackend::UnifiedBatchInput input;
   input.sequence_id = sequence_id;
   input.n_past = n_past;
   input.tokens = std::move(tokens);
@@ -21,8 +21,8 @@ MakeInput(int sequence_id, int n_past, std::vector<int> tokens) {
 
 bool CollectWithTimeout(
     inferflux::UnifiedBatchLaneDispatcher *dispatcher,
-    inferflux::LlamaCPUBackend::UnifiedBatchHandle handle,
-    std::vector<inferflux::LlamaCPUBackend::UnifiedBatchOutput> *outputs,
+    inferflux::LlamaCppBackend::UnifiedBatchHandle handle,
+    std::vector<inferflux::LlamaCppBackend::UnifiedBatchOutput> *outputs,
     bool *decode_lane,
     std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -55,7 +55,7 @@ TEST_CASE("UnifiedBatchLaneDispatcher executes lane work on persistent workers",
   std::thread::id prefill_thread_id;
 
   REQUIRE(dispatcher.Start(
-      [&](const std::vector<inferflux::LlamaCPUBackend::UnifiedBatchInput>
+      [&](const std::vector<inferflux::LlamaCppBackend::UnifiedBatchInput>
               &inputs,
           bool decode_lane)
           -> inferflux::UnifiedBatchLaneDispatcher::ExecutionResult {
@@ -66,7 +66,7 @@ TEST_CASE("UnifiedBatchLaneDispatcher executes lane work on persistent workers",
           prefill_thread_id = std::this_thread::get_id();
         }
 
-        inferflux::LlamaCPUBackend::UnifiedBatchOutput output;
+        inferflux::LlamaCppBackend::UnifiedBatchOutput output;
         output.ok = true;
         output.token = decode_lane ? 101 : 202;
         output.piece = decode_lane ? "d" : "p";
@@ -83,7 +83,7 @@ TEST_CASE("UnifiedBatchLaneDispatcher executes lane work on persistent workers",
   REQUIRE(decode_handle != 0);
   REQUIRE(prefill_handle != 0);
 
-  std::vector<inferflux::LlamaCPUBackend::UnifiedBatchOutput> decode_outputs;
+  std::vector<inferflux::LlamaCppBackend::UnifiedBatchOutput> decode_outputs;
   bool decode_lane = false;
   REQUIRE(CollectWithTimeout(&dispatcher, decode_handle, &decode_outputs,
                              &decode_lane));
@@ -92,7 +92,7 @@ TEST_CASE("UnifiedBatchLaneDispatcher executes lane work on persistent workers",
   REQUIRE(decode_outputs[0].ok);
   REQUIRE(decode_outputs[0].token == 101);
 
-  std::vector<inferflux::LlamaCPUBackend::UnifiedBatchOutput> prefill_outputs;
+  std::vector<inferflux::LlamaCppBackend::UnifiedBatchOutput> prefill_outputs;
   bool prefill_lane = true;
   REQUIRE(CollectWithTimeout(&dispatcher, prefill_handle, &prefill_outputs,
                              &prefill_lane));
@@ -115,14 +115,14 @@ TEST_CASE("UnifiedBatchLaneDispatcher enforces per-lane pending limits",
   std::promise<void> release_gate_promise;
   std::shared_future<void> release_gate = release_gate_promise.get_future();
   REQUIRE(dispatcher.Start(
-      [&](const std::vector<inferflux::LlamaCPUBackend::UnifiedBatchInput>
+      [&](const std::vector<inferflux::LlamaCppBackend::UnifiedBatchInput>
               &inputs,
           bool decode_lane)
           -> inferflux::UnifiedBatchLaneDispatcher::ExecutionResult {
         (void)inputs;
         (void)decode_lane;
         release_gate.wait();
-        inferflux::LlamaCPUBackend::UnifiedBatchOutput output;
+        inferflux::LlamaCppBackend::UnifiedBatchOutput output;
         output.ok = true;
         output.token = 7;
         output.piece = "ok";
@@ -146,13 +146,13 @@ TEST_CASE("UnifiedBatchLaneDispatcher enforces per-lane pending limits",
 
   release_gate_promise.set_value();
 
-  std::vector<inferflux::LlamaCPUBackend::UnifiedBatchOutput> outputs_a;
+  std::vector<inferflux::LlamaCppBackend::UnifiedBatchOutput> outputs_a;
   bool lane_a = false;
   REQUIRE(
       CollectWithTimeout(&dispatcher, decode_handle_a, &outputs_a, &lane_a));
   REQUIRE(lane_a);
 
-  std::vector<inferflux::LlamaCPUBackend::UnifiedBatchOutput> outputs_prefill;
+  std::vector<inferflux::LlamaCppBackend::UnifiedBatchOutput> outputs_prefill;
   bool lane_prefill = true;
   REQUIRE(CollectWithTimeout(&dispatcher, prefill_handle, &outputs_prefill,
                              &lane_prefill));
@@ -164,7 +164,7 @@ TEST_CASE("UnifiedBatchLaneDispatcher enforces per-lane pending limits",
   const auto decode_handle_c = dispatcher.Submit({MakeInput(4, 5, {11})}, true);
   REQUIRE(decode_handle_c != 0);
 
-  std::vector<inferflux::LlamaCPUBackend::UnifiedBatchOutput> outputs_c;
+  std::vector<inferflux::LlamaCppBackend::UnifiedBatchOutput> outputs_c;
   bool lane_c = false;
   REQUIRE(
       CollectWithTimeout(&dispatcher, decode_handle_c, &outputs_c, &lane_c));

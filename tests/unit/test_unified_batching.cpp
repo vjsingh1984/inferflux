@@ -1,4 +1,4 @@
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/execution/batch_executor.h"
 #include "scheduler/single_model_router.h"
 #include "server/metrics/metrics.h"

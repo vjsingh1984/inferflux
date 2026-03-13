@@ -20,6 +20,11 @@ LOGITS_RE = re.compile(
     r"n_past=(?P<n_past>-?\d+) top-\d+: (?P<top>.+)$"
 )
 
+RAW_NATIVE_LOGITS_RE = re.compile(
+    r"\[DEBUG_LOGITS\] tokens=\[(?P<tokens>[^\]]*)\] "
+    r"n_past=(?P<n_past>-?\d+) top-\d+: (?P<top>.+?)(?: \(nan=.*)?$"
+)
+
 TOKEN_RE = re.compile(
     r"(?P<kind>token_trace|decode_mapping|sample_mapping)\[[^\]]+\]: .*?"
     r"(?:(?:client_request_id=(?P<client_request_id>[^,]+), )?)"
@@ -76,6 +81,26 @@ def parse_trace(path: Path) -> Dict[TraceKey, Dict[str, object]]:
             row["sequence_generation"] = key[1]
             row["n_past"] = key[2]
             row["top_logits"] = parse_top_entries(logits_match.group("top"))
+            continue
+
+        raw_native_logits_match = RAW_NATIVE_LOGITS_RE.search(line)
+        if raw_native_logits_match:
+            tokens = [
+                int(token)
+                for token in raw_native_logits_match.group("tokens").split(",")
+                if token.strip()
+            ]
+            effective_n_past = int(raw_native_logits_match.group("n_past")) + len(
+                tokens
+            )
+            key = ("request:-1", 0, effective_n_past)
+            row = rows.setdefault(key, {})
+            row["request_key"] = key[0]
+            row["request_id"] = -1
+            row["sequence_generation"] = key[1]
+            row["n_past"] = key[2]
+            row["prompt_tokens"] = tokens
+            row["top_logits"] = parse_top_entries(raw_native_logits_match.group("top"))
             continue
 
         token_match = TOKEN_RE.search(line)

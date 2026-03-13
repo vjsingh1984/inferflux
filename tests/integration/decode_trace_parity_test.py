@@ -174,6 +174,43 @@ class DecodeTraceParityTests(unittest.TestCase):
         self.assertFalse(payload["parity"])
         self.assertEqual(payload["first_divergence"]["request_key"], "client:bench-5")
 
+    def test_parses_raw_native_prefill_logits_against_generate_trace(self):
+        native_log = textwrap.dedent(
+            """\
+            [DEBUG_LOGITS] tokens=[10,11,12] n_past=0 top-10: [42]=9.5 [7]=1.0 (nan=0 inf=0 zero=0/100)
+            [INFO] inferflux_cuda_executor: sample_mapping[primary_prefill]: input_idx=0, request_id=-1, sequence_id=0, sequence_generation=0, n_past=0, token_count=3, sampled_token=42, piece= answer
+            """
+        )
+        llama_log = textwrap.dedent(
+            """\
+            [INFO] llama_backend: debug_logits[generate]: request_id=-1, sequence_id=0, sequence_generation=0, n_past=3 top-5: [42]=9.500000 [7]=1.000000
+            [INFO] llama_backend: token_trace[generate]: request_id=-1, sequence_id=0, sequence_generation=0, n_past=3, sampled_token=42, piece= answer
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            native_path = Path(tmpdir) / "native.log"
+            llama_path = Path(tmpdir) / "llama.log"
+            native_path.write_text(native_log, encoding="utf-8")
+            llama_path.write_text(llama_log, encoding="utf-8")
+            proc = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    str(native_path),
+                    str(llama_path),
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+            )
+
+        payload = json.loads(proc.stdout)
+        self.assertTrue(payload["parity"])
+        self.assertEqual(payload["shared_steps"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

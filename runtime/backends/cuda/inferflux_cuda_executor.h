@@ -321,6 +321,7 @@ private:
 
   bool lane_overlap_ready_{false};
   bool lane_overlap_init_attempted_{false};
+  std::mutex lane_overlap_mutex_;
   std::mutex shared_pipeline_mutex_;
   std::unique_ptr<ModelForward> decode_lane_forward_;
   std::unique_ptr<ModelForward> prefill_lane_forward_;
@@ -350,6 +351,7 @@ private:
   };
   std::vector<PendingSequenceRelease> pending_sequence_releases_;
   uint64_t next_sequence_release_token_{1};
+  std::mutex pending_sequence_releases_mutex_;
 #endif
 
   // Performance timing via cudaEvents
@@ -396,6 +398,7 @@ private:
                                  bool want_bf16, int max_batch);
   bool EnsureLaneOverlapResources();
   void DestroyLaneOverlapResources();
+  void DestroyLaneOverlapResourcesUnlocked();
   bool CanRunLaneOverlap() const;
   LaneExecutionResources PrimaryLaneResources();
   LaneExecutionResources GetLaneResources(bool decode_lane);

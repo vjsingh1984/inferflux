@@ -25,7 +25,7 @@ flowchart TD
 | Not ready | `curl -s http://127.0.0.1:8080/readyz` | model/backend not ready | fix model path/backend config; re-check logs |
 | `401` / `403` | run same request with known key | missing/invalid key or insufficient scope | pass bearer key with required scope |
 | `404 model_not_found` | `./build/inferctl models --api-key <KEY>` | wrong model id/default model missing | use valid model id or set default model |
-| `422 backend_policy_violation` | inspect routing + backend exposure | strict native request policy blocked fallback | disable strict native policy or request compatible backend |
+| `422 backend_policy_violation` | inspect routing + backend exposure | strict inferflux request policy blocked fallback | disable strict inferflux policy or request compatible backend |
 | `std::bad_alloc` / CUDA OOM | check startup advisor + slot settings + model size | FP16 or large model exceeds practical VRAM budget at current concurrency | reduce `max_parallel_sequences`/context, switch to quantized model, or use larger VRAM GPU |
 | high latency / low throughput | `curl -s .../metrics | head -120` | under-sized batches or backend mismatch | tune scheduler/KV/cuda settings in config |
 | WebUI blank/empty | verify binary + model list | UI not built or no model loaded | build with `-DENABLE_WEBUI=ON` and load model |
@@ -82,10 +82,10 @@ Sequence-slot / native decode debug capture:
 INFERFLUX_DEBUG_SEQUENCE_SLOTS=1 \
 INFERFLUX_DEBUG_UNIFIED_ASSEMBLY=1 \
 INFERFLUX_DEBUG_UNIFIED_ASSEMBLY_LIMIT=256 \
-INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING=1 \
-INFERFLUX_NATIVE_DEBUG_DECODE_MAPPING_LIMIT=256 \
-INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION=1 \
-INFERFLUX_NATIVE_DEBUG_OPERATOR_SELECTION_LIMIT=128 \
+INFERFLUX_CUDA_DEBUG_DECODE_MAPPING=1 \
+INFERFLUX_CUDA_DEBUG_DECODE_MAPPING_LIMIT=256 \
+INFERFLUX_CUDA_DEBUG_OPERATOR_SELECTION=1 \
+INFERFLUX_CUDA_DEBUG_OPERATOR_SELECTION_LIMIT=128 \
 ./build/inferfluxd --config config/server.cuda.yaml
 ```
 
@@ -110,7 +110,7 @@ INFERFLUX_BENCH_DEBUG_SEQUENCE_SLOTS=1 \
 INFERFLUX_BENCH_DEBUG_UNIFIED_ASSEMBLY=1 \
 INFERFLUX_BENCH_NATIVE_DEBUG_DECODE_MAPPING=1 \
 INFERFLUX_BENCH_NATIVE_DEBUG_OPERATOR_SELECTION=1 \
-bash scripts/run_gguf_comparison_benchmark.sh
+./scripts/benchmark.sh gguf-compare
 ```
 
 If benchmark exact-match regresses while native throughput rises only slightly:
@@ -122,8 +122,8 @@ To localize the first native-vs-llama decode divergence from debug logs:
 
 ```bash
 python3 scripts/compare_decode_traces.py \
-  /path/to/server_cuda_native.log \
-  /path/to/server_cuda_llama_cpp.log \
+  /path/to/server_inferflux_cuda.log \
+  /path/to/server_llama_cpp_cuda.log \
   --json
 ```
 
@@ -137,7 +137,7 @@ ordering on mixed-prompt batches.
 | Platform | Issue | Fix |
 |---|---|---|
 | macOS | Metal command queue failures | set `GGML_METAL_DISABLE=1` for CPU fallback |
-| NVIDIA CUDA | explicit `cuda_native` rejected | adjust strict mode or use `cuda_llama_cpp` until native ready |
+| NVIDIA CUDA | explicit `inferflux_cuda` rejected | adjust strict mode or use `llama_cpp_cuda` until native ready |
 | Docker | config/model persistence | mount config/models volumes and verify permissions |
 
 Docker quick commands:

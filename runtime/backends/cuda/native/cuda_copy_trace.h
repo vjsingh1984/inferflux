@@ -47,7 +47,7 @@ inline std::array<CopyTraceEntry, static_cast<size_t>(CopyTraceSite::kCount)>
 
 inline bool CopyTraceEnabled() {
   static const bool enabled = []() {
-    const char *raw = std::getenv("INFERFLUX_NATIVE_COPY_TRACE");
+    const char *raw = std::getenv("INFERFLUX_CUDA_COPY_TRACE");
     return raw && std::string(raw) != "0" && std::string(raw) != "false";
   }();
   return enabled;

@@ -80,6 +80,44 @@ std::vector<half> CopyDeviceHalfs(const half *device, size_t count) {
   return host;
 }
 
+void ApplyRopeHost(std::vector<half> *q, std::vector<half> *k, int seq_len,
+                   int num_heads, int num_kv_heads, int head_dim, int n_past,
+                   float freq_base, int rope_type) {
+  const int half_dim = head_dim / 2;
+  auto apply = [&](std::vector<half> *tensor, int heads) {
+    for (int pos = 0; pos < seq_len; ++pos) {
+      const int position = n_past + pos;
+      for (int head = 0; head < heads; ++head) {
+        const int offset = pos * heads * head_dim + head * head_dim;
+        for (int pair_idx = 0; pair_idx < half_dim; ++pair_idx) {
+          const float freq = 1.0f / std::pow(
+                                        freq_base,
+                                        2.0f * pair_idx /
+                                            static_cast<float>(head_dim));
+          const float angle = position * freq;
+          const float cos_val = std::cos(angle);
+          const float sin_val = std::sin(angle);
+
+          int i0 = offset + 2 * pair_idx;
+          int i1 = offset + 2 * pair_idx + 1;
+          if (rope_type == 2) {
+            i0 = offset + pair_idx;
+            i1 = offset + pair_idx + half_dim;
+          }
+
+          const float v0 = __half2float((*tensor)[i0]);
+          const float v1 = __half2float((*tensor)[i1]);
+          (*tensor)[i0] = __float2half(v0 * cos_val - v1 * sin_val);
+          (*tensor)[i1] = __float2half(v0 * sin_val + v1 * cos_val);
+        }
+      }
+    }
+  };
+
+  apply(q, num_heads);
+  apply(k, num_kv_heads);
+}
+
 std::pair<float, float>
 DecodeQ81Ds(const runtime::cuda::native::block_q8_1 &block) {
   const __half2_raw ds_raw = static_cast<__half2_raw>(block.ds);
@@ -89,6 +127,182 @@ DecodeQ81Ds(const runtime::cuda::native::block_q8_1 &block) {
   ds_raw_half.x = ds_raw.y;
   return {__half2float(static_cast<half>(d_raw)),
           __half2float(static_cast<half>(ds_raw_half))};
+}
+
+void FillQuantizedRows(runtime::cuda::native::GGUF::TensorType tensor_type,
+                       int rows, int blocks_per_row, void *weights) {
+  auto encode_half = [](float value) {
+    const half h = __float2half(value);
+    unsigned short bits = 0;
+    std::memcpy(&bits, &h, sizeof(bits));
+    return bits;
+  };
+
+  if (tensor_type == runtime::cuda::native::GGUF::TensorType::Q4_K) {
+    auto *w = reinterpret_cast<runtime::cuda::native::block_q4_k *>(weights);
+    for (int row = 0; row < rows; ++row) {
+      for (int blk = 0; blk < blocks_per_row; ++blk) {
+        auto &block = w[static_cast<size_t>(row) * blocks_per_row + blk];
+        block.d = encode_half(0.012f * static_cast<float>(((row + blk) % 5) + 1));
+        block.dmin =
+            encode_half(0.006f * static_cast<float>(((row + blk) % 3) + 1));
+        for (int i = 0; i < 12; ++i) {
+          block.scales[i] =
+              static_cast<unsigned char>((row * 17 + blk * 7 + i * 5) & 0xFF);
+        }
+        for (int i = 0; i < QK_K / 2; ++i) {
+          block.qs[i] =
+              static_cast<unsigned char>((row * 13 + blk * 11 + i * 3) & 0xFF);
+        }
+      }
+    }
+    return;
+  }
+
+  auto *w = reinterpret_cast<runtime::cuda::native::block_q6_k *>(weights);
+  for (int row = 0; row < rows; ++row) {
+    for (int blk = 0; blk < blocks_per_row; ++blk) {
+      auto &block = w[static_cast<size_t>(row) * blocks_per_row + blk];
+      for (int i = 0; i < QK_K / 2; ++i) {
+        block.ql[i] =
+            static_cast<unsigned char>((row * 11 + blk * 5 + i * 3) & 0xFF);
+      }
+      for (int i = 0; i < QK_K / 4; ++i) {
+        block.qh[i] =
+            static_cast<unsigned char>((row * 7 + blk * 13 + i * 9) & 0xFF);
+      }
+      for (int i = 0; i < QK_K / 16; ++i) {
+        block.scales[i] =
+            static_cast<char>(((row * 5 + blk * 3 + i * 7) % 31) - 15);
+      }
+      block.d = encode_half(0.01f * static_cast<float>(((row + blk) % 5) + 1));
+    }
+  }
+}
+
+void RunLmHeadLongPrefillContract(
+    runtime::cuda::native::GGUF::TensorType tensor_type, float margin) {
+  const int quant_type = static_cast<int>(tensor_type);
+  if (!FusedQuantGemm::SupportsQ8_1Activations(quant_type)) {
+    SUCCEED("Q8_1 lm_head kernels unavailable for this device/profile.");
+    return;
+  }
+
+  constexpr int seq_len = 23;
+  constexpr int M = 1;
+  constexpr int K = 2048;
+  constexpr int N = 4096;
+  constexpr float eps = 1e-5f;
+  constexpr std::array<int, 10> sample_outputs = {
+      0, 1, 2, 17, 63, 255, 511, 1023, 2047, 4095};
+
+  const FusedDispatchGeometry geometry{M, N, K, 1, false, true};
+  REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, geometry));
+
+  std::vector<half> h_residual_all =
+      MakeWaveTensor(static_cast<size_t>(seq_len) * K, 0.013f, -0.001f);
+  std::vector<half> h_residual(K);
+  std::copy(h_residual_all.end() - K, h_residual_all.end(), h_residual.begin());
+
+  std::vector<half> h_norm_weight(K);
+  float sum_sq = 0.0f;
+  for (int i = 0; i < K; ++i) {
+    const float weight = 0.9f + static_cast<float>(i % 17) * 0.01f;
+    h_norm_weight[i] = __float2half(weight);
+    const float residual = __half2float(h_residual[i]);
+    sum_sq += residual * residual;
+  }
+
+  const size_t weight_bytes =
+      tensor_type == runtime::cuda::native::GGUF::TensorType::Q4_K
+          ? static_cast<size_t>(N) * (K / QK_K) *
+                sizeof(runtime::cuda::native::block_q4_k)
+          : static_cast<size_t>(N) * (K / QK_K) *
+                sizeof(runtime::cuda::native::block_q6_k);
+  std::vector<unsigned char> h_weights(weight_bytes);
+  FillQuantizedRows(tensor_type, N, K / QK_K, h_weights.data());
+
+  void *d_w = nullptr;
+  half *d_residual = nullptr;
+  half *d_norm_weight = nullptr;
+  runtime::cuda::native::block_q8_1 *d_act_q8_1 = nullptr;
+  half *d_out = nullptr;
+  half *d_deq = nullptr;
+  REQUIRE(cudaMalloc(&d_w, weight_bytes) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_residual),
+                     K * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_norm_weight),
+                     K * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_act_q8_1),
+                     (K / QK8_1) *
+                         sizeof(runtime::cuda::native::block_q8_1)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out), N * sizeof(half)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_deq),
+                     static_cast<size_t>(N) * K * sizeof(half)) ==
+          cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_w, h_weights.data(), weight_bytes,
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_residual, h_residual.data(), K * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_norm_weight, h_norm_weight.data(), K * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  FusedQuantGemm::FusedRmsNormQuantizeQ8_1(d_residual, d_norm_weight, d_act_q8_1,
+                                           M, K, eps, nullptr);
+  if (tensor_type == runtime::cuda::native::GGUF::TensorType::Q4_K) {
+    REQUIRE(runtime::cuda::native::dequantize_q4_k(
+                reinterpret_cast<const runtime::cuda::native::block_q4_k *>(d_w),
+                d_deq, static_cast<size_t>(N) * K) == cudaSuccess);
+  } else {
+    REQUIRE(runtime::cuda::native::dequantize_q6_k(
+                reinterpret_cast<const runtime::cuda::native::block_q6_k *>(d_w),
+                d_deq, static_cast<size_t>(N) * K) == cudaSuccess);
+  }
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  std::vector<runtime::cuda::native::block_q8_1> q8_1_blocks(K / QK8_1);
+  REQUIRE(cudaMemcpy(q8_1_blocks.data(), d_act_q8_1,
+                     q8_1_blocks.size() *
+                         sizeof(runtime::cuda::native::block_q8_1),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  const std::vector<half> deq =
+      CopyDeviceHalfs(d_deq, static_cast<size_t>(N) * K);
+
+  std::vector<float> act_ref(K, 0.0f);
+  for (int blk = 0; blk < K / QK8_1; ++blk) {
+    const auto &a = q8_1_blocks[blk];
+    const float scale = DecodeQ81Ds(a).first;
+    for (int j = 0; j < QK8_1; ++j) {
+      act_ref[blk * QK8_1 + j] = scale * static_cast<float>(a.qs[j]);
+    }
+  }
+
+  QuantizedWeightInfo info{d_w, quant_type, static_cast<int64_t>(N) * K};
+  REQUIRE(FusedQuantGemm::GemvQ8_1(info, d_act_q8_1, d_out, M, N, K, nullptr));
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> out = CopyDeviceHalfs(d_out, N);
+  for (int out_idx : sample_outputs) {
+    float ref = 0.0f;
+    for (int i = 0; i < K; ++i) {
+      ref += act_ref[i] *
+             __half2float(deq[static_cast<size_t>(out_idx) * K + i]);
+    }
+    CAPTURE(static_cast<int>(tensor_type), out_idx);
+    const float tolerance = std::max(margin, std::fabs(ref) * 1.0e-3f);
+    REQUIRE(__half2float(out[out_idx]) ==
+            Catch::Approx(ref).margin(tolerance));
+  }
+
+  REQUIRE(cudaFree(d_deq) == cudaSuccess);
+  REQUIRE(cudaFree(d_out) == cudaSuccess);
+  REQUIRE(cudaFree(d_act_q8_1) == cudaSuccess);
+  REQUIRE(cudaFree(d_norm_weight) == cudaSuccess);
+  REQUIRE(cudaFree(d_residual) == cudaSuccess);
+  REQUIRE(cudaFree(d_w) == cudaSuccess);
 }
 
 } // namespace
@@ -1243,6 +1457,205 @@ TEST_CASE(
   REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
 }
 
+TEST_CASE("FlashAttention2Typed matches naive causal attention for Qwen "
+          "long-prefill geometry",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping Qwen long-prefill attention "
+            "parity.");
+    return;
+  }
+
+  constexpr int batch_size = 1;
+  constexpr int query_len = 17;
+  constexpr int kv_len = 17;
+  constexpr int num_heads = 16;
+  constexpr int num_kv_heads = 2;
+  constexpr int head_dim = 128;
+  constexpr int q_cols = num_heads * head_dim;
+  constexpr int kv_cols = num_kv_heads * head_dim;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  cudaStream_t stream = nullptr;
+  REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
+
+  const std::vector<half> h_q =
+      MakeWaveTensor(static_cast<size_t>(query_len) * q_cols, 0.03f);
+  const std::vector<half> h_k =
+      MakeWaveTensor(static_cast<size_t>(kv_len) * kv_cols, 0.02f, 0.01f);
+  const std::vector<half> h_v =
+      MakeWaveTensor(static_cast<size_t>(kv_len) * kv_cols, 0.015f, -0.02f);
+
+  half *d_q = nullptr;
+  half *d_k = nullptr;
+  half *d_v = nullptr;
+  half *d_o = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_q),
+                     h_q.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_k),
+                     h_k.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_v),
+                     h_v.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_o),
+                     h_q.size() * sizeof(half)) == cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_k, h_k.data(), h_k.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_v, h_v.data(), h_v.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  REQUIRE(cuda_kernel::FlashAttention2Typed<half>(
+              d_q, d_k, d_v, d_o, batch_size, query_len, kv_len, num_heads,
+              num_kv_heads, head_dim, scale, /*causal=*/true,
+              stream) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+  const std::vector<half> o_cuda = CopyDeviceHalfs(d_o, h_q.size());
+  std::vector<float> ref(o_cuda.size(), 0.0f);
+  const int kv_head_ratio = num_heads / num_kv_heads;
+
+  for (int q_pos = 0; q_pos < query_len; ++q_pos) {
+    for (int head = 0; head < num_heads; ++head) {
+      const int kv_head = head / kv_head_ratio;
+      std::vector<float> scores(q_pos + 1, 0.0f);
+      float max_score = -1.0e30f;
+      for (int k_pos = 0; k_pos <= q_pos; ++k_pos) {
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+          const float qv =
+              __half2float(h_q[static_cast<size_t>(q_pos) * q_cols +
+                               head * head_dim + d]);
+          const float kv =
+              __half2float(h_k[static_cast<size_t>(k_pos) * kv_cols +
+                               kv_head * head_dim + d]);
+          dot += qv * kv;
+        }
+        const float score = dot * scale;
+        scores[k_pos] = score;
+        max_score = std::max(max_score, score);
+      }
+
+      float denom = 0.0f;
+      for (float &score : scores) {
+        score = std::exp(score - max_score);
+        denom += score;
+      }
+
+      for (int d = 0; d < head_dim; ++d) {
+        float acc = 0.0f;
+        for (int k_pos = 0; k_pos <= q_pos; ++k_pos) {
+          const float prob = scores[k_pos] / denom;
+          const float vv =
+              __half2float(h_v[static_cast<size_t>(k_pos) * kv_cols +
+                               kv_head * head_dim + d]);
+          acc += prob * vv;
+        }
+        ref[static_cast<size_t>(q_pos) * q_cols + head * head_dim + d] = acc;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < o_cuda.size(); ++i) {
+    REQUIRE(__half2float(o_cuda[i]) == Catch::Approx(ref[i]).margin(6e-2f));
+  }
+
+  REQUIRE(cudaFree(d_o) == cudaSuccess);
+  REQUIRE(cudaFree(d_v) == cudaSuccess);
+  REQUIRE(cudaFree(d_k) == cudaSuccess);
+  REQUIRE(cudaFree(d_q) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+}
+
+TEST_CASE("RoPE matches host reference for Qwen long-prefill geometry",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping Qwen long-prefill RoPE parity.");
+    return;
+  }
+
+  constexpr int seq_len = 17;
+  constexpr int num_heads = 16;
+  constexpr int num_kv_heads = 2;
+  constexpr int head_dim = 128;
+  constexpr int q_cols = num_heads * head_dim;
+  constexpr int kv_cols = num_kv_heads * head_dim;
+  constexpr float freq_base = 1000000.0f;
+  constexpr int rope_type = 2;
+
+  cudaStream_t stream = nullptr;
+  REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
+
+  const std::vector<half> h_q =
+      MakeWaveTensor(static_cast<size_t>(seq_len) * q_cols, 0.03f);
+  const std::vector<half> h_k =
+      MakeWaveTensor(static_cast<size_t>(seq_len) * kv_cols, 0.02f, 0.01f);
+  std::vector<half> q_ref = h_q;
+  std::vector<half> k_ref = h_k;
+  ApplyRopeHost(&q_ref, &k_ref, seq_len, num_heads, num_kv_heads, head_dim,
+                /*n_past=*/0, freq_base, rope_type);
+
+  half *d_q = nullptr;
+  half *d_k = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_q),
+                     h_q.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_k),
+                     h_k.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_k, h_k.data(), h_k.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  REQUIRE(cuda_kernel::RoPE<half>(d_q, d_k, seq_len, num_heads, num_kv_heads,
+                                  head_dim, /*n_past=*/0, freq_base, stream,
+                                  rope_type) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+  const std::vector<half> q_cuda = CopyDeviceHalfs(d_q, h_q.size());
+  const std::vector<half> k_cuda = CopyDeviceHalfs(d_k, h_k.size());
+  for (size_t i = 0; i < q_cuda.size(); ++i) {
+    REQUIRE(__half2float(q_cuda[i]) ==
+            Catch::Approx(__half2float(q_ref[i])).margin(2e-3f));
+  }
+  for (size_t i = 0; i < k_cuda.size(); ++i) {
+    REQUIRE(__half2float(k_cuda[i]) ==
+            Catch::Approx(__half2float(k_ref[i])).margin(2e-3f));
+  }
+
+  REQUIRE(cudaFree(d_k) == cudaSuccess);
+  REQUIRE(cudaFree(d_q) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+}
+
+TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves sampled outputs for long-prefill "
+          "lm_head Q4_K geometry",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping long-prefill lm_head Q4_K parity.");
+    return;
+  }
+
+  RunLmHeadLongPrefillContract(runtime::cuda::native::GGUF::TensorType::Q4_K,
+                               2.0e-1f);
+}
+
+TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves sampled outputs for long-prefill "
+          "lm_head Q6_K geometry",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping long-prefill lm_head Q6_K parity.");
+    return;
+  }
+
+  RunLmHeadLongPrefillContract(runtime::cuda::native::GGUF::TensorType::Q6_K,
+                               2.0e-1f);
+}
+
 TEST_CASE("FusedQuantGemm::GemvPackedPair preserves per-row grouped Q8_0 "
           "outputs",
           "[native_forward][cuda_runtime_contract]") {
@@ -1727,6 +2140,216 @@ TEST_CASE("FusedQuantGemm::GemvPackedTriple preserves per-row grouped Q4_K "
   REQUIRE(cudaFree(d_w2) == cudaSuccess);
   REQUIRE(cudaFree(d_w1) == cudaSuccess);
   REQUIRE(cudaFree(d_w0) == cudaSuccess);
+}
+
+TEST_CASE("FusedQuantGemm::GemvPackedTriple preserves sampled outputs for "
+          "Qwen QKV long-prefill geometry",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping Qwen long-prefill QKV parity.");
+    return;
+  }
+
+  constexpr int M = 17;
+  constexpr int K = 2048;
+  constexpr int NQ = 2048;
+  constexpr int NK = 256;
+  constexpr int NV = 256;
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  const FusedDispatchGeometry geometry{M, NQ, K, 3, true, false};
+  if (!FusedQuantGemm::SupportsPackedActivations(quant_type) ||
+      !FusedQuantGemm::ShouldUseFusedPath(quant_type, geometry)) {
+    SUCCEED("Packed Q4_K triple kernel unavailable for long-prefill geometry "
+            "on this device/profile.");
+    return;
+  }
+
+  auto encode_half = [](float value) {
+    const half h = __float2half(value);
+    unsigned short bits = 0;
+    std::memcpy(&bits, &h, sizeof(bits));
+    return bits;
+  };
+
+  auto make_q4_k_weights = [&](int rows, int cols, int seed) {
+    REQUIRE(cols % QK_K == 0);
+    const int blocks_per_row = cols / QK_K;
+    std::vector<runtime::cuda::native::block_q4_k> blocks(
+        static_cast<size_t>(rows) * blocks_per_row);
+    for (int row = 0; row < rows; ++row) {
+      for (int blk = 0; blk < blocks_per_row; ++blk) {
+        auto &block = blocks[static_cast<size_t>(row) * blocks_per_row + blk];
+        block.d = encode_half(
+            0.0095f * static_cast<float>(((row + seed + blk) % 5) + 1));
+        block.dmin = encode_half(
+            0.0060f * static_cast<float>(((row + seed + blk) % 3) + 1));
+        for (int i = 0; i < K_SCALE_SIZE; ++i) {
+          block.scales[i] = static_cast<unsigned char>(
+              (seed * 29 + row * 17 + blk * 11 + i * 7) & 0xFF);
+        }
+        for (int i = 0; i < QK_K / 2; ++i) {
+          block.qs[i] = static_cast<unsigned char>(
+              (seed * 13 + row * 19 + blk * 5 + i * 3) & 0xFF);
+        }
+      }
+    }
+    return blocks;
+  };
+
+  const auto h_wq = make_q4_k_weights(NQ, K, 1);
+  const auto h_wk = make_q4_k_weights(NK, K, 2);
+  const auto h_wv = make_q4_k_weights(NV, K, 3);
+
+  std::vector<int8_t> h_activation(M * K);
+  std::vector<float> h_row_scales(M);
+  for (int m = 0; m < M; ++m) {
+    h_row_scales[m] = 0.0115f * static_cast<float>(m + 1);
+    for (int i = 0; i < K; ++i) {
+      h_activation[m * K + i] =
+          static_cast<int8_t>(((m * 31 + i * 7) % 15) - 7);
+    }
+  }
+
+  runtime::cuda::native::block_q4_k *d_wq = nullptr;
+  runtime::cuda::native::block_q4_k *d_wk = nullptr;
+  runtime::cuda::native::block_q4_k *d_wv = nullptr;
+  int8_t *d_activation = nullptr;
+  float *d_row_scales = nullptr;
+  half *d_q = nullptr;
+  half *d_k = nullptr;
+  half *d_v = nullptr;
+  half *d_q_deq = nullptr;
+  half *d_k_deq = nullptr;
+  half *d_v_deq = nullptr;
+
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_wq),
+                     h_wq.size() * sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_wk),
+                     h_wk.size() * sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_wv),
+                     h_wv.size() * sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_activation),
+                     h_activation.size() * sizeof(int8_t)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_row_scales),
+                     h_row_scales.size() * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_q),
+                     static_cast<size_t>(M) * NQ * sizeof(half)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_k),
+                     static_cast<size_t>(M) * NK * sizeof(half)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_v),
+                     static_cast<size_t>(M) * NV * sizeof(half)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_q_deq),
+                     static_cast<size_t>(NQ) * K * sizeof(half)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_k_deq),
+                     static_cast<size_t>(NK) * K * sizeof(half)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_v_deq),
+                     static_cast<size_t>(NV) * K * sizeof(half)) ==
+          cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_wq, h_wq.data(),
+                     h_wq.size() * sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_wk, h_wk.data(),
+                     h_wk.size() * sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_wv, h_wv.data(),
+                     h_wv.size() * sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_activation, h_activation.data(),
+                     h_activation.size() * sizeof(int8_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_row_scales, h_row_scales.data(),
+                     h_row_scales.size() * sizeof(float),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(d_wq, d_q_deq, NQ * K) ==
+          cudaSuccess);
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(d_wk, d_k_deq, NK * K) ==
+          cudaSuccess);
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(d_wv, d_v_deq, NV * K) ==
+          cudaSuccess);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> q_deq =
+      CopyDeviceHalfs(d_q_deq, static_cast<size_t>(NQ) * K);
+  const std::vector<half> k_deq =
+      CopyDeviceHalfs(d_k_deq, static_cast<size_t>(NK) * K);
+  const std::vector<half> v_deq =
+      CopyDeviceHalfs(d_v_deq, static_cast<size_t>(NV) * K);
+
+  auto deq_ref = [&](const std::vector<half> &weights, int rows) {
+    std::vector<float> out(static_cast<size_t>(M) * rows, 0.0f);
+    for (int m = 0; m < M; ++m) {
+      for (int row = 0; row < rows; ++row) {
+        float acc = 0.0f;
+        for (int i = 0; i < K; ++i) {
+          const float a =
+              h_row_scales[m] * static_cast<float>(h_activation[m * K + i]);
+          const float b =
+              __half2float(weights[static_cast<size_t>(row) * K + i]);
+          acc += a * b;
+        }
+        out[static_cast<size_t>(m) * rows + row] = acc;
+      }
+    }
+    return out;
+  };
+
+  const std::vector<float> ref_q = deq_ref(q_deq, NQ);
+  const std::vector<float> ref_k = deq_ref(k_deq, NK);
+  const std::vector<float> ref_v = deq_ref(v_deq, NV);
+
+  const std::array<PackedProjectionSpec, 3> projections = {{
+      {{d_wq, quant_type, static_cast<int64_t>(NQ) * K}, d_q, NQ},
+      {{d_wk, quant_type, static_cast<int64_t>(NK) * K}, d_k, NK},
+      {{d_wv, quant_type, static_cast<int64_t>(NV) * K}, d_v, NV},
+  }};
+  const PackedActivationInfo activation{d_activation, d_row_scales};
+  REQUIRE(
+      FusedQuantGemm::GemvPackedTriple(projections, activation, M, K, nullptr));
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> q_out =
+      CopyDeviceHalfs(d_q, static_cast<size_t>(M) * NQ);
+  const std::vector<half> k_out =
+      CopyDeviceHalfs(d_k, static_cast<size_t>(M) * NK);
+  const std::vector<half> v_out =
+      CopyDeviceHalfs(d_v, static_cast<size_t>(M) * NV);
+
+  for (size_t i = 0; i < q_out.size(); ++i) {
+    REQUIRE(__half2float(q_out[i]) ==
+            Catch::Approx(ref_q[i]).margin(4.0e-1f));
+  }
+  for (size_t i = 0; i < k_out.size(); ++i) {
+    REQUIRE(__half2float(k_out[i]) ==
+            Catch::Approx(ref_k[i]).margin(3.0e-1f));
+  }
+  for (size_t i = 0; i < v_out.size(); ++i) {
+    REQUIRE(__half2float(v_out[i]) ==
+            Catch::Approx(ref_v[i]).margin(3.0e-1f));
+  }
+
+  REQUIRE(cudaFree(d_v_deq) == cudaSuccess);
+  REQUIRE(cudaFree(d_k_deq) == cudaSuccess);
+  REQUIRE(cudaFree(d_q_deq) == cudaSuccess);
+  REQUIRE(cudaFree(d_v) == cudaSuccess);
+  REQUIRE(cudaFree(d_k) == cudaSuccess);
+  REQUIRE(cudaFree(d_q) == cudaSuccess);
+  REQUIRE(cudaFree(d_row_scales) == cudaSuccess);
+  REQUIRE(cudaFree(d_activation) == cudaSuccess);
+  REQUIRE(cudaFree(d_wv) == cudaSuccess);
+  REQUIRE(cudaFree(d_wk) == cudaSuccess);
+  REQUIRE(cudaFree(d_wq) == cudaSuccess);
 }
 
 TEST_CASE("FusedQuantGemm::GemvPackedPair preserves per-row grouped Q6_K "
@@ -3274,6 +3897,186 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1Pair preserves per-row grouped Q4_K "
   REQUIRE(cudaFree(d_out0_tuned) == cudaSuccess);
   REQUIRE(cudaFree(d_out1_generic) == cudaSuccess);
   REQUIRE(cudaFree(d_out0_generic) == cudaSuccess);
+  REQUIRE(cudaFree(d_act_q8_1) == cudaSuccess);
+  REQUIRE(cudaFree(d_input) == cudaSuccess);
+  REQUIRE(cudaFree(d_w1) == cudaSuccess);
+  REQUIRE(cudaFree(d_w0) == cudaSuccess);
+}
+
+TEST_CASE("FusedQuantGemm::GemvQ8_1Pair preserves sampled outputs for "
+          "Qwen FFN long-prefill geometry",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping Qwen-FFN long-prefill parity.");
+    return;
+  }
+
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  if (!FusedQuantGemm::SupportsQ8_1Activations(quant_type)) {
+    SUCCEED("Q8_1 Q4_K kernels unavailable for this device/profile.");
+    return;
+  }
+
+  NativeExecutionPolicy policy;
+  const QuantizedWeightInfo raw{reinterpret_cast<const void *>(0x1), quant_type,
+                                2048LL * 11008LL};
+  REQUIRE(SelectInferfluxCudaFfnProjOperator(
+              raw, raw, InferfluxCudaDispatchPhase::kPrefill,
+              FusedDispatchGeometry{23, 11008, 2048, 2, true, true},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == FusedQuantGemm::FfnProjOperator::kQ81Group);
+
+  constexpr int M = 23;
+  constexpr int K = 2048;
+  constexpr int N0 = 11008;
+  constexpr int N1 = 11008;
+  const std::array<int, 10> sample_rows = {0, 1, 2, 17, 63,
+                                           511, 2047, 4095, 8191, 11007};
+
+  auto encode_half = [](float value) {
+    const half h = __float2half(value);
+    unsigned short bits = 0;
+    std::memcpy(&bits, &h, sizeof(bits));
+    return bits;
+  };
+
+  const int blocks_per_row = K / QK_K;
+  auto make_q4_k_weights = [&](int rows, int seed) {
+    std::vector<runtime::cuda::native::block_q4_k> blocks(
+        static_cast<size_t>(rows) * blocks_per_row);
+    for (int row = 0; row < rows; ++row) {
+      for (int blk = 0; blk < blocks_per_row; ++blk) {
+        auto &block = blocks[static_cast<size_t>(row) * blocks_per_row + blk];
+        block.d = encode_half(0.02f *
+                              static_cast<float>(((row + blk + seed) % 4) + 1));
+        block.dmin = encode_half(
+            0.01f * static_cast<float>(((row + blk + seed) % 3) + 1));
+        for (int i = 0; i < 12; ++i) {
+          block.scales[i] = static_cast<unsigned char>(
+              (seed * 17 + row * 7 + blk * 11 + i * 5) & 0xFF);
+        }
+        for (int i = 0; i < QK_K / 2; ++i) {
+          block.qs[i] = static_cast<unsigned char>(
+              (seed * 11 + row * 13 + blk * 19 + i * 3) & 0xFF);
+        }
+      }
+    }
+    return blocks;
+  };
+
+  const auto h_w0 = make_q4_k_weights(N0, 3);
+  const auto h_w1 = make_q4_k_weights(N1, 7);
+  const std::vector<half> h_input = MakeWaveTensor(static_cast<size_t>(M) * K,
+                                                   0.015f, -0.002f);
+
+  runtime::cuda::native::block_q4_k *d_w0 = nullptr;
+  runtime::cuda::native::block_q4_k *d_w1 = nullptr;
+  half *d_input = nullptr;
+  void *d_act_q8_1 = nullptr;
+  half *d_out0 = nullptr;
+  half *d_out1 = nullptr;
+  half *d_deq0 = nullptr;
+  half *d_deq1 = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_w0),
+                     h_w0.size() * sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_w1),
+                     h_w1.size() * sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_input),
+                     h_input.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(
+      cudaMalloc(&d_act_q8_1,
+                 static_cast<size_t>(M) * (K / QK8_1) *
+                     sizeof(runtime::cuda::native::block_q8_1)) ==
+      cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out0),
+                     static_cast<size_t>(M) * N0 * sizeof(half)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out1),
+                     static_cast<size_t>(M) * N1 * sizeof(half)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_deq0),
+                     static_cast<size_t>(N0) * K * sizeof(half)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_deq1),
+                     static_cast<size_t>(N1) * K * sizeof(half)) ==
+          cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_w0, h_w0.data(),
+                     h_w0.size() * sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_w1, h_w1.data(),
+                     h_w1.size() * sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  FusedQuantGemm::QuantizeRowQ8_1(d_input, d_act_q8_1, M, K, nullptr);
+
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(
+              d_w0, d_deq0, static_cast<size_t>(N0) * K) == cudaSuccess);
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(
+              d_w1, d_deq1, static_cast<size_t>(N1) * K) == cudaSuccess);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> deq0 =
+      CopyDeviceHalfs(d_deq0, static_cast<size_t>(N0) * K);
+  const std::vector<half> deq1 =
+      CopyDeviceHalfs(d_deq1, static_cast<size_t>(N1) * K);
+  std::vector<runtime::cuda::native::block_q8_1> q8_1_blocks(
+      static_cast<size_t>(M) * (K / QK8_1));
+  REQUIRE(cudaMemcpy(
+              q8_1_blocks.data(), d_act_q8_1,
+              q8_1_blocks.size() * sizeof(runtime::cuda::native::block_q8_1),
+              cudaMemcpyDeviceToHost) == cudaSuccess);
+
+  std::vector<float> act_ref(static_cast<size_t>(M) * K, 0.0f);
+  for (int m = 0; m < M; ++m) {
+    for (int blk = 0; blk < K / QK8_1; ++blk) {
+      const auto &a = q8_1_blocks[static_cast<size_t>(m) * (K / QK8_1) + blk];
+      const float scale = DecodeQ81Ds(a).first;
+      for (int j = 0; j < QK8_1; ++j) {
+        act_ref[static_cast<size_t>(m) * K + blk * QK8_1 + j] =
+            scale * static_cast<float>(a.qs[j]);
+      }
+    }
+  }
+
+  const std::array<PackedProjectionSpec, 2> projections = {{
+      {{d_w0, quant_type, static_cast<int64_t>(N0) * K}, d_out0, N0},
+      {{d_w1, quant_type, static_cast<int64_t>(N1) * K}, d_out1, N1},
+  }};
+  REQUIRE(FusedQuantGemm::GemvQ8_1Pair(projections, d_act_q8_1, M, K, nullptr));
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> out0 = CopyDeviceHalfs(d_out0, static_cast<size_t>(M) * N0);
+  const std::vector<half> out1 = CopyDeviceHalfs(d_out1, static_cast<size_t>(M) * N1);
+
+  auto check_samples = [&](const std::vector<half> &weights,
+                           const std::vector<half> &actual, int rows) {
+    for (int m = 0; m < M; ++m) {
+      for (int row : sample_rows) {
+        CAPTURE(m, row, rows);
+        float ref = 0.0f;
+        for (int i = 0; i < K; ++i) {
+          ref += act_ref[static_cast<size_t>(m) * K + i] *
+                 __half2float(weights[static_cast<size_t>(row) * K + i]);
+        }
+        REQUIRE(__half2float(actual[static_cast<size_t>(m) * rows + row]) ==
+                Catch::Approx(ref).margin(8e-2f));
+      }
+    }
+  };
+
+  check_samples(deq0, out0, N0);
+  check_samples(deq1, out1, N1);
+
+  REQUIRE(cudaFree(d_deq1) == cudaSuccess);
+  REQUIRE(cudaFree(d_deq0) == cudaSuccess);
+  REQUIRE(cudaFree(d_out1) == cudaSuccess);
+  REQUIRE(cudaFree(d_out0) == cudaSuccess);
   REQUIRE(cudaFree(d_act_q8_1) == cudaSuccess);
   REQUIRE(cudaFree(d_input) == cudaSuccess);
   REQUIRE(cudaFree(d_w1) == cudaSuccess);
@@ -5121,6 +5924,146 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q4_K outputs for exact "
   REQUIRE(cudaFree(d_w) == cudaSuccess);
 }
 
+TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves sampled outputs for long-prefill "
+          "down-proj row-quad geometry",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping long-prefill down-proj parity.");
+    return;
+  }
+
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  if (!FusedQuantGemm::SupportsQ8_1Activations(quant_type)) {
+    SUCCEED("Q8_1 Q4_K kernels unavailable for this device/profile.");
+    return;
+  }
+
+  NativeExecutionPolicy policy;
+  const QuantizedWeightInfo raw{reinterpret_cast<const void *>(0x1), quant_type,
+                                11008LL * 2048LL};
+  const MmqWeightInfo mmq{};
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw, mmq, InferfluxCudaDispatchPhase::kPrefill,
+              FusedDispatchGeometry{23, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad);
+
+  constexpr int M = 23;
+  constexpr int K = 11008;
+  constexpr int N = 2048;
+  constexpr int kBlocksPerRow = K / QK_K;
+  const std::array<int, 10> sample_outputs = {0, 1, 2, 17, 63,
+                                              127, 511, 1023, 1535, 2047};
+
+  auto encode_half = [](float value) {
+    const half h = __float2half(value);
+    unsigned short bits = 0;
+    std::memcpy(&bits, &h, sizeof(bits));
+    return bits;
+  };
+
+  std::vector<runtime::cuda::native::block_q4_k> h_w(
+      static_cast<size_t>(N) * kBlocksPerRow);
+  for (int row = 0; row < N; ++row) {
+    for (int blk = 0; blk < kBlocksPerRow; ++blk) {
+      auto &block = h_w[static_cast<size_t>(row) * kBlocksPerRow + blk];
+      block.d = encode_half(0.012f * static_cast<float>(((row + blk) % 5) + 1));
+      block.dmin =
+          encode_half(0.006f * static_cast<float>(((row + blk) % 3) + 1));
+      for (int i = 0; i < 12; ++i) {
+        block.scales[i] =
+            static_cast<unsigned char>((row * 17 + blk * 7 + i * 5) & 0xFF);
+      }
+      for (int i = 0; i < QK_K / 2; ++i) {
+        block.qs[i] =
+            static_cast<unsigned char>((row * 13 + blk * 11 + i * 3) & 0xFF);
+      }
+    }
+  }
+  const std::vector<half> h_input =
+      MakeWaveTensor(static_cast<size_t>(M) * K, 0.009f, -0.001f);
+
+  runtime::cuda::native::block_q4_k *d_w = nullptr;
+  half *d_input = nullptr;
+  void *d_act_q8_1 = nullptr;
+  half *d_out = nullptr;
+  half *d_deq = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_w),
+                     h_w.size() * sizeof(runtime::cuda::native::block_q4_k)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_input),
+                     h_input.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(
+      cudaMalloc(&d_act_q8_1,
+                 static_cast<size_t>(M) * (K / QK8_1) *
+                     sizeof(runtime::cuda::native::block_q8_1)) ==
+      cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out),
+                     static_cast<size_t>(M) * N * sizeof(half)) ==
+          cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_deq),
+                     static_cast<size_t>(N) * K * sizeof(half)) ==
+          cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_w, h_w.data(),
+                     h_w.size() * sizeof(runtime::cuda::native::block_q4_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  FusedQuantGemm::QuantizeRowQ8_1(d_input, d_act_q8_1, M, K, nullptr);
+
+  REQUIRE(runtime::cuda::native::dequantize_q4_k(
+              d_w, d_deq, static_cast<size_t>(N) * K) == cudaSuccess);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> deq =
+      CopyDeviceHalfs(d_deq, static_cast<size_t>(N) * K);
+  std::vector<runtime::cuda::native::block_q8_1> q8_1_blocks(
+      static_cast<size_t>(M) * (K / QK8_1));
+  REQUIRE(cudaMemcpy(
+              q8_1_blocks.data(), d_act_q8_1,
+              q8_1_blocks.size() * sizeof(runtime::cuda::native::block_q8_1),
+              cudaMemcpyDeviceToHost) == cudaSuccess);
+
+  std::vector<float> act_ref(static_cast<size_t>(M) * K, 0.0f);
+  for (int row = 0; row < M; ++row) {
+    for (int blk = 0; blk < K / QK8_1; ++blk) {
+      const auto &a = q8_1_blocks[static_cast<size_t>(row) * (K / QK8_1) + blk];
+      const float scale = DecodeQ81Ds(a).first;
+      for (int j = 0; j < QK8_1; ++j) {
+        act_ref[static_cast<size_t>(row) * K + blk * QK8_1 + j] =
+            scale * static_cast<float>(a.qs[j]);
+      }
+    }
+  }
+
+  QuantizedWeightInfo info{d_w, quant_type, static_cast<int64_t>(N) * K};
+  REQUIRE(FusedQuantGemm::GemvQ8_1(info, d_act_q8_1, d_out, M, N, K, nullptr));
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const std::vector<half> out = CopyDeviceHalfs(d_out, static_cast<size_t>(M) * N);
+  for (int row = 0; row < M; ++row) {
+    for (int out_idx : sample_outputs) {
+      CAPTURE(row, out_idx);
+      float ref = 0.0f;
+      for (int i = 0; i < K; ++i) {
+        ref += act_ref[static_cast<size_t>(row) * K + i] *
+               __half2float(deq[static_cast<size_t>(out_idx) * K + i]);
+      }
+      REQUIRE(__half2float(out[static_cast<size_t>(row) * N + out_idx]) ==
+              Catch::Approx(ref).margin(1.0e-1f));
+    }
+  }
+
+  REQUIRE(cudaFree(d_deq) == cudaSuccess);
+  REQUIRE(cudaFree(d_out) == cudaSuccess);
+  REQUIRE(cudaFree(d_act_q8_1) == cudaSuccess);
+  REQUIRE(cudaFree(d_input) == cudaSuccess);
+  REQUIRE(cudaFree(d_w) == cudaSuccess);
+}
+
 TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for exact "
           "down-proj hot geometry",
           "[native_forward][cuda_runtime_contract]") {
@@ -6325,13 +7268,19 @@ TEST_CASE("FusedQuantGemm: metric names distinguish V2 hot-path variants",
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q8_K);
 
   REQUIRE(FusedQuantGemm::FfnProjOperatorMetricName(
-              FusedQuantGemm::FfnProjOperator::kQ81Group, q4k, 2048) ==
-          std::string("q8_1_group"));
+              FusedQuantGemm::FfnProjOperator::kQ81Group, q4k, 1, 2048) ==
+          std::string("q8_1_group_generic"));
   REQUIRE(FusedQuantGemm::FfnProjOperatorMetricName(
-              FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K, q4k, 2048) ==
+              FusedQuantGemm::FfnProjOperator::kQ81Group, q4k, 2, 2048) ==
+          std::string("q8_1_group_row_pair"));
+  REQUIRE(FusedQuantGemm::FfnProjOperatorMetricName(
+              FusedQuantGemm::FfnProjOperator::kQ81Group, q6k, 5, 2048) ==
+          std::string("q8_1_group_row_quad"));
+  REQUIRE(FusedQuantGemm::FfnProjOperatorMetricName(
+              FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K, q4k, 1, 2048) ==
           std::string("q8_1_group_hot_q4k"));
   REQUIRE(FusedQuantGemm::FfnProjOperatorMetricName(
-              FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4, q4k, 2048) ==
+              FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4, q4k, 4, 2048) ==
           std::string("q8_1_group_row_quad_m4"));
   REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
               FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed, q4k, 2,

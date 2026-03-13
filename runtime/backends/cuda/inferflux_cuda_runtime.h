@@ -1,7 +1,7 @@
 #pragma once
 
 #include "runtime/backends/common/backend_types.h"
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 
 #include <filesystem>
 #include <memory>

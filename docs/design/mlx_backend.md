@@ -30,7 +30,7 @@ flowchart LR
 | Use | Current reading |
 |---|---|
 | Apple Silicon / Metal-aligned path | Valid long-term hardware breadth direction |
-| Near-term throughput leadership | Not the current priority; native CUDA and distributed work matter more |
+| Near-term throughput leadership | Not the current priority; InferFlux CUDA and distributed work matter more |
 | Compatibility | Useful, but GGUF compatibility is still stronger through llama.cpp-backed paths |
 
 ## 4) Current Limits

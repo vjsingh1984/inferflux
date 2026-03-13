@@ -167,6 +167,7 @@ const half *QuantizedWeightMap::GetDequantizedWeights(
 
 const half *QuantizedWeightMap::DequantizeToScratch(
     std::shared_ptr<IWeightAccessor> accessor) const {
+#ifdef INFERFLUX_HAS_CUDA
   if (!accessor) {
     return nullptr;
   }
@@ -223,6 +224,10 @@ const half *QuantizedWeightMap::DequantizeToScratch(
 
   handler->DequantizeGpuToGpu(raw_gpu, scratch_buffer_, num_elements, stream_);
   return scratch_buffer_;
+#else
+  (void)accessor;
+  return nullptr;
+#endif // INFERFLUX_HAS_CUDA
 }
 
 // --- Per-layer accessors ---

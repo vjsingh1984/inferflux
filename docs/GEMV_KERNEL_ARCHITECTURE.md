@@ -3,7 +3,7 @@
 **Status:** Canonical
 **Snapshot date:** March 10, 2026
 
-This document describes the geometry, dispatch, and TDD structure of the native fused dequantization GEMV kernels that form the throughput-critical hot path in InferFlux's native CUDA backend.
+This document describes the geometry, dispatch, and TDD structure of the native fused dequantization GEMV kernels that form the throughput-critical hot path in the InferFlux CUDA backend.
 
 ```mermaid
 flowchart TD

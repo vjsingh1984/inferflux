@@ -12,6 +12,7 @@
 #include "runtime/backends/cuda/native/kernels/fused_ffn_gemm.cuh"
 // Vectorized kernel: optimized memory access patterns for better bandwidth
 #include "runtime/backends/cuda/native/kernels/fused_dequant_gemv_vectorized.cuh"
+#include "runtime/backends/cuda/native/kernels/mmq_grouped_ffn.cuh"
 #include "server/logging/logger.h"
 
 #include <algorithm>
@@ -1094,7 +1095,7 @@ int FusedQuantGemm::GetAdaptiveThreshold(int quant_type) {
   if (gpu.has_dp4a &&
       (qtype == GGUF::TensorType::Q4_K || qtype == GGUF::TensorType::Q6_K ||
        qtype == GGUF::TensorType::Q8_0 || qtype == GGUF::TensorType::Q8_K)) {
-    base = std::max(base * 2, 12);
+    base = std::max(base * 2, 14);
   }
   return ComputeThreshold(base, bpw);
 }
@@ -1125,15 +1126,15 @@ int FusedQuantGemm::GetGeometryAwareThreshold(
     // Very large single-output surfaces (notably lm_head) still favor the
     // compatibility path earlier than sibling projection groups do.
     if (grouped_outputs == 1 && n >= 32768) {
-      threshold -= 12;
+      threshold -= 8;
     } else if (grouped_outputs == 1 && n >= 8192) {
-      threshold -= 4;
+      threshold -= 2;
     }
   } else {
     // Legacy shared-memory activation paths lose relative advantage as output
     // surface grows.
     if (n >= 8192) {
-      threshold -= 4;
+      threshold -= 2;
     }
     if (geometry.includes_rmsnorm) {
       threshold -= 2;
@@ -1281,6 +1282,8 @@ FusedQuantGemm::FfnProjOperatorName(FusedQuantGemm::FfnProjOperator op) {
     return "q8_1_group_row_pair_w4";
   case FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4:
     return "q8_1_group_row_quad_m4";
+  case FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3:
+    return "q8_1_group_mmq3";
   case FusedQuantGemm::FfnProjOperator::kPackedGroup:
     return "packed_group";
   case FusedQuantGemm::FfnProjOperator::kFallback:
@@ -1291,11 +1294,21 @@ FusedQuantGemm::FfnProjOperatorName(FusedQuantGemm::FfnProjOperator op) {
 
 const char *
 FusedQuantGemm::FfnProjOperatorMetricName(FusedQuantGemm::FfnProjOperator op,
-                                          int quant_type, int k) {
+                                          int quant_type, int m, int k) {
   const auto qtype = static_cast<GGUF::TensorType>(quant_type);
   if (op == FusedQuantGemm::FfnProjOperator::kQ81Group && UseV2(k) &&
       (qtype == GGUF::TensorType::Q4_K || qtype == GGUF::TensorType::Q6_K)) {
     return "q8_1_group_v2";
+  }
+  if (op == FusedQuantGemm::FfnProjOperator::kQ81Group &&
+      (qtype == GGUF::TensorType::Q4_K || qtype == GGUF::TensorType::Q6_K)) {
+    if (m >= 4) {
+      return "q8_1_group_row_quad";
+    }
+    if (m > 1) {
+      return "q8_1_group_row_pair";
+    }
+    return "q8_1_group_generic";
   }
   return FfnProjOperatorName(op);
 }
@@ -2467,6 +2480,10 @@ bool FusedQuantGemm::FusedFfnQ4K(const QuantizedWeightInfo &gate_weight,
   return cudaGetLastError() == cudaSuccess;
 }
 
+static bool GemvQ8_1PairMmq3(
+    const std::array<PackedProjectionSpec, 2> &projections,
+    const void *act_q8_1, int M, int K, cudaStream_t stream);
+
 bool FusedQuantGemm::GemvQ8_1Pair(
     const std::array<PackedProjectionSpec, 2> &projections,
     const void *act_q8_1, int M, int K, cudaStream_t stream,
@@ -2492,6 +2509,20 @@ bool FusedQuantGemm::GemvQ8_1Pair(
       M,    std::max(projections[0].output_cols, projections[1].output_cols),
       K,    2,
       true, false};
+  if (selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3) {
+    static bool mmq3_logged[kMaxTensorType] = {};
+    if (idx < kMaxTensorType && !mmq3_logged[idx] && entry.name) {
+      mmq3_logged[idx] = true;
+      log::Info("fused_quant_gemm",
+                std::string("Using MMQ3 grouped Q8_1 pair kernel for ") +
+                    entry.name + " (M=" + std::to_string(M) +
+                    ", N=" + std::to_string(projections[0].output_cols) + "/" +
+                    std::to_string(projections[1].output_cols) +
+                    ", K=" + std::to_string(K) + ")");
+    }
+    return GemvQ8_1PairMmq3(projections, act_q8_1, M, K, stream);
+  }
+
   if (selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4) {
     static bool rowquad_m4_logged[kMaxTensorType] = {};
     if (idx < kMaxTensorType && !rowquad_m4_logged[idx] && entry.name) {
@@ -2599,6 +2630,59 @@ bool FusedQuantGemm::GemvQ8_1PairRowQuadCandidate(
   dim3 grid(grid_x, (M + 3) / 4);
   fused_dequant_gemv_q4k_q8_1_group_rowquad<2>
       <<<grid, kGemvThreadsPerBlock, 0, stream>>>(params, a, K, M);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+static bool GemvQ8_1PairMmq3(
+    const std::array<PackedProjectionSpec, 2> &projections,
+    const void *act_q8_1, int M, int K, cudaStream_t stream) {
+  if (!act_q8_1 || M < 3 || K <= 0) {
+    return false;
+  }
+
+  const int quant_type = projections[0].weight.quant_type;
+  if (quant_type != static_cast<int>(GGUF::TensorType::Q4_K)) {
+    return false;
+  }
+
+  for (const auto &p : projections) {
+    if (!p.weight.data || p.output == nullptr || p.output_cols <= 0 ||
+        p.weight.quant_type != quant_type) {
+      return false;
+    }
+  }
+
+  auto *a = static_cast<const block_q8_1 *>(act_q8_1);
+  MmqGroupParams<block_q4_k, 2> params{};
+  params.weights[0] =
+      static_cast<const block_q4_k *>(projections[0].weight.data);
+  params.weights[1] =
+      static_cast<const block_q4_k *>(projections[1].weight.data);
+  params.outputs[0] = projections[0].output;
+  params.outputs[1] = projections[1].output;
+  params.output_cols[0] = projections[0].output_cols;
+  params.output_cols[1] = projections[1].output_cols;
+  const int max_output_cols =
+      std::max(projections[0].output_cols, projections[1].output_cols);
+
+  const int grid_x = (max_output_cols + kMmq3Warps - 1) / kMmq3Warps;
+  if (M >= 9) {
+    constexpr int kRows = 8;
+    const int grid_y = (M + kRows - 1) / kRows;
+    dim3 grid(grid_x, grid_y);
+    dim3 block(kMmq3Warps * 32);
+    const size_t smem = kRows * 8 * sizeof(block_q8_1);
+    fused_grouped_ffn_mmq3_q4k_q8_1<kRows, 2>
+        <<<grid, block, smem, stream>>>(params, a, K, M);
+  } else {
+    constexpr int kRows = 4;
+    const int grid_y = (M + kRows - 1) / kRows;
+    dim3 grid(grid_x, grid_y);
+    dim3 block(kMmq3Warps * 32);
+    const size_t smem = kRows * 8 * sizeof(block_q8_1);
+    fused_grouped_ffn_mmq3_q4k_q8_1<kRows, 2>
+        <<<grid, block, smem, stream>>>(params, a, K, M);
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 

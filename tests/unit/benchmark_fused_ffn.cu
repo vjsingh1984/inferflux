@@ -308,7 +308,7 @@ bool RunCase(int M, int K, int N_inter, int N_hidden) {
 
 int main() {
 #ifndef INFERFLUX_NATIVE_KERNELS_READY
-  std::puts("benchmark_fused_ffn requires native CUDA kernels");
+  std::puts("benchmark_fused_ffn requires InferFlux CUDA kernels");
   return 0;
 #else
   int device_count = 0;

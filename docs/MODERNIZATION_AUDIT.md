@@ -55,7 +55,7 @@ flowchart LR
 | Priority | Change |
 |---|---|
 | P0 | Finish first-class native quantized GGUF hot paths so memory-first mode is also the fast path |
-| P0 | Add required GPU/provider behavior lane for native provider, overlap, and quantized-path contracts |
+| P0 | Add required GPU/provider behavior lane for `inferflux` provider, overlap, and quantized-path contracts |
 | P1 | Close distributed sequence ownership cleanup now that transport lifecycle and health signals exist |
 | P1 | Remove remaining delegate-coupled parity for completion/chat/embeddings where native logic can own the feature |
 
@@ -65,7 +65,7 @@ flowchart LR
 |---|---|
 | Scheduler | Prefix-aware and cost-aware admission becomes the default policy, not an opt-in experiment |
 | Memory economy | Planner outputs feed startup advice, capacity planning, and later autoscaling signals |
-| Native CUDA | Graph capture buckets and broader fused quantized kernels become standard for repeatable envelopes |
+| InferFlux CUDA | Graph capture buckets and broader fused quantized kernels become standard for repeatable envelopes |
 | Distributed runtime | Worker-loss, queue pressure, and transport health become required failure-path gates |
 
 ## 6) Defer Until Proof

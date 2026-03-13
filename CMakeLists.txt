@@ -39,8 +39,9 @@ add_library(inferflux_core
   runtime/tensors/tensor.h
   runtime/backends/cpu/cpu_backend.cpp
   runtime/backends/cpu/cpu_backend.h
-  runtime/backends/cpu/llama_cpp_backend.cpp
   runtime/backends/cpu/llama_cpp_backend.h
+  runtime/backends/llama/llama_cpp_backend.cpp
+  runtime/backends/llama/llama_cpp_backend.h
   runtime/backends/cuda/cuda_device_context.cpp
   runtime/backends/cuda/cuda_device_context.h
   runtime/backends/cuda/cuda_backend.cpp
@@ -61,8 +62,32 @@ add_library(inferflux_core
   runtime/backends/common/backend_types.h
   runtime/backends/common/backend_interface.h
   runtime/backends/common/batching_utils.h
+  runtime/backends/gpu/gpu_device_strategy.h
+  runtime/backends/gpu/gpu_accelerated_backend.cpp
+  runtime/backends/gpu/gpu_accelerated_backend.h
+  runtime/backends/gpu/backend_config_extensions.h
+  runtime/backends/gpu/cuda_device_strategy.cpp
+  runtime/backends/gpu/cuda_device_strategy.h
+  runtime/backends/gpu/rocm_device_strategy.cpp
+  runtime/backends/gpu/rocm_device_strategy.h
+  runtime/backends/gpu/mps_device_strategy.cpp
+  runtime/backends/gpu/mps_device_strategy.h
+  runtime/backends/gpu/vulkan_device_strategy.cpp
+  runtime/backends/gpu/vulkan_device_strategy.h
+  runtime/backends/gpu/cpu_device_strategy.cpp
+  runtime/backends/gpu/cpu_device_strategy.h
+  runtime/backends/gpu/opencl_device_strategy.cpp
+  runtime/backends/gpu/opencl_device_strategy.h
+  runtime/backends/vulkan/vulkan_backend.cpp
+  runtime/backends/vulkan/vulkan_backend.h
+  runtime/backends/mps/mps_backend.cpp
+  runtime/backends/mps/mps_backend.h
+  runtime/backends/opencl/opencl_backend.cpp
+  runtime/backends/opencl/opencl_backend.h
   runtime/backends/llama/llama_backend_traits.cpp
   runtime/backends/llama/llama_backend_traits.h
+  runtime/backends/backend_registry.cpp
+  runtime/backends/backend_registry.h
   runtime/backends/backend_factory.cpp
   runtime/backends/backend_factory.h
   runtime/backends/backend_manager.cpp
@@ -303,8 +328,10 @@ else()
 endif()
 
 if(ENABLE_ROCM)
-  find_package(hip 6.1 QUIET)
-  if(hip_FOUND)
+  find_package(hip QUIET CONFIG PATHS /opt/rocm)
+  find_package(rocblas QUIET CONFIG PATHS /opt/rocm)
+  find_package(hipblas QUIET CONFIG PATHS /opt/rocm)
+  if(hip_FOUND AND rocblas_FOUND AND hipblas_FOUND)
     message(STATUS "ROCm/HIP found: enabling ROCm build path")
     set(LLAMA_HIP ON CACHE BOOL "" FORCE)
     target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_ROCM=1)
@@ -525,6 +552,7 @@ add_executable(inferflux_tests
   tests/unit/test_parallel_context.cpp
   tests/unit/test_ep_dispatch.cpp
   tests/unit/test_backend_factory.cpp
+  tests/unit/test_backend_registry.cpp
   tests/unit/test_backend_capabilities.cpp
   tests/unit/test_model_format.cpp
   tests/unit/test_model_info_paths.cpp
@@ -556,6 +584,15 @@ add_executable(inferflux_tests
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
 target_link_libraries(inferflux_tests PRIVATE inferflux_core)
+if(ENABLE_CUDA)
+  add_executable(inferflux_first_token_probe
+    tests/tools/first_token_probe.cpp
+  )
+  target_include_directories(inferflux_first_token_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external
+  )
+  target_link_libraries(inferflux_first_token_probe PRIVATE inferflux_core)
+endif()
 if(ENABLE_MLX)
   target_sources(inferflux_tests PRIVATE
     tests/unit/test_mlx_loader.cpp
@@ -940,6 +977,16 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(IntegrationDecodeTraceParity PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 30)
+
+  if(ENABLE_CUDA)
+    add_test(NAME IntegrationFirstTokenParityProbe
+             COMMAND ${Python3_EXECUTABLE}
+                     tests/integration/first_token_parity_probe_test.py)
+    set_tests_properties(IntegrationFirstTokenParityProbe PROPERTIES
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      TIMEOUT 180
+      ENVIRONMENT "INFERFLUX_FIRST_TOKEN_PROBE_BIN=${CMAKE_BINARY_DIR}/inferflux_first_token_probe")
+  endif()
 
   add_test(NAME SSECancel
            COMMAND ${Python3_EXECUTABLE} tests/integration/sse_cancel_test.py)

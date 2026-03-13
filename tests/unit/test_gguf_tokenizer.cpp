@@ -2,7 +2,7 @@
 
 #include "model/gguf_tokenizer.h"
 #include "model/llama_tokenizer.h"
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
 
 #include <filesystem>
@@ -115,6 +115,7 @@ TEST_CASE("GGUFTokenizer matches llama tokenizer on local Qwen GGUF prompts",
       "Paris",
       "Hola mundo",
       "Three prime numbers greater than 10 are",
+      "List the highest-impact ways to reduce cloud infrastructure cost for a GPU inference service without causing major reliability regressions.",
   };
 
   for (const auto &prompt : prompts) {

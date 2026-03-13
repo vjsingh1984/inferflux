@@ -18,7 +18,7 @@ quadrantChart
 
 | Category | Typical strength | InferFlux status now |
 |---|---|---|
-| Compatibility-first local servers | Broad GGUF support and low friction | Covered through `cuda_llama_cpp` and CPU paths; not the main differentiator |
+| Compatibility-first local servers | Broad GGUF support and low friction | Covered through `llama_cpp_cuda` and CPU paths; not the main differentiator |
 | Native-kernel-first GPU servers | Peak throughput and batching efficiency | Native path is real but still behind best-in-class maturity on quantized heavy-batch workloads |
 | Operator/control-plane servers | Auth, policy, routing, audit, metrics, admin APIs | Strong today and part of the shipped product contract |
 | Distributed inference stacks | Multi-node reliability and ownership semantics | Transport-health foundation exists, but not yet a competitive strength |

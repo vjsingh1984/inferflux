@@ -108,7 +108,7 @@ automation and policy validation.
 |---|---|
 | `backend_exposure.requested_backend` | backend hint requested by config/admin load path |
 | `backend_exposure.exposed_backend` | backend actually exposed by the router |
-| `backend_exposure.provider` | provider path (`native` or `llama_cpp`) |
+| `backend_exposure.provider` | provider path (`inferflux` or `llama_cpp`) |
 | `backend_exposure.fallback` | `true` when selected backend differs due fallback |
 | `backend_exposure.fallback_reason` | optional fallback diagnostic string |
 
@@ -118,9 +118,9 @@ stay aligned.
 
 ## 7) Strict Native-Request Error Contract
 
-When backend exposure strict mode is enabled
-(`runtime.backend_exposure.strict_native_request: true`), explicit admin model
-loads that request `cuda_native` fail fast if native kernels are not ready.
+When backend exposure inferflux-strict mode is enabled
+(`runtime.backend_exposure.strict_inferflux_request: true`), explicit admin model
+loads that request `inferflux_cuda` fail fast if native kernels are not ready.
 
 - Endpoint: `POST /v1/admin/models`
 - Status: `422 Unprocessable Entity`

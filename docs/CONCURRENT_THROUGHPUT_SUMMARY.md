@@ -1,7 +1,7 @@
 # Concurrent Throughput Investigation: Summary & Recommendations
 
 **Date**: March 10, 2026
-**Issue**: Native CUDA achieves 0.83x sequential parity but only 0.50x at concurrency=4
+**Issue**: InferFlux CUDA achieves 0.83x sequential parity but only 0.50x at concurrency=4
 **Status**: Investigation complete, modest improvement identified
 
 ---
@@ -169,8 +169,8 @@ The concurrent throughput gap is **NOT a configuration issue**. The scheduler's 
 **Documents Created**:
 1. `docs/CONCURRENT_THROUGHPUT_INVESTIGATION.md` - Full investigation details
 2. `docs/BATCH_ACCUMULATION_TEST_RESULTS.md` - Accumulation delay test results
-3. `scripts/investigate_concurrent_batch_size.sh` - Batch size testing tool
-4. `scripts/test_batch_accumulation.sh` - Accumulation delay testing tool
+3. `scripts/archive/analysis/investigate_concurrent_batch_size.sh` - archived batch-size probe
+4. `scripts/archive/test/test_batch_accumulation.sh` - archived accumulation-delay probe
 
 **Status**: Investigation complete, ready to proceed with GPU kernel profiling
 

@@ -1,4 +1,4 @@
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/backends/backend_utils.h"
 #include "runtime/execution/parallel_context.h"
 #include "server/logging/logger.h"
@@ -612,6 +612,8 @@ std::string LlamaCppBackend::Generate(
       break;
     }
 
+    LogTopLogits("generate", llama_get_logits(context_), n_vocab_, -1, "", 0,
+                 0, static_cast<int>(position));
     auto sample_start = std::chrono::high_resolution_clock::now();
     int token = llama_sampler_sample(active_sampler_, context_, -1);
     auto sample_end = std::chrono::high_resolution_clock::now();
@@ -626,15 +628,19 @@ std::string LlamaCppBackend::Generate(
     }
 
     std::string piece = TokenToString(token);
+    LogTokenTrace("generate", -1, 0, "", 0, static_cast<int>(position), token,
+                  piece);
     // Collect logprob before the next llama_decode invalidates the logits ptr.
     if (out_logprobs) {
       out_logprobs->push_back(CollectLogprob(token, piece, logprob_top_n));
     }
     output += piece;
+    const int emitted_index = generated_count;
+    generated_count++;
 
-    if (generated_count == 0 || generated_count % 10 == 0) {
+    if (emitted_index == 0 || emitted_index % 10 == 0) {
       log::Debug("llama_backend",
-                 "Generated token " + std::to_string(generated_count) +
+                 "Generated token " + std::to_string(emitted_index) +
                      ": sample_ms=" + std::to_string(sample_ms) +
                      ", output_len=" + std::to_string(output.size()));
     }
@@ -659,6 +665,9 @@ std::string LlamaCppBackend::Generate(
     if (should_stop && should_stop()) {
       log::Debug("llama_backend",
                  "Generation stopped by should_stop callback (post-chunk)");
+      break;
+    }
+    if (tokens_remaining <= 0) {
       break;
     }
     // Context-window management: sliding-window KV eviction when the next
@@ -701,7 +710,6 @@ std::string LlamaCppBackend::Generate(
     }
 
     BatchClear(batch);
-    generated_count++;
   }
 
   auto generation_end = std::chrono::high_resolution_clock::now();
@@ -1502,6 +1510,13 @@ TokenLogprob LlamaCppBackend::CollectLogprob(int token_id,
   const float *logits = llama_get_logits(context_);
   return ComputeLogprob(logits, n_vocab_, token_id, token_str, top_n,
                         [this](int32_t id) { return TokenToString(id); });
+}
+
+std::vector<TopLogitEntry> LlamaCppBackend::TopLogitsForParity(int top_n) {
+  BackendStateLock lock(backend_state_mutex_);
+  const float *logits = context_ ? llama_get_logits(context_) : nullptr;
+  return ComputeTopLogits(logits, n_vocab_, top_n,
+                          [this](int32_t id) { return TokenToString(id); });
 }
 
 // §2.3 — model-native chat template formatting.

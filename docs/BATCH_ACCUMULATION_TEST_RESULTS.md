@@ -51,7 +51,7 @@ Average latency increased from 920ms to 964ms (+44ms), which is expected given t
 
 ## Comparison to llama.cpp
 
-**Current gap**: Native CUDA achieves ~0.50x of llama.cpp throughput at c=4
+**Current gap**: InferFlux CUDA achieves ~0.50x of llama.cpp throughput at c=4
 
 If llama.cpp achieves ~150 tok/s at c=4 (extrapolating from earlier benchmarks), then:
 - Native at accum_ms=0: 71.7 tok/s (0.48x)

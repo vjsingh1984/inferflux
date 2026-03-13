@@ -87,7 +87,7 @@ flowchart LR
 ## 7) Risk Controls
 
 1. Do not use async support as a proxy for throughput progress.
-2. Keep fallback to `cuda_llama_cpp` deterministic where policy allows.
+2. Keep fallback to `llama_cpp_cuda` deterministic where policy allows.
 3. Move grades only when contract gates and runtime evidence agree.
 4. Keep session reuse optional until ownership semantics are closed.
 

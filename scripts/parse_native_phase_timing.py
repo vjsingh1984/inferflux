@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize native CUDA phase timing lines from a server log."""
+"""Summarize InferFlux CUDA phase timing lines from a server log."""
 
 import argparse
 import json

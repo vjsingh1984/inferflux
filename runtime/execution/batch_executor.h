@@ -1,7 +1,7 @@
 #pragma once
 
 #include "model/tokenizer/simple_tokenizer.h"
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/device_context.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/speculative/speculative_decoder.h"

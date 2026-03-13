@@ -51,6 +51,35 @@ TEST_CASE("GpuSampler: Greedy argmax", "[gpu_sampler][cuda]") {
   cudaStreamDestroy(stream);
 }
 
+TEST_CASE("GpuSampler: Async greedy argmax collect", "[gpu_sampler][cuda]") {
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count == 0) {
+    SKIP("No CUDA device available");
+  }
+
+  int vocab_size = 64;
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+
+  GpuSampler sampler;
+  REQUIRE(sampler.Initialize(vocab_size, stream));
+
+  std::vector<float> h_logits(vocab_size, -1.0f);
+  h_logits[17] = 4.0f;
+
+  float *d_logits = nullptr;
+  cudaMalloc(&d_logits, vocab_size * sizeof(float));
+  cudaMemcpy(d_logits, h_logits.data(), vocab_size * sizeof(float),
+             cudaMemcpyHostToDevice);
+
+  sampler.EnqueueSample(d_logits, 0.0f, 0, 1.0f);
+  REQUIRE(sampler.CollectSample() == 17);
+
+  cudaFree(d_logits);
+  cudaStreamDestroy(stream);
+}
+
 TEST_CASE("GpuSampler: Batched greedy argmax", "[gpu_sampler][cuda]") {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -93,6 +122,48 @@ TEST_CASE("GpuSampler: Batched greedy argmax", "[gpu_sampler][cuda]") {
   REQUIRE(out_tokens[1] == 42);
   REQUIRE(out_tokens[2] == 0);
   REQUIRE(out_tokens[3] == 99);
+
+  cudaFree(d_logits);
+  cudaStreamDestroy(stream);
+}
+
+TEST_CASE("GpuSampler: Async batched greedy argmax collect",
+          "[gpu_sampler][cuda]") {
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count == 0) {
+    SKIP("No CUDA device available");
+  }
+
+  int vocab_size = 100;
+  int batch_size = 3;
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+
+  GpuSampler sampler;
+  REQUIRE(sampler.Initialize(vocab_size, stream));
+
+  std::vector<float> h_logits(batch_size * vocab_size, 0.0f);
+  h_logits[0 * vocab_size + 3] = 8.0f;
+  h_logits[1 * vocab_size + 15] = 9.0f;
+  h_logits[2 * vocab_size + 71] = 7.0f;
+
+  float *d_logits = nullptr;
+  cudaMalloc(&d_logits, batch_size * vocab_size * sizeof(float));
+  cudaMemcpy(d_logits, h_logits.data(), batch_size * vocab_size * sizeof(float),
+             cudaMemcpyHostToDevice);
+
+  const std::vector<float> temps(batch_size, 0.0f);
+  const std::vector<int> top_ks(batch_size, 0);
+  const std::vector<float> top_ps(batch_size, 1.0f);
+  const std::vector<uint32_t> seeds(batch_size, UINT32_MAX);
+  std::vector<int> out_tokens;
+
+  sampler.EnqueueSampleBatch(d_logits, batch_size, temps, top_ks, top_ps,
+                             seeds);
+  sampler.CollectSampleBatch(&out_tokens);
+
+  REQUIRE(out_tokens == std::vector<int>{3, 15, 71});
 
   cudaFree(d_logits);
   cudaStreamDestroy(stream);

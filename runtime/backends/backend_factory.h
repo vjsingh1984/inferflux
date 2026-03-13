@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/backends/cpu/llama_cpp_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
 
 #include <memory>

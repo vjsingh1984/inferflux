@@ -27,6 +27,7 @@ flowchart LR
 | [GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05](archive/evidence/GGUF_CONCURRENT_PROFILING_RESULTS_2026_03_05.md) | Reference-Evidence | GGUF concurrent throughput snapshot |
 | [GGUF_PROFILING_QUICK_REFERENCE_2026_03_05](archive/evidence/GGUF_PROFILING_QUICK_REFERENCE_2026_03_05.md) | Reference-Evidence | GGUF quick tuning snapshot |
 | [FLASHATTENTION_LIVE_TEST_RESULTS_2025_03_02](archive/evidence/FLASHATTENTION_LIVE_TEST_RESULTS_2025_03_02.md) | Reference-Evidence | FlashAttention validation snapshot |
+| [throughput-investigations/README](archive/evidence/throughput-investigations/README.md) | Reference-Evidence | archived Sprint 2 throughput, profiling, and vectorized-load investigation cluster |
 | [FP16_MODEL_GUIDE_2026_03_05](archive/evidence/FP16_MODEL_GUIDE_2026_03_05.md) | Reference-Evidence | FP16 sizing and backend guidance snapshot |
 | [FP16_BENCHMARK_RESULTS_FINAL_2026_03_05](archive/evidence/FP16_BENCHMARK_RESULTS_FINAL_2026_03_05.md) | Reference-Evidence | FP16 benchmark results snapshot |
 | [FP16_CONCURRENT_BENCHMARK_FINAL_2026_03_05](archive/evidence/FP16_CONCURRENT_BENCHMARK_FINAL_2026_03_05.md) | Reference-Evidence | FP16 concurrent benchmark snapshot |
@@ -45,6 +46,7 @@ flowchart LR
 | [VISION_2026_03_05](archive/evidence/VISION_2026_03_05.md) | Canonical-Elsewhere | [PRD](PRD.md), [Roadmap](Roadmap.md), [TechDebt](TechDebt_and_Competitive_Roadmap.md) |
 | [COMPETITIVE_POSITIONING_2026_03_05](archive/evidence/COMPETITIVE_POSITIONING_2026_03_05.md) | Canonical-Elsewhere | [PRD](PRD.md), [TechDebt](TechDebt_and_Competitive_Roadmap.md) |
 | [NFR_2026_03_05](archive/evidence/NFR_2026_03_05.md) | Canonical-Elsewhere | [PRD](PRD.md), [Roadmap](Roadmap.md) |
+| [BACKEND_RENAME_VERIFICATION_2026_03_05](archive/evidence/BACKEND_RENAME_VERIFICATION_2026_03_05.md) | Reference-Evidence | rename verification snapshot; canonical naming now lives in [design/backend_naming_strategy](design/backend_naming_strategy.md) plus current config/API docs |
 
 ## 3) Consolidated Operations and Tuning Deep-Dives
 

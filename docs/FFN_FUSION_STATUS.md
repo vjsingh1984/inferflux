@@ -19,7 +19,7 @@ yet selected by the runtime hot path.
 
 ### Phase 1: Analysis and Profiling ✅
 
-**Profiling Results** (from `INFERFLUX_NATIVE_PHASE_TIMING=1`):
+**Profiling Results** (from `INFERFLUX_CUDA_PHASE_TIMING=1`):
 
 **Prefill** (tokens=16):
 - `ffn_proj` (gate+up): 50.02 ms (42% of FFN time)
@@ -51,7 +51,7 @@ yet selected by the runtime hot path.
    - Risk assessment
    - Success criteria
 
-2. **`scripts/profile_ffn_breakdown.sh`** - Profiling script
+2. **`scripts/archive/profile/profile_ffn_breakdown.sh`** - archived profiling script
    - Automated FFN performance profiling
    - Nsight Systems integration
    - Phase timing extraction

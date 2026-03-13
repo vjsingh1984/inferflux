@@ -148,7 +148,7 @@ Phase A/Phase B correctness is now covered by:
 Short end-to-end benchmark after Phase B on the source branch:
 
 - native: `113.9 tok/s`
-- `cuda_llama_cpp`: `115.0 tok/s`
+- `llama_cpp_cuda`: `115.0 tok/s`
 - exact match: `6/8`
 - artifact:
   [comparison_20260311_122203.json](/home/vsingh/code/inferflux/gguf_benchmark_results/comparison_20260311_122203.json)
@@ -180,7 +180,7 @@ After adding:
 the short `c=4` benchmark reported:
 
 - native: `123.6 tok/s`
-- `cuda_llama_cpp`: `127.9 tok/s`
+- `llama_cpp_cuda`: `127.9 tok/s`
 - ratio: `0.97x`
 - artifact:
   [comparison_20260311_123017.json](/home/vsingh/code/inferflux/gguf_benchmark_results/comparison_20260311_123017.json)

@@ -2,33 +2,56 @@
 #
 # Multi-Backend Comparison Benchmark
 #
-# Benchmarks inferflux_cuda, llama_cpp_cuda, Ollama, and LM Studio backends.
+# Benchmarks inferflux_cuda, llama_cpp_cuda, Ollama, LM Studio, vLLM, and
+# SGLang backends.
 # Measures throughput, latency percentiles, and GPU memory consumption across
 # multiple concurrency levels to generate scaling curves.
 #
 # Usage:
-#   ./scripts/benchmark_multi_backend_comparison.sh [model.gguf]
+#   ./scripts/benchmark_multi_backend_comparison.sh [model.gguf|model.safetensors|model_dir]
 #   ./scripts/benchmark_multi_backend_comparison.sh models/qwen2.5-3b-instruct-q4_k_m.gguf
-#   CONCURRENCY_LEVELS="1,2,4,8" ./scripts/benchmark_multi_backend_comparison.sh model.gguf
+#   CONCURRENCY_LEVELS="1,2,4,8" ./scripts/benchmark_multi_backend_comparison.sh model_dir
+#
+# The script auto-detects the supplied model format and only benchmarks
+# backends that can serve that format.
 #
 # Environment Variables:
 #   OLLAMA_HOST           - Ollama server URL (default: http://192.168.1.20:11434)
 #   LMSTUDIO_HOST         - LM Studio server URL (default: http://192.168.1.20:1234)
 #   LMSTUDIO_MODEL        - LM Studio model id (default: auto-discover first /v1/models entry)
+#   VLLM_HOST             - vLLM server URL (default: http://127.0.0.1:8000)
+#   VLLM_MODEL            - vLLM model id (default: auto-discover first /v1/models entry)
+#   VLLM_MODEL_PATH       - vLLM local model path for AUTOSTART_VLLM=true
+#   VLLM_BIN              - vLLM CLI path (default: ./.venv-vllm/bin/vllm)
+#   VLLM_LAUNCH_ARGS      - Extra args appended to `vllm serve`
+#   AUTOSTART_VLLM        - Launch/teardown local vLLM for this benchmark (default: false)
+#   SGLANG_HOST           - SGLang server URL (default: http://127.0.0.1:30000)
+#   SGLANG_MODEL          - SGLang model id (default: auto-discover first /v1/models entry)
+#   SGLANG_MODEL_PATH     - SGLang local model path for AUTOSTART_SGLANG=true
+#   SGLANG_PYTHON         - SGLang venv python path (default: ./.venv-sglang/bin/python)
+#   SGLANG_LAUNCH_ARGS    - Extra args appended to `sglang serve`
+#   AUTOSTART_SGLANG      - Launch/teardown local SGLang for this benchmark (default: false)
+#   SAFETENSORS_MODEL_PATH - Shared local safetensors model dir for vLLM/SGLang autostart
 #   CONCURRENCY_LEVELS    - Comma-separated concurrency levels (default: 1,2,4,8,16)
 #   NUM_REQUESTS          - Requests per concurrency level (default: 32)
 #   MAX_TOKENS            - Max tokens per request (default: 64)
 #   OUTPUT_DIR            - Results directory (default: ./multi_backend_benchmark_results)
 #   SKIP_OLLAMA           - Skip Ollama benchmark (default: false)
 #   SKIP_LMSTUDIO         - Skip LM Studio benchmark (default: false)
+#   SKIP_VLLM             - Skip vLLM benchmark (default: false)
+#   SKIP_SGLANG           - Skip SGLang benchmark (default: false)
 #   BUILD_DIR             - Build directory (default: auto-detect ./build or ./build-cuda)
 #   PORT_NATIVE           - Port for inferflux_cuda (default: 18090)
 #   PORT_LLAMA            - Port for llama_cpp_cuda (default: 18091)
+#   RESET_CUDA_BETWEEN_BACKENDS - Reset CUDA device after local InferFlux/llama.cpp
+#                                 backend teardown (default: true)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEFAULT_PROMPT_SUITE="$SCRIPT_DIR/../tests/data/benchmarks/prompt_suite_32.json"
+DEFAULT_SAFETENSORS_MODEL="$REPO_ROOT/models/qwen2.5-3b-instruct-safetensors"
 
 # ============================================================================
 # Configuration
@@ -50,6 +73,8 @@ NUM_REQUESTS="${NUM_REQUESTS:-32}"
 MAX_TOKENS="${MAX_TOKENS:-64}"
 API_KEY="${API_KEY:-dev-key-123}"
 PROMPT_SUITE_PATH="${INFERFLUX_BENCH_PROMPT_SUITE:-$DEFAULT_PROMPT_SUITE}"
+SAFETENSORS_MODEL_PATH_INPUT="${SAFETENSORS_MODEL_PATH:-}"
+SAFETENSORS_MODEL_PATH="${SAFETENSORS_MODEL_PATH:-$DEFAULT_SAFETENSORS_MODEL}"
 
 # Backend ports
 PORT_NATIVE="${PORT_NATIVE:-18090}"
@@ -57,10 +82,31 @@ PORT_LLAMA="${PORT_LLAMA:-18091}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://192.168.1.20:11434}"
 LMSTUDIO_HOST="${LMSTUDIO_HOST:-http://192.168.1.20:1234}"
 LMSTUDIO_MODEL="${LMSTUDIO_MODEL:-}"
+VLLM_HOST="${VLLM_HOST:-http://127.0.0.1:8000}"
+VLLM_MODEL="${VLLM_MODEL:-}"
+VLLM_MODEL_PATH_INPUT="${VLLM_MODEL_PATH:-}"
+VLLM_MODEL_PATH="${VLLM_MODEL_PATH:-$SAFETENSORS_MODEL_PATH}"
+VLLM_BIN="${VLLM_BIN:-$REPO_ROOT/.venv-vllm/bin/vllm}"
+VLLM_LAUNCH_ARGS="${VLLM_LAUNCH_ARGS:-}"
+AUTOSTART_VLLM="${AUTOSTART_VLLM:-false}"
+SGLANG_HOST="${SGLANG_HOST:-http://127.0.0.1:30000}"
+SGLANG_MODEL="${SGLANG_MODEL:-}"
+SGLANG_MODEL_PATH_INPUT="${SGLANG_MODEL_PATH:-}"
+SGLANG_MODEL_PATH="${SGLANG_MODEL_PATH:-$SAFETENSORS_MODEL_PATH}"
+SGLANG_PYTHON="${SGLANG_PYTHON:-$REPO_ROOT/.venv-sglang/bin/python}"
+SGLANG_LAUNCH_ARGS="${SGLANG_LAUNCH_ARGS:-}"
+AUTOSTART_SGLANG="${AUTOSTART_SGLANG:-false}"
+RESET_CUDA_BETWEEN_BACKENDS="${RESET_CUDA_BETWEEN_BACKENDS:-true}"
+INFERFLUX_BENCH_CHILD_MODE="${INFERFLUX_BENCH_CHILD_MODE:-0}"
+INFERFLUX_BENCH_SINGLE_BACKEND="${INFERFLUX_BENCH_SINGLE_BACKEND:-}"
+
+ALL_BACKENDS=(inferflux_cuda llama_cpp_cuda ollama lmstudio vllm sglang)
 
 # Skip Ollama?
 SKIP_OLLAMA="${SKIP_OLLAMA:-false}"
 SKIP_LMSTUDIO="${SKIP_LMSTUDIO:-false}"
+SKIP_VLLM="${SKIP_VLLM:-false}"
+SKIP_SGLANG="${SKIP_SGLANG:-false}"
 
 # Logging
 log()      { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $1"; }
@@ -152,6 +198,289 @@ require_port_free() {
     if port_has_listener "$port"; then
         log_err "$backend cannot start: port $port already has a listener"
         log_err "Free the port or override PORT_NATIVE/PORT_LLAMA before rerunning."
+        return 1
+    fi
+    return 0
+}
+
+url_host() {
+    python3 - "$1" <<'PYEOF'
+from urllib.parse import urlparse
+import sys
+
+parsed = urlparse(sys.argv[1])
+print(parsed.hostname or "")
+PYEOF
+}
+
+url_port() {
+    python3 - "$1" <<'PYEOF'
+from urllib.parse import urlparse
+import sys
+
+parsed = urlparse(sys.argv[1])
+if parsed.port:
+    print(parsed.port)
+elif parsed.scheme == "https":
+    print(443)
+else:
+    print(80)
+PYEOF
+}
+
+is_local_url() {
+    local host
+    host=$(url_host "$1")
+    [ "$host" = "127.0.0.1" ] || [ "$host" = "localhost" ] || [ "$host" = "0.0.0.0" ]
+}
+
+detect_model_format() {
+    python3 - "$1" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1]).expanduser()
+name = path.name.lower()
+
+if path.is_file():
+    if name.endswith(".gguf"):
+        print("gguf")
+        raise SystemExit(0)
+    if name.endswith(".safetensors"):
+        print("safetensors")
+        raise SystemExit(0)
+
+if path.is_dir():
+    if any(path.glob("*.gguf")):
+        print("gguf")
+        raise SystemExit(0)
+    if (path / "model.safetensors.index.json").exists():
+        print("safetensors")
+        raise SystemExit(0)
+    if any(path.glob("*.safetensors")):
+        print("safetensors")
+        raise SystemExit(0)
+
+print("unknown")
+PYEOF
+}
+
+backend_supports_model_format() {
+    local backend=$1
+    local format=$2
+    case "${backend}:${format}" in
+        inferflux_cuda:gguf|inferflux_cuda:safetensors|\
+        llama_cpp_cuda:gguf|\
+        ollama:gguf|\
+        lmstudio:gguf|lmstudio:safetensors|\
+        vllm:safetensors|\
+        sglang:safetensors)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+managed_backend_pidfile() {
+    echo "$OUTPUT_DIR/$1.pid"
+}
+
+managed_backend_logfile() {
+    echo "$OUTPUT_DIR/server_$1.log"
+}
+
+validate_local_openai_backend_launch() {
+    local label=$1 host=$2 bin_path=$3 model_path=$4
+    if ! is_local_url "$host"; then
+        log_err "$label autostart requires a local host URL, got: $host"
+        return 1
+    fi
+    if [ ! -x "$bin_path" ]; then
+        log_err "$label CLI not found or not executable: $bin_path"
+        return 1
+    fi
+    if [ ! -e "$model_path" ]; then
+        log_err "$label model path not found: $model_path"
+        return 1
+    fi
+    return 0
+}
+
+start_vllm_server() {
+    local backend=vllm
+    local host
+    host=$(url_host "$VLLM_HOST")
+    local port
+    port=$(url_port "$VLLM_HOST")
+    local model_path
+    model_path=$(realpath "$VLLM_MODEL_PATH")
+    local served_model="${VLLM_MODEL:-$(basename "$model_path")}"
+    local pidfile
+    pidfile=$(managed_backend_pidfile "$backend")
+    local log_file
+    log_file=$(managed_backend_logfile "$backend")
+    local vllm_bin_dir
+    vllm_bin_dir=$(dirname "$VLLM_BIN")
+
+    validate_local_openai_backend_launch "vLLM" "$VLLM_HOST" "$VLLM_BIN" "$model_path" || return 1
+    stop_managed_openai_backend "$backend" >/dev/null 2>&1 || true
+    if ! wait_for_port_free "$port"; then
+        log_err "vLLM cannot start: port $port did not become free after cleanup"
+        return 1
+    fi
+    require_port_free "vLLM" "$port" || return 1
+
+    local -a cmd=("$VLLM_BIN" serve "$model_path" --host "$host" --port "$port" --served-model-name "$served_model")
+    if [ -n "$VLLM_LAUNCH_ARGS" ]; then
+        local -a extra_args=()
+        read -r -a extra_args <<< "$VLLM_LAUNCH_ARGS"
+        cmd+=("${extra_args[@]}")
+    fi
+
+    log "Starting vLLM on $VLLM_HOST using $model_path..."
+    env \
+        -u VLLM_HOST \
+        -u VLLM_MODEL \
+        -u VLLM_MODEL_PATH \
+        -u VLLM_BIN \
+        -u VLLM_LAUNCH_ARGS \
+        -u AUTOSTART_VLLM \
+        PATH="$vllm_bin_dir:$PATH" \
+        "${cmd[@]}" > "$log_file" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$pidfile"
+
+    local waited=0
+    while [ $waited -lt 120 ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_err "vLLM exited early. Last log lines:"
+            tail -20 "$log_file" || true
+            return 1
+        fi
+        if curl -sf "$VLLM_HOST/v1/models" >/dev/null 2>&1; then
+            sleep 1
+            if ! kill -0 "$pid" 2>/dev/null; then
+                log_err "vLLM exited immediately after readiness. Last log lines:"
+                tail -20 "$log_file" || true
+                return 1
+            fi
+            if [ -z "$VLLM_MODEL" ]; then
+                VLLM_MODEL="$served_model"
+            fi
+            log_ok "vLLM ready (PID $pid, model=$VLLM_MODEL)"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    log_err "vLLM did not start in 120s. Last log lines:"
+    tail -20 "$log_file" || true
+    kill "$pid" 2>/dev/null || true
+    return 1
+}
+
+start_sglang_server() {
+    local backend=sglang
+    local host
+    host=$(url_host "$SGLANG_HOST")
+    local port
+    port=$(url_port "$SGLANG_HOST")
+    local model_path
+    model_path=$(realpath "$SGLANG_MODEL_PATH")
+    local served_model="${SGLANG_MODEL:-$(basename "$model_path")}"
+    local pidfile
+    pidfile=$(managed_backend_pidfile "$backend")
+    local log_file
+    log_file=$(managed_backend_logfile "$backend")
+    local sglang_bin_dir
+    sglang_bin_dir=$(dirname "$SGLANG_PYTHON")
+
+    validate_local_openai_backend_launch "SGLang" "$SGLANG_HOST" "$SGLANG_PYTHON" "$model_path" || return 1
+    stop_managed_openai_backend "$backend" >/dev/null 2>&1 || true
+    if ! wait_for_port_free "$port"; then
+        log_err "SGLang cannot start: port $port did not become free after cleanup"
+        return 1
+    fi
+    require_port_free "SGLang" "$port" || return 1
+
+    local -a cmd=("$SGLANG_PYTHON" -m sglang.launch_server --model-path "$model_path" --host "$host" --port "$port" --served-model-name "$served_model" --load-format safetensors)
+    if [ -n "$SGLANG_LAUNCH_ARGS" ]; then
+        local -a extra_args=()
+        read -r -a extra_args <<< "$SGLANG_LAUNCH_ARGS"
+        cmd+=("${extra_args[@]}")
+    fi
+
+    log "Starting SGLang on $SGLANG_HOST using $model_path..."
+    env \
+        -u SGLANG_HOST \
+        -u SGLANG_MODEL \
+        -u SGLANG_MODEL_PATH \
+        -u SGLANG_PYTHON \
+        -u SGLANG_LAUNCH_ARGS \
+        -u AUTOSTART_SGLANG \
+        PATH="$sglang_bin_dir:$PATH" \
+        "${cmd[@]}" > "$log_file" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$pidfile"
+
+    local waited=0
+    while [ $waited -lt 120 ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_err "SGLang exited early. Last log lines:"
+            tail -20 "$log_file" || true
+            return 1
+        fi
+        if curl -sf "$SGLANG_HOST/v1/models" >/dev/null 2>&1; then
+            sleep 1
+            if ! kill -0 "$pid" 2>/dev/null; then
+                log_err "SGLang exited immediately after readiness. Last log lines:"
+                tail -20 "$log_file" || true
+                return 1
+            fi
+            if [ -z "$SGLANG_MODEL" ]; then
+                SGLANG_MODEL="$served_model"
+            fi
+            log_ok "SGLang ready (PID $pid, model=$SGLANG_MODEL)"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    log_err "SGLang did not start in 120s. Last log lines:"
+    tail -20 "$log_file" || true
+    kill "$pid" 2>/dev/null || true
+    return 1
+}
+
+stop_managed_openai_backend() {
+    local backend=$1
+    local pidfile
+    pidfile=$(managed_backend_pidfile "$backend")
+    [ -f "$pidfile" ] || return 0
+    local host_url=""
+    case "$backend" in
+        vllm) host_url="$VLLM_HOST" ;;
+        sglang) host_url="$SGLANG_HOST" ;;
+        *) return 0 ;;
+    esac
+    local port
+    port=$(url_port "$host_url")
+    if [ -f "$pidfile" ]; then
+        local pid
+        pid=$(cat "$pidfile")
+        if kill -0 "$pid" 2>/dev/null; then
+            log "Stopping $backend (PID $pid)..."
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pidfile"
+    fi
+    if ! wait_for_port_free "$port"; then
+        log_warn "$backend port $port is still busy after shutdown"
         return 1
     fi
     return 0
@@ -287,7 +616,7 @@ server:
 models:
   - id: bench-model
     path: "$(realpath "$MODEL_PATH")"
-    format: gguf
+    format: $MODEL_FORMAT
     backend: $backend
     default: true
 
@@ -427,6 +756,30 @@ stop_inferflux_server() {
     return 0
 }
 
+reset_cuda_device() {
+    log "Resetting CUDA device..."
+    if python3 - <<'PYEOF' >/dev/null 2>&1
+import ctypes
+import ctypes.util
+import sys
+
+libname = ctypes.util.find_library("cudart")
+if not libname:
+    sys.exit(1)
+try:
+    cudart = ctypes.CDLL(libname)
+except OSError:
+    sys.exit(1)
+if cudart.cudaDeviceReset() != 0:
+    sys.exit(2)
+PYEOF
+    then
+        log_ok "CUDA device reset"
+    else
+        log_warn "CUDA device reset unavailable; GPU state may persist until OS cleanup"
+    fi
+}
+
 reset_benchmark_artifacts() {
     local backend=$1 concurrency=$2
     rm -rf "$OUTPUT_DIR/responses_${backend}/c${concurrency}"
@@ -542,17 +895,46 @@ check_ollama_available() {
 }
 
 check_lmstudio_available() {
-    log "Checking LM Studio availability at $LMSTUDIO_HOST..."
+    check_openai_backend_available "LM Studio" "$LMSTUDIO_HOST" LMSTUDIO_HOST LMSTUDIO_MODEL SKIP_LMSTUDIO
+}
+
+check_vllm_available() {
+    check_openai_backend_available "vLLM" "$VLLM_HOST" VLLM_HOST VLLM_MODEL SKIP_VLLM
+}
+
+check_sglang_available() {
+    check_openai_backend_available "SGLang" "$SGLANG_HOST" SGLANG_HOST SGLANG_MODEL SKIP_SGLANG
+}
+
+should_autostart_backend() {
+    case "$1" in
+        vllm) [ "$AUTOSTART_VLLM" = "true" ] ;;
+        sglang) [ "$AUTOSTART_SGLANG" = "true" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+check_openai_backend_available() {
+    local label=$1 host=$2 host_var=$3 model_var=$4 skip_var=$5
+    local skip_value=${!skip_var:-false}
+
+    if [ "$skip_value" = "true" ]; then
+        log_warn "Skipping $label benchmark ($skip_var=true)"
+        return 2
+    fi
+
+    log "Checking $label availability at $host..."
 
     local models_json
-    models_json=$(curl -sf "$LMSTUDIO_HOST/v1/models" 2>/dev/null) || {
-        log_warn "LM Studio not available at $LMSTUDIO_HOST"
-        log_warn "Set LMSTUDIO_HOST=http://your-host:port or SKIP_LMSTUDIO=true"
+    models_json=$(curl -sf "$host/v1/models" 2>/dev/null) || {
+        log_warn "$label not available at $host"
+        log_warn "Set ${host_var}=http://your-host:port or ${skip_var}=true"
         return 1
     }
 
-    if [ -z "$LMSTUDIO_MODEL" ]; then
-        LMSTUDIO_MODEL=$(printf '%s' "$models_json" | python3 -c "
+    local model_value=${!model_var:-}
+    if [ -z "$model_value" ]; then
+        model_value=$(printf '%s' "$models_json" | python3 -c "
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -561,15 +943,16 @@ try:
 except Exception:
     print('')
 ")
+        printf -v "$model_var" '%s' "$model_value"
     fi
 
-    if [ -z "$LMSTUDIO_MODEL" ]; then
-        log_warn \"LM Studio responded but no model id could be discovered from /v1/models\"
-        log_warn \"Set LMSTUDIO_MODEL explicitly\"
+    if [ -z "${!model_var:-}" ]; then
+        log_warn "$label responded but no model id could be discovered from /v1/models"
+        log_warn "Set ${model_var} explicitly"
         return 1
     fi
 
-    log_ok "LM Studio is available (model=$LMSTUDIO_MODEL)"
+    log_ok "$label is available (model=${!model_var})"
     return 0
 }
 
@@ -650,7 +1033,19 @@ print(json.dumps({'request_id': '$request_id', 'text': text.strip(), 'tokens': t
 }
 
 send_lmstudio_request() {
-    local prompt=$1 max_tokens=$2 output_file=$3 request_id=$4
+    send_openai_request "$LMSTUDIO_HOST" "$LMSTUDIO_MODEL" "$1" "$2" "$3" "$4"
+}
+
+send_vllm_request() {
+    send_openai_request "$VLLM_HOST" "$VLLM_MODEL" "$1" "$2" "$3" "$4"
+}
+
+send_sglang_request() {
+    send_openai_request "$SGLANG_HOST" "$SGLANG_MODEL" "$1" "$2" "$3" "$4"
+}
+
+send_openai_request() {
+    local host=$1 model=$2 prompt=$3 max_tokens=$4 output_file=$5 request_id=$6
 
     mkdir -p "$(dirname "$output_file")"
 
@@ -659,9 +1054,9 @@ send_lmstudio_request() {
     prompt_json=$(printf '%s' "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
 
     local response
-    response=$(curl -sf -X POST "${LMSTUDIO_HOST}/v1/completions" \
+    response=$(curl -sf -X POST "${host}/v1/completions" \
         -H "Content-Type: application/json" \
-        -d "{\"model\":\"${LMSTUDIO_MODEL}\",\"prompt\":$prompt_json,\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
+        -d "{\"model\":\"${model}\",\"prompt\":$prompt_json,\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
         --max-time 120 2>/dev/null) || {
         echo "ERROR" > "$output_file"
         return 1
@@ -697,22 +1092,7 @@ run_benchmark() {
     mkdir -p "$results_dir"
     write_prompt_rotation_plan "$backend" "$concurrency"
 
-    # Warmup
     log "  Warmup (2 requests)..."
-    for i in 0 1; do
-        local prompt="${PROMPTS[$((i % ${#PROMPTS[@]}))]}"
-        case "$backend_kind" in
-            ollama)
-                send_ollama_request "$prompt" "$MAX_TOKENS" "/dev/null" "warmup-$i" || true
-                ;;
-            lmstudio)
-                send_lmstudio_request "$prompt" "$MAX_TOKENS" "/dev/null" "warmup-$i" || true
-                ;;
-            *)
-                send_inferflux_request "$port_or_url" "$prompt" "$MAX_TOKENS" "/dev/null" "warmup-$i" || true
-                ;;
-        esac
-    done
 
     # Measure GPU memory after warmup
     sleep 1
@@ -722,50 +1102,80 @@ run_benchmark() {
     log "  Running $NUM_REQUESTS requests (concurrency=$concurrency)..."
     local start_time=$(date +%s%N)
 
-    # Track peak memory and GPU utilization
+    # Track peak memory and GPU utilization.
+    # Seed the trace with an initial sample so transient nvidia-smi failures do
+    # not collapse the whole row to zero.
     local mem_peak=$mem_loaded
     local gpu_util_peak=0
+    local initial_util
+    initial_util=$(gpu_utilization || true)
+    initial_util=${initial_util:-0}
+    local mem_trace_file="$OUTPUT_DIR/mem_trace_${backend}_c${concurrency}.txt"
+    printf '%s %s\n' "${mem_loaded:-0}" "$initial_util" > "$mem_trace_file"
     (
+        set +e
         while true; do
-            local m=$(gpu_mem_mb)
-            local u=$(gpu_utilization)
-            echo "$m $u"
-            sleep 0.2
+            local m u
+            m=$(gpu_mem_mb 2>/dev/null || true)
+            u=$(gpu_utilization 2>/dev/null || true)
+            [ -n "$m" ] || m=${mem_loaded:-0}
+            [ -n "$u" ] || u=0
+            printf '%s %s\n' "$m" "$u"
+            sleep 0.2 || break
         done
-    ) > "$OUTPUT_DIR/mem_trace_${backend}_c${concurrency}.txt" &
+    ) >> "$mem_trace_file" &
     local monitor_pid=$!
 
-    # Launch requests with concurrency limit
-    local pids=()
-    for i in $(seq 0 $((NUM_REQUESTS - 1))); do
-        local prompt="${PROMPTS[$((i % ${#PROMPTS[@]}))]}"
-        local outfile="$results_dir/req_${i}.json"
-        local request_id="bench-c${concurrency}-${i}"
+    local driver_backend_kind=""
+    local driver_endpoint=""
+    local driver_model=""
+    case "$backend_kind" in
+        ollama)
+            driver_backend_kind="ollama"
+            driver_endpoint="${OLLAMA_HOST}/api/generate"
+            driver_model="${OLLAMA_MODEL:-qwen2.5:3b}"
+            ;;
+        lmstudio)
+            driver_backend_kind="openai"
+            driver_endpoint="${LMSTUDIO_HOST}/v1/completions"
+            driver_model="${LMSTUDIO_MODEL}"
+            ;;
+        vllm)
+            driver_backend_kind="openai"
+            driver_endpoint="${VLLM_HOST}/v1/completions"
+            driver_model="${VLLM_MODEL}"
+            ;;
+        sglang)
+            driver_backend_kind="openai"
+            driver_endpoint="${SGLANG_HOST}/v1/completions"
+            driver_model="${SGLANG_MODEL}"
+            ;;
+        *)
+            driver_backend_kind="inferflux"
+            driver_endpoint="http://127.0.0.1:${port_or_url}/v1/completions"
+            driver_model="default"
+            ;;
+    esac
 
-        case "$backend_kind" in
-            ollama)
-                send_ollama_request "$prompt" "$MAX_TOKENS" "$outfile" "$request_id" &
-                ;;
-            lmstudio)
-                send_lmstudio_request "$prompt" "$MAX_TOKENS" "$outfile" "$request_id" &
-                ;;
-            *)
-                send_inferflux_request "$port_or_url" "$prompt" "$MAX_TOKENS" "$outfile" "$request_id" &
-                ;;
-        esac
-        pids+=($!)
+    local -a driver_cmd=(
+        python3 "$SCRIPT_DIR/benchmark_request_driver.py"
+        --backend-kind "$driver_backend_kind"
+        --endpoint "$driver_endpoint"
+        --model "$driver_model"
+        --api-key "$API_KEY"
+        --num-requests "$NUM_REQUESTS"
+        --max-tokens "$MAX_TOKENS"
+        --concurrency "$concurrency"
+        --output-dir "$results_dir"
+    )
+    if [ -n "${INFERFLUX_BENCH_SINGLE_PROMPT:-}" ]; then
+        driver_cmd+=(--single-prompt "$INFERFLUX_BENCH_SINGLE_PROMPT")
+    else
+        driver_cmd+=(--prompt-suite "$PROMPT_SUITE_PATH")
+    fi
 
-        # Enforce concurrency limit
-        if [ ${#pids[@]} -ge $concurrency ]; then
-            wait "${pids[0]}" 2>/dev/null || true
-            pids=("${pids[@]:1}")
-        fi
-    done
-
-    # Wait for remaining
-    for pid in "${pids[@]}"; do
-        wait "$pid" 2>/dev/null || true
-    done
+    local driver_summary
+    driver_summary=$("${driver_cmd[@]}")
 
     local end_time=$(date +%s%N)
     local total_ms=$(( (end_time - start_time) / 1000000 ))
@@ -775,32 +1185,25 @@ run_benchmark() {
     wait $monitor_pid 2>/dev/null || true
 
     # Compute peak memory and GPU utilization
-    if [ -f "$OUTPUT_DIR/mem_trace_${backend}_c${concurrency}.txt" ]; then
-        mem_peak=$(awk '{print $1}' "$OUTPUT_DIR/mem_trace_${backend}_c${concurrency}.txt" | sort -rn | head -1)
-        gpu_util_peak=$(awk '{print $2}' "$OUTPUT_DIR/mem_trace_${backend}_c${concurrency}.txt" | sort -rn | head -1)
+    if [ -f "$mem_trace_file" ]; then
+        mem_peak=$(awk '{print $1}' "$mem_trace_file" | sed '/^$/d' | sort -rn | head -1)
+        gpu_util_peak=$(awk '{print $2}' "$mem_trace_file" | sed '/^$/d' | sort -rn | head -1)
     fi
 
     # Aggregate results
-    local total_tokens=0
-    local total_latency=0
-    local success_count=0
-    local latencies=""
-
-    for f in "$results_dir"/req_*.json; do
-        [ -f "$f" ] || continue
-        local content=$(cat "$f")
-        if [ "$content" = "ERROR" ] || [ "$content" = "PARSE_ERROR" ]; then
-            continue
-        fi
-
-        local tokens=$(echo "$content" | python3 -c "import json,sys; print(json.load(sys.stdin).get('tokens',0))" 2>/dev/null || echo 0)
-        local lat=$(echo "$content" | python3 -c "import json,sys; print(json.load(sys.stdin).get('latency_ms',0))" 2>/dev/null || echo 0)
-
-        total_tokens=$((total_tokens + tokens))
-        total_latency=$((total_latency + lat))
-        success_count=$((success_count + 1))
-        latencies="$latencies $lat"
-    done
+    local total_tokens
+    total_tokens=$(printf '%s' "$driver_summary" | python3 -c "import json,sys; print(json.load(sys.stdin)['total_tokens'])")
+    local total_latency
+    total_latency=$(printf '%s' "$driver_summary" | python3 -c "import json,sys; print(json.load(sys.stdin)['total_latency_ms'])")
+    local success_count
+    success_count=$(printf '%s' "$driver_summary" | python3 -c "import json,sys; print(json.load(sys.stdin)['success_count'])")
+    local latencies
+    latencies=$(printf '%s' "$driver_summary" | python3 -c "import json,sys; print(' '.join(str(v) for v in json.load(sys.stdin)['latencies']))")
+    local wall_time_ms
+    wall_time_ms=$(printf '%s' "$driver_summary" | python3 -c "import json,sys; print(json.load(sys.stdin).get('wall_time_ms', 0))")
+    if [ "${wall_time_ms:-0}" -gt 0 ]; then
+        total_ms=$wall_time_ms
+    fi
 
     # Compute stats
     local tok_per_sec=0
@@ -960,13 +1363,7 @@ for concurrency in concurrency_levels:
 PYEOF
 }
 
-# ============================================================================
-# Main Benchmark Loop
-# ============================================================================
-
-main() {
-    BUILD_DIR=$(resolve_build_dir)
-
+print_benchmark_banner() {
     header "Multi-Backend Comparison Benchmark"
     echo "  Model:       $MODEL_PATH"
     echo "  GPU:         $(gpu_name)"
@@ -976,6 +1373,55 @@ main() {
     echo "  Concurrency: $CONCURRENCY_LEVELS"
     echo "  Build dir:   $BUILD_DIR"
     echo ""
+}
+
+invoke_isolated_backend_child() {
+    local backend=$1
+    log "Launching isolated backend benchmark for $backend"
+    env \
+        BUILD_DIR="$BUILD_DIR" \
+        OUTPUT_DIR="$OUTPUT_DIR" \
+        CONCURRENCY_LEVELS="$CONCURRENCY_LEVELS" \
+        NUM_REQUESTS="$NUM_REQUESTS" \
+        MAX_TOKENS="$MAX_TOKENS" \
+        API_KEY="$API_KEY" \
+        PROMPT_SUITE_PATH="$PROMPT_SUITE_PATH" \
+        MODEL_FORMAT="$MODEL_FORMAT" \
+        OLLAMA_HOST="$OLLAMA_HOST" \
+        LMSTUDIO_HOST="$LMSTUDIO_HOST" \
+        LMSTUDIO_MODEL="$LMSTUDIO_MODEL" \
+        VLLM_HOST="$VLLM_HOST" \
+        VLLM_MODEL="$VLLM_MODEL" \
+        VLLM_MODEL_PATH="$VLLM_MODEL_PATH" \
+        VLLM_BIN="$VLLM_BIN" \
+        VLLM_LAUNCH_ARGS="$VLLM_LAUNCH_ARGS" \
+        AUTOSTART_VLLM="$AUTOSTART_VLLM" \
+        SGLANG_HOST="$SGLANG_HOST" \
+        SGLANG_MODEL="$SGLANG_MODEL" \
+        SGLANG_MODEL_PATH="$SGLANG_MODEL_PATH" \
+        SGLANG_PYTHON="$SGLANG_PYTHON" \
+        SGLANG_LAUNCH_ARGS="$SGLANG_LAUNCH_ARGS" \
+        AUTOSTART_SGLANG="$AUTOSTART_SGLANG" \
+        SAFETENSORS_MODEL_PATH="$SAFETENSORS_MODEL_PATH" \
+        SKIP_OLLAMA="$SKIP_OLLAMA" \
+        SKIP_LMSTUDIO="$SKIP_LMSTUDIO" \
+        SKIP_VLLM="$SKIP_VLLM" \
+        SKIP_SGLANG="$SKIP_SGLANG" \
+        PORT_NATIVE="$PORT_NATIVE" \
+        PORT_LLAMA="$PORT_LLAMA" \
+        RESET_CUDA_BETWEEN_BACKENDS="$RESET_CUDA_BETWEEN_BACKENDS" \
+        INFERFLUX_BENCH_CHILD_MODE=1 \
+        INFERFLUX_BENCH_SINGLE_BACKEND="$backend" \
+        "${BASH:-/bin/bash}" "$0" "$MODEL_PATH"
+}
+
+# ============================================================================
+# Main Benchmark Loop
+# ============================================================================
+
+main() {
+    BUILD_DIR=$(resolve_build_dir)
+    print_benchmark_banner
 
     mkdir -p "$OUTPUT_DIR"
     write_prompt_suite_artifacts
@@ -983,9 +1429,44 @@ main() {
     sleep 1
 
     # Validate model
-    if [ ! -f "$MODEL_PATH" ]; then
+    if [ ! -e "$MODEL_PATH" ]; then
         log_err "Model not found: $MODEL_PATH"
         exit 1
+    fi
+
+    MODEL_FORMAT=$(detect_model_format "$MODEL_PATH")
+    if [ "$MODEL_FORMAT" = "unknown" ]; then
+        log_err "Unable to detect model format from: $MODEL_PATH"
+        log_err "Expected a .gguf file/directory or a safetensors file/directory."
+        exit 1
+    fi
+    echo "  Model fmt:   $MODEL_FORMAT"
+
+    if [ "$MODEL_FORMAT" = "safetensors" ]; then
+        if [ -z "$SAFETENSORS_MODEL_PATH_INPUT" ]; then
+            SAFETENSORS_MODEL_PATH="$MODEL_PATH"
+        fi
+        if [ -z "$VLLM_MODEL_PATH_INPUT" ]; then
+            VLLM_MODEL_PATH="$SAFETENSORS_MODEL_PATH"
+        fi
+        if [ -z "$SGLANG_MODEL_PATH_INPUT" ]; then
+            SGLANG_MODEL_PATH="$SAFETENSORS_MODEL_PATH"
+        fi
+    fi
+
+    if [ -n "$INFERFLUX_BENCH_SINGLE_BACKEND" ]; then
+        local backend_known=false
+        local backend
+        for backend in "${ALL_BACKENDS[@]}"; do
+            if [ "$backend" = "$INFERFLUX_BENCH_SINGLE_BACKEND" ]; then
+                backend_known=true
+                break
+            fi
+        done
+        if [ "$backend_known" != "true" ]; then
+            log_err "Unknown isolated backend: $INFERFLUX_BENCH_SINGLE_BACKEND"
+            exit 1
+        fi
     fi
 
     # Validate inferfluxd
@@ -1001,6 +1482,29 @@ main() {
         exit 1
     fi
 
+    if [ "$INFERFLUX_BENCH_CHILD_MODE" != "1" ]; then
+        local requested_backends=("${ALL_BACKENDS[@]}")
+        if [ -n "$INFERFLUX_BENCH_SINGLE_BACKEND" ]; then
+            requested_backends=("$INFERFLUX_BENCH_SINGLE_BACKEND")
+        fi
+
+        local backend
+        for backend in "${requested_backends[@]}"; do
+            if ! invoke_isolated_backend_child "$backend"; then
+                log_warn "Isolated backend benchmark failed for $backend"
+            fi
+        done
+
+        compare_responses
+
+        echo ""
+        header "Scaling Analysis Report"
+        generate_report
+        save_combined_results
+        log_ok "Benchmark complete! Results saved to $OUTPUT_DIR"
+        return 0
+    fi
+
     local mem_baseline=$(gpu_mem_mb)
     log "GPU baseline memory: ${mem_baseline} MB"
     log "InferFlux backends will run one at a time."
@@ -1013,6 +1517,11 @@ main() {
     declare -A BACKEND_PORTS
     declare -A BACKEND_KIND
     declare -A BACKEND_AVAILABLE
+    declare -A BACKEND_FORMAT_COMPATIBLE
+    local requested_backends=("${ALL_BACKENDS[@]}")
+    if [ -n "$INFERFLUX_BENCH_SINGLE_BACKEND" ]; then
+        requested_backends=("$INFERFLUX_BENCH_SINGLE_BACKEND")
+    fi
 
     BACKEND_PORTS[inferflux_cuda]=$PORT_NATIVE
     BACKEND_KIND[inferflux_cuda]=inferflux
@@ -1028,33 +1537,87 @@ main() {
     BACKEND_PORTS[lmstudio]="$LMSTUDIO_HOST"
     BACKEND_KIND[lmstudio]=lmstudio
 
-    for backend in inferflux_cuda llama_cpp_cuda ollama lmstudio; do
+    BACKEND_PORTS[vllm]="$VLLM_HOST"
+    BACKEND_KIND[vllm]=vllm
+
+    BACKEND_PORTS[sglang]="$SGLANG_HOST"
+    BACKEND_KIND[sglang]=sglang
+
+    local backend
+    for backend in "${requested_backends[@]}"; do
+        if backend_supports_model_format "$backend" "$MODEL_FORMAT"; then
+            BACKEND_FORMAT_COMPATIBLE[$backend]=true
+        else
+            BACKEND_FORMAT_COMPATIBLE[$backend]=false
+            BACKEND_AVAILABLE[$backend]=false
+            log_warn "Skipping $backend benchmark (model format $MODEL_FORMAT unsupported)"
+        fi
+    done
+
+    for backend in "${requested_backends[@]}"; do
         for concurrency in "${CONCURRENCY_ARRAY[@]}"; do
             reset_benchmark_artifacts "$backend" "$concurrency"
         done
     done
 
     # Check Ollama availability
-    if [ "$SKIP_OLLAMA" = "true" ]; then
+    if [[ " ${requested_backends[*]} " == *" ollama "* ]] && [ "${BACKEND_FORMAT_COMPATIBLE[ollama]}" != "true" ]; then
+        BACKEND_AVAILABLE[ollama]=false
+    elif [[ " ${requested_backends[*]} " == *" ollama "* ]] && [ "$SKIP_OLLAMA" = "true" ]; then
         log_warn "Skipping Ollama benchmark (SKIP_OLLAMA=true)"
         BACKEND_AVAILABLE[ollama]=false
-    elif check_ollama_available; then
+    elif [[ " ${requested_backends[*]} " == *" ollama "* ]] && check_ollama_available; then
         BACKEND_AVAILABLE[ollama]=true
-    else
+    elif [[ " ${requested_backends[*]} " == *" ollama "* ]]; then
         BACKEND_AVAILABLE[ollama]=false
     fi
 
-    if [ "$SKIP_LMSTUDIO" = "true" ]; then
-        log_warn "Skipping LM Studio benchmark (SKIP_LMSTUDIO=true)"
+    if [[ " ${requested_backends[*]} " == *" lmstudio "* ]] && [ "${BACKEND_FORMAT_COMPATIBLE[lmstudio]}" != "true" ]; then
         BACKEND_AVAILABLE[lmstudio]=false
-    elif check_lmstudio_available; then
+    elif [[ " ${requested_backends[*]} " == *" lmstudio "* ]] && check_lmstudio_available; then
         BACKEND_AVAILABLE[lmstudio]=true
-    else
+    elif [[ " ${requested_backends[*]} " == *" lmstudio "* ]] && [ "$SKIP_LMSTUDIO" = "true" ]; then
         BACKEND_AVAILABLE[lmstudio]=false
+    elif [[ " ${requested_backends[*]} " == *" lmstudio "* ]]; then
+        BACKEND_AVAILABLE[lmstudio]=false
+    fi
+
+    if [[ " ${requested_backends[*]} " == *" vllm "* ]] && [ "${BACKEND_FORMAT_COMPATIBLE[vllm]}" != "true" ]; then
+        BACKEND_AVAILABLE[vllm]=false
+    elif [[ " ${requested_backends[*]} " == *" vllm "* ]] && [ "$SKIP_VLLM" = "true" ]; then
+        log_warn "Skipping vLLM benchmark (SKIP_VLLM=true)"
+        BACKEND_AVAILABLE[vllm]=false
+    elif [[ " ${requested_backends[*]} " == *" vllm "* ]] && should_autostart_backend vllm; then
+        if validate_local_openai_backend_launch "vLLM" "$VLLM_HOST" "$VLLM_BIN" "$VLLM_MODEL_PATH"; then
+            BACKEND_AVAILABLE[vllm]=true
+        else
+            BACKEND_AVAILABLE[vllm]=false
+        fi
+    elif [[ " ${requested_backends[*]} " == *" vllm "* ]] && check_vllm_available; then
+        BACKEND_AVAILABLE[vllm]=true
+    elif [[ " ${requested_backends[*]} " == *" vllm "* ]]; then
+        BACKEND_AVAILABLE[vllm]=false
+    fi
+
+    if [[ " ${requested_backends[*]} " == *" sglang "* ]] && [ "${BACKEND_FORMAT_COMPATIBLE[sglang]}" != "true" ]; then
+        BACKEND_AVAILABLE[sglang]=false
+    elif [[ " ${requested_backends[*]} " == *" sglang "* ]] && [ "$SKIP_SGLANG" = "true" ]; then
+        log_warn "Skipping SGLang benchmark (SKIP_SGLANG=true)"
+        BACKEND_AVAILABLE[sglang]=false
+    elif [[ " ${requested_backends[*]} " == *" sglang "* ]] && should_autostart_backend sglang; then
+        if validate_local_openai_backend_launch "SGLang" "$SGLANG_HOST" "$SGLANG_PYTHON" "$SGLANG_MODEL_PATH"; then
+            BACKEND_AVAILABLE[sglang]=true
+        else
+            BACKEND_AVAILABLE[sglang]=false
+        fi
+    elif [[ " ${requested_backends[*]} " == *" sglang "* ]] && check_sglang_available; then
+        BACKEND_AVAILABLE[sglang]=true
+    elif [[ " ${requested_backends[*]} " == *" sglang "* ]]; then
+        BACKEND_AVAILABLE[sglang]=false
     fi
 
     # Run benchmarks for all backends and concurrency levels
-    for backend in inferflux_cuda llama_cpp_cuda ollama lmstudio; do
+    for backend in "${requested_backends[@]}"; do
         if [ "${BACKEND_AVAILABLE[$backend]}" != "true" ]; then
             continue
         fi
@@ -1067,6 +1630,28 @@ main() {
             header "Starting: $backend"
             local mem_before_start=$(gpu_mem_mb)
             if ! start_inferflux_server "$backend" "$port_or_url"; then
+                log_err "Failed to start $backend"
+                continue
+            fi
+            local mem_after_start=$(gpu_mem_mb)
+            local mem_for_model=$((mem_after_start - mem_before_start))
+            log "GPU memory after $backend startup: ${mem_after_start} MB (delta: +${mem_for_model} MB)"
+        elif [ "$backend" = "vllm" ] && should_autostart_backend vllm; then
+            echo ""
+            header "Starting: $backend"
+            local mem_before_start=$(gpu_mem_mb)
+            if ! start_vllm_server; then
+                log_err "Failed to start $backend"
+                continue
+            fi
+            local mem_after_start=$(gpu_mem_mb)
+            local mem_for_model=$((mem_after_start - mem_before_start))
+            log "GPU memory after $backend startup: ${mem_after_start} MB (delta: +${mem_for_model} MB)"
+        elif [ "$backend" = "sglang" ] && should_autostart_backend sglang; then
+            echo ""
+            header "Starting: $backend"
+            local mem_before_start=$(gpu_mem_mb)
+            if ! start_sglang_server; then
                 log_err "Failed to start $backend"
                 continue
             fi
@@ -1092,6 +1677,23 @@ main() {
             if ! stop_inferflux_server "$backend"; then
                 log_warn "  $backend shutdown reported a fatal runtime signature"
             fi
+            if [ "$RESET_CUDA_BETWEEN_BACKENDS" = "true" ]; then
+                reset_cuda_device
+            fi
+            sleep 3
+            local mem_after_stop=$(gpu_mem_mb)
+            local mem_freed=$((mem_before_stop - mem_after_stop))
+            log "GPU memory after stopping $backend: ${mem_after_stop} MB (freed: ${mem_freed} MB)"
+        elif [ "$backend" = "vllm" ] && should_autostart_backend vllm; then
+            local mem_before_stop=$(gpu_mem_mb)
+            stop_managed_openai_backend "$backend" || true
+            sleep 3
+            local mem_after_stop=$(gpu_mem_mb)
+            local mem_freed=$((mem_before_stop - mem_after_stop))
+            log "GPU memory after stopping $backend: ${mem_after_stop} MB (freed: ${mem_freed} MB)"
+        elif [ "$backend" = "sglang" ] && should_autostart_backend sglang; then
+            local mem_before_stop=$(gpu_mem_mb)
+            stop_managed_openai_backend "$backend" || true
             sleep 3
             local mem_after_stop=$(gpu_mem_mb)
             local mem_freed=$((mem_before_stop - mem_after_stop))
@@ -1099,17 +1701,7 @@ main() {
         fi
     done
 
-    compare_responses
-
-    # Generate comparison report
-    echo ""
-    header "Scaling Analysis Report"
-    generate_report
-
-    # Save combined JSON
-    save_combined_results
-
-    log_ok "Benchmark complete! Results saved to $OUTPUT_DIR"
+    log_ok "Isolated backend benchmark complete for ${requested_backends[*]}"
 }
 
 # ============================================================================
@@ -1123,7 +1715,7 @@ import json, os, sys
 output_dir = sys.argv[1]
 concurrency_levels = sys.argv[2].split(',')
 
-backends = ['inferflux_cuda', 'llama_cpp_cuda', 'ollama', 'lmstudio']
+backends = ['inferflux_cuda', 'llama_cpp_cuda', 'ollama', 'lmstudio', 'vllm', 'sglang']
 
 # Load all results
 results = {}
@@ -1211,7 +1803,7 @@ output_dir = sys.argv[1]
 concurrency_levels = sys.argv[2].split(',')
 model_path = sys.argv[3]
 
-backends = ['inferflux_cuda', 'llama_cpp_cuda', 'ollama', 'lmstudio']
+backends = ['inferflux_cuda', 'llama_cpp_cuda', 'ollama', 'lmstudio', 'vllm', 'sglang']
 
 combined = {
     'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
@@ -1278,6 +1870,8 @@ cleanup() {
     local mem_before=$(gpu_mem_mb 2>/dev/null || echo "0")
     stop_inferflux_server inferflux_cuda 2>/dev/null || true
     stop_inferflux_server llama_cpp_cuda 2>/dev/null || true
+    stop_managed_openai_backend vllm 2>/dev/null || true
+    stop_managed_openai_backend sglang 2>/dev/null || true
     stop_stale_benchmark_inferflux_servers
     sleep 2
     local mem_after=$(gpu_mem_mb 2>/dev/null || echo "0")

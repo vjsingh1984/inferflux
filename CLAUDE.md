@@ -72,7 +72,9 @@ cmake --build build-cov --target coverage
 
 Test files are in `tests/unit/` (one per module). Framework: Catch2 v3.7.1. Available ctest labels: `paged_kv`, `unified_batch`, `parallel`, `ep`, `backend_factory`, `backend_capabilities`, `moe`, `flash_attn`, `shm_transport`, `chat_template`, `sampling`, `logger`, `structured`, `model_registry`, `model_format`, `model_paths`, `model_identity`, `embeddings_routing`, `stop_sequences`, `fairness`.
 
-Integration test suites (Python, require built `inferfluxd`): `StubIntegration`, `IntegrationCLIModelListContract`, `IntegrationEmbeddingsRoutingContract`, `IntegrationModelIdentityContract`, `SSECancel`, `ShmSmoke`, `IntegrationSSE` (needs model).
+Integration test suites (Python, require built `inferfluxd`): `StubIntegration`, `IntegrationCLIModelListContract`, `IntegrationEmbeddingsRoutingContract`, `IntegrationModelIdentityContract`, `SSECancel`, `ShmSmoke`, `SSEMetrics`, `BackendIdentityContract`, `BenchmarkHarnessDefaults`, `BenchmarkResponseClassifier`, `InferctlAdminPools`, `NativePhaseTiming`, `ThroughputGateContract`, `ThroughputGateFailureContract`, `IntegrationSSE` (needs model).
+
+**First-token parity probe** (`tests/tools/first_token_probe.cpp`): builds `inferflux_first_token_probe` binary that runs a single forward pass and emits top-N logit distributions as JSON. Used by `tests/integration/first_token_parity_probe_test.py` to validate numeric parity across backends. Set `INFERFLUX_FIRST_TOKEN_PROBE_BIN` to override the binary path (defaults to `build/inferflux_first_token_probe`).
 
 ## Architecture
 
@@ -104,6 +106,9 @@ The CMake target `inferflux_core` links all modules into a single library consum
 - `docs/GGUF_NATIVE_KERNEL_IMPLEMENTATION.md` — native GGUF runtime guide, operator status
 - `docs/MONITORING.md` — observability signals, tuning levers, profiling workflow
 - `docs/design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE.md` — design rules and next gates
+- `docs/API_SURFACE.md` — all HTTP endpoints and CLI contracts (source-aligned)
+- `docs/CONFIG_REFERENCE.md` — full config map including all env vars and YAML knobs
+- `docs/BACKEND_DEVELOPMENT.md` — guide to adding or extending backends
 
 ## Coding Conventions
 
@@ -165,6 +170,7 @@ Only structured output (grammar-constrained generation) still delegates to the l
 **InferFlux CUDA kernel files:**
 - `runtime/backends/cuda/native/kernels/fused_dequant_gemv.cuh` — v1 GEMV kernels (column-major, 8 warps/block)
 - `runtime/backends/cuda/native/kernels/fused_dequant_gemv_v2.cuh` — v2 GEMV kernels (cooperative 4-warp, L2-friendly)
+- `runtime/backends/cuda/native/kernels/fused_dequant_gemv_vectorized.cuh` — vectorized load helpers for Q4_K dequantization (reduced memory bandwidth)
 - `runtime/backends/cuda/native/fused_quant_gemm.cu` — dispatch tables, v1/v2 selection, threshold logic
 - `runtime/backends/cuda/native/transformer_forward.cu` — forward pass wiring
 - `runtime/backends/cuda/native/cuda_kernels.cu` — batched RoPE/KvAppend, MeanPool, utility kernels
@@ -173,20 +179,37 @@ Only structured output (grammar-constrained generation) still delegates to the l
 **InferFlux CUDA policy and execution files:**
 - `runtime/backends/cuda/native/native_execution_policy.h` — `NativeExecutionPolicy` struct, env var parsing
 - `runtime/backends/cuda/native/native_dispatch_policy.{h,cpp}` — operator selection, dispatch decisions
+- `runtime/backends/cuda/native/native_dispatch_registry.{h,cpp}` — per-phase/batch-bucket dispatch winner registry
 - `runtime/backends/cuda/native/native_bootstrap_config.{h,cpp}` — KV cache sizing, startup config
 - `runtime/backends/cuda/native/native_linear_executor.h` — projection stage execution with fallback chains
+- `runtime/backends/cuda/native/cuda_sync_trace.h` — CUDA sync latency tracing at named pipeline sites
 
 **InferFlux CUDA metrics:** Prometheus at `/metrics`: `inferflux_cuda_forward_passes_total{phase}`, `inferflux_cuda_forward_batch_tokens_total`, `inferflux_cuda_forward_duration_ms`, `inferflux_cuda_sampling_duration_ms`, `inferflux_cuda_kv_active_sequences`, `inferflux_cuda_kv_max_sequences`, FFN/down-proj operator counters. NVTX annotations for Nsight Systems profiling.
 
 **Throughput validation:**
 ```bash
-# Performance regression gate
-./scripts/run_throughput_gate.py --server-bin ./build/inferfluxd --config config/server.cuda.yaml \
-  --backend cuda --min-completion-tok-per-sec 120
+# Performance regression gate (canonical entry point)
+bash scripts/benchmark.sh throughput-gate
 
 # Native vs llama.cpp comparison benchmark
-bash scripts/run_gguf_comparison_benchmark.sh
+bash scripts/benchmark.sh gguf-compare
+
+# Multi-backend benchmark (inferflux_cuda, llama_cpp_cuda, ollama, vllm, sglang, lmstudio)
+bash scripts/benchmark.sh multi-backend
+# AUTOSTART_VLLM=true / AUTOSTART_SGLANG=true to launch external engines automatically
+# INFERFLUX_BENCH_SINGLE_BACKEND=<id> to run one backend through the full harness
+
+# Profiling entry points
+bash scripts/profile.sh backend           # nsys backend profile
+bash scripts/profile.sh backend-ncu       # ncu kernel profile
+bash scripts/profile.sh phase-timing      # per-phase timing breakdown
+
+# Smoke tests (no model required)
+bash scripts/smoke.sh gguf-native
+bash scripts/smoke.sh backend-identity
 ```
+
+**Script archive policy:** One-off probes and superseded wrappers live in `scripts/archive/`. New scripts should extend the entry points above, not add new top-level files.
 
 ## Disaggregated Runtime
 

@@ -24,6 +24,16 @@ Per-concurrency artifacts are intentionally isolated. Expect files such as:
 
 If these files are being overwritten across concurrency levels, the harness is broken and the benchmark should not be trusted.
 
+`benchmark_multi_backend_comparison.sh` now runs each backend in an isolated child invocation. That is intentional:
+
+1. the parent process only prepares the suite, dispatches one backend at a time, and merges results
+2. each child process starts, benchmarks, and tears down exactly one backend
+3. local CUDA backends get a `cudaDeviceReset()` between children
+
+This avoids cross-backend allocator / stream / shell-job state leaking from one engine into the next.
+
+For targeted debugging, set `INFERFLUX_BENCH_SINGLE_BACKEND=<backend_id>` and run the same script directly.
+
 ## 3. Run order and reset hook
 The benchmark runs `inferflux_cuda` first, then `llama_cpp_cuda`. To avoid CUDA state leaking between the two:
 1. The script already calls `stop_server inferflux_cuda` once the InferFlux CUDA run is done.
@@ -74,3 +84,28 @@ When promoting the row-pair flag for release:
 Current release posture:
 * Keep the proven `Q4_K M=1` grouped hot path on by default.
 * Keep `q8_1_group_row_pair_w4` behind `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4=1` until a future implementation beats the generic grouped path on the exact live `M=2,N=11008,K=2048` envelope.
+
+## 8. Local vLLM / SGLang safetensors runs
+
+`benchmark_multi_backend_comparison.sh` can now auto-launch local `vllm` and `sglang` servers one at a time so their VRAM is released before the next backend starts.
+
+Recommended local safetensors setup:
+
+```bash
+AUTOSTART_VLLM=true \
+AUTOSTART_SGLANG=true \
+VLLM_MODEL_PATH=models/qwen2.5-3b-instruct-safetensors \
+SGLANG_MODEL_PATH=models/qwen2.5-3b-instruct-safetensors \
+VLLM_LAUNCH_ARGS="--dtype half --max-model-len 2048" \
+SGLANG_LAUNCH_ARGS="--dtype half --context-length 2048" \
+BUILD_DIR=./build-cuda \
+./scripts/benchmark.sh multi-backend \
+  models/qwen2.5-3b-instruct-safetensors
+```
+
+Notes:
+
+* The harness auto-detects the supplied model format and skips incompatible backends.
+* GGUF inputs skip `vllm` / `sglang`; safetensors inputs skip `llama_cpp_cuda` / `ollama`.
+* `vllm` and `sglang` should be benchmarked with safetensors/Hugging Face model directories via `VLLM_MODEL_PATH` / `SGLANG_MODEL_PATH`.
+* If you already run those servers elsewhere, leave `AUTOSTART_VLLM` / `AUTOSTART_SGLANG` unset and point `VLLM_HOST` / `SGLANG_HOST` at the existing endpoints.

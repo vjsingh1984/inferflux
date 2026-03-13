@@ -63,8 +63,6 @@ std::string NormalizeNativeOutputPiece(const ITokenizer *tokenizer,
 
 } // namespace
 
-std::atomic<int> InferfluxCudaBackend::next_ephemeral_sequence_id_{1 << 20};
-
 InferfluxCudaBackend::InferfluxCudaBackend() : LlamaCppBackend(false) {}
 
 InferfluxCudaBackend::~InferfluxCudaBackend() = default;
@@ -480,7 +478,12 @@ std::string InferfluxCudaBackend::Generate(
     return {};
   }
 
-  const int sequence_id = AcquireEphemeralSequenceId();
+  // Match llama.cpp Generate(): use a fixed reserved single-request slot.
+  // The native KV cache is indexed by [0, max_parallel_sequences), so the old
+  // global ephemeral sequence ids could exceed the allocation and fail on
+  // long-prefill append before logits were produced.
+  constexpr int kDirectGenerateSequenceId = 0;
+  const int sequence_id = kDirectGenerateSequenceId;
   const SamplingParams sampling = SnapshotSamplingParams();
   const ITokenizer *tokenizer = runtime_->NativeGetTokenizer();
   std::string output;
@@ -495,6 +498,8 @@ std::string InferfluxCudaBackend::Generate(
       }
     }
   } release{runtime_.get(), sequence_id};
+
+  runtime_->NativeFreeSequence(sequence_id);
 
   UnifiedBatchInput prefill_input;
   prefill_input.sequence_id = sequence_id;
@@ -802,6 +807,31 @@ TokenLogprob InferfluxCudaBackend::CollectNativeLogprob(
                         });
 }
 
+std::vector<TopLogitEntry>
+InferfluxCudaBackend::TopLogitsForParity(int top_n) {
+  std::lock_guard<std::recursive_mutex> runtime_lock(runtime_mutex_);
+  if (!runtime_ || top_n <= 0) {
+    return {};
+  }
+  const int vocab = runtime_->NativeVocabSize();
+  if (vocab <= 0) {
+    return {};
+  }
+  if (static_cast<int>(host_logits_buf_.size()) < vocab) {
+    host_logits_buf_.resize(vocab);
+  }
+  const int copied = runtime_->CopyLastLogitsToHost(host_logits_buf_.data(),
+                                                    vocab);
+  if (copied <= 0) {
+    return {};
+  }
+  const ITokenizer *tok = runtime_->NativeGetTokenizer();
+  return ComputeTopLogits(host_logits_buf_.data(), vocab, top_n,
+                          [tok](int32_t id) -> std::string {
+                            return tok ? tok->TokenToString(id) : "";
+                          });
+}
+
 std::vector<float> InferfluxCudaBackend::EmbedForParity(
     const std::string &text) {
   // Try native embedding first.
@@ -843,15 +873,6 @@ SamplingParams InferfluxCudaBackend::SnapshotSamplingParams() const {
     return {};
   }
   return active_sampling_;
-}
-
-int InferfluxCudaBackend::AcquireEphemeralSequenceId() {
-  int seq = next_ephemeral_sequence_id_.fetch_add(1, std::memory_order_relaxed);
-  if (seq < 0) {
-    next_ephemeral_sequence_id_.store(1 << 20, std::memory_order_relaxed);
-    seq = next_ephemeral_sequence_id_.fetch_add(1, std::memory_order_relaxed);
-  }
-  return seq;
 }
 
 } // namespace inferflux

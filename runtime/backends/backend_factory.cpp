@@ -1,7 +1,11 @@
 #include "runtime/backends/backend_factory.h"
 
+#include "runtime/backends/backend_registry.h"
 #include "runtime/backends/cuda/cuda_backend.h"
 #include "runtime/backends/cuda/inferflux_cuda_backend.h"
+#include "runtime/backends/mps/mps_backend.h"
+#include "runtime/backends/rocm/rocm_backend.h"
+#include "runtime/backends/vulkan/vulkan_backend.h"
 #include "server/logging/logger.h"
 
 #if INFERFLUX_HAS_MLX
@@ -70,7 +74,8 @@ BackendFactoryResult CpuFallback(const std::string &reason) {
   out.capabilities = out.traits.capabilities;
   out.backend = std::make_shared<LlamaCppBackend>();
   out.provider = BackendProvider::kLlamaCpp;
-  out.backend_label = BackendFactory::CanonicalBackendId(out.provider, out.target);
+  out.backend_label =
+      BackendFactory::CanonicalBackendId(out.provider, out.target);
   out.config = TuneLlamaBackendConfig(out.target, {});
   return out;
 }
@@ -112,8 +117,36 @@ BackendFactoryResult LlamaCppForTarget(LlamaBackendTarget target,
 #endif
   }
 
-  if (hint == "mps" || hint == "rocm" || hint == "vulkan") {
-    out.backend = std::make_shared<LlamaCppBackend>();
+  if (hint == "rocm") {
+#ifdef INFERFLUX_HAS_ROCM
+    out.backend = std::make_shared<RocmBackend>();
+#else
+    return CpuFallback(
+        "ROCm backend requested but binary was built without ROCm support. "
+        "Falling back to CPU backend.");
+#endif
+    return out;
+  }
+
+  if (hint == "mps") {
+    auto &reg = BackendRegistry::Instance();
+    if (reg.Has(LlamaBackendTarget::kMps, BackendProvider::kLlamaCpp)) {
+      out.backend =
+          reg.Create(LlamaBackendTarget::kMps, BackendProvider::kLlamaCpp);
+    } else {
+      out.backend = std::make_shared<MpsBackend>();
+    }
+    return out;
+  }
+
+  if (hint == "vulkan") {
+    auto &reg = BackendRegistry::Instance();
+    if (reg.Has(LlamaBackendTarget::kVulkan, BackendProvider::kLlamaCpp)) {
+      out.backend =
+          reg.Create(LlamaBackendTarget::kVulkan, BackendProvider::kLlamaCpp);
+    } else {
+      out.backend = std::make_shared<VulkanBackend>();
+    }
     return out;
   }
 
@@ -149,7 +182,7 @@ std::string BackendFactory::NormalizeHint(const std::string &backend_hint) {
   const std::string lowered = ToLower(backend_hint);
   if (lowered == "auto" || lowered == "mlx" || lowered == "cpu" ||
       lowered == "cuda" || lowered == "mps" || lowered == "rocm" ||
-      lowered == "vulkan") {
+      lowered == "vulkan" || lowered == "opencl") {
     return lowered;
   }
   if (IsExplicitNativeHint(lowered)) {
@@ -175,6 +208,8 @@ std::string BackendFactory::CanonicalBackendId(BackendProvider provider,
       return "inferflux_rocm";
     case LlamaBackendTarget::kVulkan:
       return "inferflux_vulkan";
+    case LlamaBackendTarget::kOpenCL:
+      return "inferflux_opencl";
     case LlamaBackendTarget::kCpu:
     default:
       return "inferflux_cpu";
@@ -190,6 +225,8 @@ std::string BackendFactory::CanonicalBackendId(BackendProvider provider,
     return "llama_cpp_rocm";
   case LlamaBackendTarget::kVulkan:
     return "llama_cpp_vulkan";
+  case LlamaBackendTarget::kOpenCL:
+    return "llama_cpp_opencl";
   case LlamaBackendTarget::kCpu:
   default:
     return "llama_cpp_cpu";
@@ -206,8 +243,8 @@ std::string BackendFactory::ProviderLabel(BackendProvider provider) {
   }
 }
 
-BackendProvider BackendFactory::ParseProviderLabel(
-    const std::string &provider_label) {
+BackendProvider
+BackendFactory::ParseProviderLabel(const std::string &provider_label) {
   const std::string lowered = ToLower(provider_label);
   if (lowered == "inferflux") {
     return BackendProvider::kNative;
@@ -283,7 +320,8 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
           return NativeUnavailableResult(
               target, traits,
               "backend_policy_violation: strict_inferflux_request enabled; "
-              "inferflux backend explicitly requested but InferFlux CUDA kernels are not "
+              "inferflux backend explicitly requested but InferFlux CUDA "
+              "kernels are not "
               "ready");
         }
         if (policy.allow_llama_cpp_fallback) {
@@ -307,11 +345,13 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
         out.target = target;
         out.traits = traits;
         out.capabilities = traits.capabilities;
-        out.backend_label = CanonicalBackendId(BackendProvider::kNative, target);
+        out.backend_label =
+            CanonicalBackendId(BackendProvider::kNative, target);
         out.provider = BackendProvider::kNative;
         out.backend = std::move(backend);
         out.config = TuneLlamaBackendConfig(target, {});
-        out.require_strict_inferflux_execution = policy.strict_inferflux_request;
+        out.require_strict_inferflux_execution =
+            policy.strict_inferflux_request;
         return out;
       }
       return NativeUnavailableResult(
@@ -331,7 +371,8 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
         out.target = target;
         out.traits = traits;
         out.capabilities = traits.capabilities;
-        out.backend_label = CanonicalBackendId(BackendProvider::kNative, target);
+        out.backend_label =
+            CanonicalBackendId(BackendProvider::kNative, target);
         out.provider = BackendProvider::kNative;
         out.backend = std::move(backend);
         out.config = TuneLlamaBackendConfig(target, {});

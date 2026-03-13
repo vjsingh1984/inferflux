@@ -91,7 +91,7 @@ struct SequenceLease {
 };
 
 /**
- * @brief Manages KV cache slots for both cuda_native and cuda_llama_cpp
+ * @brief Manages KV cache slots for both inferflux_cuda and llama_cpp_cuda
  * backends
  *
  * This provides universal sequence slot management at the orchestration layer,

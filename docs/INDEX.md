@@ -46,7 +46,7 @@ graph TD
 | Configuration | [CONFIG_REFERENCE](CONFIG_REFERENCE.md) |
 | **Benchmark results (validated vs Ollama)** | **[benchmarks](benchmarks.md)** ⭐ |
 | Monitoring and tuning | [MONITORING](MONITORING.md) |
-| **cuda_native scaling improvement plan** | **[cuda_native_scaling_roadmap](cuda_native_scaling_roadmap.md)** ⭐ |
+| Archived throughput investigations | [ARCHIVE_INDEX](ARCHIVE_INDEX.md) |
 | Developer workflow + CI contracts | [DeveloperGuide](DeveloperGuide.md) |
 | Grades and execution plan | [Roadmap](Roadmap.md), [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |
 | Modernization migration guide | [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) |
@@ -72,7 +72,7 @@ graph TD
 | Policy surface | [Policy](Policy.md) |
 | Backend parity design | [design/Backend_Parity_LlamaCpp_CUDA_MLX](design/Backend_Parity_LlamaCpp_CUDA_MLX.md) |
 | Native GGUF quantized runtime design | [design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE](design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE.md) |
-| Native CUDA + distributed uplift plan | [design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN](design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN.md) |
+| InferFlux CUDA + distributed uplift plan | [design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN](design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN.md) |
 | Session handle layer (Phase 1) | [design/SESSION_HANDLE_LAYER_PHASE1](design/SESSION_HANDLE_LAYER_PHASE1.md) |
 | EP/TP scaling design | [design_ep_tp](design_ep_tp.md) |
 

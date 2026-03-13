@@ -57,6 +57,8 @@ public:
     kQ81Group,
     kQ81GroupHotQ4K,
     kQ81GroupRowPairW4,
+    kQ81GroupRowQuadM4,
+    kQ81GroupMmq3,
     kPackedGroup,
   };
 
@@ -130,10 +132,10 @@ public:
    * grouped path is unsupported so the caller can fall back to per-projection
    * launches without losing the shared activation pack.
    */
-  static bool GemvPackedPair(
-      const std::array<PackedProjectionSpec, 2> &projections,
-      const PackedActivationInfo &activation, int M, int K,
-      cudaStream_t stream);
+  static bool
+  GemvPackedPair(const std::array<PackedProjectionSpec, 2> &projections,
+                 const PackedActivationInfo &activation, int M, int K,
+                 cudaStream_t stream);
 
   /**
    * Attempt a single packed-activation launch for three sibling projections.
@@ -142,10 +144,10 @@ public:
    * grouped path is unsupported so the caller can fall back to per-projection
    * launches without losing the shared activation pack.
    */
-  static bool GemvPackedTriple(
-      const std::array<PackedProjectionSpec, 3> &projections,
-      const PackedActivationInfo &activation, int M, int K,
-      cudaStream_t stream);
+  static bool
+  GemvPackedTriple(const std::array<PackedProjectionSpec, 3> &projections,
+                   const PackedActivationInfo &activation, int M, int K,
+                   cudaStream_t stream);
 
   /**
    * Quantize FP16 activation rows to Q8_1 block format in global memory.
@@ -200,10 +202,9 @@ public:
    * @param K  Inner dimension (must be multiple of 32)
    * @param stream  CUDA stream
    * @return true if Q8_1 kernel was launched, false if unsupported
-  */
-  static bool GemvQ8_1(const QuantizedWeightInfo &weight,
-                       const void *act_q8_1, half *output, int M, int N, int K,
-                       cudaStream_t stream,
+   */
+  static bool GemvQ8_1(const QuantizedWeightInfo &weight, const void *act_q8_1,
+                       half *output, int M, int N, int K, cudaStream_t stream,
                        const NativeExecutionPolicy *policy = nullptr);
 
   /**
@@ -233,7 +234,8 @@ public:
                           cudaStream_t stream,
                           const NativeExecutionPolicy *policy = nullptr);
 
-  static bool IsDownProjMmqEnabled(const NativeExecutionPolicy *policy = nullptr);
+  static bool
+  IsDownProjMmqEnabled(const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Build a tile-major MMQ layout for a quantized tensor.
@@ -242,13 +244,13 @@ public:
    * the quant types with explicit MMQ dispatch entries.
    */
   static bool BuildDownProjMmqLayout(const QuantizedWeightInfo &weight,
-                                     int rows, int cols,
-                                     MmqWeightInfo *layout,
+                                     int rows, int cols, MmqWeightInfo *layout,
                                      cudaStream_t stream);
 
   static void DestroyDownProjMmqLayout(const MmqWeightInfo &layout);
 
   static bool SupportsDownProjMmq(int quant_type);
+  static int GetDownProjMmqThreshold(int quant_type, int m, int n, int k);
 
   /**
    * Hybrid FFN gate+up grouped operator selector.
@@ -265,7 +267,7 @@ public:
 
   static const char *FfnProjOperatorName(FfnProjOperator op);
   static const char *FfnProjOperatorMetricName(FfnProjOperator op,
-                                               int quant_type, int k);
+                                               int quant_type, int m, int k);
 
   /**
    * Hybrid down-proj operator selector.
@@ -286,18 +288,30 @@ public:
   /**
    * Grouped Q8_1 GEMV for two sibling projections (single kernel launch).
    */
-  static bool GemvQ8_1Pair(
+  static bool
+  GemvQ8_1Pair(const std::array<PackedProjectionSpec, 2> &projections,
+               const void *act_q8_1, int M, int K, cudaStream_t stream,
+               const NativeExecutionPolicy *policy = nullptr,
+               FfnProjOperator selected_op = FfnProjOperator::kFallback);
+
+  /**
+   * Explicit grouped row-quad FFN benchmark candidate.
+   *
+   * This bypasses runtime selection and exists only so benchmarks/tests can
+   * measure the Q4_K grouped row-quad candidate on exact live geometries
+   * without exposing it as a serving policy.
+   */
+  static bool GemvQ8_1PairRowQuadCandidate(
       const std::array<PackedProjectionSpec, 2> &projections,
-      const void *act_q8_1, int M, int K, cudaStream_t stream,
-      const NativeExecutionPolicy *policy = nullptr);
+      const void *act_q8_1, int M, int K, cudaStream_t stream);
 
   /**
    * Grouped Q8_1 GEMV for three sibling projections (single kernel launch).
    */
-  static bool GemvQ8_1Triple(
-      const std::array<PackedProjectionSpec, 3> &projections,
-      const void *act_q8_1, int M, int K, cudaStream_t stream,
-      const NativeExecutionPolicy *policy = nullptr);
+  static bool
+  GemvQ8_1Triple(const std::array<PackedProjectionSpec, 3> &projections,
+                 const void *act_q8_1, int M, int K, cudaStream_t stream,
+                 const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Returns true when a quant type supports Q8_1 activation GEMV.
@@ -308,15 +322,13 @@ public:
    * Small-batch grouped Q8_1 fast-path selector.
    *
    * This is an additive hot-shape optimization for native decode kernels.
-   * The current staged rollout only promotes the grouped Q4_K FFN path for
-   * the measured K=2048, M<=2 envelope and falls back to the generic grouped
-   * kernels for every other geometry.
+   * The current staged rollout promotes only the measured grouped Q4_K FFN
+   * single-row decode envelope and falls back to the generic grouped kernels
+   * for every other geometry.
    */
-  static bool
-  ShouldUseSpecializedQ8_1GroupedFastPath(int quant_type,
-                                          const FusedDispatchGeometry &geometry,
-                                          const NativeExecutionPolicy *policy =
-                                              nullptr);
+  static bool ShouldUseSpecializedQ8_1GroupedFastPath(
+      int quant_type, const FusedDispatchGeometry &geometry,
+      const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Experimental 4-warp grouped row-pair selector.
@@ -326,6 +338,14 @@ public:
    * more closely than the generic one-warp-per-output row-pair path.
    */
   static bool ShouldUseSpecializedQ8_1GroupedRowPairW4Path(
+      int quant_type, const FusedDispatchGeometry &geometry,
+      const NativeExecutionPolicy *policy = nullptr);
+
+  static bool ShouldUseSpecializedQ8_1DownProjHotPath(
+      int quant_type, const FusedDispatchGeometry &geometry,
+      const NativeExecutionPolicy *policy = nullptr);
+
+  static bool ShouldUseSpecializedQ8_1DownProjRowPairHotPath(
       int quant_type, const FusedDispatchGeometry &geometry,
       const NativeExecutionPolicy *policy = nullptr);
 

@@ -5,6 +5,7 @@
 #include "server/metrics/metrics.h"
 
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace inferflux {
@@ -98,13 +99,13 @@ bool ExecuteInferfluxCudaFfnProjectionStage(
   }
 
   const char *metric_op = FusedQuantGemm::FfnProjOperatorMetricName(
-      local_summary.actual_op, quant_type, hidden_size);
+      local_summary.actual_op, quant_type, batch_rows, hidden_size);
   GlobalMetrics().RecordInferfluxCudaFfnProjOperator(phase, metric_op);
   GlobalMetrics().RecordInferfluxCudaFfnProjGeometry(
       phase, metric_op, quant_label, batch_rows, intermediate_size, hidden_size,
       /*grouped_outputs=*/2);
-  if (local_summary.actual_op ==
-      FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4) {
+  const std::string_view metric_op_view(metric_op);
+  if (metric_op_view.find("row_pair") != std::string_view::npos) {
     GlobalMetrics().RecordInferfluxCudaRowPairSelection(phase, metric_op, batch_rows);
   }
 

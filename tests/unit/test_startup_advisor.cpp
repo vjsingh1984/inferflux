@@ -23,7 +23,7 @@ static inferflux::StartupAdvisorContext WellTunedCudaContext() {
   ctx.config.max_batch_size = 16;
   ctx.config.max_batch_tokens = 4096;
   ctx.config.kv_cpu_pages = 128;
-  ctx.config.prefer_native = true;
+  ctx.config.prefer_inferflux = true;
   ctx.config.tp_degree = 1;
 
   inferflux::AdvisorModelInfo m;
@@ -32,7 +32,7 @@ static inferflux::StartupAdvisorContext WellTunedCudaContext() {
                                             // recommendation
   m.format = "gguf";
   m.backend = "cuda";
-  m.backend_provider = "native";
+  m.backend_provider = "inferflux";
   m.file_size_bytes = 4ULL * 1024 * 1024 * 1024;
   m.quantization =
       inferflux::DetectQuantization(m.path, m.format); // Detect from filename
@@ -105,7 +105,7 @@ TEST_CASE("Multi-GPU with TP=1 and large model triggers tensor_parallel",
   m.id = "llama-70b";
   m.format = "gguf";
   m.backend = "cuda";
-  m.backend_provider = "native";
+  m.backend_provider = "inferflux";
   // Model uses > 70% of single-GPU VRAM.
   m.file_size_bytes = 35ULL * 1024 * 1024 * 1024;
   ctx.models.push_back(m);

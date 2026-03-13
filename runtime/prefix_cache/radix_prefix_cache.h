@@ -10,7 +10,7 @@
 namespace inferflux {
 
 class PagedKVCache;
-class LlamaCPUBackend;
+class LlamaCppBackend;
 
 struct RadixNode {
   std::vector<int> edge;
@@ -22,7 +22,7 @@ struct RadixNode {
   // The sequence_id where these blocks were originally computed (§P1b).
   int sequence_id{-1};
   // The backend that owns the sequence_id.
-  std::weak_ptr<LlamaCPUBackend> backend;
+  std::weak_ptr<LlamaCppBackend> backend;
 
   // Total BPE tokens covered by the prefix at this node (including edges up to
   // here).
@@ -61,13 +61,13 @@ public:
   // Returns true if a full node match was found (allowing CopySequencePrefix).
   // matched_tokens is always filled with the longest common prefix length
   // including partial edge matches for metrics (§ Item 3).
-  bool Lookup(const std::vector<int> &tokens, LlamaCPUBackend *backend,
+  bool Lookup(const std::vector<int> &tokens, LlamaCppBackend *backend,
               RadixLookupResult *result);
 
   // Insert a sequence of tokens and its corresponding block_table.
   void Insert(const std::vector<int> &tokens,
               const std::vector<int> &block_table, int sequence_id,
-              const std::shared_ptr<LlamaCPUBackend> &backend);
+              const std::shared_ptr<LlamaCppBackend> &backend);
 
   std::size_t Capacity() const { return capacity_; }
   std::size_t Size() const; // total nodes in tree

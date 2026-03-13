@@ -4,7 +4,7 @@
 
 namespace inferflux {
 
-std::shared_ptr<LlamaCPUBackend>
+std::shared_ptr<LlamaCppBackend>
 BackendManager::LoadBackend(const std::string &name, const std::string &path,
                             const LlamaBackendConfig &config,
                             bool prefer_cuda) {
@@ -32,7 +32,7 @@ BackendManager::LoadBackend(const std::string &name, const std::string &path,
   return selection.backend;
 }
 
-std::shared_ptr<LlamaCPUBackend>
+std::shared_ptr<LlamaCppBackend>
 BackendManager::GetBackend(const std::string &name) const {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = backends_.find(name);
