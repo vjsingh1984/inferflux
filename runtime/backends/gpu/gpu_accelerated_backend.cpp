@@ -47,7 +47,6 @@ bool GpuAcceleratedBackend::IsReady() const {
   return device_initialized_ && LlamaCppBackend::IsReady();
 }
 
-#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
 std::string GpuAcceleratedBackend::Name() const {
   if (strategy_) {
     auto target = strategy_->Target();
@@ -56,6 +55,5 @@ std::string GpuAcceleratedBackend::Name() const {
   }
   return "gpu_unknown";
 }
-#endif
 
 } // namespace inferflux

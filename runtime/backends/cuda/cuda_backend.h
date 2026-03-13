@@ -11,9 +11,7 @@ class CudaBackend : public GpuAcceleratedBackend {
 public:
   CudaBackend();
 
-#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
   std::string Name() const override { return "llama_cpp_cuda"; }
-#endif
 };
 
 } // namespace inferflux

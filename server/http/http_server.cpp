@@ -1,10 +1,9 @@
 #include "server/http/http_server.h"
 
 #include "model/model_format.h"
-#include "runtime/backends/backend_factory.h"
 #include "runtime/backends/backend_capabilities.h"
+#include "runtime/backends/backend_factory.h"
 #include "runtime/backends/llama/llama_cpp_backend.h"
-#include "runtime/backends/cuda/inferflux_cuda_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "scheduler/model_selection.h"
 #include "server/logging/logger.h"
@@ -52,9 +51,9 @@ int ParseNonNegativeEnvInt(const char *name, int default_value) {
   try {
     return std::max(0, std::stoi(raw));
   } catch (...) {
-    inferflux::log::Warn(
-        "http", std::string("Invalid value for ") + name + ": " + raw +
-                    "; using default " + std::to_string(default_value));
+    inferflux::log::Warn("http", std::string("Invalid value for ") + name +
+                                     ": " + raw + "; using default " +
+                                     std::to_string(default_value));
     return default_value;
   }
 }
@@ -74,9 +73,9 @@ bool ParseBoolEnv(const char *name, bool default_value) {
   if (value == "0" || value == "false" || value == "no" || value == "off") {
     return false;
   }
-  inferflux::log::Warn(
-      "http", std::string("Invalid value for ") + name + ": " + raw +
-                  "; using default " + (default_value ? "true" : "false"));
+  inferflux::log::Warn("http", std::string("Invalid value for ") + name + ": " +
+                                   raw + "; using default " +
+                                   (default_value ? "true" : "false"));
   return default_value;
 }
 
@@ -99,10 +98,9 @@ json OptionalIntToJson(const std::optional<int64_t> &value) {
 std::string GetHeaderValue(const std::string &headers,
                            const std::string &name) {
   auto lower_name = name;
-  std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
-                 [](unsigned char c) {
-                   return static_cast<char>(std::tolower(c));
-                 });
+  std::transform(
+      lower_name.begin(), lower_name.end(), lower_name.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
   std::size_t line_start = 0;
   while (line_start < headers.size()) {
@@ -112,13 +110,11 @@ std::string GetHeaderValue(const std::string &headers,
     const std::size_t colon = headers.find(':', line_start);
     if (colon != std::string::npos && colon < current_end) {
       std::string header_name = headers.substr(line_start, colon - line_start);
-      std::transform(header_name.begin(), header_name.end(), header_name.begin(),
-                     [](unsigned char c) {
-                       return static_cast<char>(std::tolower(c));
-                     });
+      std::transform(
+          header_name.begin(), header_name.end(), header_name.begin(),
+          [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
       if (header_name == lower_name) {
-        std::string val =
-            headers.substr(colon + 1, current_end - (colon + 1));
+        std::string val = headers.substr(colon + 1, current_end - (colon + 1));
         const auto s = val.find_first_not_of(" \t");
         const auto e = val.find_last_not_of(" \t\r\n");
         return (s == std::string::npos) ? "" : val.substr(s, e - s + 1);
@@ -1097,15 +1093,15 @@ HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
       speculative_decoder_(std::move(speculative_decoder)),
       model_selection_options_(model_selection_options),
       num_workers_(num_workers > 0 ? num_workers : 4) {
-  admission_fail_closed_on_disagg_degraded_ = ParseBoolEnv(
-      "INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED", false);
+  admission_fail_closed_on_disagg_degraded_ =
+      ParseBoolEnv("INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED", false);
   readyz_disagg_timeout_streak_threshold_ = ParseNonNegativeEnvInt(
       "INFERFLUX_READYZ_DISAGG_TIMEOUT_STREAK_THRESHOLD", 3);
-  readyz_disagg_timeout_debt_threshold_ = ParseNonNegativeEnvInt(
-      "INFERFLUX_READYZ_DISAGG_TIMEOUT_DEBT_THRESHOLD",
-      readyz_disagg_timeout_streak_threshold_ > 0
-          ? readyz_disagg_timeout_streak_threshold_ * 2
-          : 0);
+  readyz_disagg_timeout_debt_threshold_ =
+      ParseNonNegativeEnvInt("INFERFLUX_READYZ_DISAGG_TIMEOUT_DEBT_THRESHOLD",
+                             readyz_disagg_timeout_streak_threshold_ > 0
+                                 ? readyz_disagg_timeout_streak_threshold_ * 2
+                                 : 0);
 #if INFERFLUX_ENABLE_WEBUI
   webui_renderer_ = std::make_unique<WebUiRenderer>();
 #endif
@@ -1167,9 +1163,10 @@ HttpServer::ReadyStatus HttpServer::EvaluateReadyStatus() const {
     } else {
       status.model_loaded = model_ready_.load(std::memory_order_relaxed);
     }
-    status.decode_pool_warm =
-        scheduler_ && scheduler_->ConfiguredDecodeWorkers() > 0 &&
-        scheduler_->LiveDecodeWorkers() == scheduler_->ConfiguredDecodeWorkers();
+    status.decode_pool_warm = scheduler_ &&
+                              scheduler_->ConfiguredDecodeWorkers() > 0 &&
+                              scheduler_->LiveDecodeWorkers() ==
+                                  scheduler_->ConfiguredDecodeWorkers();
     status.ready = status.model_loaded && status.decode_pool_warm;
     if (!status.ready) {
       status.reason = !status.model_loaded ? "no model backend loaded"
@@ -1181,9 +1178,10 @@ HttpServer::ReadyStatus HttpServer::EvaluateReadyStatus() const {
     } else {
       status.model_loaded = model_ready_.load(std::memory_order_relaxed);
     }
-    status.decode_pool_warm =
-        !scheduler_ || scheduler_->ConfiguredDecodeWorkers() == 0 ||
-        scheduler_->LiveDecodeWorkers() == scheduler_->ConfiguredDecodeWorkers();
+    status.decode_pool_warm = !scheduler_ ||
+                              scheduler_->ConfiguredDecodeWorkers() == 0 ||
+                              scheduler_->LiveDecodeWorkers() ==
+                                  scheduler_->ConfiguredDecodeWorkers();
     status.ready = status.model_loaded;
     if (!status.ready) {
       status.reason = "no model backend loaded";
@@ -1200,8 +1198,7 @@ HttpServer::ReadyStatus HttpServer::EvaluateReadyStatus() const {
     status.disagg_timeout_streak = metrics_->GetDisaggKVTimeoutStreak();
     const bool streak_degraded =
         status.disagg_timeout_streak_threshold > 0 &&
-        status.disagg_timeout_streak >=
-            status.disagg_timeout_streak_threshold;
+        status.disagg_timeout_streak >= status.disagg_timeout_streak_threshold;
     const bool debt_degraded =
         status.disagg_timeout_debt_threshold > 0 &&
         status.disagg_timeout_debt >= status.disagg_timeout_debt_threshold;
@@ -1777,26 +1774,20 @@ void HttpServer::HandleClient(ClientSession &session) {
           {"prefill_queue_depth", OptionalIntToJson(pools.prefill_queue_depth)},
           {"decode_queue_depth", OptionalIntToJson(pools.decode_queue_depth)},
           {"batch_limit_size", OptionalIntToJson(pools.batch_limit_size)},
-          {"batch_limit_tokens",
-           OptionalIntToJson(pools.batch_limit_tokens)}}},
+          {"batch_limit_tokens", OptionalIntToJson(pools.batch_limit_tokens)}}},
         {"distributed_kv",
          {{"enqueue_rejections_total",
-           OptionalIntToJson(
-               pools.distributed_kv.enqueue_rejections_total)},
+           OptionalIntToJson(pools.distributed_kv.enqueue_rejections_total)},
           {"enqueue_exhausted_total",
-           OptionalIntToJson(
-               pools.distributed_kv.enqueue_exhausted_total)},
+           OptionalIntToJson(pools.distributed_kv.enqueue_exhausted_total)},
           {"tickets_enqueued_total",
            OptionalIntToJson(pools.distributed_kv.tickets_enqueued_total)},
           {"tickets_acknowledged_total",
-           OptionalIntToJson(
-               pools.distributed_kv.tickets_acknowledged_total)},
+           OptionalIntToJson(pools.distributed_kv.tickets_acknowledged_total)},
           {"tickets_committed_total",
-           OptionalIntToJson(
-               pools.distributed_kv.tickets_committed_total)},
+           OptionalIntToJson(pools.distributed_kv.tickets_committed_total)},
           {"tickets_timed_out_total",
-           OptionalIntToJson(
-               pools.distributed_kv.tickets_timed_out_total)}}},
+           OptionalIntToJson(pools.distributed_kv.tickets_timed_out_total)}}},
     };
     SendAll(session, BuildResponse(payload.dump()));
     return;
@@ -2387,12 +2378,10 @@ void HttpServer::HandleClient(ClientSession &session) {
         {"memory",
          {{"inferflux_cuda_model",
            {{"model", inferflux_cuda_model_memory.model_label},
-            {"reserved_bytes",
-             static_cast<int64_t>(
-                 inferflux_cuda_model_memory.total.reserved_bytes)},
-            {"in_use_bytes",
-             static_cast<int64_t>(
-                 inferflux_cuda_model_memory.total.in_use_bytes)},
+            {"reserved_bytes", static_cast<int64_t>(inferflux_cuda_model_memory
+                                                        .total.reserved_bytes)},
+            {"in_use_bytes", static_cast<int64_t>(inferflux_cuda_model_memory
+                                                      .total.in_use_bytes)},
             {"high_water_bytes",
              static_cast<int64_t>(
                  inferflux_cuda_model_memory.total.high_water_bytes)},
@@ -2416,27 +2405,20 @@ void HttpServer::HandleClient(ClientSession &session) {
             {"free_sequences", inferflux_cuda_kv_memory.free_sequences},
             {"max_sequences", inferflux_cuda_kv_memory.max_sequences}}},
           {"paged_kv",
-           {{"total_blocks",
-             static_cast<int64_t>(paged_kv_usage.total_blocks)},
-            {"used_blocks",
-             static_cast<int64_t>(paged_kv_usage.used_blocks)},
-            {"free_blocks",
-             static_cast<int64_t>(paged_kv_usage.free_blocks)},
+           {{"total_blocks", static_cast<int64_t>(paged_kv_usage.total_blocks)},
+            {"used_blocks", static_cast<int64_t>(paged_kv_usage.used_blocks)},
+            {"free_blocks", static_cast<int64_t>(paged_kv_usage.free_blocks)},
             {"page_size_bytes",
              static_cast<int64_t>(paged_kv_usage.page_size_bytes)},
-            {"total_bytes",
-             static_cast<int64_t>(paged_kv_usage.total_bytes())},
-            {"used_bytes",
-             static_cast<int64_t>(paged_kv_usage.used_bytes())},
-            {"free_bytes",
-             static_cast<int64_t>(paged_kv_usage.free_bytes())},
+            {"total_bytes", static_cast<int64_t>(paged_kv_usage.total_bytes())},
+            {"used_bytes", static_cast<int64_t>(paged_kv_usage.used_bytes())},
+            {"free_bytes", static_cast<int64_t>(paged_kv_usage.free_bytes())},
             {"prefix_retained_blocks",
              static_cast<int64_t>(prefix_memory.unique_retained_blocks)},
             {"prefix_retained_bytes",
              static_cast<int64_t>(prefix_memory.retained_bytes)},
             {"prefix_live_sequences",
-             static_cast<int64_t>(prefix_memory.live_sequences)}}}}}
-    };
+             static_cast<int64_t>(prefix_memory.live_sequences)}}}}}};
     SendAll(session, BuildResponse(payload.dump()));
     return;
   }
@@ -2561,7 +2543,7 @@ void HttpServer::HandleClient(ClientSession &session) {
 
     // Resolve backend with capability-aware fallback semantics.
     auto *router = scheduler_ ? scheduler_->Router() : nullptr;
-    std::shared_ptr<LlamaCppBackend> embed_backend;
+    std::shared_ptr<BackendInterface> embed_backend;
     std::string resolved_model = embed_model.empty() ? "default" : embed_model;
     if (router) {
       BackendFeatureRequirements requirements =
@@ -2628,15 +2610,8 @@ void HttpServer::HandleClient(ClientSession &session) {
     // Generate embeddings for each input.
     json data = json::array();
     int total_tokens = 0;
-    auto native_backend =
-        std::dynamic_pointer_cast<InferfluxCudaBackend>(embed_backend);
     for (std::size_t idx = 0; idx < inputs.size(); ++idx) {
-      std::vector<float> emb;
-      if (native_backend) {
-        emb = native_backend->EmbedForParity(inputs[idx]);
-      } else {
-        emb = embed_backend->Embed(inputs[idx]);
-      }
+      std::vector<float> emb = embed_backend->Embed(inputs[idx]);
       if (emb.empty()) {
         SendAll(session, BuildResponse(BuildErrorBody(
                                            "model_does_not_support_embeddings"),
@@ -2830,9 +2805,9 @@ void HttpServer::HandleClient(ClientSession &session) {
 
     const auto admission = EvaluateGenerationAdmissionDecision();
     if (!admission.allowed) {
-      auto payload = BuildResponse(BuildErrorBody(admission.error),
-                                   admission.http_status,
-                                   "Service Unavailable");
+      auto payload =
+          BuildResponse(BuildErrorBody(admission.error), admission.http_status,
+                        "Service Unavailable");
       SendAll(session, payload);
       if (audit_logger_) {
         audit_logger_->Log(auth_ctx.subject, parsed.model, admission.error,

@@ -183,6 +183,72 @@ cudaError_t ResidualAdd(T *residual, const T *input, int count,
 }
 
 // ============================================================================
+// Fused Residual Add + RMS Normalization
+// ============================================================================
+// Combines residual += input and output = RmsNorm(residual, weight, eps) into
+// a single kernel, eliminating one kernel launch per fusion site.
+
+template <typename T>
+__global__ void ResidualAddRmsNormKernel(T *__restrict__ residual,
+                                         const T *__restrict__ input,
+                                         const T *__restrict__ weight,
+                                         T *__restrict__ output,
+                                         int hidden_size, float eps) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  T *res_row = residual + row * hidden_size;
+  T *out_row = output + row * hidden_size;
+
+  extern __shared__ float shared[];
+
+  // Pass 1: residual += input, compute sum of squares
+  float local_sum = 0.0f;
+  for (int i = tid; i < hidden_size; i += blockDim.x) {
+    float r = DtypeTraits<T>::to_float(res_row[i]);
+    float x = DtypeTraits<T>::to_float(input[row * hidden_size + i]);
+    float val = r + x;
+    res_row[i] = DtypeTraits<T>::from_float(val);
+    local_sum += val * val;
+  }
+  shared[tid] = local_sum;
+  __syncthreads();
+
+  // Reduce
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      shared[tid] += shared[tid + s];
+    }
+    __syncthreads();
+  }
+
+  float rms = rsqrtf(shared[0] / static_cast<float>(hidden_size) + eps);
+
+  // Pass 2: apply RmsNorm (re-read from residual which now has the sum)
+  for (int i = tid; i < hidden_size; i += blockDim.x) {
+    float val = DtypeTraits<T>::to_float(res_row[i]) * rms *
+                DtypeTraits<T>::to_float(weight[i]);
+    out_row[i] = DtypeTraits<T>::from_float(val);
+  }
+}
+
+template <typename T>
+cudaError_t ResidualAddRmsNorm(T *residual, const T *input, const T *weight,
+                               T *output, int count, int hidden_size, float eps,
+                               cudaStream_t stream) {
+  int threads = min(1024, hidden_size);
+  int t = 1;
+  while (t < threads)
+    t <<= 1;
+  threads = t;
+  int smem = threads * sizeof(float);
+
+  ResidualAddRmsNormKernel<T>
+      <<<count, threads, smem, stream>>>(residual, input, weight, output,
+                                         hidden_size, eps);
+  return cudaGetLastError();
+}
+
+// ============================================================================
 // Embedding Lookup (templated)
 // ============================================================================
 
@@ -421,6 +487,13 @@ template cudaError_t ResidualAdd<half>(half *, const half *, int, cudaStream_t);
 template cudaError_t ResidualAdd<__nv_bfloat16>(__nv_bfloat16 *,
                                                 const __nv_bfloat16 *, int,
                                                 cudaStream_t);
+
+template cudaError_t ResidualAddRmsNorm<half>(half *, const half *,
+                                              const half *, half *, int, int,
+                                              float, cudaStream_t);
+template cudaError_t ResidualAddRmsNorm<__nv_bfloat16>(
+    __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *,
+    __nv_bfloat16 *, int, int, float, cudaStream_t);
 
 template cudaError_t EmbeddingLookup<half>(const half *, const int *, half *,
                                            int, int, cudaStream_t);

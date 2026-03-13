@@ -1,6 +1,7 @@
 #pragma once
 
-#include "runtime/backends/llama/llama_cpp_backend.h"
+#include "runtime/backends/common/backend_config.h"
+#include "runtime/backends/common/backend_interface.h"
 #include "scheduler/model_router.h"
 
 #include <chrono>
@@ -23,7 +24,7 @@ class SingleModelRouter : public ModelRouter {
 public:
   // Construct with a pre-loaded backend. The model info (id, path, backend
   // label) describes it for the /v1/models list endpoint.
-  explicit SingleModelRouter(std::shared_ptr<LlamaCppBackend> backend,
+  explicit SingleModelRouter(std::shared_ptr<BackendInterface> backend,
                              ModelInfo info);
 
   // Construct empty (no model loaded yet).
@@ -35,7 +36,7 @@ public:
 
   // Registers an already-loaded backend (used by server startup/tests).
   bool RegisterModel(const ModelInfo &info,
-                     std::shared_ptr<LlamaCppBackend> backend);
+                     std::shared_ptr<BackendInterface> backend);
 
   // ModelRouter interface.
   std::vector<ModelInfo> ListModels() const override;
@@ -46,7 +47,7 @@ public:
   bool UnloadModel(const std::string &id) override;
   ModelInfo *Resolve(const std::string &requested_model) override;
   ModelInfo *ResolveExact(const std::string &model_id) override;
-  std::shared_ptr<LlamaCppBackend>
+  std::shared_ptr<BackendInterface>
   GetBackend(const std::string &model_id) override;
   bool SetDefaultModel(const std::string &model_id) override;
   std::string DefaultModelId() const override;
@@ -54,12 +55,12 @@ public:
   std::string Name() const override { return "single"; }
 
   // Returns the underlying backend (nullptr if no model is loaded).
-  std::shared_ptr<LlamaCppBackend> Backend() const;
+  std::shared_ptr<BackendInterface> Backend() const;
 
 private:
   struct Entry {
     ModelInfo info;
-    std::shared_ptr<LlamaCppBackend> backend;
+    std::shared_ptr<BackendInterface> backend;
     std::chrono::steady_clock::time_point load_time;
   };
 

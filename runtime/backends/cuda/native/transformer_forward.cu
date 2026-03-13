@@ -73,6 +73,7 @@ struct PhaseTiming {
   double o_proj_ms{0}, ffn_proj_ms{0}, ffn_silu_ms{0}, ffn_down_ms{0},
       lm_head_ms{0};
   int forward_count{0};
+  int kernel_launches{0};
 
   void Begin(cudaStream_t s, bool should_enable) {
     if (!should_enable)
@@ -81,8 +82,15 @@ struct PhaseTiming {
     stream = s;
     embed_ms = qkv_ms = rope_ms = kv_ms = attn_ms = 0;
     o_proj_ms = ffn_proj_ms = ffn_silu_ms = ffn_down_ms = lm_head_ms = 0;
+    kernel_launches = 0;
     cudaStreamSynchronize(stream);
     last = std::chrono::steady_clock::now();
+  }
+
+  void CountKernel(int count = 1) {
+    if (enabled) {
+      kernel_launches += count;
+    }
   }
 
   double Mark() {
@@ -105,12 +113,14 @@ struct PhaseTiming {
     // Print every forward pass for first 5, then every 10th
     if (forward_count <= 5 || forward_count % 10 == 0) {
       fprintf(stderr,
-              "[phase_timing] #%d L=%d tokens=%d embed=%.2f qkv=%.2f rope=%.2f "
-              "kv=%.2f attn=%.2f o_proj=%.2f ffn_proj=%.2f ffn_silu=%.2f "
-              "ffn_down=%.2f ffn=%.2f lm_head=%.2f total=%.2f ms\n",
-              forward_count, num_layers, token_count, embed_ms, qkv_ms, rope_ms,
-              kv_ms, attn_ms, o_proj_ms, ffn_proj_ms, ffn_silu_ms, ffn_down_ms,
-              ffn_ms, lm_head_ms, total);
+              "[phase_timing] #%d L=%d tokens=%d kernels=%d embed=%.2f "
+              "qkv=%.2f rope=%.2f kv=%.2f attn=%.2f o_proj=%.2f "
+              "ffn_proj=%.2f ffn_silu=%.2f ffn_down=%.2f ffn=%.2f "
+              "lm_head=%.2f total=%.2f ms\n",
+              forward_count, num_layers, token_count, kernel_launches,
+              embed_ms, qkv_ms, rope_ms, kv_ms, attn_ms, o_proj_ms,
+              ffn_proj_ms, ffn_silu_ms, ffn_down_ms, ffn_ms, lm_head_ms,
+              total);
     }
   }
 };
@@ -1302,10 +1312,11 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
     pt.attn_ms += pt.Mark();
 
-    // 4h: O projection
+    // 4h: O projection + residual accumulation
     {
       NVTX_SCOPE("O_Projection");
       auto o_raw = weights_->LayerOProjRaw(layer);
+      bool o_accumulated = false;
       if (!TryQ8_1Gemv<T>(o_raw, d_attn_out_, d_norm_out_, d_act_q8_1_, seq_len,
                           hidden_size_, num_heads_ * head_dim_, stream_,
                           "o_proj", &execution_policy_) &&
@@ -1316,22 +1327,28 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           !TryFusedGemv<T>(o_raw, d_attn_out_, d_norm_out_, seq_len,
                            hidden_size_, num_heads_ * head_dim_, stream_,
                            "o_proj", &execution_policy_)) {
+        // cuBLAS fallback: accumulate directly into residual (beta=1.0),
+        // eliminating a separate ResidualAdd kernel launch.
         const T *o_proj =
             reinterpret_cast<const T *>(weights_->LayerOProj(layer));
-        if (!gemm_->GemmTyped<T>(seq_len, hidden_size_, num_heads_ * head_dim_,
-                                 d_attn_out_, o_proj, d_norm_out_)) {
+        if (!gemm_->GemmTypedAccum<T>(seq_len, hidden_size_,
+                                      num_heads_ * head_dim_, d_attn_out_,
+                                      o_proj, d_residual_)) {
           log::Error("llama_forward", "O projection failed");
           return false;
         }
+        o_accumulated = true;
       }
-    }
 
-    // 4i: residual += O
-    err = cuda_kernel::ResidualAdd<T>(d_residual_, d_norm_out_,
-                                      seq_len * hidden_size_, stream_);
-    if (err != cudaSuccess) {
-      log::Error("llama_forward", "Residual add (attn) failed");
-      return false;
+      // 4i: residual += O (skip if cuBLAS accumulated directly)
+      if (!o_accumulated) {
+        err = cuda_kernel::ResidualAdd<T>(d_residual_, d_norm_out_,
+                                          seq_len * hidden_size_, stream_);
+        if (err != cudaSuccess) {
+          log::Error("llama_forward", "Residual add (attn) failed");
+          return false;
+        }
+      }
     }
 
     pt.o_proj_ms += pt.Mark();
@@ -1461,6 +1478,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
       auto down_raw = weights_->LayerDownProjRaw(layer);
       auto down_mmq = weights_->LayerDownProjMmq(layer);
+      bool down_accumulated = false;
       const auto down_selected_op = SelectInferfluxCudaDownProjOperator(
           down_raw, down_mmq, ParseInferfluxCudaDispatchPhase(ffn_phase),
           FusedDispatchGeometry{seq_len, hidden_size_, intermediate_size_, 1,
@@ -1533,14 +1551,17 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                      seq_len, hidden_size_, intermediate_size_,
                                      stream_, "down_proj",
                                      &execution_policy_)) {
+                  // cuBLAS fallback: accumulate directly into residual
+                  // (beta=1.0), eliminating a separate ResidualAdd kernel.
                   const T *down_proj = reinterpret_cast<const T *>(
                       weights_->LayerDownProj(layer));
-                  if (!gemm_->GemmTyped<T>(seq_len, hidden_size_,
-                                           intermediate_size_, d_ffn_gate_,
-                                           down_proj, d_ffn_down_)) {
+                  if (!gemm_->GemmTypedAccum<T>(seq_len, hidden_size_,
+                                                intermediate_size_, d_ffn_gate_,
+                                                down_proj, d_residual_)) {
                     log::Error("llama_forward", "Down projection failed");
                     return false;
                   }
+                  down_accumulated = true;
                 }
                 return true;
               },
@@ -1555,12 +1576,14 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       }
     }
 
-    // 4o: residual += down
-    err = cuda_kernel::ResidualAdd<T>(d_residual_, d_ffn_down_,
-                                      seq_len * hidden_size_, stream_);
-    if (err != cudaSuccess) {
-      log::Error("llama_forward", "Residual add (FFN) failed");
-      return false;
+    // 4o: residual += down (skip if cuBLAS accumulated directly)
+    if (!down_accumulated) {
+      err = cuda_kernel::ResidualAdd<T>(d_residual_, d_ffn_down_,
+                                        seq_len * hidden_size_, stream_);
+      if (err != cudaSuccess) {
+        log::Error("llama_forward", "Residual add (FFN) failed");
+        return false;
+      }
     }
     pt.ffn_down_ms += pt.Mark();
   }
@@ -2017,10 +2040,11 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       }
       pt.attn_ms += pt.Mark();
 
-      // O projection
+      // O projection + residual accumulation
       {
         NVTX_SCOPE("O_Projection");
         auto o_raw = weights_->LayerOProjRaw(layer);
+        bool o_accumulated = false;
         if (!TryQ8_1Gemv<T>(o_raw, d_attn_out_, d_norm_out_, d_act_q8_1_, B,
                             hidden_size_, num_heads_ * head_dim_, stream_,
                             "o_proj", &execution_policy_) &&
@@ -2037,14 +2061,17 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
           }
           const T *o_proj =
               reinterpret_cast<const T *>(weights_->LayerOProj(layer));
-          gemm_->GemmTyped<T>(B, hidden_size_, num_heads_ * head_dim_,
-                              d_attn_out_, o_proj, d_norm_out_);
+          gemm_->GemmTypedAccum<T>(B, hidden_size_, num_heads_ * head_dim_,
+                                   d_attn_out_, o_proj, d_residual_);
+          o_accumulated = true;
+        }
+
+        // Residual add (skip if cuBLAS accumulated directly)
+        if (!o_accumulated) {
+          cuda_kernel::ResidualAdd<T>(d_residual_, d_norm_out_, B * hidden_size_,
+                                      stream_);
         }
       }
-
-      // Residual add
-      cuda_kernel::ResidualAdd<T>(d_residual_, d_norm_out_, B * hidden_size_,
-                                  stream_);
       pt.o_proj_ms += pt.Mark();
 
       // FFN block
@@ -2161,6 +2188,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
 
         auto down_raw = weights_->LayerDownProjRaw(layer);
         auto down_mmq = weights_->LayerDownProjMmq(layer);
+        bool down_accumulated = false;
         const auto down_selected_op = SelectInferfluxCudaDownProjOperator(
             down_raw, down_mmq, InferfluxCudaDispatchPhase::kDecode,
             FusedDispatchGeometry{B, hidden_size_, intermediate_size_, 1, true,
@@ -2231,8 +2259,10 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                     }
                     const T *down_proj = reinterpret_cast<const T *>(
                         weights_->LayerDownProj(layer));
-                    gemm_->GemmTyped<T>(B, hidden_size_, intermediate_size_,
-                                        d_ffn_gate_, down_proj, d_ffn_down_);
+                    gemm_->GemmTypedAccum<T>(B, hidden_size_, intermediate_size_,
+                                             d_ffn_gate_, down_proj,
+                                             d_residual_);
+                    down_accumulated = true;
                   }
                   return true;
                 },
@@ -2247,8 +2277,11 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
         }
       }
 
-      cuda_kernel::ResidualAdd<T>(d_residual_, d_ffn_down_, B * hidden_size_,
-                                  stream_);
+      // Residual add (skip if cuBLAS accumulated directly)
+      if (!down_accumulated) {
+        cuda_kernel::ResidualAdd<T>(d_residual_, d_ffn_down_, B * hidden_size_,
+                                    stream_);
+      }
       pt.ffn_down_ms += pt.Mark();
     }
 

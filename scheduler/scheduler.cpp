@@ -215,8 +215,8 @@ int ResidentSequenceTokenCount(const InferenceRequest &inference) {
 }
 
 bool WaitForUnifiedBatchAsync(
-    LlamaCppBackend *backend, LlamaCppBackend::UnifiedBatchHandle handle,
-    std::vector<LlamaCppBackend::UnifiedBatchOutput> *outputs,
+    LlamaCppBackend *backend, UnifiedBatchHandle handle,
+    std::vector<UnifiedBatchOutput> *outputs,
     std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
   if (!backend || !outputs || handle == 0) {
     return false;
@@ -240,7 +240,7 @@ struct PrefillStepState {
 bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
                               const InferenceRequest &inference,
                               const PrefillStepState &state,
-                              LlamaCppBackend::PrefillResult *result) {
+                              PrefillResult *result) {
   const int sequence_id = state.sequence_id;
   const int n_past_start = state.n_past_start;
   if (!backend || !result || sequence_id < 0) {
@@ -265,7 +265,7 @@ bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
 
   const int token_cap = std::max(1, backend->UnifiedBatchTokenCapacity());
   int chunk_start = bounded_start;
-  LlamaCppBackend::UnifiedBatchOutput final_output{};
+  UnifiedBatchOutput final_output{};
   while (chunk_start < static_cast<int>(prompt_tokens.size())) {
     int chunk_end = std::min(chunk_start + token_cap,
                              static_cast<int>(prompt_tokens.size()));
@@ -274,8 +274,8 @@ bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
     const bool request_logits =
         chunk_end == static_cast<int>(prompt_tokens.size());
 
-    std::vector<LlamaCppBackend::UnifiedBatchInput> inputs;
-    LlamaCppBackend::UnifiedBatchInput input;
+    std::vector<UnifiedBatchInput> inputs;
+    UnifiedBatchInput input;
     input.sequence_id = sequence_id;
     input.n_past = chunk_start;
     input.tokens = std::move(chunk);
@@ -285,10 +285,10 @@ bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
     input.sequence_generation = state.sequence_generation;
     inputs.push_back(std::move(input));
 
-    std::vector<LlamaCppBackend::UnifiedBatchOutput> outputs;
+    std::vector<UnifiedBatchOutput> outputs;
     if (backend->SupportsAsyncUnifiedBatch()) {
       const auto handle = backend->SubmitUnifiedBatchAsync(
-          inputs, LlamaCppBackend::UnifiedBatchLane::kPrefill);
+          inputs, UnifiedBatchLane::kPrefill);
       if (handle == 0 || !WaitForUnifiedBatchAsync(backend, handle, &outputs) ||
           outputs.size() != 1) {
         return false;
@@ -1556,7 +1556,8 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
           resolved = router_->Resolve(inf.model);
         }
         if (resolved && !resolved->id.empty()) {
-          backend_hint = router_->GetBackend(resolved->id);
+          backend_hint = std::static_pointer_cast<LlamaCppBackend>(
+              router_->GetBackend(resolved->id));
         }
       }
 
@@ -1925,7 +1926,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
             staged_decode_local.push_back(pending);
             queued_via_unified_prefill = true;
           } else {
-            LlamaCppBackend::PrefillResult pr;
+            PrefillResult pr;
             bool copied_prefix = false;
             int prefill_start = 0;
             if (prefix_hit && matched_tokens > 0 && cached_seq_id >= 0) {
@@ -2584,7 +2585,8 @@ void Scheduler::ReleaseSessionState(
     return;
   }
   if (!backend_hint && router_ && !state.model_id.empty()) {
-    backend_hint = router_->GetBackend(state.model_id);
+    backend_hint = std::static_pointer_cast<LlamaCppBackend>(
+        router_->GetBackend(state.model_id));
   }
   if (cache_ && !state.block_table.empty()) {
     cache_->ReleaseBlocksRef(state.block_table);
@@ -2758,7 +2760,8 @@ void Scheduler::ResolveBackends(
     }
 
     if (selection.backend && selection.backend->IsReady()) {
-      pending->resolved_backend = selection.backend;
+      pending->resolved_backend =
+          std::static_pointer_cast<LlamaCppBackend>(selection.backend);
       pending->inference.resolved_model = selection.info.id;
       GlobalMetrics().RecordModelRoute(selection.info.id,
                                        selection.info.backend, true);

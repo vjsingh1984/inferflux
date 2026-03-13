@@ -1327,7 +1327,9 @@ int main(int argc, char **argv) {
 
   // §2.2: Load multimodal projector if specified.
   if (llama_backend && !mmproj_path.empty()) {
-    if (llama_backend->LoadMmproj(mmproj_path)) {
+    auto llama_backend_cast =
+        std::static_pointer_cast<inferflux::LlamaCppBackend>(llama_backend);
+    if (llama_backend_cast->LoadMmproj(mmproj_path)) {
       std::cout << "[server] Multimodal projector loaded: " << mmproj_path
                 << "\n";
     } else {
@@ -1428,7 +1430,7 @@ int main(int argc, char **argv) {
   spec_config.max_prefill_tokens = speculative_max_prefill_tokens;
   spec_config.draft_model = speculative_draft_model;
   spec_config.chunk_size = speculative_chunk_size;
-  std::shared_ptr<inferflux::LlamaCppBackend> draft_backend = llama_backend;
+  std::shared_ptr<inferflux::BackendInterface> draft_backend = llama_backend;
   if (speculative_enabled && !speculative_draft_model.empty() &&
       speculative_draft_model != model_path) {
     auto draft_cfg = primary_cfg;

@@ -13,12 +13,14 @@ Commands:
   backend         Run the standard Nsight Systems backend profiler
   backend-ncu     Run the Nsight Compute backend profiler
   phase-timing    Parse native phase timing lines from a server log
+  phase-compare   Run inferflux_cuda vs llama_cpp_cuda side-by-side timing comparison
   analyze-nsys    Summarize exported Nsight Systems CSV reports
 
 Examples:
   scripts/profile.sh backend inferflux_cuda
   scripts/profile.sh backend-ncu inferflux_cuda
   scripts/profile.sh phase-timing gguf_benchmark_results/server_inferflux_cuda.log
+  scripts/profile.sh phase-compare --model /path/to/model.gguf
   scripts/profile.sh analyze-nsys nsys_backend_profiles/phaseb_inferflux_cuda
 EOF
 }
@@ -36,6 +38,10 @@ case "$cmd" in
   phase-timing)
     shift
     exec python3 "$ROOT_DIR/parse_native_phase_timing.py" "$@"
+    ;;
+  phase-compare)
+    shift
+    exec "$ROOT_DIR/phase_compare.sh" "$@"
     ;;
   analyze-nsys)
     shift

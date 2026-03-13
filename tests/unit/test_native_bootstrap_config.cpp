@@ -52,7 +52,7 @@ TEST_CASE("NativeBootstrapConfig: uses hinted KV precision and default sizing",
   const auto config = NativeBootstrapConfig::FromEnv("bf16");
   REQUIRE(config.dtype_override.empty());
   REQUIRE(config.kv_precision_choice == "bf16");
-  REQUIRE(config.kv_max_batch == 16);
+  REQUIRE(config.kv_max_batch == 32);
   REQUIRE(config.kv_max_seq == 4096);
   REQUIRE_FALSE(config.kv_max_seq_overridden);
   REQUIRE(config.kv_auto_tune);
@@ -74,7 +74,7 @@ TEST_CASE("NativeBootstrapConfig: records valid overrides and invalid raw values
   REQUIRE(config.dtype_override == "fp16");
   REQUIRE(config.ForceFp16());
   REQUIRE(config.kv_precision_choice == "bf16");
-  REQUIRE(config.kv_max_batch == 16);
+  REQUIRE(config.kv_max_batch == 32);
   REQUIRE(config.invalid_kv_max_batch == "bad");
   REQUIRE(config.kv_max_seq == 8192);
   REQUIRE(config.kv_max_seq_overridden);

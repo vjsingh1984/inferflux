@@ -1,7 +1,7 @@
 #pragma once
 
+#include "runtime/backends/common/backend_interface.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
-#include "runtime/backends/llama/llama_cpp_backend.h"
 
 #include <functional>
 #include <memory>
@@ -16,14 +16,14 @@ enum class BackendProvider;
 
 class BackendRegistry {
 public:
-  using CreatorFn = std::function<std::shared_ptr<LlamaCppBackend>()>;
+  using CreatorFn = std::function<std::shared_ptr<BackendInterface>()>;
 
   static BackendRegistry &Instance();
 
   void Register(LlamaBackendTarget target, BackendProvider provider,
                 CreatorFn fn);
-  std::shared_ptr<LlamaCppBackend> Create(LlamaBackendTarget target,
-                                          BackendProvider provider) const;
+  std::shared_ptr<BackendInterface> Create(LlamaBackendTarget target,
+                                           BackendProvider provider) const;
   bool Has(LlamaBackendTarget target, BackendProvider provider) const;
   std::vector<LlamaBackendTarget> AvailableTargets() const;
 

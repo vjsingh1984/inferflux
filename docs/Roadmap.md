@@ -1,7 +1,7 @@
 # InferFlux Roadmap
 
-**Snapshot date:** March 9, 2026  
-**Current overall grade:** B-  
+**Snapshot date:** March 13, 2026
+**Current overall grade:** B-
 **Target overall grade:** B (after native/runtime maturity), B+ (after required GPU and distributed gates)
 
 ```mermaid
@@ -51,6 +51,8 @@ Single benchmarks, partial scaffolding, or broad aspirations do not move grades.
 | P1 | Native-first parity independence | Completion/chat/embeddings critical behavior does not silently depend on delegate fallback |
 | P1 | Mandatory GPU behavior lane | Release cannot pass without native/provider/runtime behavioral gates |
 | P2 | Decode-worker session reuse | Session reuse remains safe in split-role deployments |
+| P2 | Lightweight distribution UI | Web-based management console for model serving, backend monitoring, and multi-GPU orchestration |
+| P2 | Dual/multi-GPU orchestration | First-class support for heterogeneous GPU setups (e.g., AMD + NVIDIA concurrent serving) |
 
 ## 5) Quarter Targets
 
@@ -59,7 +61,8 @@ Single benchmarks, partial scaffolding, or broad aspirations do not move grades.
 | Q2 2026 | Canonical docs, identity contracts, transport-health semantics, and memory foundations stay aligned with code |
 | Q3 2026 | Native quantized GGUF plus graph/overlap work show sustained representative gains |
 | Q4 2026 | Distributed runtime moves from ticketed foundation to ownership-safe, fault-tested foundation |
-| 2027 | Required GPU/provider CI and broader runtime maturity support higher grades |
+| 2027-H1 | Lightweight distribution UI ships: model management, backend dashboard, multi-GPU controls |
+| 2027-H2 | Required GPU/provider CI and broader runtime maturity support higher grades |
 
 ## 6) Canonical References
 

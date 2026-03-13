@@ -3113,11 +3113,37 @@ bool InferfluxCudaExecutor::RunNativeInference(
 }
 
 bool InferfluxCudaExecutor::ConfigureDequantizedCachePolicy(
-    const std::string &) {
-  return false;
+    const std::string &raw_policy) {
+  std::string policy = ToLowerAscii(raw_policy);
+  if (policy.empty()) {
+    policy = "none";
+  }
+
+  runtime::cuda::native::DequantizedCachePolicy parsed =
+      runtime::cuda::native::DequantizedCachePolicy::kNone;
+  if (!runtime::cuda::native::ParseDequantizedCachePolicy(policy, &parsed)) {
+    parsed = runtime::cuda::native::DequantizedCachePolicy::kNone;
+    policy = "none";
+  }
+  dequantized_cache_policy_ = parsed;
+  dequantized_cache_policy_hint_ = policy;
+
+  if (model_loader_) {
+    model_loader_->SetDequantizedCachePolicy(dequantized_cache_policy_);
+  }
+  return true;
 }
 
-void InferfluxCudaExecutor::ReleaseBatchScopedDequantizedCache() {}
+void InferfluxCudaExecutor::ReleaseBatchScopedDequantizedCache() {
+  if (!model_loader_ || model_loader_->GetFormat() != "gguf") {
+    return;
+  }
+  if (dequantized_cache_policy_ ==
+      runtime::cuda::native::DequantizedCachePolicy::kModelLifetime) {
+    return;
+  }
+  model_loader_->ClearDequantizedCache();
+}
 
 #endif // INFERFLUX_HAS_CUDA
 

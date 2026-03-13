@@ -2,6 +2,7 @@
 
 #include "model/tokenizer/simple_tokenizer.h"
 #include "runtime/backends/cpu/cpu_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/disaggregated/kv_channel.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/logprob.h"
@@ -181,7 +182,7 @@ private:
   struct DeferredSequenceRetirement {
     std::shared_ptr<LlamaCppBackend> backend;
     scheduler::SequenceLease lease;
-    LlamaCppBackend::SequenceReleaseFence fence;
+    SequenceReleaseFence fence;
     std::chrono::steady_clock::time_point retired_at;
   };
 

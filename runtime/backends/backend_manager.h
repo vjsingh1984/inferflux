@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/backends/llama/llama_cpp_backend.h"
+#include "runtime/backends/common/backend_interface.h"
 
 #include <memory>
 #include <mutex>
@@ -13,15 +13,15 @@ class BackendManager {
 public:
   BackendManager() = default;
 
-  std::shared_ptr<LlamaCppBackend> LoadBackend(const std::string &name,
+  std::shared_ptr<BackendInterface> LoadBackend(const std::string &name,
                                                const std::string &path,
                                                const LlamaBackendConfig &config,
                                                bool prefer_cuda = false);
-  std::shared_ptr<LlamaCppBackend> GetBackend(const std::string &name) const;
+  std::shared_ptr<BackendInterface> GetBackend(const std::string &name) const;
 
 private:
   mutable std::mutex mutex_;
-  std::unordered_map<std::string, std::shared_ptr<LlamaCppBackend>> backends_;
+  std::unordered_map<std::string, std::shared_ptr<BackendInterface>> backends_;
 };
 
 } // namespace inferflux

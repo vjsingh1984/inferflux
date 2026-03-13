@@ -1,5 +1,6 @@
 #include "runtime/execution/batch_executor.h"
 #include "runtime/backends/backend_utils.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 
@@ -1231,7 +1232,8 @@ BatchExecutor::ResolveBackend(const std::string &requested_model,
   if (resolved_id) {
     *resolved_id = info->id;
   }
-  return router_->GetBackend(info->id);
+  return std::static_pointer_cast<LlamaCppBackend>(
+      router_->GetBackend(info->id));
 }
 
 void BatchExecutor::ExecuteUnifiedBatchStep(

@@ -3,6 +3,7 @@
 #include "runtime/backends/backend_registry.h"
 #include "runtime/backends/cuda/cuda_backend.h"
 #include "runtime/backends/cuda/inferflux_cuda_backend.h"
+#include "runtime/backends/gpu/native_cuda_device_strategy.h"
 #include "runtime/backends/mps/mps_backend.h"
 #include "runtime/backends/rocm/rocm_backend.h"
 #include "runtime/backends/vulkan/vulkan_backend.h"
@@ -38,8 +39,11 @@ BackendExposurePolicy LoadPolicy() {
 }
 
 bool SupportsNativeBackend(LlamaBackendTarget target) {
+  // Check if a native provider is registered in the BackendRegistry AND the
+  // underlying hardware/kernels are available.  For CUDA this delegates to the
+  // NativeCudaDeviceStrategy readiness probe.
   if (target == LlamaBackendTarget::kCuda) {
-    return InferfluxCudaBackend::NativeKernelsReady();
+    return NativeCudaDeviceStrategy::NativeKernelsReady();
   }
   return false;
 }
@@ -54,12 +58,11 @@ bool IsExplicitLlamaCppHint(const std::string &hint) {
          hint == "cuda_llama";
 }
 
-std::shared_ptr<LlamaCppBackend>
+std::shared_ptr<BackendInterface>
 CreateNativeBackendForTarget(LlamaBackendTarget target) {
-  if (target == LlamaBackendTarget::kCuda) {
-#ifdef INFERFLUX_HAS_CUDA
-    return std::make_shared<InferfluxCudaBackend>();
-#endif
+  auto &reg = BackendRegistry::Instance();
+  if (reg.Has(target, BackendProvider::kNative)) {
+    return reg.Create(target, BackendProvider::kNative);
   }
   return nullptr;
 }

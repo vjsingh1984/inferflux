@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/backends/llama/llama_cpp_backend.h"
+#include "runtime/backends/common/backend_interface.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
 
 #include <memory>
@@ -24,7 +24,7 @@ struct BackendExposurePolicy {
 };
 
 struct BackendFactoryResult {
-  std::shared_ptr<LlamaCppBackend> backend;
+  std::shared_ptr<BackendInterface> backend;
   std::string backend_label{"cpu"};
   LlamaBackendTarget target{LlamaBackendTarget::kCpu};
   LlamaBackendTraits traits{};

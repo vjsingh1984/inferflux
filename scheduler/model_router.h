@@ -8,6 +8,7 @@
 
 namespace inferflux {
 
+class BackendInterface;
 class LlamaCppBackend;
 
 // ModelInfo describes a loaded model for routing and management.
@@ -83,7 +84,7 @@ public:
   virtual ModelInfo *ResolveExact(const std::string &model_id) = 0;
 
   // Retrieve the backend instance associated with a resolved model ID.
-  virtual std::shared_ptr<LlamaCppBackend>
+  virtual std::shared_ptr<BackendInterface>
   GetBackend(const std::string &model_id) = 0;
 
   // Set or query the default routing target.

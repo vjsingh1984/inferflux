@@ -199,7 +199,7 @@ public:
       UnifiedBatchHandle handle,
       std::vector<UnifiedBatchOutput> *outputs) override;
 
-  std::shared_ptr<LlamaCppBackend> BackendHandle() const override {
+  std::shared_ptr<BackendInterface> BackendHandle() const override {
     return nullptr; // No llama backend!
   }
 

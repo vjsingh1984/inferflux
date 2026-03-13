@@ -23,14 +23,12 @@ set(MLX_C_TAG "v0.5.0" CACHE STRING "mlx-c git tag to use when building from sou
 
 option(ENABLE_CPU "Enable CPU runtime" ON)
 option(ENABLE_MTMD "Enable multimodal (vision) support via libmtmd" OFF)
-option(INFERFLUX_USE_COMMON_BACKEND_TYPES "Use common backend types from runtime/backends/common (Phase 2 migration)" OFF)
 option(INFERFLUX_CUDA_DEVICE_LTO "Enable CUDA device LTO profile (requires custom lto gencode)" OFF)
 option(INFERFLUX_CUDA_USE_FAST_MATH "Enable --use_fast_math for CUDA kernels (default ON, matches llama.cpp)" ON)
 option(INFERFLUX_CUDA_NATIVE_ARCH "Compile CUDA kernels for local GPU only (faster builds, better codegen)" OFF)
 
-if(INFERFLUX_USE_COMMON_BACKEND_TYPES)
-  add_compile_definitions(INFERFLUX_USE_COMMON_BACKEND_TYPES)
-endif()
+# BackendInterface is the canonical base for all backends.
+add_compile_definitions(INFERFLUX_USE_COMMON_BACKEND_TYPES)
 
 add_library(inferflux_core
   runtime/device_context.h
@@ -50,6 +48,9 @@ add_library(inferflux_core
   runtime/backends/cuda/inferflux_cuda_runtime.h
   runtime/backends/cuda/inferflux_cuda_backend.cpp
   runtime/backends/cuda/inferflux_cuda_backend.h
+  runtime/backends/native/native_inference_runtime.h
+  runtime/backends/native/native_gpu_backend.cpp
+  runtime/backends/native/native_gpu_backend.h
   runtime/backends/cuda/native/safetensors_parser.cpp
   runtime/backends/cuda/native/safetensors_parser.h
   runtime/backends/cuda/inferflux_cuda_executor.cpp
@@ -68,6 +69,8 @@ add_library(inferflux_core
   runtime/backends/gpu/backend_config_extensions.h
   runtime/backends/gpu/cuda_device_strategy.cpp
   runtime/backends/gpu/cuda_device_strategy.h
+  runtime/backends/gpu/native_cuda_device_strategy.cpp
+  runtime/backends/gpu/native_cuda_device_strategy.h
   runtime/backends/gpu/rocm_device_strategy.cpp
   runtime/backends/gpu/rocm_device_strategy.h
   runtime/backends/gpu/mps_device_strategy.cpp
@@ -192,6 +195,38 @@ find_package(CUDAToolkit QUIET)
 
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   message(STATUS "CUDA toolkit found: enabling CUDA build path")
+
+  # GCC 14+ on Ubuntu 24.04 moved cc1plus to /usr/libexec/ which nvcc cannot
+  # find.  Auto-detect a compatible host compiler if the default g++ fails.
+  if(NOT CMAKE_CUDA_HOST_COMPILER)
+    execute_process(
+      COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=cc1plus
+      OUTPUT_VARIABLE _cc1plus_path OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_cc1plus_path STREQUAL "cc1plus" OR NOT EXISTS "${_cc1plus_path}"
+       OR NOT _cc1plus_path MATCHES "/usr/lib/")
+      # cc1plus is not in the standard path nvcc expects — find an older g++
+      foreach(_gxx g++-13 g++-12 g++-11)
+        find_program(_compat_gxx ${_gxx})
+        if(_compat_gxx)
+          execute_process(
+            COMMAND ${_compat_gxx} -print-file-name=cc1plus
+            OUTPUT_VARIABLE _compat_cc1plus OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+          if(EXISTS "${_compat_cc1plus}" AND _compat_cc1plus MATCHES "/usr/lib/")
+            set(CMAKE_CUDA_HOST_COMPILER "${_compat_gxx}" CACHE FILEPATH
+                "CUDA host compiler (auto-detected for nvcc compatibility)" FORCE)
+            message(STATUS "CUDA host compiler auto-set to ${_compat_gxx} (system g++ cc1plus not in nvcc search path)")
+            break()
+          endif()
+        endif()
+        unset(_compat_gxx CACHE)
+      endforeach()
+      if(NOT CMAKE_CUDA_HOST_COMPILER)
+        message(WARNING "System g++ cc1plus not found in nvcc search path and no compatible g++-{13,12,11} found. "
+                        "CUDA build may fail. Install g++-12: sudo apt install g++-12")
+      endif()
+    endif()
+  endif()
+
   if(INFERFLUX_CUDA_NATIVE_ARCH)
     # Keep the cache aligned with the requested mode so reconfigured dev builds
     # do not retain an old numeric architecture list and still pass -arch=native
@@ -327,6 +362,9 @@ else()
   set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
 endif()
 
+# Multi-backend: CUDA and ROCm can be enabled simultaneously.  llama.cpp builds
+# ggml-cuda and ggml-hip as independent backends; InferFlux native kernels use
+# CUDA only.  Use --all-backends in scripts/build.sh or set both options here.
 if(ENABLE_ROCM)
   find_package(hip QUIET CONFIG PATHS /opt/rocm)
   find_package(rocblas QUIET CONFIG PATHS /opt/rocm)
@@ -348,6 +386,10 @@ if(ENABLE_ROCM)
     endif()
     set(LLAMA_HIP OFF CACHE BOOL "" FORCE)
   endif()
+endif()
+
+if(TARGET CUDA::cudart AND LLAMA_HIP)
+  message(STATUS "Multi-backend build: CUDA + ROCm enabled simultaneously")
 endif()
 
 if(ENABLE_WEBUI)
@@ -426,6 +468,10 @@ endif()
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+# Workaround: llama.cpp ggml-cuda CUDA host compiler version detection can fail
+# in WSL2, causing ggml_get_flags() to receive empty CCVER argument.
+# Disable ggml compiler warnings flags to skip the problematic detection path.
+set(GGML_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
 # NOTE: LLAMA_CUDA, LLAMA_METAL, and LLAMA_BLAS are set by the hardware-detection
 # blocks above.  Do NOT override them here — the former stale reset was a bug
 # that silently disabled GPU support even when CUDAToolkit was found.
@@ -592,6 +638,25 @@ if(ENABLE_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/external
   )
   target_link_libraries(inferflux_first_token_probe PRIVATE inferflux_core)
+
+  add_executable(inferflux_kernel_count_probe
+    tests/tools/kernel_count_probe.cpp
+  )
+  target_include_directories(inferflux_kernel_count_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external
+  )
+  target_link_libraries(inferflux_kernel_count_probe PRIVATE inferflux_core)
+  find_library(CUPTI_LIBRARY cupti
+    HINTS ${CUDAToolkit_LIBRARY_DIR}
+          ${CUDA_TOOLKIT_ROOT_DIR}/extras/CUPTI/lib64
+          ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+  )
+  if(CUPTI_LIBRARY)
+    target_link_libraries(inferflux_kernel_count_probe PRIVATE ${CUPTI_LIBRARY})
+    target_include_directories(inferflux_kernel_count_probe PRIVATE
+      ${CUDA_TOOLKIT_ROOT_DIR}/extras/CUPTI/include
+    )
+  endif()
 endif()
 if(ENABLE_MLX)
   target_sources(inferflux_tests PRIVATE

@@ -34,7 +34,9 @@ find server runtime scheduler model cli net io policy \
 
 **Build outputs:** `build/inferfluxd` (server), `build/inferctl` (CLI), `build/inferflux_tests` (test binary)
 
-**Dependencies:** llama.cpp (git submodule at `external/llama.cpp` — treat as vendor code), yaml-cpp (auto-fetched via CMake FetchContent), OpenSSL, nlohmann/json v3.11.3 (single-header at `external/nlohmann/json.hpp`), Catch2 v3.7.1 (amalgamated at `external/catch2/`)
+**Dependencies:** llama.cpp (git submodule at `external/llama.cpp` — **READONLY, never modify**), yaml-cpp (auto-fetched via CMake FetchContent), OpenSSL, nlohmann/json v3.11.3 (single-header at `external/nlohmann/json.hpp`), Catch2 v3.7.1 (amalgamated at `external/catch2/`)
+
+**IMPORTANT:** `external/llama.cpp` is a readonly git submodule used for reference and build only. **Never edit, patch, or write files inside `external/llama.cpp/`**. If llama.cpp behavior needs to change, wrap or override it in InferFlux code instead. To update the submodule version, use `git submodule update` — do not commit changes inside the submodule directory.
 
 ## Testing
 

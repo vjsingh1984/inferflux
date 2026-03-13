@@ -586,7 +586,7 @@ public:
     return it == models_.end() ? nullptr : &it->second;
   }
 
-  std::shared_ptr<LlamaCppBackend>
+  std::shared_ptr<BackendInterface>
   GetBackend(const std::string &model_id) override {
     auto it = backends_.find(model_id);
     return it == backends_.end() ? nullptr : it->second;

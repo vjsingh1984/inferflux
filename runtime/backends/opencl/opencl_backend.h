@@ -8,9 +8,7 @@ class OpenClBackend : public GpuAcceleratedBackend {
 public:
   OpenClBackend();
 
-#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
   std::string Name() const override { return "llama_cpp_opencl"; }
-#endif
 };
 
 } // namespace inferflux

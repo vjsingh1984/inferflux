@@ -1,5 +1,5 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
-#include "runtime/backends/llama/llama_cpp_backend.h"
+#include "runtime/backends/common/backend_interface.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
 
 #include <algorithm>
@@ -70,7 +70,7 @@ RadixPrefixMemorySnapshot RadixPrefixCache::MemorySnapshot() const {
 }
 
 bool RadixPrefixCache::Lookup(const std::vector<int> &tokens,
-                              LlamaCppBackend *backend,
+                              BackendInterface *backend,
                               RadixLookupResult *result) {
   if (result) {
     result->block_table.clear();
@@ -170,7 +170,7 @@ void RadixPrefixCache::SplitEdge(RadixNode *parent, const SplitEdgeSpec &spec) {
 void RadixPrefixCache::Insert(const std::vector<int> &tokens,
                               const std::vector<int> &block_table,
                               int sequence_id,
-                              const std::shared_ptr<LlamaCppBackend> &backend) {
+                              const std::shared_ptr<BackendInterface> &backend) {
   if (capacity_ == 0 || tokens.empty() || block_table.empty()) {
     return;
   }

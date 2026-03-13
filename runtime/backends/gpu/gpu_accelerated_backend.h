@@ -19,9 +19,7 @@ public:
 
   const GpuDeviceInfo &DeviceInfo() const { return device_info_; }
 
-#ifdef INFERFLUX_USE_COMMON_BACKEND_TYPES
   std::string Name() const override;
-#endif
 
 protected:
   std::unique_ptr<GpuDeviceStrategy> strategy_;

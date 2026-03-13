@@ -16,7 +16,7 @@ void BackendRegistry::Register(LlamaBackendTarget target,
   creators_[key] = std::move(fn);
 }
 
-std::shared_ptr<LlamaCppBackend>
+std::shared_ptr<BackendInterface>
 BackendRegistry::Create(LlamaBackendTarget target,
                         BackendProvider provider) const {
   std::lock_guard<std::mutex> lock(mutex_);

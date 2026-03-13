@@ -29,6 +29,16 @@ template <typename T>
 cudaError_t ResidualAdd(T *residual, const T *input, int count,
                         cudaStream_t stream);
 
+/**
+ * FusedResidualAddRmsNorm: residual += input; output = RmsNorm(residual)
+ * Combines two kernels into one, saving a kernel launch per fusion site.
+ * count = number of rows, hidden_size = row width.
+ */
+template <typename T>
+cudaError_t ResidualAddRmsNorm(T *residual, const T *input, const T *weight,
+                               T *output, int count, int hidden_size, float eps,
+                               cudaStream_t stream);
+
 template <typename T>
 cudaError_t EmbeddingLookup(const T *table, const int *token_ids, T *output,
                             int seq_len, int hidden_size, cudaStream_t stream);
@@ -72,6 +82,11 @@ cudaError_t SiluMul(const half *gate, const half *up, half *output, int count,
 
 cudaError_t ResidualAdd(half *residual, const half *input, int count,
                         cudaStream_t stream);
+
+cudaError_t ResidualAddRmsNorm(half *residual, const half *input,
+                               const half *weight, half *output, int count,
+                               int hidden_size, float eps,
+                               cudaStream_t stream);
 
 cudaError_t EmbeddingLookup(const half *table, const int *token_ids,
                             half *output, int seq_len, int hidden_size,
