@@ -481,6 +481,9 @@ assert_backend_identity() {
     if [ "$backend" != "inferflux_cuda" ]; then
         return 0
     fi
+    if [ "${SKIP_IDENTITY_CHECK:-0}" = "1" ]; then
+        return 0
+    fi
 
     python3 scripts/check_backend_identity.py \
         --base-url "http://127.0.0.1:$port" \

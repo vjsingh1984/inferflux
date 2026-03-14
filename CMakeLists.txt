@@ -529,7 +529,16 @@ else()
 endif()
 
 add_executable(inferfluxd server/main.cpp)
-target_link_libraries(inferfluxd PRIVATE inferflux_core)
+# Use --whole-archive to ensure static self-registration objects (backend
+# registry entries in inferflux_cuda_backend.cpp etc.) are linked even when
+# nothing else in main.cpp references them directly.
+if(MSVC)
+  target_link_libraries(inferfluxd PRIVATE inferflux_core)
+  target_link_options(inferfluxd PRIVATE /WHOLEARCHIVE:inferflux_core)
+else()
+  target_link_libraries(inferfluxd PRIVATE
+    -Wl,--whole-archive inferflux_core -Wl,--no-whole-archive)
+endif()
 
 add_executable(inferctl cli/main.cpp)
 target_link_libraries(inferctl PRIVATE inferflux_core)
