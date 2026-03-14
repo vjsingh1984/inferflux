@@ -1354,6 +1354,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     pt.o_proj_ms += pt.Mark();
 
     // 4j-n: FFN block
+    bool down_accumulated = false;
     {
       NVTX_SCOPE("FFN");
       // Gate projection: try fused RmsNorm+GEMV (post-attn norm)
@@ -1478,7 +1479,6 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
       auto down_raw = weights_->LayerDownProjRaw(layer);
       auto down_mmq = weights_->LayerDownProjMmq(layer);
-      bool down_accumulated = false;
       const auto down_selected_op = SelectInferfluxCudaDownProjOperator(
           down_raw, down_mmq, ParseInferfluxCudaDispatchPhase(ffn_phase),
           FusedDispatchGeometry{seq_len, hidden_size_, intermediate_size_, 1,
@@ -2075,6 +2075,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       pt.o_proj_ms += pt.Mark();
 
       // FFN block
+      bool down_accumulated = false;
       {
         NVTX_SCOPE("FFN");
         auto gate_raw = weights_->LayerGateProjRaw(layer);
@@ -2188,7 +2189,6 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
 
         auto down_raw = weights_->LayerDownProjRaw(layer);
         auto down_mmq = weights_->LayerDownProjMmq(layer);
-        bool down_accumulated = false;
         const auto down_selected_op = SelectInferfluxCudaDownProjOperator(
             down_raw, down_mmq, InferfluxCudaDispatchPhase::kDecode,
             FusedDispatchGeometry{B, hidden_size_, intermediate_size_, 1, true,
