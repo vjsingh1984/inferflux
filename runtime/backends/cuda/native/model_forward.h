@@ -72,6 +72,14 @@ public:
   }
 
   /**
+   * Pre-warm lazily-initialized weight caches (F32→FP16 norm weights,
+   * attention biases, embeddings).  Must be called once after Initialize()
+   * so that subsequent CUDA graph capture does not encounter illegal
+   * cudaStreamSynchronize calls inside the capture region.
+   */
+  virtual void WarmWeightCaches() {}
+
+  /**
    * Set the CUDA stream for forward passes.
    * Subclasses should propagate to cuBLAS handle and sampler.
    */

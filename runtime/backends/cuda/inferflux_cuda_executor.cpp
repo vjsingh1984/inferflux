@@ -949,6 +949,17 @@ void InferfluxCudaExecutor::FreeDeviceMemory() {
   // GPU memory is managed by SafetensorsLoader and native components
 }
 
+void InferfluxCudaExecutor::MaybeRefreshMemoryLedger() {
+  // Throttle memory ledger refresh to every 64 batches (~1/s at typical
+  // decode throughput). The ledger rebuild is CPU-only but involves ~10
+  // UpsertItem calls and a full metrics push, adding measurable overhead
+  // when called on every single batch.
+  if ((++batch_counter_ & 63) != 0) {
+    return;
+  }
+  RefreshMemoryLedger();
+}
+
 void InferfluxCudaExecutor::RefreshMemoryLedger() {
   memory_ledger_.Clear();
   if (!loaded_model_path_.empty()) {
@@ -1127,37 +1138,52 @@ void InferfluxCudaExecutor::ReleaseBatchScopedDequantizedCache() {
     return;
   }
 
-  if (compute_stream_) {
-    CheckCudaStatus(cudaStreamSynchronize(compute_stream_),
-                    "cudaStreamSynchronize(compute_stream_,dequant_cleanup)");
-  }
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-  if (decode_stream_) {
-    CheckCudaStatus(cudaStreamSynchronize(decode_stream_),
-                    "cudaStreamSynchronize(decode_stream_,dequant_cleanup)");
-  }
-  if (prefill_stream_) {
-    CheckCudaStatus(cudaStreamSynchronize(prefill_stream_),
-                    "cudaStreamSynchronize(prefill_stream_,dequant_cleanup)");
-  }
+  // Skip expensive stream synchronization when no dequant scratch is in use.
+  // With MMVQ/MMQ as the primary dispatch path, dequant scratch is only
+  // allocated for cuBLAS fallback (M>64 prefill) which is rare during decode.
+  // The 3 stream syncs (~2-4ms) per batch were the root cause of c=1
+  // throughput regression (81.7 → 50 tok/s).
+  const bool has_scratch = quantized_weight_map_ &&
+                           quantized_weight_map_->ScratchInUseBytes() > 0;
+#else
+  const bool has_scratch = true;
+#endif
+
+  if (has_scratch) {
+    if (compute_stream_) {
+      CheckCudaStatus(cudaStreamSynchronize(compute_stream_),
+                      "cudaStreamSynchronize(compute_stream_,dequant_cleanup)");
+    }
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+    if (decode_stream_) {
+      CheckCudaStatus(cudaStreamSynchronize(decode_stream_),
+                      "cudaStreamSynchronize(decode_stream_,dequant_cleanup)");
+    }
+    if (prefill_stream_) {
+      CheckCudaStatus(cudaStreamSynchronize(prefill_stream_),
+                      "cudaStreamSynchronize(prefill_stream_,dequant_cleanup)");
+    }
 #endif
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-  if (quantized_weight_map_) {
-    quantized_weight_map_->ClearCache();
-    quantized_weight_map_->ReleaseScratchBuffer();
-  }
-  if (decode_lane_quantized_weight_map_) {
-    decode_lane_quantized_weight_map_->ClearCache();
-    decode_lane_quantized_weight_map_->ReleaseScratchBuffer();
-  }
-  if (prefill_lane_quantized_weight_map_) {
-    prefill_lane_quantized_weight_map_->ClearCache();
-    prefill_lane_quantized_weight_map_->ReleaseScratchBuffer();
-  }
+    if (quantized_weight_map_) {
+      quantized_weight_map_->ClearCache();
+      quantized_weight_map_->ReleaseScratchBuffer();
+    }
+    if (decode_lane_quantized_weight_map_) {
+      decode_lane_quantized_weight_map_->ClearCache();
+      decode_lane_quantized_weight_map_->ReleaseScratchBuffer();
+    }
+    if (prefill_lane_quantized_weight_map_) {
+      prefill_lane_quantized_weight_map_->ClearCache();
+      prefill_lane_quantized_weight_map_->ReleaseScratchBuffer();
+    }
 #endif
+    RefreshMemoryLedger();
+  }
+
   model_loader_->ClearDequantizedCache();
-  RefreshMemoryLedger();
 }
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
@@ -1773,6 +1799,10 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
     }
     model_forward_->SetExecutionPolicy(execution_policy_);
   }
+
+  // 3b. Pre-warm weight caches so CUDA graph capture doesn't encounter
+  // illegal cudaStreamSynchronize from lazy F32→FP16 dequantization.
+  model_forward_->WarmWeightCaches();
 
   // 4. Initialize GPU sampler
   sampler_ = std::make_unique<GpuSampler>();
@@ -2650,15 +2680,15 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
   // Check for mixed workload and use overlap path if enabled
   if (allow_overlap && HasMixedWorkload(inputs)) {
     auto outputs = ExecuteUnifiedBatchWithOverlap(inputs);
-    RefreshMemoryLedger();
+    MaybeRefreshMemoryLedger();
     return outputs;
   }
 
-  std::unique_lock<std::mutex> shared_pipeline_lock(shared_pipeline_mutex_,
-                                                    std::defer_lock);
-  if (!CanRunLaneOverlap()) {
-    shared_pipeline_lock.lock();
-  }
+  // Always serialize access to the shared GPU pipeline (model_forward_,
+  // d_logits_, sampler_) in the standard (non-overlap) execution path.
+  // Without this lock, concurrent ExecuteUnifiedBatch() calls from the
+  // scheduler race on shared device buffers, causing segfaults at c≥8.
+  std::lock_guard<std::mutex> shared_pipeline_lock(shared_pipeline_mutex_);
 
   // Standard execution path for non-mixed workloads
   std::vector<UnifiedBatchOutput> outputs;
@@ -2980,7 +3010,7 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
     }
   }
 
-  RefreshMemoryLedger();
+  MaybeRefreshMemoryLedger();
   return outputs;
 #else
   log::Warn("inferflux_cuda_executor",
@@ -3144,6 +3174,8 @@ void InferfluxCudaExecutor::ReleaseBatchScopedDequantizedCache() {
   }
   model_loader_->ClearDequantizedCache();
 }
+
+void InferfluxCudaExecutor::MaybeRefreshMemoryLedger() {}
 
 #endif // INFERFLUX_HAS_CUDA
 

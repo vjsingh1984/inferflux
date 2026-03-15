@@ -170,6 +170,7 @@ private:
   size_t dequantized_buffer_size_{0};
   DequantizedCachePolicy dequantized_cache_policy_{
       DequantizedCachePolicy::kNone};
+  bool has_dequantized_entries_{false}; // Fast bail-out for ClearDequantizedCache
 
   // File path
   std::filesystem::path model_path_;
@@ -187,7 +188,8 @@ private:
  */
 class GGUFWeightAccessor : public IWeightAccessor {
 public:
-  explicit GGUFWeightAccessor(GGUFTensorData *tensor);
+  explicit GGUFWeightAccessor(GGUFTensorData *tensor,
+                              bool *dequant_dirty_flag = nullptr);
 
   // IWeightAccessor interface
   std::pair<size_t, size_t> GetDimensions() const override;
@@ -199,6 +201,7 @@ public:
 
 private:
   GGUFTensorData *tensor_;
+  bool *dequant_dirty_flag_{nullptr};
 };
 
 } // namespace native

@@ -974,19 +974,24 @@ void Scheduler::DecodeWorkerLoop() {
           return true;
         };
 
+        // All AllocSeqSlot/FreeSeqSlot calls must be protected by
+        // queue_mutex_ to prevent concurrent sequence slot operations
+        // that corrupt llama.cpp internal state (double-free at c≥16).
         bool ticket_committed = false;
-        for (auto &pending : batch) {
-          if (try_apply_packet(pending)) {
-            ticket_committed = true;
-            break;
-          }
-        }
-        if (!ticket_committed) {
+        {
           std::lock_guard<std::mutex> lock(queue_mutex_);
-          for (auto &pending : pending_decode_) {
+          for (auto &pending : batch) {
             if (try_apply_packet(pending)) {
               ticket_committed = true;
               break;
+            }
+          }
+          if (!ticket_committed) {
+            for (auto &pending : pending_decode_) {
+              if (try_apply_packet(pending)) {
+                ticket_committed = true;
+                break;
+              }
             }
           }
         }

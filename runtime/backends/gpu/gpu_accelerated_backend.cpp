@@ -8,8 +8,8 @@ GpuAcceleratedBackend::GpuAcceleratedBackend(
     std::unique_ptr<GpuDeviceStrategy> strategy)
     : strategy_(std::move(strategy)) {}
 
-bool GpuAcceleratedBackend::LoadModel(const std::filesystem::path &model_path,
-                                      const LlamaBackendConfig &config) {
+bool GpuAcceleratedBackend::InitializeDevice(
+    const LlamaBackendConfig &config, LlamaBackendConfig *tuned_out) {
   if (!strategy_) {
     log::Error("gpu_backend", "No device strategy configured");
     return false;
@@ -30,13 +30,28 @@ bool GpuAcceleratedBackend::LoadModel(const std::filesystem::path &model_path,
 
   LlamaBackendConfig tuned =
       TuneLlamaBackendConfig(strategy_->Target(), config);
+  strategy_->RecordMetrics(tuned);
+
+  if (tuned_out) {
+    *tuned_out = tuned;
+  }
+
+  log::Info("gpu_backend", "Device initialized: " + device_info_.device_name +
+                               " (arch=" + device_info_.arch + ")");
+  return true;
+}
+
+bool GpuAcceleratedBackend::LoadModel(const std::filesystem::path &model_path,
+                                      const LlamaBackendConfig &config) {
+  LlamaBackendConfig tuned;
+  if (!InitializeDevice(config, &tuned)) {
+    return false;
+  }
 
   if (!LlamaCppBackend::LoadModel(model_path, tuned)) {
     log::Error("gpu_backend", "Failed to load model at " + model_path.string());
     return false;
   }
-
-  strategy_->RecordMetrics(tuned);
 
   log::Info("gpu_backend", "Model loaded on " + device_info_.device_name +
                                " (arch=" + device_info_.arch + ")");

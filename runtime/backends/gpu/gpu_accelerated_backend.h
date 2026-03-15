@@ -15,6 +15,11 @@ public:
   bool LoadModel(const std::filesystem::path &model_path,
                  const LlamaBackendConfig &config = {}) override;
 
+  /// Initialize the GPU device without loading a llama.cpp model.
+  /// Returns the tuned config for downstream use.
+  bool InitializeDevice(const LlamaBackendConfig &config,
+                        LlamaBackendConfig *tuned_out = nullptr);
+
   bool IsReady() const override;
 
   const GpuDeviceInfo &DeviceInfo() const { return device_info_; }

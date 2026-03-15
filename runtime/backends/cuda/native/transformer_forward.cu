@@ -195,19 +195,6 @@ void DebugDumpHidden(const char *label, const void *d_data, int count,
           label, count, min_v, max_v, sum / count, nan_count);
 }
 
-// One-shot per-projection path logger. Logs which GEMM path (fused vs cuBLAS)
-// is taken for each projection name on first invocation only.
-void LogGemmPath(const char *proj_name, bool fused) {
-  // Hash projection name pointer (string literals have fixed addresses)
-  static std::unordered_map<const char *, bool> logged;
-  if (logged.count(proj_name))
-    return;
-  logged[proj_name] = true;
-  log::Info("llama_forward", std::string(proj_name) +
-                                 (fused ? ": using fused dequant-GEMV"
-                                        : ": using cuBLAS (dequantized FP16)"));
-}
-
 void LogPackedGemmPath(const char *proj_name, const char *label) {
   static std::unordered_map<std::string, bool> logged;
   const std::string key =
@@ -232,66 +219,6 @@ public:
 private:
   bool prev_{true};
 };
-
-// Fused dequant-GEMV dispatch: only valid for half (FP16) type.
-// Returns true if the fused kernel was launched.
-template <typename T>
-bool TryFusedGemv(const QuantizedWeightInfo &, const T *, T *, int, int, int,
-                  cudaStream_t, const char * = nullptr,
-                  const NativeExecutionPolicy * = nullptr) {
-  return false; // BF16 and other types: no fused path
-}
-
-template <>
-bool TryFusedGemv<half>(const QuantizedWeightInfo &raw, const half *input,
-                        half *output, int M, int N, int K, cudaStream_t stream,
-                        const char *proj_name,
-                        const NativeExecutionPolicy *policy) {
-  const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
-  if (ForceCublasRequested(policy_ref) || !g_allow_fused_quantized_matmul)
-    return false;
-  bool ok = raw.data &&
-            FusedQuantGemm::Gemv(raw, input, output, M, N, K, stream, policy);
-  if (proj_name)
-    LogGemmPath(proj_name, ok);
-  return ok;
-}
-
-// Fused RmsNorm+GEMV dispatch: computes normalization inside the GEMV kernel,
-// eliminating the standalone RmsNorm kernel launch and d_norm_out_ round-trip.
-// Only valid for half (FP16) type.
-template <typename T>
-bool TryFusedRmsNormGemv(const QuantizedWeightInfo &, const T *, const T *, T *,
-                         int, int, int, float, cudaStream_t,
-                         const char * = nullptr,
-                         const NativeExecutionPolicy * = nullptr) {
-  return false; // BF16 and other types: no fused path
-}
-
-template <>
-bool TryFusedRmsNormGemv<half>(const QuantizedWeightInfo &raw,
-                               const half *residual, const half *norm_weight,
-                               half *output, int M, int N, int K, float eps,
-                               cudaStream_t stream, const char *proj_name,
-                               const NativeExecutionPolicy *policy) {
-  const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
-  if (ForceCublasRequested(policy_ref) || !g_allow_fused_quantized_matmul)
-    return false;
-  bool ok = raw.data &&
-            FusedQuantGemm::RmsNormGemv(raw, residual, norm_weight, output, M,
-                                        N, K, eps, stream, policy);
-  if (proj_name) {
-    static std::unordered_map<const char *, bool> logged;
-    if (!logged.count(proj_name)) {
-      logged[proj_name] = true;
-      log::Info("llama_forward",
-                std::string(proj_name) +
-                    (ok ? ": using fused RmsNorm+GEMV"
-                        : ": using separate RmsNorm + GEMV/cuBLAS"));
-    }
-  }
-  return ok;
-}
 
 template <typename T>
 bool TryPackedGemv(const QuantizedWeightInfo &, const T *, T *, int8_t *,
@@ -1089,13 +1016,6 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 bool norm_computed = false;
 
                 if (!ExecuteNativeNormalizedProjectionStage(
-                        [&]() {
-                          return TryFusedRmsNormGemv<T>(
-                              q_raw, d_residual_, input_norm, d_q_, seq_len,
-                              num_heads_ * head_dim_, hidden_size_,
-                              rms_norm_eps_, stream_, "q_proj",
-                              &execution_policy_);
-                        },
                         &norm_computed,
                         [&]() {
                           err = cuda_kernel::RmsNorm<T>(
@@ -1110,10 +1030,11 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryFusedGemv<T>(
-                              q_raw, d_norm_out_, d_q_, seq_len,
-                              num_heads_ * head_dim_, hidden_size_, stream_,
-                              "q_proj", &execution_policy_);
+                          return TryQ8_1Gemv<T>(
+                                     q_raw, d_norm_out_, d_q_, d_act_q8_1_,
+                                     seq_len, num_heads_ * head_dim_,
+                                     hidden_size_, stream_, "q_proj",
+                                     &execution_policy_);
                         },
                         [&]() {
                           const T *q_proj = reinterpret_cast<const T *>(
@@ -1130,13 +1051,6 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 }
 
                 if (!ExecuteNativeNormalizedProjectionStage(
-                        [&]() {
-                          return TryFusedRmsNormGemv<T>(
-                              k_raw, d_residual_, input_norm, d_k_new_, seq_len,
-                              num_kv_heads_ * head_dim_, hidden_size_,
-                              rms_norm_eps_, stream_, "k_proj",
-                              &execution_policy_);
-                        },
                         &norm_computed,
                         [&]() {
                           err = cuda_kernel::RmsNorm<T>(
@@ -1151,10 +1065,11 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryFusedGemv<T>(
-                              k_raw, d_norm_out_, d_k_new_, seq_len,
-                              num_kv_heads_ * head_dim_, hidden_size_, stream_,
-                              "k_proj", &execution_policy_);
+                          return TryQ8_1Gemv<T>(
+                                     k_raw, d_norm_out_, d_k_new_, d_act_q8_1_,
+                                     seq_len, num_kv_heads_ * head_dim_,
+                                     hidden_size_, stream_, "k_proj",
+                                     &execution_policy_);
                         },
                         [&]() {
                           const T *k_proj = reinterpret_cast<const T *>(
@@ -1172,13 +1087,6 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 }
 
                 if (!ExecuteNativeNormalizedProjectionStage(
-                        [&]() {
-                          return TryFusedRmsNormGemv<T>(
-                              v_raw, d_residual_, input_norm, d_v_new_, seq_len,
-                              num_kv_heads_ * head_dim_, hidden_size_,
-                              rms_norm_eps_, stream_, "v_proj",
-                              &execution_policy_);
-                        },
                         &norm_computed,
                         [&]() {
                           err = cuda_kernel::RmsNorm<T>(
@@ -1193,10 +1101,11 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryFusedGemv<T>(
-                              v_raw, d_norm_out_, d_v_new_, seq_len,
-                              num_kv_heads_ * head_dim_, hidden_size_, stream_,
-                              "v_proj", &execution_policy_);
+                          return TryQ8_1Gemv<T>(
+                                     v_raw, d_norm_out_, d_v_new_, d_act_q8_1_,
+                                     seq_len, num_kv_heads_ * head_dim_,
+                                     hidden_size_, stream_, "v_proj",
+                                     &execution_policy_);
                         },
                         [&]() {
                           const T *v_proj = reinterpret_cast<const T *>(
@@ -1323,10 +1232,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           !TryPackedGemv<T>(o_raw, d_attn_out_, d_norm_out_,
                             d_packed_activation_, d_packed_activation_scales_,
                             seq_len, hidden_size_, num_heads_ * head_dim_,
-                            stream_, "o_proj", &execution_policy_) &&
-          !TryFusedGemv<T>(o_raw, d_attn_out_, d_norm_out_, seq_len,
-                           hidden_size_, num_heads_ * head_dim_, stream_,
-                           "o_proj", &execution_policy_)) {
+                            stream_, "o_proj", &execution_policy_)) {
         // cuBLAS fallback: accumulate directly into residual (beta=1.0),
         // eliminating a separate ResidualAdd kernel launch.
         const T *o_proj =
@@ -1391,13 +1297,6 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 bool ffn_norm_computed = false;
 
                 if (!ExecuteNativeNormalizedProjectionStage(
-                        [&]() {
-                          return TryFusedRmsNormGemv<T>(
-                              gate_raw, d_residual_, post_attn_norm,
-                              d_ffn_gate_, seq_len, intermediate_size_,
-                              hidden_size_, rms_norm_eps_, stream_, "gate_proj",
-                              &execution_policy_);
-                        },
                         &ffn_norm_computed,
                         [&]() {
                           err = cuda_kernel::RmsNorm<T>(
@@ -1411,10 +1310,11 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryFusedGemv<T>(
-                              gate_raw, d_norm_out_, d_ffn_gate_, seq_len,
-                              intermediate_size_, hidden_size_, stream_,
-                              "gate_proj", &execution_policy_);
+                          return TryQ8_1Gemv<T>(
+                                     gate_raw, d_norm_out_, d_ffn_gate_,
+                                     d_act_q8_1_, seq_len, intermediate_size_,
+                                     hidden_size_, stream_, "gate_proj",
+                                     &execution_policy_);
                         },
                         [&]() {
                           const T *gate_proj = reinterpret_cast<const T *>(
@@ -1432,13 +1332,6 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 }
 
                 if (!ExecuteNativeNormalizedProjectionStage(
-                        [&]() {
-                          return TryFusedRmsNormGemv<T>(
-                              up_raw, d_residual_, post_attn_norm, d_ffn_up_,
-                              seq_len, intermediate_size_, hidden_size_,
-                              rms_norm_eps_, stream_, "up_proj",
-                              &execution_policy_);
-                        },
                         &ffn_norm_computed,
                         [&]() {
                           err = cuda_kernel::RmsNorm<T>(
@@ -1452,10 +1345,11 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryFusedGemv<T>(up_raw, d_norm_out_, d_ffn_up_,
-                                                 seq_len, intermediate_size_,
-                                                 hidden_size_, stream_,
-                                                 "up_proj", &execution_policy_);
+                          return TryQ8_1Gemv<T>(
+                                     up_raw, d_norm_out_, d_ffn_up_,
+                                     d_act_q8_1_, seq_len, intermediate_size_,
+                                     hidden_size_, stream_, "up_proj",
+                                     &execution_policy_);
                         },
                         [&]() {
                           const T *up_proj = reinterpret_cast<const T *>(
@@ -1546,11 +1440,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                       d_packed_activation_,
                                       d_packed_activation_scales_, seq_len,
                                       hidden_size_, intermediate_size_, stream_,
-                                      "down_proj", &execution_policy_) &&
-                    !TryFusedGemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
-                                     seq_len, hidden_size_, intermediate_size_,
-                                     stream_, "down_proj",
-                                     &execution_policy_)) {
+                                      "down_proj", &execution_policy_)) {
                   // cuBLAS fallback: accumulate directly into residual
                   // (beta=1.0), eliminating a separate ResidualAdd kernel.
                   const T *down_proj = reinterpret_cast<const T *>(
@@ -1624,11 +1514,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                  d_packed_activation_,
                                  d_packed_activation_scales_, d_logits_typed_,
                                  1, vocab_size_, hidden_size_, rms_norm_eps_,
-                                 stream_, "lm_head", &execution_policy_) &&
-        !TryFusedRmsNormGemv<T>(lm_raw, last_hidden, final_norm,
-                                d_logits_typed_, 1, vocab_size_, hidden_size_,
-                                rms_norm_eps_, stream_, "lm_head",
-                                &execution_policy_)) {
+                                 stream_, "lm_head", &execution_policy_)) {
       // Fallback: standalone RmsNorm + GEMV/cuBLAS
       err = cuda_kernel::RmsNorm<T>(last_hidden, final_norm, d_norm_out_, 1,
                                     hidden_size_, rms_norm_eps_, stream_);
@@ -1636,9 +1522,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         log::Error("llama_forward", "Final RmsNorm failed");
         return false;
       }
-      if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, 1, vocab_size_,
-                           hidden_size_, stream_, "lm_head",
-                           &execution_policy_)) {
+      if (!TryQ8_1Gemv<T>(lm_raw, d_norm_out_, d_logits_typed_, d_act_q8_1_,
+                          1, vocab_size_, hidden_size_, stream_, "lm_head",
+                          &execution_policy_)) {
         const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
         if (!gemm_->GemmTyped<T>(1, vocab_size_, hidden_size_, d_norm_out_,
                                  lm_head, d_logits_typed_)) {
@@ -1674,6 +1560,29 @@ template <typename T>
 void LlamaForwardTyped<T>::SetExecutionPolicy(
     const NativeExecutionPolicy &policy) {
   execution_policy_ = policy;
+}
+
+template <typename T> void LlamaForwardTyped<T>::WarmWeightCaches() {
+  // Trigger lazy F32→FP16 dequantization for all norm weights, embedding
+  // tables, and attention biases.  These are stored as F32 in GGUF and
+  // converted via cudaStreamSynchronize on first access — which is illegal
+  // inside a CUDA graph capture region.  Calling this at model-load time
+  // ensures the caches are populated before the first BatchForward().
+  weights_->EmbedTokens();
+  for (int l = 0; l < num_layers_; ++l) {
+    weights_->LayerInputNorm(l);
+    weights_->LayerPostAttnNorm(l);
+    weights_->LayerQProjBias(l);
+    weights_->LayerKProjBias(l);
+    weights_->LayerVProjBias(l);
+  }
+  weights_->FinalNorm();
+  // Clear any CUDA errors from pre-warm (e.g., missing bias tensors return
+  // nullptr without error, but some edge-case allocations may fail).
+  cudaGetLastError();
+  log::Info("llama_forward",
+            "Weight caches pre-warmed (" + std::to_string(num_layers_) +
+                " layers)");
 }
 
 template <typename T>
@@ -1760,6 +1669,13 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   }
   bool use_graph = ShouldUseDecodeGraph(graph_enabled_, graph_disabled,
                                         phase_timing_enabled, capture_safe);
+  // Graph warmup: skip capture for the first N calls to let any remaining
+  // lazy first-use allocations settle.  With WarmWeightCaches() called at
+  // init time, this should normally be 0.
+  if (use_graph && graph_warmup_remaining_ > 0 && !decode_graph_exec_) {
+    --graph_warmup_remaining_;
+    use_graph = false;
+  }
   PhaseTiming pt;
   pt.Begin(stream_, phase_timing_enabled);
 
@@ -1788,6 +1704,9 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   // Begin graph capture if enabled
   bool capturing = false;
   if (use_graph) {
+    // Drain any sticky CUDA error from prior operations (e.g., prefill
+    // Forward(), weight dequantization, or pre-warm failures).
+    cudaGetLastError();
     err = cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed);
     if (err == cudaSuccess) {
       capturing = true;
@@ -1861,13 +1780,6 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                   bool norm_computed = false;
 
                   if (!ExecuteNativeNormalizedProjectionStage(
-                          [&]() {
-                            return TryFusedRmsNormGemv<T>(
-                                q_raw, d_residual_, input_norm, d_q_, B,
-                                num_heads_ * head_dim_, hidden_size_,
-                                rms_norm_eps_, stream_, "q_proj",
-                                &execution_policy_);
-                          },
                           &norm_computed,
                           [&]() {
                             cuda_kernel::RmsNorm<T>(
@@ -1876,10 +1788,11 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                             return true;
                           },
                           [&]() {
-                            return TryFusedGemv<T>(
-                                q_raw, d_norm_out_, d_q_, B,
-                                num_heads_ * head_dim_, hidden_size_, stream_,
-                                "q_proj", &execution_policy_);
+                            return TryQ8_1Gemv<T>(
+                                       q_raw, d_norm_out_, d_q_, d_act_q8_1_,
+                                       B, num_heads_ * head_dim_, hidden_size_,
+                                       stream_, "q_proj",
+                                       &execution_policy_);
                           },
                           [&]() {
                             if (capturing) {
@@ -1897,13 +1810,6 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                   }
 
                   if (!ExecuteNativeNormalizedProjectionStage(
-                          [&]() {
-                            return TryFusedRmsNormGemv<T>(
-                                k_raw, d_residual_, input_norm, d_k_new_, B,
-                                num_kv_heads_ * head_dim_, hidden_size_,
-                                rms_norm_eps_, stream_, "k_proj",
-                                &execution_policy_);
-                          },
                           &norm_computed,
                           [&]() {
                             cuda_kernel::RmsNorm<T>(
@@ -1912,10 +1818,12 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                             return true;
                           },
                           [&]() {
-                            return TryFusedGemv<T>(
-                                k_raw, d_norm_out_, d_k_new_, B,
-                                num_kv_heads_ * head_dim_, hidden_size_,
-                                stream_, "k_proj", &execution_policy_);
+                            return TryQ8_1Gemv<T>(
+                                       k_raw, d_norm_out_, d_k_new_,
+                                       d_act_q8_1_, B,
+                                       num_kv_heads_ * head_dim_, hidden_size_,
+                                       stream_, "k_proj",
+                                       &execution_policy_);
                           },
                           [&]() {
                             if (capturing) {
@@ -1933,13 +1841,6 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                   }
 
                   if (!ExecuteNativeNormalizedProjectionStage(
-                          [&]() {
-                            return TryFusedRmsNormGemv<T>(
-                                v_raw, d_residual_, input_norm, d_v_new_, B,
-                                num_kv_heads_ * head_dim_, hidden_size_,
-                                rms_norm_eps_, stream_, "v_proj",
-                                &execution_policy_);
-                          },
                           &norm_computed,
                           [&]() {
                             cuda_kernel::RmsNorm<T>(
@@ -1948,10 +1849,12 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                             return true;
                           },
                           [&]() {
-                            return TryFusedGemv<T>(
-                                v_raw, d_norm_out_, d_v_new_, B,
-                                num_kv_heads_ * head_dim_, hidden_size_,
-                                stream_, "v_proj", &execution_policy_);
+                            return TryQ8_1Gemv<T>(
+                                       v_raw, d_norm_out_, d_v_new_,
+                                       d_act_q8_1_, B,
+                                       num_kv_heads_ * head_dim_, hidden_size_,
+                                       stream_, "v_proj",
+                                       &execution_policy_);
                           },
                           [&]() {
                             if (capturing) {
@@ -2051,10 +1954,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             !TryPackedGemv<T>(o_raw, d_attn_out_, d_norm_out_,
                               d_packed_activation_, d_packed_activation_scales_,
                               B, hidden_size_, num_heads_ * head_dim_, stream_,
-                              "o_proj", &execution_policy_) &&
-            !TryFusedGemv<T>(o_raw, d_attn_out_, d_norm_out_, B, hidden_size_,
-                             num_heads_ * head_dim_, stream_, "o_proj",
-                             &execution_policy_)) {
+                              "o_proj", &execution_policy_)) {
           if (capturing) {
             capture_abort = true;
             return false;
@@ -2110,13 +2010,6 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                   bool ffn_norm_computed = false;
 
                   if (!ExecuteNativeNormalizedProjectionStage(
-                          [&]() {
-                            return TryFusedRmsNormGemv<T>(
-                                gate_raw, d_residual_, post_attn_norm,
-                                d_ffn_gate_, B, intermediate_size_,
-                                hidden_size_, rms_norm_eps_, stream_,
-                                "gate_proj", &execution_policy_);
-                          },
                           &ffn_norm_computed,
                           [&]() {
                             cuda_kernel::RmsNorm<T>(
@@ -2125,10 +2018,11 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                             return true;
                           },
                           [&]() {
-                            return TryFusedGemv<T>(
-                                gate_raw, d_norm_out_, d_ffn_gate_, B,
-                                intermediate_size_, hidden_size_, stream_,
-                                "gate_proj", &execution_policy_);
+                            return TryQ8_1Gemv<T>(
+                                       gate_raw, d_norm_out_, d_ffn_gate_,
+                                       d_act_q8_1_, B, intermediate_size_,
+                                       hidden_size_, stream_, "gate_proj",
+                                       &execution_policy_);
                           },
                           [&]() {
                             if (capturing) {
@@ -2146,13 +2040,6 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                   }
 
                   if (!ExecuteNativeNormalizedProjectionStage(
-                          [&]() {
-                            return TryFusedRmsNormGemv<T>(
-                                up_raw, d_residual_, post_attn_norm, d_ffn_up_,
-                                B, intermediate_size_, hidden_size_,
-                                rms_norm_eps_, stream_, "up_proj",
-                                &execution_policy_);
-                          },
                           &ffn_norm_computed,
                           [&]() {
                             cuda_kernel::RmsNorm<T>(
@@ -2161,10 +2048,11 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                             return true;
                           },
                           [&]() {
-                            return TryFusedGemv<T>(
-                                up_raw, d_norm_out_, d_ffn_up_, B,
-                                intermediate_size_, hidden_size_, stream_,
-                                "up_proj", &execution_policy_);
+                            return TryQ8_1Gemv<T>(
+                                       up_raw, d_norm_out_, d_ffn_up_,
+                                       d_act_q8_1_, B, intermediate_size_,
+                                       hidden_size_, stream_, "up_proj",
+                                       &execution_policy_);
                           },
                           [&]() {
                             if (capturing) {
@@ -2248,11 +2136,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                           down_raw, d_ffn_gate_, d_ffn_down_,
                           d_packed_activation_, d_packed_activation_scales_, B,
                           hidden_size_, intermediate_size_, stream_,
-                          "down_proj", &execution_policy_) &&
-                      !TryFusedGemv<T>(down_raw, d_ffn_gate_, d_ffn_down_, B,
-                                       hidden_size_, intermediate_size_,
-                                       stream_, "down_proj",
-                                       &execution_policy_)) {
+                          "down_proj", &execution_policy_)) {
                     if (capturing) {
                       capture_abort = true;
                       return false;
@@ -2313,15 +2197,11 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                                    d_packed_activation_,
                                    d_packed_activation_scales_, d_logits_typed_,
                                    B, vocab_size_, hidden_size_, rms_norm_eps_,
-                                   stream_, "lm_head", &execution_policy_) &&
-          !TryFusedRmsNormGemv<T>(lm_raw, d_residual_, final_norm,
-                                  d_logits_typed_, B, vocab_size_, hidden_size_,
-                                  rms_norm_eps_, stream_, "lm_head",
-                                  &execution_policy_)) {
+                                   stream_, "lm_head", &execution_policy_)) {
         cuda_kernel::RmsNorm<T>(d_residual_, final_norm, d_norm_out_, B,
                                 hidden_size_, rms_norm_eps_, stream_);
-        if (!TryFusedGemv<T>(lm_raw, d_norm_out_, d_logits_typed_, B,
-                             vocab_size_, hidden_size_, stream_, "lm_head",
+        if (!TryQ8_1Gemv<T>(lm_raw, d_norm_out_, d_logits_typed_, d_act_q8_1_,
+                             B, vocab_size_, hidden_size_, stream_, "lm_head",
                              &execution_policy_)) {
           if (capturing) {
             capture_abort = true;
@@ -2348,6 +2228,10 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   if (capturing) {
     // End capture regardless of compute success — CUDA requires it.
     err = cudaStreamEndCapture(stream_, &decode_graph_);
+    // Clear any sticky CUDA errors from failed operations during capture
+    // (e.g., lazy weight dequantization calling cudaStreamSynchronize).
+    // Without this, the re-execution path below inherits the error state.
+    cudaGetLastError();
 
     if (capture_abort) {
       // cuBLAS fallback was needed but skipped during capture.

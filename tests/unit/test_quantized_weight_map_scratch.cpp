@@ -202,6 +202,8 @@ TEST_CASE("GGUFModelLoader ClearDequantizedCache retains quantized token "
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&proj.dequantized_gpu),
                      16 * sizeof(half)) == cudaSuccess);
 
+  // Dirty flag must be set since we bypassed GGUFWeightAccessor.
+  loader.has_dequantized_entries_ = true;
   loader.ClearDequantizedCache();
 
   REQUIRE(embed.dequantized_gpu != nullptr);

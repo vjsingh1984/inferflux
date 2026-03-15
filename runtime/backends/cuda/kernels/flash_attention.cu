@@ -1,4 +1,5 @@
 #include "flash_attention.cuh"
+#include "flash_attention_mma.cuh"
 #include "runtime/backends/cuda/common/dtype_traits.cuh"
 #include <cmath>
 #include <cuda_runtime.h>
@@ -42,7 +43,11 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 // For kv_len=1024, d=128: 128 barriers vs 8192 in the scalar version.
 // ============================================================================
 
-constexpr int FA2_TILE_KV = 32;
+// KV tile size: 64 positions per tile (2x over previous 32).
+// For head_dim=128, 4 warps: smem = (2*64*128 + 4*64 + 64) * 4 = ~67KB.
+// Fits Ada (100KB max configurable) and Ampere (164KB). GPUs that can't
+// configure enough smem will use cudaFuncSetAttribute in the host wrappers.
+constexpr int FA2_TILE_KV = 64;
 
 template <typename T>
 __global__ void FlashAttention2TypedKernel(
@@ -168,8 +173,230 @@ __global__ void FlashAttention2TypedKernel(
 }
 
 // ============================================================================
+// GQA-grouped prefill: one block per (q_pos, kv_head, batch), processing all
+// Q-heads that share that KV head. Amortizes KV tile loads by gqa_ratio.
+//
+// Grid: (query_len, num_kv_heads, batch_size)
+// Block: next_pow2(head_dim) threads
+// ============================================================================
+
+template <typename T, int GQARatio>
+__global__ void FlashAttention2TypedGQAKernel(
+    const T *__restrict__ Q, const T *__restrict__ K, const T *__restrict__ V,
+    T *__restrict__ O, int query_len, int kv_len, int num_heads,
+    int num_kv_heads, int head_dim, float scale, bool causal) {
+  const int batch_idx = blockIdx.z;
+  const int kv_head_idx = blockIdx.y;
+  const int q_pos = blockIdx.x;
+
+  if (q_pos >= query_len)
+    return;
+
+  const int d = threadIdx.x;
+  const int num_threads = blockDim.x;
+  const int warp_id = d / 32;
+  const int lane = d & 31;
+  const int num_warps = num_threads / 32;
+
+  const int q_stride = num_heads * head_dim;
+  const int kv_stride = num_kv_heads * head_dim;
+
+  // Load Q registers for all GQARatio heads sharing this KV head
+  float q_reg[GQARatio];
+#pragma unroll
+  for (int h = 0; h < GQARatio; h++) {
+    const int head_idx = kv_head_idx * GQARatio + h;
+    if (d < head_dim && head_idx < num_heads) {
+      size_t q_offset = (size_t)batch_idx * query_len * q_stride +
+                        (size_t)q_pos * q_stride + head_idx * head_dim + d;
+      q_reg[h] = DtypeTraits<T>::to_float(Q[q_offset]);
+    } else {
+      q_reg[h] = 0.0f;
+    }
+  }
+
+  const int causal_limit = causal ? (kv_len - query_len + q_pos + 1) : kv_len;
+
+  extern __shared__ float smem[];
+  float *s_k = smem;
+  float *s_v = smem + FA2_TILE_KV * head_dim;
+  float *s_warp_dots = smem + 2 * FA2_TILE_KV * head_dim;
+  float *s_scores = s_warp_dots + GQARatio * num_warps * FA2_TILE_KV;
+
+  const size_t kv_base =
+      (size_t)batch_idx * kv_len * kv_stride + kv_head_idx * head_dim;
+
+  float row_max[GQARatio];
+  float row_sum[GQARatio];
+  float o_acc[GQARatio];
+#pragma unroll
+  for (int h = 0; h < GQARatio; h++) {
+    row_max[h] = -INFINITY;
+    row_sum[h] = 0.0f;
+    o_acc[h] = 0.0f;
+  }
+
+  for (int kv_start = 0; kv_start < causal_limit; kv_start += FA2_TILE_KV) {
+    int tile_len = min(FA2_TILE_KV, causal_limit - kv_start);
+    int total_elements = tile_len * head_dim;
+
+    // Phase 1: Load K/V tile (ONCE for all GQARatio heads)
+    for (int i = d; i < total_elements; i += num_threads) {
+      int t = i / head_dim;
+      int dim = i % head_dim;
+      size_t kv_offset = kv_base + (size_t)(kv_start + t) * kv_stride + dim;
+      s_k[i] = DtypeTraits<T>::to_float(K[kv_offset]);
+      s_v[i] = DtypeTraits<T>::to_float(V[kv_offset]);
+    }
+    __syncthreads();
+
+    // Phase 2: Dot products for all GQARatio heads
+    for (int t = 0; t < tile_len; t++) {
+#pragma unroll
+      for (int h = 0; h < GQARatio; h++) {
+        float partial =
+            (d < head_dim) ? q_reg[h] * s_k[t * head_dim + d] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+          partial += __shfl_down_sync(0xFFFFFFFF, partial, offset);
+        if (lane == 0)
+          s_warp_dots[(h * num_warps + warp_id) * FA2_TILE_KV + t] = partial;
+      }
+    }
+    __syncthreads();
+
+    // Phase 3: Cross-warp reduction per head
+    const int total_scores = GQARatio * tile_len;
+    if (d < total_scores) {
+      const int h = d / tile_len;
+      const int t = d % tile_len;
+      float dot_sum = 0.0f;
+      for (int w = 0; w < num_warps; w++)
+        dot_sum += s_warp_dots[(h * num_warps + w) * FA2_TILE_KV + t];
+      s_scores[h * FA2_TILE_KV + t] = dot_sum * scale;
+    }
+    __syncthreads();
+
+    // Phase 4: Online softmax + V accumulation per head
+    for (int t = 0; t < tile_len; t++) {
+#pragma unroll
+      for (int h = 0; h < GQARatio; h++) {
+        float score = s_scores[h * FA2_TILE_KV + t];
+        float new_max = fmaxf(row_max[h], score);
+        float rescale = expf(row_max[h] - new_max);
+        float exp_w = expf(score - new_max);
+
+        if (d < head_dim)
+          o_acc[h] = o_acc[h] * rescale + exp_w * s_v[t * head_dim + d];
+
+        row_sum[h] = row_sum[h] * rescale + exp_w;
+        row_max[h] = new_max;
+      }
+    }
+    __syncthreads();
+  }
+
+  // Write output for all GQARatio heads
+  if (d < head_dim) {
+#pragma unroll
+    for (int h = 0; h < GQARatio; h++) {
+      const int head_idx = kv_head_idx * GQARatio + h;
+      if (head_idx < num_heads) {
+        size_t o_offset = (size_t)batch_idx * query_len * q_stride +
+                          (size_t)q_pos * q_stride + head_idx * head_dim + d;
+        O[o_offset] = DtypeTraits<T>::from_float(
+            (row_sum[h] > 0.0f) ? (o_acc[h] / row_sum[h]) : 0.0f);
+      }
+    }
+  }
+}
+
+// ============================================================================
 // Host wrappers
 // ============================================================================
+
+// Compute shared memory bytes for FA2 kernels given tile size.
+static inline int ComputeFA2Smem(int tile_kv, int head_dim, int num_warps) {
+  return (2 * tile_kv * head_dim + num_warps * tile_kv + tile_kv) *
+         static_cast<int>(sizeof(float));
+}
+
+// Compute shared memory bytes for GQA-grouped FA2 kernels.
+static inline int ComputeFA2SmemGQA(int tile_kv, int head_dim, int num_warps,
+                                     int gqa_ratio) {
+  // K tile + V tile + per-head warp partial dots + per-head scores
+  return (2 * tile_kv * head_dim + num_warps * tile_kv + tile_kv) *
+             static_cast<int>(sizeof(float)) +
+         // Extra smem for gqa_ratio-1 additional heads' warp_dots and scores
+         (gqa_ratio - 1) * (num_warps * tile_kv + tile_kv) *
+             static_cast<int>(sizeof(float));
+}
+
+// Configure extended shared memory for FA2 kernels.
+// cudaFuncSetAttribute is idempotent and lightweight.
+template <typename Func>
+static void ConfigureFA2Smem(Func kernel, int smem_bytes) {
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       smem_bytes);
+}
+
+// Launch MMA-accelerated GQA prefill kernel for query_len >= 16.
+// Uses tensor cores for Q*K^T, scalar V accumulation.
+template <typename T, int GQARatio>
+static cudaError_t LaunchMMAGQAPrefill(const T *Q, const T *K, const T *V,
+                                        T *O, int batch_size, int query_len,
+                                        int kv_len, int num_heads,
+                                        int num_kv_heads, int head_dim,
+                                        float scale, bool causal,
+                                        cudaStream_t stream) {
+  const int threads = MMA_FA2_THREADS; // 128 = 4 warps
+  int smem = ComputeMMAFA2Smem(head_dim);
+
+  ConfigureFA2Smem(FlashAttention2MMAGQAKernel<T, GQARatio>, smem);
+
+  const int q_blocks = (query_len + MMA_FA2_BR - 1) / MMA_FA2_BR;
+  dim3 grid(q_blocks, num_kv_heads, batch_size);
+
+  FlashAttention2MMAGQAKernel<T, GQARatio><<<grid, threads, smem, stream>>>(
+      Q, K, V, O, query_len, kv_len, num_heads, num_kv_heads, head_dim, scale,
+      causal);
+  return cudaGetLastError();
+}
+
+// Launch GQA-grouped prefill kernel for a specific GQA ratio.
+// Selects MMA kernel when query_len >= 16 and head_dim fits MMA tiles.
+template <typename T, int GQARatio>
+static cudaError_t LaunchGQAPrefill(const T *Q, const T *K, const T *V, T *O,
+                                     int batch_size, int query_len, int kv_len,
+                                     int num_heads, int num_kv_heads,
+                                     int head_dim, float scale, bool causal,
+                                     cudaStream_t stream) {
+  // Use MMA kernel when query_len >= 16, head_dim is multiple of 16, and
+  // head_dim <= 128 (so 128 threads suffice to cover all dimensions).
+  if (query_len >= MMA_FA2_BR && head_dim <= MMA_FA2_THREADS &&
+      (head_dim % 16) == 0) {
+    return LaunchMMAGQAPrefill<T, GQARatio>(Q, K, V, O, batch_size, query_len,
+                                             kv_len, num_heads, num_kv_heads,
+                                             head_dim, scale, causal, stream);
+  }
+
+  // Fallback: scalar GQA kernel (one Q position per block)
+  int threads = 1;
+  while (threads < head_dim)
+    threads <<= 1;
+  threads = min(threads, 1024);
+  int num_warps = threads / 32;
+  int smem = ComputeFA2SmemGQA(FA2_TILE_KV, head_dim, num_warps, GQARatio);
+
+  ConfigureFA2Smem(FlashAttention2TypedGQAKernel<T, GQARatio>, smem);
+
+  dim3 grid(query_len, num_kv_heads, batch_size);
+
+  FlashAttention2TypedGQAKernel<T, GQARatio><<<grid, threads, smem, stream>>>(
+      Q, K, V, O, query_len, kv_len, num_heads, num_kv_heads, head_dim, scale,
+      causal);
+  return cudaGetLastError();
+}
 
 // Templated FlashAttention-2 host wrapper (tiled)
 template <typename T>
@@ -178,17 +405,37 @@ cudaError_t FlashAttention2Typed(const T *Q, const T *K, const T *V, T *O,
                                  int num_heads, int num_kv_heads, int head_dim,
                                  float scale, bool causal,
                                  cudaStream_t stream) {
-  // Thread count = next power of 2 >= head_dim
+  // Use GQA-grouped kernel when multiple Q-heads share a KV head.
+  const int gqa_ratio =
+      (num_kv_heads > 0 && num_heads > num_kv_heads)
+          ? (num_heads / num_kv_heads)
+          : 1;
+
+  if (gqa_ratio == 8) {
+    return LaunchGQAPrefill<T, 8>(Q, K, V, O, batch_size, query_len, kv_len,
+                                   num_heads, num_kv_heads, head_dim, scale,
+                                   causal, stream);
+  }
+  if (gqa_ratio == 4) {
+    return LaunchGQAPrefill<T, 4>(Q, K, V, O, batch_size, query_len, kv_len,
+                                   num_heads, num_kv_heads, head_dim, scale,
+                                   causal, stream);
+  }
+  if (gqa_ratio == 2) {
+    return LaunchGQAPrefill<T, 2>(Q, K, V, O, batch_size, query_len, kv_len,
+                                   num_heads, num_kv_heads, head_dim, scale,
+                                   causal, stream);
+  }
+
+  // Fallback: non-GQA or unsupported ratio
   int threads = 1;
   while (threads < head_dim)
     threads <<= 1;
   threads = min(threads, 1024);
   int num_warps = threads / 32;
+  int smem = ComputeFA2Smem(FA2_TILE_KV, head_dim, num_warps);
 
-  // Shared memory: K tile + V tile + warp partials + scores
-  int smem =
-      (2 * FA2_TILE_KV * head_dim + num_warps * FA2_TILE_KV + FA2_TILE_KV) *
-      sizeof(float);
+  ConfigureFA2Smem(FlashAttention2TypedKernel<T>, smem);
 
   dim3 grid(query_len, num_heads, batch_size);
 
@@ -332,9 +579,9 @@ cudaError_t FlashDecodeMultiSeq(const T *Q, const T *const *d_k_ptrs,
   threads = min(threads, 1024);
   int num_warps = threads / 32;
 
-  int smem =
-      (2 * FA2_TILE_KV * head_dim + num_warps * FA2_TILE_KV + FA2_TILE_KV) *
-      sizeof(float);
+  int smem = ComputeFA2Smem(FA2_TILE_KV, head_dim, num_warps);
+
+  ConfigureFA2Smem(FlashDecodeMultiSeqKernel<T>, smem);
 
   dim3 grid(batch_size, num_heads);
 
@@ -352,6 +599,160 @@ template cudaError_t FlashDecodeMultiSeq<__nv_bfloat16>(
     const __nv_bfloat16 *, const __nv_bfloat16 *const *,
     const __nv_bfloat16 *const *, __nv_bfloat16 *, const int *, int, int, int,
     int, float, cudaStream_t);
+
+// ============================================================================
+// GQA-grouped decode: one block per (batch, kv_head), processing all Q-heads
+// that share that KV head. This amortizes KV tile loads by gqa_ratio
+// (e.g., 4x for Qwen 2.5 3B with 32 Q-heads / 8 KV-heads).
+//
+// Grid: (batch_size, num_kv_heads)
+// Block: next_pow2(head_dim) threads
+// Smem: K tile + V tile + warp_dots*gqa + scores*gqa
+// ============================================================================
+
+template <typename T, int GQARatio>
+__global__ void FlashDecodeMultiSeqStridedGQAKernel(
+    const T *__restrict__ Q, const T *__restrict__ kv_buffer,
+    T *__restrict__ O, const int *__restrict__ seq_ids,
+    const int *__restrict__ kv_lens, int layer, int num_heads,
+    int num_kv_heads, int head_dim, size_t slot_stride, size_t layer_stride,
+    size_t kv_stride, float scale) {
+  const int b = blockIdx.x;
+  const int kv_head_idx = blockIdx.y;
+
+  const int d = threadIdx.x;
+  const int num_threads = blockDim.x;
+  const int warp_id = d / 32;
+  const int lane = d & 31;
+  const int num_warps = num_threads / 32;
+
+  const int kv_len = kv_lens[b];
+  if (kv_len <= 0) {
+    return;
+  }
+
+  // Load Q registers for all GQARatio heads sharing this KV head.
+  // head_idx = kv_head_idx * GQARatio + h
+  float q_reg[GQARatio];
+#pragma unroll
+  for (int h = 0; h < GQARatio; h++) {
+    const int head_idx = kv_head_idx * GQARatio + h;
+    if (d < head_dim && head_idx < num_heads) {
+      q_reg[h] = DtypeTraits<T>::to_float(
+          Q[b * num_heads * head_dim + head_idx * head_dim + d]);
+    } else {
+      q_reg[h] = 0.0f;
+    }
+  }
+
+  // Derive K/V pointers for this KV head
+  const size_t seq_offset = static_cast<size_t>(seq_ids[b]) * slot_stride;
+  const size_t layer_offset = static_cast<size_t>(layer) * layer_stride;
+  const T *K = kv_buffer + seq_offset + layer_offset;
+  const T *V = K + kv_stride;
+  const int kv_stride_elems = num_kv_heads * head_dim;
+
+  // Shared memory layout:
+  //   s_k:         [FA2_TILE_KV * head_dim] floats — K tile (shared across heads)
+  //   s_v:         [FA2_TILE_KV * head_dim] floats — V tile (shared across heads)
+  //   s_warp_dots: [GQARatio * num_warps * FA2_TILE_KV] floats — per-head warp partials
+  //   s_scores:    [GQARatio * FA2_TILE_KV] floats — per-head final scores
+  extern __shared__ float smem[];
+  float *s_k = smem;
+  float *s_v = smem + FA2_TILE_KV * head_dim;
+  float *s_warp_dots = s_v + FA2_TILE_KV * head_dim;
+  float *s_scores = s_warp_dots + GQARatio * num_warps * FA2_TILE_KV;
+
+  // Per-head online softmax state
+  float row_max[GQARatio];
+  float row_sum[GQARatio];
+  float o_acc[GQARatio];
+#pragma unroll
+  for (int h = 0; h < GQARatio; h++) {
+    row_max[h] = -INFINITY;
+    row_sum[h] = 0.0f;
+    o_acc[h] = 0.0f;
+  }
+
+  for (int kv_start = 0; kv_start < kv_len; kv_start += FA2_TILE_KV) {
+    const int tile_len = min(FA2_TILE_KV, kv_len - kv_start);
+    const int total_elements = tile_len * head_dim;
+
+    // Phase 1: Load K/V tile (ONCE for all GQARatio heads)
+    for (int i = d; i < total_elements; i += num_threads) {
+      const int t = i / head_dim;
+      const int dim = i % head_dim;
+      const size_t kv_offset = static_cast<size_t>(kv_start + t) *
+                                   static_cast<size_t>(kv_stride_elems) +
+                               static_cast<size_t>(kv_head_idx * head_dim + dim);
+      s_k[i] = DtypeTraits<T>::to_float(K[kv_offset]);
+      s_v[i] = DtypeTraits<T>::to_float(V[kv_offset]);
+    }
+    __syncthreads();
+
+    // Phase 2: Dot products — all GQARatio heads against shared K tile
+    for (int t = 0; t < tile_len; t++) {
+#pragma unroll
+      for (int h = 0; h < GQARatio; h++) {
+        float partial =
+            (d < head_dim) ? q_reg[h] * s_k[t * head_dim + d] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+          partial += __shfl_down_sync(0xFFFFFFFF, partial, offset);
+        }
+        if (lane == 0) {
+          s_warp_dots[(h * num_warps + warp_id) * FA2_TILE_KV + t] = partial;
+        }
+      }
+    }
+    __syncthreads();
+
+    // Phase 3: Cross-warp reduction — per head
+    const int total_scores = GQARatio * tile_len;
+    if (d < total_scores) {
+      const int h = d / tile_len;
+      const int t = d % tile_len;
+      float dot_sum = 0.0f;
+      for (int w = 0; w < num_warps; w++) {
+        dot_sum += s_warp_dots[(h * num_warps + w) * FA2_TILE_KV + t];
+      }
+      s_scores[h * FA2_TILE_KV + t] = dot_sum * scale;
+    }
+    __syncthreads();
+
+    // Phase 4: Online softmax + V accumulation (per head)
+    for (int t = 0; t < tile_len; t++) {
+#pragma unroll
+      for (int h = 0; h < GQARatio; h++) {
+        const float score = s_scores[h * FA2_TILE_KV + t];
+        const float new_max = fmaxf(row_max[h], score);
+        const float rescale = expf(row_max[h] - new_max);
+        const float exp_w = expf(score - new_max);
+
+        if (d < head_dim) {
+          o_acc[h] = o_acc[h] * rescale + exp_w * s_v[t * head_dim + d];
+        }
+
+        row_sum[h] = row_sum[h] * rescale + exp_w;
+        row_max[h] = new_max;
+      }
+    }
+    __syncthreads();
+  }
+
+  // Write output for all GQARatio heads
+  if (d < head_dim) {
+#pragma unroll
+    for (int h = 0; h < GQARatio; h++) {
+      const int head_idx = kv_head_idx * GQARatio + h;
+      if (head_idx < num_heads) {
+        O[b * num_heads * head_dim + head_idx * head_dim + d] =
+            DtypeTraits<T>::from_float(
+                (row_sum[h] > 0.0f) ? (o_acc[h] / row_sum[h]) : 0.0f);
+      }
+    }
+  }
+}
 
 template <typename T>
 __global__ void FlashDecodeMultiSeqStridedKernel(
@@ -458,6 +859,34 @@ __global__ void FlashDecodeMultiSeqStridedKernel(
   }
 }
 
+// Launch GQA-grouped decode kernel for a specific GQA ratio.
+template <typename T, int GQARatio>
+static cudaError_t LaunchGQADecode(const T *Q, const T *kv_buffer, T *O,
+                                    const int *d_seq_ids, const int *d_kv_lens,
+                                    int layer, int batch_size, int num_heads,
+                                    int num_kv_heads, int head_dim,
+                                    size_t slot_stride, size_t layer_stride,
+                                    size_t kv_stride, float scale,
+                                    cudaStream_t stream) {
+  int threads = 1;
+  while (threads < head_dim)
+    threads <<= 1;
+  threads = min(threads, 1024);
+  const int num_warps = threads / 32;
+  int smem = ComputeFA2SmemGQA(FA2_TILE_KV, head_dim, num_warps, GQARatio);
+
+  ConfigureFA2Smem(FlashDecodeMultiSeqStridedGQAKernel<T, GQARatio>, smem);
+
+  dim3 grid(batch_size, num_kv_heads);
+
+  FlashDecodeMultiSeqStridedGQAKernel<T, GQARatio>
+      <<<grid, threads, smem, stream>>>(Q, kv_buffer, O, d_seq_ids, d_kv_lens,
+                                        layer, num_heads, num_kv_heads,
+                                        head_dim, slot_stride, layer_stride,
+                                        kv_stride, scale);
+  return cudaGetLastError();
+}
+
 template <typename T>
 cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
                                        const int *d_seq_ids,
@@ -467,15 +896,43 @@ cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
                                        size_t slot_stride, size_t layer_stride,
                                        size_t kv_stride, float scale,
                                        cudaStream_t stream) {
+  // Use GQA-grouped kernel when multiple Q-heads share a KV head.
+  // This reduces KV memory reads by gqa_ratio (e.g., 4x for ratio=4).
+  const int gqa_ratio =
+      (num_kv_heads > 0 && num_heads > num_kv_heads)
+          ? (num_heads / num_kv_heads)
+          : 1;
+
+  if (gqa_ratio == 8) {
+    return LaunchGQADecode<T, 8>(Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer,
+                                  batch_size, num_heads, num_kv_heads, head_dim,
+                                  slot_stride, layer_stride, kv_stride, scale,
+                                  stream);
+  }
+  if (gqa_ratio == 4) {
+    return LaunchGQADecode<T, 4>(Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer,
+                                  batch_size, num_heads, num_kv_heads, head_dim,
+                                  slot_stride, layer_stride, kv_stride, scale,
+                                  stream);
+  }
+  if (gqa_ratio == 2) {
+    return LaunchGQADecode<T, 2>(Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer,
+                                  batch_size, num_heads, num_kv_heads, head_dim,
+                                  slot_stride, layer_stride, kv_stride, scale,
+                                  stream);
+  }
+
+  // Fallback: non-GQA or unsupported ratio — use per-head kernel
   int threads = 1;
   while (threads < head_dim) {
     threads <<= 1;
   }
   threads = min(threads, 1024);
   const int num_warps = threads / 32;
-  const int smem =
-      (2 * FA2_TILE_KV * head_dim + num_warps * FA2_TILE_KV + FA2_TILE_KV) *
-      sizeof(float);
+  int smem = ComputeFA2Smem(FA2_TILE_KV, head_dim, num_warps);
+
+  ConfigureFA2Smem(FlashDecodeMultiSeqStridedKernel<T>, smem);
+
   dim3 grid(batch_size, num_heads);
 
   FlashDecodeMultiSeqStridedKernel<T>

@@ -90,8 +90,9 @@ GGUFTensorData::GetQuantizationHandler() const {
 // GGUFWeightAccessor Implementation
 //==============================================================================
 
-GGUFWeightAccessor::GGUFWeightAccessor(GGUFTensorData *tensor)
-    : tensor_(tensor) {
+GGUFWeightAccessor::GGUFWeightAccessor(GGUFTensorData *tensor,
+                                       bool *dequant_dirty_flag)
+    : tensor_(tensor), dequant_dirty_flag_(dequant_dirty_flag) {
   if (!tensor_) {
     log::Error("gguf_weight_accessor", "Null tensor");
   }
@@ -193,6 +194,8 @@ half *GGUFWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
         return nullptr;
       }
       tensor_->dequantized_gpu = d_dequantized;
+      if (dequant_dirty_flag_)
+        *dequant_dirty_flag_ = true;
       return d_dequantized;
     }
     log::Error("gguf_weight_accessor",
@@ -254,6 +257,8 @@ half *GGUFWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
 
   // Cache result
   tensor_->dequantized_gpu = d_dequantized;
+  if (dequant_dirty_flag_)
+    *dequant_dirty_flag_ = true;
 
   log::Debug("gguf_weight_accessor",
              "Dequantized tensor: " + tensor_->info.name + " (" +
@@ -1048,6 +1053,10 @@ DequantizedCachePolicy GGUFModelLoader::GetDequantizedCachePolicy() const {
 }
 
 void GGUFModelLoader::ClearDequantizedCache() {
+  if (!has_dequantized_entries_) {
+    return;
+  }
+  has_dequantized_entries_ = false;
   for (auto &[name, tensor] : tensors_) {
     if (tensor.dequantized_gpu) {
       // Only free request/batch scoped dequantized caches for projection-like
@@ -1058,6 +1067,9 @@ void GGUFModelLoader::ClearDequantizedCache() {
         CheckCudaStatus(cudaFree(tensor.dequantized_gpu), "gguf_loader",
                         "cudaFree(tensor.dequantized_gpu:" + name + ")");
         tensor.dequantized_gpu = nullptr;
+      } else {
+        // Retained entries mean we still have dequantized data
+        has_dequantized_entries_ = true;
       }
     }
   }
@@ -1098,7 +1110,8 @@ GGUFModelLoader::GetWeightAccessor(const std::string &tensor_name) {
   }
 
   // Create accessor
-  auto accessor = std::make_shared<GGUFWeightAccessor>(&tensor_it->second);
+  auto accessor = std::make_shared<GGUFWeightAccessor>(
+      &tensor_it->second, &has_dequantized_entries_);
 
   weight_accessor_cache_[tensor_name] = accessor;
   return accessor;

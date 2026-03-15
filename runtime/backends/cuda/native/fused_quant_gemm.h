@@ -48,10 +48,6 @@ class FusedQuantGemm {
 public:
   static constexpr int kDownProjMmqTileCols = 8;
 
-  // V2 cooperative-warp GEMV constants (visible to callers for graph capture).
-  static constexpr int kGemvWarpsPerBlockV2 = 4;
-  static constexpr int kGemvThreadsPerBlockV2 = kGemvWarpsPerBlockV2 * 32;
-
   enum class FfnProjOperator {
     kFallback = 0,
     kQ81Group,
@@ -72,46 +68,6 @@ public:
     kPackedGemv,
     kMmq,
   };
-
-  /**
-   * Attempt a fused dequant-GEMV/GEMM.
-   *
-   * @param weight  Raw quantized weight info (GPU pointer + quant type)
-   * @param activation  Input activation matrix [M, K] (half, device)
-   * @param output  Output matrix [M, N] (half, device)
-   * @param M  Number of rows in activation (1 = decode, M>1 = prefill)
-   * @param N  Number of output columns (weight rows)
-   * @param K  Inner dimension (weight cols / activation cols)
-   * @param stream  CUDA stream
-   * @return true if fused kernel was launched, false to fall back to cuBLAS
-   */
-  static bool Gemv(const QuantizedWeightInfo &weight, const half *activation,
-                   half *output, int M, int N, int K, cudaStream_t stream,
-                   const NativeExecutionPolicy *policy = nullptr);
-
-  /**
-   * Fused RmsNorm+GEMV: computes normalization inside the GEMV kernel's shared
-   * memory loading phase, eliminating standalone RmsNorm kernel launches and
-   * the intermediate d_norm_out_ buffer round-trip.
-   *
-   * @param weight  Raw quantized weight info (GPU pointer + quant type)
-   * @param residual  Raw residual activation [M, K] (half, device, not
-   * normalized)
-   * @param norm_weight  RmsNorm weight vector [K] (half, device)
-   * @param output  Output matrix [M, N] (half, device)
-   * @param M  Number of rows (1 = decode, M>1 = batched decode)
-   * @param N  Number of output columns
-   * @param K  Inner dimension
-   * @param rms_norm_eps  RmsNorm epsilon
-   * @param stream  CUDA stream
-   * @return true if fused kernel was launched, false to fall back to separate
-   *         RmsNorm + GEMV/cuBLAS
-   */
-  static bool RmsNormGemv(const QuantizedWeightInfo &weight,
-                          const half *residual, const half *norm_weight,
-                          half *output, int M, int N, int K, float rms_norm_eps,
-                          cudaStream_t stream,
-                          const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Attempt a fused dequant-GEMV using pre-quantized int8 activations packed
@@ -206,22 +162,6 @@ public:
   static bool GemvQ8_1(const QuantizedWeightInfo &weight, const void *act_q8_1,
                        half *output, int M, int N, int K, cudaStream_t stream,
                        const NativeExecutionPolicy *policy = nullptr);
-
-  /**
-   * Explicit fused FFN prototype for Q4_K weights.
-   *
-   * This is currently a bring-up/testing entry point only. It uses an
-   * output-tiled design that reuses activated intermediate values across a
-   * hidden-output tile, but it is not yet selected by the runtime hot path.
-   * Exposing it here allows the kernel to be compiled and parity-tested
-   * through the main native CUDA test suite before any rollout decision.
-   */
-  static bool FusedFfnQ4K(const QuantizedWeightInfo &gate_weight,
-                          const QuantizedWeightInfo &up_weight,
-                          const QuantizedWeightInfo &down_weight,
-                          const half *activation, half *output, int M,
-                          int N_inter, int N_hidden, int K,
-                          cudaStream_t stream);
 
   /**
    * MMQ-style tiled down-projection path for transformed GGUF weights.

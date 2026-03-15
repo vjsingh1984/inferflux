@@ -544,10 +544,6 @@ add_executable(inferctl cli/main.cpp)
 target_link_libraries(inferctl PRIVATE inferflux_core)
 
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
-  add_executable(benchmark_fused_ffn tests/unit/benchmark_fused_ffn.cu)
-  target_include_directories(benchmark_fused_ffn PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/external)
-  target_link_libraries(benchmark_fused_ffn PRIVATE inferflux_core)
   add_executable(benchmark_downproj_q81 tests/unit/benchmark_downproj_q81.cu)
   target_include_directories(benchmark_downproj_q81 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)

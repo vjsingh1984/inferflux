@@ -323,6 +323,7 @@ private:
   bool lane_overlap_init_attempted_{false};
   std::mutex lane_overlap_mutex_;
   std::mutex shared_pipeline_mutex_;
+  uint64_t batch_counter_{0}; // Throttle for periodic operations
   std::unique_ptr<ModelForward> decode_lane_forward_;
   std::unique_ptr<ModelForward> prefill_lane_forward_;
   std::unique_ptr<GpuSampler> decode_lane_sampler_;
@@ -384,6 +385,7 @@ private:
   bool InitializeCUDA();
   bool InitializeNativePipeline();
   void RefreshMemoryLedger();
+  void MaybeRefreshMemoryLedger();
   void FreeDeviceMemory();
   bool RunNativeInference(const std::vector<UnifiedBatchInput> &inputs,
                           std::vector<UnifiedBatchOutput> *outputs);

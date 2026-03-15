@@ -163,20 +163,21 @@ Only structured output (grammar-constrained generation) still delegates to the l
 **Key CUDA env vars:** (centralized in `NativeExecutionPolicy::FromEnv()`)
 - `INFERFLUX_DISABLE_BATCHED_DECODE=1` — opt out of batched decode (default-on)
 - `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` — disable pre-quantized Q8_1 activation path
-- `INFERFLUX_GEMV_V2=1` — opt-in to v2 cooperative-warp GEMV (default: v1 column-major, faster on Ada)
 - `INFERFLUX_CUDA_TIMING_SAMPLE_RATE=N` — record CUDA event timing every Nth batch (0=off)
 - `INFERFLUX_CUDA_PHASE_OVERLAP` — enable prefill/decode lane overlap
 - `INFERFLUX_CUDA_ATTENTION_KERNEL` — force attention kernel (`auto`, `fa2`, `standard`)
 - `INFERFLUX_CUDA_KV_MAX_BATCH` / `INFERFLUX_CUDA_KV_MAX_SEQ` — KV cache sizing
 
 **InferFlux CUDA kernel files:**
-- `runtime/backends/cuda/native/kernels/fused_dequant_gemv.cuh` — v1 GEMV kernels (column-major, 8 warps/block)
-- `runtime/backends/cuda/native/kernels/fused_dequant_gemv_v2.cuh` — v2 GEMV kernels (cooperative 4-warp, L2-friendly)
-- `runtime/backends/cuda/native/kernels/fused_dequant_gemv_vectorized.cuh` — vectorized load helpers for Q4_K dequantization (reduced memory bandwidth)
-- `runtime/backends/cuda/native/fused_quant_gemm.cu` — dispatch tables, v1/v2 selection, threshold logic
+- `runtime/backends/cuda/native/kernels/fused_dequant_gemv.cuh` — V1 GEMV kernels (column-major, 8 warps/block, used for pair/triple M>8 fallback)
+- `runtime/backends/cuda/native/kernels/mmvq.cuh` — MMVQ weight-read-first kernels (batch 1-8, primary dispatch path)
+- `runtime/backends/cuda/native/kernels/mmq.cuh` — MMQ tiled quantized GEMM kernels (batch 9-64)
+- `runtime/backends/cuda/native/kernels/quant_common.cuh` — shared quantization primitives (Dp4aS8, Vsubss4, LoadPacked*)
+- `runtime/backends/cuda/native/fused_quant_gemm.cu` — dispatch tables, MMVQ/MMQ selection, threshold logic
 - `runtime/backends/cuda/native/transformer_forward.cu` — forward pass wiring
 - `runtime/backends/cuda/native/cuda_kernels.cu` — batched RoPE/KvAppend, MeanPool, utility kernels
 - `runtime/backends/cuda/kernels/flash_attention.cu` — FlashAttention-2 and FlashDecodeMultiSeq
+- `runtime/backends/cuda/kernels/flash_attention_mma.cuh` — MMA tensor-core prefill kernel (m16n8k16, Br=16, auto-selected for query_len≥16)
 
 **InferFlux CUDA policy and execution files:**
 - `runtime/backends/cuda/native/native_execution_policy.h` — `NativeExecutionPolicy` struct, env var parsing

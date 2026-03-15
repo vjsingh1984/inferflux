@@ -103,6 +103,7 @@ public:
                     const std::vector<int> &sequence_ids, float *d_logits,
                     int batch_size) override;
 
+  void WarmWeightCaches() override;
   void SetStream(cudaStream_t stream) override;
   void SetExecutionPolicy(const NativeExecutionPolicy &policy) override;
 
@@ -171,11 +172,14 @@ private:
   int *h_batch_seq_ids_{nullptr};
   int *h_batch_kv_lens_{nullptr};
 
-  // CUDA graph state for batched decode
+  // CUDA graph state for batched decode.
+  // graph_warmup_remaining_ skips capture for the first N calls to let lazy
+  // allocations and weight dequantizations settle before attempting capture.
   cudaGraph_t decode_graph_{nullptr};
   cudaGraphExec_t decode_graph_exec_{nullptr};
   int graph_batch_size_{0};
   bool graph_enabled_{true};
+  int graph_warmup_remaining_{0};
   NativeExecutionPolicy execution_policy_{};
   std::size_t device_workspace_bytes_{0};
   std::size_t host_workspace_bytes_{0};
