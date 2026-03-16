@@ -145,6 +145,8 @@ add_library(inferflux_core
   server/auth/rate_limiter.h
   server/auth/oidc_validator.cpp
   server/auth/oidc_validator.h
+  server/diagnostics/crash_handler.cpp
+  server/diagnostics/crash_handler.h
   server/logging/audit_logger.cpp
   server/logging/audit_logger.h
   server/logging/logger.cpp
@@ -570,6 +572,7 @@ add_executable(inferflux_tests
   tests/unit/test_tokenizer.cpp
   tests/unit/test_api_key_auth.cpp
   tests/unit/test_rate_limiter.cpp
+  tests/unit/test_crash_handler.cpp
   tests/unit/test_guardrail.cpp
   tests/unit/test_audit_logger.cpp
   tests/unit/test_metrics.cpp

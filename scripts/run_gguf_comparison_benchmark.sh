@@ -418,7 +418,20 @@ capture_inferflux_cuda_bucket_winners() {
 has_fatal_runtime_signature() {
     local log_file=$1
     [ -f "$log_file" ] || return 1
-    grep -Eqi 'double free|corruption \(|segmentation fault|addresssanitizer|terminate called after throwing|fatal glibc error|aborted \(core dumped\)' "$log_file"
+    grep -Eqi 'double free|corruption \(|segmentation fault|addresssanitizer|terminate called after throwing|fatal glibc error|aborted \(core dumped\)|INFERFLUX CRASH DIAGNOSTIC' "$log_file"
+}
+
+# Extract and display crash diagnostics from server log if present.
+report_crash_diagnostics() {
+    local log_file=$1
+    local backend=$2
+    [ -f "$log_file" ] || return
+    if grep -q "INFERFLUX CRASH DIAGNOSTIC" "$log_file"; then
+        log_err "$backend crash diagnostic found in server log:"
+        sed -n '/=== INFERFLUX CRASH DIAGNOSTIC ===/,/=== END CRASH DIAGNOSTIC ===/p' "$log_file" | while IFS= read -r line; do
+            log_err "  $line"
+        done
+    fi
 }
 
 capture_inferflux_admin_cache_snapshot() {
@@ -694,6 +707,7 @@ stop_server() {
     fi
 
     local log_file="$OUTPUT_DIR/server_${backend}.log"
+    report_crash_diagnostics "$log_file" "$backend"
     if has_fatal_runtime_signature "$log_file"; then
         log_err "$backend log contains fatal runtime signature; treat this backend result as invalid"
         return 1

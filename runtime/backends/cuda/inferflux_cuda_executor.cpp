@@ -8,6 +8,7 @@
 #include "runtime/backends/cuda/native/quantized_weight_map_adapter.h"
 #include "runtime/backends/cuda/native/safetensors_parser.h"
 #include "runtime/string_utils.h"
+#include "server/diagnostics/crash_handler.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 
@@ -2676,6 +2677,7 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
   } scoped_cleanup{this};
 
   NVTX_SCOPE("NativeExecuteUnifiedBatch");
+  diagnostics::ScopedBreadcrumb breadcrumb("ExecuteUnifiedBatch");
 
   // Check for mixed workload and use overlap path if enabled
   if (allow_overlap && HasMixedWorkload(inputs)) {

@@ -1,4 +1,5 @@
 #include "server/metrics/metrics.h"
+#include "server/diagnostics/crash_handler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -556,11 +557,13 @@ void MetricsRegistry::RecordDecodeDuration(double decode_ms) {
 }
 
 void MetricsRegistry::IncrementConnections() {
-  active_connections_.fetch_add(1, std::memory_order_relaxed);
+  int n = active_connections_.fetch_add(1, std::memory_order_relaxed) + 1;
+  diagnostics::SetActiveRequests(n);
 }
 
 void MetricsRegistry::DecrementConnections() {
-  active_connections_.fetch_sub(1, std::memory_order_relaxed);
+  int n = active_connections_.fetch_sub(1, std::memory_order_relaxed) - 1;
+  diagnostics::SetActiveRequests(n);
 }
 
 void MetricsRegistry::SetQueueDepth(int depth) {
@@ -1047,6 +1050,14 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_errors_total counter\n";
   out << "inferflux_errors_total{backend=\"" << backend << "\"} "
       << total_errors_.load() << "\n";
+
+  auto cuda_errors = diagnostics::GetCudaErrorCount();
+  if (cuda_errors > 0) {
+    out << "# HELP inferflux_cuda_errors_total Total CUDA API errors "
+           "encountered\n";
+    out << "# TYPE inferflux_cuda_errors_total counter\n";
+    out << "inferflux_cuda_errors_total " << cuda_errors << "\n";
+  }
 
   out << "# HELP inferflux_empty_generations_total Total backend generations "
          "that produced no completion text\n";

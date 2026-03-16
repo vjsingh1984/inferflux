@@ -1,4 +1,5 @@
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
+#include "server/diagnostics/crash_handler.h"
 #include "server/logging/logger.h"
 #include <algorithm>
 #include <climits>
@@ -67,6 +68,7 @@ bool CheckCudaStatus(cudaError_t status, const char *component,
     return true;
   }
   log::Error(component, operation + " failed: " + cudaGetErrorString(status));
+  diagnostics::RecordCudaError();
   return false;
 }
 

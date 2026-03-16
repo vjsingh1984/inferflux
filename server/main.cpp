@@ -22,6 +22,7 @@
 #include "server/auth/oidc_validator.h"
 #include "server/auth/rate_limiter.h"
 #include "server/http/http_server.h"
+#include "server/diagnostics/crash_handler.h"
 #include "server/logging/audit_logger.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
@@ -159,6 +160,10 @@ int main(int argc, char **argv) {
                 << level << "\n";
     }
   }
+
+  // Install crash signal handlers (SIGSEGV, SIGABRT, SIGBUS, SIGFPE).
+  // Writes diagnostic breadcrumbs to stderr before re-raising for core dump.
+  inferflux::diagnostics::InstallCrashHandler();
 
   // §P1e: Initialize distributed parallel environment.
   int dist_rank = 0;
