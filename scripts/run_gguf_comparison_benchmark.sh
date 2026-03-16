@@ -674,7 +674,20 @@ stop_server() {
         local pid=$(cat "$pidfile")
         if kill -0 "$pid" 2>/dev/null; then
             log "Stopping $backend (PID $pid)..."
+            # Allow in-flight requests to drain before sending SIGTERM.
+            local grace=${INFERFLUX_BENCH_SHUTDOWN_GRACE:-5}
+            sleep "$grace"
             kill "$pid" 2>/dev/null || true
+            # Wait up to 30s for clean shutdown before force-killing.
+            local waited=0
+            while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+                sleep 1
+                waited=$((waited + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                log "Force-killing $backend (PID $pid) after 30s..."
+                kill -9 "$pid" 2>/dev/null || true
+            fi
             wait "$pid" 2>/dev/null || true
         fi
         rm -f "$pidfile"
