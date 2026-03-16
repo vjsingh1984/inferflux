@@ -1707,6 +1707,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
     // Drain any sticky CUDA error from prior operations (e.g., prefill
     // Forward(), weight dequantization, or pre-warm failures).
     cudaGetLastError();
+    cudaDeviceSynchronize();  // Drain all device work before graph capture
     err = cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed);
     if (err == cudaSuccess) {
       capturing = true;

@@ -41,11 +41,11 @@ struct NativeExecutionPolicy {
     NativeExecutionPolicy policy;
     policy.enable_batched_decode =
         ParseBoolEnv("INFERFLUX_ENABLE_BATCHED_DECODE", true);
-    // CUDA graph capture causes heap corruption under concurrent
-    // ExecuteUnifiedBatch calls (malloc unaligned tcache chunk).
-    // Disabled by default until graph capture is made concurrency-safe.
+    // CUDA graph capture: cudaDeviceSynchronize drains async work before
+    // capture to prevent heap corruption. Disable with
+    // INFERFLUX_DISABLE_CUDA_GRAPH=1 if issues arise.
     policy.disable_cuda_graph =
-        ParseBoolEnv("INFERFLUX_DISABLE_CUDA_GRAPH", true);
+        ParseBoolEnv("INFERFLUX_DISABLE_CUDA_GRAPH", false);
     policy.phase_timing_enabled =
         ParseBoolEnv("INFERFLUX_CUDA_PHASE_TIMING", false);
     policy.force_cublas = ParseBoolEnv("INFERFLUX_FORCE_CUBLAS", false);

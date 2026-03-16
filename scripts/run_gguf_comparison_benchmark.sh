@@ -32,7 +32,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-./gguf_benchmark_results}"
 NUM_REQUESTS="${NUM_REQUESTS:-16}"
 MAX_TOKENS="${MAX_TOKENS:-64}"
 CONCURRENCY_LEVELS="${CONCURRENCY:-1,4,8}"
-ENDPOINT_MODE="${INFERFLUX_BENCH_ENDPOINT_MODE:-completion}"
+ENDPOINT_MODE="${INFERFLUX_BENCH_ENDPOINT_MODE:-chat}"
 NATIVE_PHASE_TIMING="${INFERFLUX_BENCH_NATIVE_PHASE_TIMING:-0}"
 NATIVE_TIMING_SAMPLE_RATE="${INFERFLUX_BENCH_NATIVE_TIMING_SAMPLE_RATE:-0}"
 API_KEY="${API_KEY:-dev-key-123}"
@@ -645,7 +645,7 @@ start_server() {
         INFERFLUX_CUDA_KV_MAX_SEQ=$kv_seq \
         INFERFLUX_CUDA_STRICT=$([ "$backend" = "inferflux_cuda" ] && echo "1" || echo "0") \
         INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE=$([ "$backend" = "inferflux_cuda" ] && echo "1" || echo "0") \
-        INFERFLUX_DISABLE_CUDA_GRAPH=$([ "$backend" = "inferflux_cuda" ] && echo "${INFERFLUX_DISABLE_CUDA_GRAPH:-1}" || echo "0") \
+        INFERFLUX_DISABLE_CUDA_GRAPH=$([ "$backend" = "inferflux_cuda" ] && echo "${INFERFLUX_DISABLE_CUDA_GRAPH:-0}" || echo "0") \
         "$BUILD_DIR/inferfluxd" --config "$config_file" \
         > "$log_file" 2>&1 &
     local pid=$!

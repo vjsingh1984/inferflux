@@ -53,7 +53,7 @@ TEST_CASE("NativeBootstrapConfig: uses hinted KV precision and default sizing",
   REQUIRE(config.dtype_override.empty());
   REQUIRE(config.kv_precision_choice == "bf16");
   REQUIRE(config.kv_max_batch == 32);
-  REQUIRE(config.kv_max_seq == 4096);
+  REQUIRE(config.kv_max_seq == 2048);
   REQUIRE_FALSE(config.kv_max_seq_overridden);
   REQUIRE(config.kv_auto_tune);
   REQUIRE(config.kv_budget_bytes == 0);

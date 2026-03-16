@@ -63,18 +63,28 @@ bool NativeGpuBackend::LoadModel(const std::filesystem::path &model_path,
   loaded_model_path_ = model_path;
   loaded_config_ = config;
   parity_delegate_enabled_ =
-      !ParseBoolEnv("INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE", false);
+      !ParseBoolEnv("INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE", true);
   parity_delegate_available_ = false;
   parity_delegate_init_attempted_ = false;
   parity_backend_.reset();
   parity_load_path_.clear();
 
-  // GpuAcceleratedBackend handles device init + config tuning + llama.cpp
-  // scaffold loading.
-  if (!GpuAcceleratedBackend::LoadModel(model_path, config)) {
-    log::Error(LogTag(),
-               "GpuAcceleratedBackend device init / model load failed");
-    return false;
+  if (parity_delegate_enabled_) {
+    // Full load: device init + llama.cpp scaffold (needed for grammar support)
+    if (!GpuAcceleratedBackend::LoadModel(model_path, config)) {
+      log::Error(LogTag(),
+                 "GpuAcceleratedBackend device init / model load failed");
+      return false;
+    }
+  } else {
+    // Lightweight: device init only, skip ~5.7 GB llama.cpp scaffold
+    LlamaBackendConfig tuned;
+    if (!GpuAcceleratedBackend::InitializeDevice(config, &tuned)) {
+      log::Error(LogTag(), "Device initialization failed");
+      return false;
+    }
+    log::Info(LogTag(),
+              "Scaffold model load skipped (parity delegate disabled)");
   }
 
   // Create the device-specific native runtime via the subclass.

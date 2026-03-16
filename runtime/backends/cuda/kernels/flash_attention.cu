@@ -265,15 +265,17 @@ __global__ void FlashAttention2TypedGQAKernel(
     }
     __syncthreads();
 
-    // Phase 3: Cross-warp reduction per head
-    const int total_scores = GQARatio * tile_len;
-    if (d < total_scores) {
-      const int h = d / tile_len;
-      const int t = d % tile_len;
-      float dot_sum = 0.0f;
-      for (int w = 0; w < num_warps; w++)
-        dot_sum += s_warp_dots[(h * num_warps + w) * FA2_TILE_KV + t];
-      s_scores[h * FA2_TILE_KV + t] = dot_sum * scale;
+    // Phase 3: Cross-warp reduction per head.
+    // Process each head sequentially; within each head, threads cover
+    // tile positions in parallel (same pattern as the non-GQA kernel).
+#pragma unroll
+    for (int h = 0; h < GQARatio; h++) {
+      if (d < tile_len) {
+        float dot_sum = 0.0f;
+        for (int w = 0; w < num_warps; w++)
+          dot_sum += s_warp_dots[(h * num_warps + w) * FA2_TILE_KV + d];
+        s_scores[h * FA2_TILE_KV + d] = dot_sum * scale;
+      }
     }
     __syncthreads();
 
@@ -707,16 +709,18 @@ __global__ void FlashDecodeMultiSeqStridedGQAKernel(
     }
     __syncthreads();
 
-    // Phase 3: Cross-warp reduction — per head
-    const int total_scores = GQARatio * tile_len;
-    if (d < total_scores) {
-      const int h = d / tile_len;
-      const int t = d % tile_len;
-      float dot_sum = 0.0f;
-      for (int w = 0; w < num_warps; w++) {
-        dot_sum += s_warp_dots[(h * num_warps + w) * FA2_TILE_KV + t];
+    // Phase 3: Cross-warp reduction — per head.
+    // Process each head sequentially; within each head, threads cover
+    // tile positions in parallel (same pattern as the non-GQA kernel).
+#pragma unroll
+    for (int h = 0; h < GQARatio; h++) {
+      if (d < tile_len) {
+        float dot_sum = 0.0f;
+        for (int w = 0; w < num_warps; w++) {
+          dot_sum += s_warp_dots[(h * num_warps + w) * FA2_TILE_KV + d];
+        }
+        s_scores[h * FA2_TILE_KV + d] = dot_sum * scale;
       }
-      s_scores[h * FA2_TILE_KV + t] = dot_sum * scale;
     }
     __syncthreads();
 

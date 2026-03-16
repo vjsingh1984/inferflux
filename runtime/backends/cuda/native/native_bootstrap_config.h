@@ -9,7 +9,7 @@ struct NativeBootstrapConfig {
   std::string dtype_override;
   std::string kv_precision_choice{"auto"};
   int kv_max_batch{32};
-  int kv_max_seq{4096};
+  int kv_max_seq{2048};
   bool kv_max_seq_overridden{false};
   bool kv_auto_tune{true};
   std::size_t kv_budget_bytes{0};
