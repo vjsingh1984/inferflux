@@ -162,6 +162,7 @@ Only structured output (grammar-constrained generation) still delegates to the l
 
 **Key CUDA env vars:** (centralized in `NativeExecutionPolicy::FromEnv()`)
 - `INFERFLUX_DISABLE_BATCHED_DECODE=1` — opt out of batched decode (default-on)
+- `INFERFLUX_DISABLE_CUDA_GRAPH=0` — re-enable CUDA graph capture (default-off; causes heap corruption under concurrency)
 - `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` — disable pre-quantized Q8_1 activation path
 - `INFERFLUX_CUDA_TIMING_SAMPLE_RATE=N` — record CUDA event timing every Nth batch (0=off)
 - `INFERFLUX_CUDA_PHASE_OVERLAP` — enable prefill/decode lane overlap
