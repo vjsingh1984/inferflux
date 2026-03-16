@@ -632,7 +632,7 @@ start_server() {
         INFERFLUX_CUDA_KV_MAX_SEQ=$kv_seq \
         INFERFLUX_CUDA_STRICT=$([ "$backend" = "inferflux_cuda" ] && echo "1" || echo "0") \
         INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE=$([ "$backend" = "inferflux_cuda" ] && echo "1" || echo "0") \
-        INFERFLUX_DISABLE_CUDA_GRAPH=$([ "$backend" = "inferflux_cuda" ] && echo "${INFERFLUX_DISABLE_CUDA_GRAPH:-0}" || echo "0") \
+        INFERFLUX_DISABLE_CUDA_GRAPH=$([ "$backend" = "inferflux_cuda" ] && echo "${INFERFLUX_DISABLE_CUDA_GRAPH:-1}" || echo "0") \
         "$BUILD_DIR/inferfluxd" --config "$config_file" \
         > "$log_file" 2>&1 &
     local pid=$!

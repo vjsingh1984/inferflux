@@ -179,7 +179,7 @@ private:
   cudaGraphExec_t decode_graph_exec_{nullptr};
   int graph_batch_size_{0};
   bool graph_enabled_{true};
-  int graph_warmup_remaining_{0};
+  int graph_warmup_remaining_{4};
   NativeExecutionPolicy execution_policy_{};
   std::size_t device_workspace_bytes_{0};
   std::size_t host_workspace_bytes_{0};
