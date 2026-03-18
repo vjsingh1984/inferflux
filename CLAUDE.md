@@ -91,7 +91,7 @@ The CMake target `inferflux_core` links all modules into a single library consum
 - `RequestBatch` (`scheduler/request_batch.h`) — per-request state and batch grouping for continuous batching. Interface only.
 
 **Key modules:**
-- `runtime/` — Device abstraction (`DeviceContext`), paged KV cache with LRU/Clock eviction, speculative decoding (draft + validator), NVMe offload via async file writer (io/)
+- `runtime/` — Device abstraction (`DeviceContext`), paged KV cache with LRU/Clock eviction, speculative decoding (draft + validator), NVMe offload via async file writer (io/), crash diagnostics with signal handler and breadcrumbs
 - `runtime/backends/` — Backend factory with native/universal provider paths, CUDA phase overlap and flash attention tuning, backend exposure policy with capability-based routing
 - `model/` — GGUF loader (via llama.cpp submodule in external/), tokenizer, model format auto-detection (`model_format.cpp` supports gguf/safetensors/hf with HuggingFace URI resolution)
 - `scheduler/` — Scheduler with global mutex (to be replaced by continuous batching via `RequestBatch`), `ModelRouter` with multi-model serving and backend provider tracking
@@ -151,12 +151,13 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 - `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` — allow fallback to llama.cpp backends
 - `INFERFLUX_CUDA_STRICT` — fail load if native CUDA runtime reports fallback
 - `INFERFLUX_MODEL_FORMAT` — override model format detection
+- `INFERFLUX_DISABLE_STARTUP_ADVISOR=true` — suppress startup configuration recommendations
 
 ## CUDA Development
 
 **Two-backend architecture:** The CUDA path has two providers that both accept GGUF models:
-- `inferflux_cuda` (`runtime/backends/cuda/inferflux_cuda_backend.cpp`, `inferflux_cuda_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp). Still trails llama.cpp on single-sequence throughput (~0.35-0.76x).
-- `llama_cpp_cuda` — delegates to llama.cpp for inference. Higher throughput today, lower ceiling for InferFlux-specific innovation.
+- `inferflux_cuda` (`runtime/backends/cuda/inferflux_cuda_backend.cpp`, `inferflux_cuda_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp). Use for **single-request optimization** and native feature development. Currently ~0.63x llama.cpp throughput on single-sequence decode (75.5 vs 119.9 tok/s on Qwen2.5-3B Q4_K_M).
+- `llama_cpp_cuda` — delegates to llama.cpp for inference. **Use for concurrent workloads** (validated 3.7x faster than Ollama at 16 agents). Higher throughput today, lower ceiling for InferFlux-specific innovation.
 
 Only structured output (grammar-constrained generation) still delegates to the llama.cpp parity backend. Logprobs and embeddings are native.
 
@@ -164,6 +165,8 @@ Only structured output (grammar-constrained generation) still delegates to the l
 - `INFERFLUX_DISABLE_BATCHED_DECODE=1` — opt out of batched decode (default-on)
 - `INFERFLUX_DISABLE_CUDA_GRAPH=1` — disable CUDA graph capture (default-on; cudaDeviceSynchronize before capture prevents heap corruption)
 - `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` — disable pre-quantized Q8_1 activation path
+- `INFERFLUX_ENABLE_FUSED_GATE_UP_SILU=0|1` — toggle fused gate+up+SiLU MMVQ kernel (default on)
+- `INFERFLUX_GEMV_V2=1` — enable v2 cooperative-warp GEMV kernels (experimental, slower on Ada)
 - `INFERFLUX_CUDA_TIMING_SAMPLE_RATE=N` — record CUDA event timing every Nth batch (0=off)
 - `INFERFLUX_CUDA_PHASE_OVERLAP` — enable prefill/decode lane overlap
 - `INFERFLUX_CUDA_ATTENTION_KERNEL` — force attention kernel (`auto`, `fa2`, `standard`)

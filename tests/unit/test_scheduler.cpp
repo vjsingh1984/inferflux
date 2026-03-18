@@ -5,9 +5,16 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "scheduler/fairness_controller.h"
 #include "scheduler/request_requeue.h"
+// MSVC includes access specifiers in name mangling, so the
+// "#define private public" trick causes linker errors on MSVC.
+// Tests that access private members are skipped on MSVC.
+#ifndef _MSC_VER
 #define private public
+#endif
 #include "scheduler/scheduler.h"
+#ifndef _MSC_VER
 #undef private
+#endif
 #include "scheduler/single_model_router.h"
 #include "server/metrics/metrics.h"
 

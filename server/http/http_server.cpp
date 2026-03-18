@@ -12,10 +12,19 @@
 
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#define SHUT_RDWR SD_BOTH
+inline int inferflux_close_socket(int fd) { return ::closesocket(fd); }
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+inline int inferflux_close_socket(int fd) { return ::close(fd); }
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -1285,7 +1294,7 @@ void HttpServer::Stop() {
   int fd = server_fd_.exchange(-1);
   if (fd >= 0) {
     ::shutdown(fd, SHUT_RDWR);
-    ::close(fd);
+    inferflux_close_socket(fd);
   }
   // Wake all worker threads.
   queue_cv_.notify_all();
@@ -1328,14 +1337,34 @@ void HttpServer::WorkerLoop() {
 }
 
 void HttpServer::Run() {
+#ifdef _WIN32
+  WSADATA wsa_data;
+  int wsa_err = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+  if (wsa_err != 0) {
+    inferflux::log::Error("http", "WSAStartup failed with error: " +
+                                      std::to_string(wsa_err));
+    return;
+  }
+#endif
+
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     std::perror("socket");
+#ifdef _WIN32
+    inferflux::log::Error(
+        "http", "socket() failed, WSAGetLastError=" +
+                    std::to_string(WSAGetLastError()));
+#endif
     return;
   }
 
   int opt = 1;
+#ifdef _WIN32
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char *>(&opt), sizeof(opt));
+#else
   ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
 
   sockaddr_in addr;
   std::memset(&addr, 0, sizeof(addr));
@@ -1345,13 +1374,13 @@ void HttpServer::Run() {
 
   if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
     std::perror("bind");
-    ::close(fd);
+    inferflux_close_socket(fd);
     return;
   }
 
   if (::listen(fd, 128) < 0) {
     std::perror("listen");
-    ::close(fd);
+    inferflux_close_socket(fd);
     return;
   }
 
@@ -1366,7 +1395,7 @@ void HttpServer::Run() {
       break; // Socket closed by Stop() or error — exit loop.
     }
     if (!running_) {
-      ::close(client_fd);
+      inferflux_close_socket(client_fd);
       break;
     }
     ClientSession session;
@@ -1374,13 +1403,13 @@ void HttpServer::Run() {
     if (tls_enabled_) {
       SSL *ssl = SSL_new(ssl_ctx_);
       if (!ssl) {
-        ::close(client_fd);
+        inferflux_close_socket(client_fd);
         continue;
       }
       SSL_set_fd(ssl, client_fd);
       if (SSL_accept(ssl) != 1) {
         SSL_free(ssl);
-        ::close(client_fd);
+        inferflux_close_socket(client_fd);
         continue;
       }
       session.ssl = ssl;
@@ -1395,8 +1424,11 @@ void HttpServer::Run() {
   // If Stop() hasn't already closed the socket, close it now.
   int expected = fd;
   if (server_fd_.compare_exchange_strong(expected, -1)) {
-    ::close(fd);
+    inferflux_close_socket(fd);
   }
+#ifdef _WIN32
+  WSACleanup();
+#endif
 }
 
 bool HttpServer::ResolveSubject(const std::string &headers,
@@ -3358,7 +3390,7 @@ void HttpServer::CloseSession(ClientSession &session) {
     session.ssl = nullptr;
   }
   if (session.fd >= 0) {
-    ::close(session.fd);
+    inferflux_close_socket(session.fd);
     session.fd = -1;
   }
 }

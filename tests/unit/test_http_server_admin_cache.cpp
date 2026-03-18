@@ -3,13 +3,22 @@
 #include <any>
 #include <memory>
 #include <string>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 
+#ifndef _MSC_VER
 #define private public
+#endif
 #include "server/http/http_server.h"
+#ifndef _MSC_VER
 #undef private
+#endif
 
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
@@ -35,6 +44,11 @@ std::unique_ptr<Scheduler> MakeSchedulerWithPrefix(SimpleTokenizer &tokenizer,
                                      FairnessConfig{}, disagg_config);
 }
 
+} // namespace
+
+#ifndef _WIN32  // socketpair() not available on Windows
+namespace {
+
 std::string ReadAll(int fd) {
   std::string out;
   char buffer[4096];
@@ -47,8 +61,6 @@ std::string ReadAll(int fd) {
   }
   return out;
 }
-
-} // namespace
 
 TEST_CASE("HttpServer admin cache endpoint includes memory payload",
           "[http_server]") {
@@ -140,5 +152,8 @@ TEST_CASE("HttpServer admin cache endpoint includes memory payload",
   REQUIRE(body["memory"]["paged_kv"]["prefix_retained_bytes"] == 2048);
   REQUIRE(body["memory"]["paged_kv"]["prefix_live_sequences"] == 1);
 }
+
+} // namespace
+#endif  // _WIN32
 
 } // namespace inferflux

@@ -1284,7 +1284,11 @@ int main(int argc, char **argv) {
     }
   }
   if (force_v2) {
+#ifdef _WIN32
+    _putenv_s("INFERFLUX_GEMV_V2", "1");
+#else
     setenv("INFERFLUX_GEMV_V2", "1", 1);
+#endif
   }
 
   int device_count = 0;

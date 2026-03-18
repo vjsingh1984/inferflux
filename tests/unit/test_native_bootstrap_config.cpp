@@ -8,6 +8,22 @@
 namespace inferflux {
 namespace {
 
+inline void portable_setenv(const char *name, const char *value) {
+#ifdef _WIN32
+  _putenv_s(name, value);
+#else
+  setenv(name, value, 1);
+#endif
+}
+
+inline void portable_unsetenv(const char *name) {
+#ifdef _WIN32
+  _putenv_s(name, "");
+#else
+  unsetenv(name);
+#endif
+}
+
 class ScopedEnvVar {
 public:
   ScopedEnvVar(std::string name, const char *value) : name_(std::move(name)) {
@@ -17,17 +33,17 @@ public:
       original_ = existing;
     }
     if (value) {
-      REQUIRE(setenv(name_.c_str(), value, 1) == 0);
+      portable_setenv(name_.c_str(), value);
     } else {
-      REQUIRE(unsetenv(name_.c_str()) == 0);
+      portable_unsetenv(name_.c_str());
     }
   }
 
   ~ScopedEnvVar() {
     if (had_original_) {
-      setenv(name_.c_str(), original_.c_str(), 1);
+      portable_setenv(name_.c_str(), original_.c_str());
     } else {
-      unsetenv(name_.c_str());
+      portable_unsetenv(name_.c_str());
     }
   }
 

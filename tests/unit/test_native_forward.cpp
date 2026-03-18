@@ -29,6 +29,22 @@ namespace inferflux {
 
 namespace {
 
+inline int portable_setenv(const char *name, const char *value, int) {
+#ifdef _WIN32
+  return _putenv_s(name, value);
+#else
+  return setenv(name, value, 1);
+#endif
+}
+
+inline int portable_unsetenv(const char *name) {
+#ifdef _WIN32
+  return _putenv_s(name, "");
+#else
+  return unsetenv(name);
+#endif
+}
+
 class ScopedEnvVar {
 public:
   ScopedEnvVar(std::string name, const char *value) : name_(std::move(name)) {
@@ -38,17 +54,17 @@ public:
       original_ = existing;
     }
     if (value) {
-      REQUIRE(setenv(name_.c_str(), value, 1) == 0);
+      REQUIRE(portable_setenv(name_.c_str(), value, 1) == 0);
     } else {
-      REQUIRE(unsetenv(name_.c_str()) == 0);
+      REQUIRE(portable_unsetenv(name_.c_str()) == 0);
     }
   }
 
   ~ScopedEnvVar() {
     if (had_original_) {
-      setenv(name_.c_str(), original_.c_str(), 1);
+      portable_setenv(name_.c_str(), original_.c_str(), 1);
     } else {
-      unsetenv(name_.c_str());
+      portable_unsetenv(name_.c_str());
     }
   }
 
@@ -3131,7 +3147,7 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1Pair preserves per-row grouped Q4_K "
   };
 
   auto make_q4_k_weights = [&](int rows, int seed) {
-    constexpr int blocks_per_row = K / QK_K;
+    const int blocks_per_row = K / QK_K;
     std::vector<runtime::cuda::native::block_q4_k> blocks(
         static_cast<size_t>(rows) * blocks_per_row);
     for (int row = 0; row < rows; ++row) {
@@ -4989,17 +5005,17 @@ TEST_CASE("FusedQuantGemm::DownProjMmq preserves per-row Q4_K outputs for "
 
   const char *prev = std::getenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", "1", 1) == 0);
+  REQUIRE(portable_setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", "1", 1) == 0);
 
   REQUIRE(
       FusedQuantGemm::DownProjMmq(layout, d_act_q8_1, d_out, M, N, K, nullptr));
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
   if (prev) {
-    REQUIRE(setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", prev_value.c_str(), 1) ==
+    REQUIRE(portable_setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", prev_value.c_str(), 1) ==
             0);
   } else {
-    REQUIRE(unsetenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ") == 0);
+    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ") == 0);
   }
 
   const std::vector<half> out = CopyDeviceHalfs(d_out, M * N);
@@ -5126,17 +5142,17 @@ TEST_CASE("FusedQuantGemm::DownProjMmq preserves per-row Q6_K outputs for "
 
   const char *prev = std::getenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", "1", 1) == 0);
+  REQUIRE(portable_setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", "1", 1) == 0);
 
   REQUIRE(
       FusedQuantGemm::DownProjMmq(layout, d_act_q8_1, d_out, M, N, K, nullptr));
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
   if (prev) {
-    REQUIRE(setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", prev_value.c_str(), 1) ==
+    REQUIRE(portable_setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", prev_value.c_str(), 1) ==
             0);
   } else {
-    REQUIRE(unsetenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ") == 0);
+    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ") == 0);
   }
 
   const std::vector<half> out = CopyDeviceHalfs(d_out, M * N);
@@ -5674,7 +5690,7 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q4_K outputs for exact "
   const char *prev =
       std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
+  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
                  1) == 0);
 
   constexpr int M = 1;
@@ -5778,10 +5794,10 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q4_K outputs for exact "
   }
 
   if (prev) {
-    REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+    REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
                    prev_value.c_str(), 1) == 0);
   } else {
-    REQUIRE(unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
+    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
             0);
   }
   REQUIRE(cudaFree(d_deq) == cudaSuccess);
@@ -5949,7 +5965,7 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for exact "
   const char *prev =
       std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
+  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
                  1) == 0);
 
   constexpr int M = 1;
@@ -6055,10 +6071,10 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for exact "
   }
 
   if (prev) {
-    REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+    REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
                    prev_value.c_str(), 1) == 0);
   } else {
-    REQUIRE(unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
+    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
             0);
   }
   REQUIRE(cudaFree(d_deq) == cudaSuccess);
@@ -6087,7 +6103,7 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q4_K outputs for exact "
       "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
   REQUIRE(
-      setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
              "1", 1) == 0);
 
   constexpr int M = 2;
@@ -6197,11 +6213,11 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q4_K outputs for exact "
 
   if (prev) {
     REQUIRE(
-        setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
                prev_value.c_str(), 1) == 0);
   } else {
     REQUIRE(
-        unsetenv(
+        portable_unsetenv(
             "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED") ==
         0);
   }
@@ -6231,7 +6247,7 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for exact "
       "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
   REQUIRE(
-      setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
              "1", 1) == 0);
 
   constexpr int M = 2;
@@ -6343,11 +6359,11 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for exact "
 
   if (prev) {
     REQUIRE(
-        setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
                prev_value.c_str(), 1) == 0);
   } else {
     REQUIRE(
-        unsetenv(
+        portable_unsetenv(
             "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED") ==
         0);
   }
@@ -6436,17 +6452,17 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes exact Q4_K decode hot "
   const char *prev =
       std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
+  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
                  1) == 0);
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{1, 2048, 11008, 1, true, false},
               true, true,
               true) == FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed);
   if (prev) {
-    REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+    REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
                    prev_value.c_str(), 1) == 0);
   } else {
-    REQUIRE(unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
+    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
             0);
   }
 }
@@ -6480,17 +6496,17 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes exact Q6_K decode hot "
   const char *prev =
       std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
+  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
                  1) == 0);
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{1, 2048, 11008, 1, true, false},
               true, true,
               true) == FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed);
   if (prev) {
-    REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+    REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
                    prev_value.c_str(), 1) == 0);
   } else {
-    REQUIRE(unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
+    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
             0);
   }
 }
@@ -6504,7 +6520,7 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes two-row Q4_K decode "
       "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
   REQUIRE(
-      setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
              "1", 1) == 0);
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{2, 2048, 11008, 1, true, false},
@@ -6512,11 +6528,11 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes two-row Q4_K decode "
           FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
   if (prev) {
     REQUIRE(
-        setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
                prev_value.c_str(), 1) == 0);
   } else {
     REQUIRE(
-        unsetenv(
+        portable_unsetenv(
             "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED") ==
         0);
   }
@@ -6542,7 +6558,7 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes two-row Q6_K decode "
       "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
   REQUIRE(
-      setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
              "1", 1) == 0);
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{2, 2048, 11008, 1, true, false},
@@ -6550,11 +6566,11 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes two-row Q6_K decode "
           FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
   if (prev) {
     REQUIRE(
-        setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
                prev_value.c_str(), 1) == 0);
   } else {
     REQUIRE(
-        unsetenv(
+        portable_unsetenv(
             "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED") ==
         0);
   }
@@ -6600,17 +6616,17 @@ TEST_CASE("FusedQuantGemm: down-proj selector honors MMQ batch override for "
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
   const char *prev = std::getenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", "1", 1) == 0);
+  REQUIRE(portable_setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", "1", 1) == 0);
 
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{1, 4096, 11008, 1, true, false},
               true, true, true) == FusedQuantGemm::DownProjOperator::kMmq);
 
   if (prev) {
-    REQUIRE(setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", prev_value.c_str(), 1) ==
+    REQUIRE(portable_setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", prev_value.c_str(), 1) ==
             0);
   } else {
-    REQUIRE(unsetenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH") == 0);
+    REQUIRE(portable_unsetenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH") == 0);
   }
 }
 
@@ -6620,17 +6636,17 @@ TEST_CASE("FusedQuantGemm: invalid MMQ batch override is ignored",
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
   const char *prev = std::getenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", "not_a_number", 1) == 0);
+  REQUIRE(portable_setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", "not_a_number", 1) == 0);
 
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{1, 4096, 11008, 1, true, false},
               true, true, true) == FusedQuantGemm::DownProjOperator::kQ81Gemv);
 
   if (prev) {
-    REQUIRE(setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", prev_value.c_str(), 1) ==
+    REQUIRE(portable_setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", prev_value.c_str(), 1) ==
             0);
   } else {
-    REQUIRE(unsetenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH") == 0);
+    REQUIRE(portable_unsetenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH") == 0);
   }
 }
 
@@ -6748,24 +6764,24 @@ TEST_CASE("FusedQuantGemm: specialized grouped Q8_1 fast path is limited to "
       std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K");
   const bool had_prev = prev_value != nullptr;
   const std::string prev = had_prev ? std::string(prev_value) : std::string();
-  REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", "0",
+  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", "0",
                  1) == 0);
   REQUIRE_FALSE(
       FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m1));
   REQUIRE_FALSE(
       FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m2));
 
-  REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", "1",
+  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", "1",
                  1) == 0);
   REQUIRE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m1));
   REQUIRE_FALSE(
       FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m2));
 
   if (had_prev) {
-    REQUIRE(setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K",
+    REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K",
                    prev.c_str(), 1) == 0);
   } else {
-    REQUIRE(unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K") ==
+    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K") ==
             0);
   }
 

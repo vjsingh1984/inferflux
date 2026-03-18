@@ -7,10 +7,17 @@
 #include "server/http/http_server.h"
 #include "server/metrics/metrics.h"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+using socklen_t = int;
+using ssize_t = ptrdiff_t;
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <chrono>
 #include <cstdlib>
@@ -20,6 +27,19 @@
 #include <thread>
 
 using namespace inferflux;
+
+#ifdef _WIN32
+namespace {
+struct WinsockInit {
+  WinsockInit() {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+  }
+  ~WinsockInit() { WSACleanup(); }
+};
+static WinsockInit winsock_init_;
+} // namespace
+#endif
 
 namespace {
 
@@ -82,7 +102,12 @@ int ReserveFreePort() {
   REQUIRE(fd >= 0);
 
   int opt = 1;
+#ifdef _WIN32
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char *>(&opt), sizeof(opt));
+#else
   ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -93,7 +118,11 @@ int ReserveFreePort() {
   socklen_t len = sizeof(addr);
   REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len) == 0);
   const int port = ntohs(addr.sin_port);
+#ifdef _WIN32
+  ::closesocket(fd);
+#else
   ::close(fd);
+#endif
   return port;
 }
 

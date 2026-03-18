@@ -286,7 +286,7 @@ bool GGUFModelLoader::Load(const std::filesystem::path &model_path) {
 
   log::Info("gguf_loader", "Loading GGUF model: " + model_path.string());
 
-  FILE *file = fopen(model_path.c_str(), "rb");
+  FILE *file = fopen(model_path.string().c_str(), "rb");
   if (!file) {
     log::Error("gguf_loader", "Failed to open file: " + model_path.string());
     return false;

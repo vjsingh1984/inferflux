@@ -2,6 +2,11 @@
 
 #include <string>
 
+// Windows headers define ERROR as 0 — undefine to avoid collision.
+#ifdef ERROR
+#undef ERROR
+#endif
+
 namespace inferflux {
 namespace log {
 

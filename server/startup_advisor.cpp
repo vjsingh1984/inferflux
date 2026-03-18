@@ -145,7 +145,7 @@ DetectQuantizationFromGgufMetadata(const std::filesystem::path &path) {
     return QuantizationType::kUnknown;
   }
 
-  FILE *file = fopen(gguf_path.c_str(), "rb");
+  FILE *file = fopen(gguf_path.string().c_str(), "rb");
   if (!file) {
     return QuantizationType::kUnknown;
   }

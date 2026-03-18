@@ -953,9 +953,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
   // WeightMap is always WeightMapTyped<half> currently, but the embed_tokens
   // pointer points to the same GPU data regardless of type. We cast it.
   const T *embed = reinterpret_cast<const T *>(weights_->EmbedTokens());
+  // Embed directly to residual stream, eliminating the D2D copy.
   {
     NVTX_SCOPE("Embedding");
-    err = cuda_kernel::EmbeddingLookup<T>(embed, d_token_ids_, d_hidden_,
+    err = cuda_kernel::EmbeddingLookup<T>(embed, d_token_ids_, d_residual_,
                                           seq_len, hidden_size_, stream_);
   }
   if (err != cudaSuccess) {
@@ -963,18 +964,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     return false;
   }
 
-  DebugDumpHidden("after_embedding", d_hidden_, seq_len * hidden_size_, stream_,
-                  &execution_policy_);
-
-  // Step 3: Copy to residual stream
-  err = runtime::cuda::native::TracedCudaMemcpyAsync(
-      runtime::cuda::native::CopyTraceSite::kForwardResidualD2D, d_residual_,
-      d_hidden_, static_cast<size_t>(seq_len) * hidden_size_ * sizeof(T),
-      cudaMemcpyDeviceToDevice, stream_);
-  if (err != cudaSuccess) {
-    log::Error("llama_forward", "Residual copy failed");
-    return false;
-  }
+  DebugDumpHidden("after_embedding", d_residual_, seq_len * hidden_size_,
+                  stream_, &execution_policy_);
   pt.embed_ms += pt.Mark();
 
   // Step 4: Transformer layers
@@ -1728,23 +1719,16 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
   // `capture_abort` and fall back to direct execution after ending capture.
   bool capture_abort = false;
   auto RunCompute = [&]() -> bool {
-    // Embedding [B, hidden_size]
+    // Embedding [B, hidden_size] — write directly to residual stream,
+    // eliminating the d_hidden_ → d_residual_ D2D copy.
     {
       NVTX_SCOPE("Embedding");
       const T *embed = reinterpret_cast<const T *>(weights_->EmbedTokens());
       err = cuda_kernel::EmbeddingLookup<T>(
-          embed, d_batch_token_ids_, d_hidden_, B, hidden_size_, stream_);
+          embed, d_batch_token_ids_, d_residual_, B, hidden_size_, stream_);
       if (err != cudaSuccess)
         return false;
     }
-
-    // Copy to residual stream
-    err = runtime::cuda::native::TracedCudaMemcpyAsync(
-        runtime::cuda::native::CopyTraceSite::kBatchResidualD2D, d_residual_,
-        d_hidden_, static_cast<size_t>(B) * hidden_size_ * sizeof(T),
-        cudaMemcpyDeviceToDevice, stream_);
-    if (err != cudaSuccess)
-      return false;
     pt.embed_ms += pt.Mark();
 
     // Transformer layers
@@ -1977,10 +1961,40 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
 
       // FFN block
       bool down_accumulated = false;
+      bool fused_gate_up_silu = false;
       {
         NVTX_SCOPE("FFN");
         auto gate_raw = weights_->LayerGateProjRaw(layer);
         auto up_raw = weights_->LayerUpProjRaw(layer);
+
+        // Try fused gate+up+SiLU MMVQ: single kernel reads both weight
+        // matrices and applies SiLU activation at write-back, halving
+        // weight memory traffic vs separate gate+up projections.
+        if constexpr (std::is_same_v<T, half>) {
+          if (execution_policy_.enable_fused_gate_up_silu &&
+              !Q81ActivationsDisabled(execution_policy_) && d_act_q8_1_ &&
+              gate_raw.data && up_raw.data &&
+              gate_raw.quant_type == up_raw.quant_type &&
+              FusedQuantGemm::SupportsQ8_1Activations(gate_raw.quant_type) &&
+              FusedQuantGemm::ShouldUseFusedPath(
+                  gate_raw.quant_type,
+                  FusedDispatchGeometry{B, intermediate_size_, hidden_size_, 2,
+                                        true, true})) {
+            NVTX_SCOPE("FusedGateUpSiLU");
+            FusedQuantGemm::FusedRmsNormQuantizeQ8_1(
+                d_residual_, post_attn_norm, d_act_q8_1_, B, hidden_size_,
+                rms_norm_eps_, stream_);
+            fused_gate_up_silu = FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
+                gate_raw, up_raw, d_act_q8_1_, d_ffn_gate_, B,
+                intermediate_size_, hidden_size_, stream_);
+            if (fused_gate_up_silu) {
+              LogPackedGemmPath("ffn_gate_up",
+                                "using fused gate+up+SiLU MMVQ kernel");
+            }
+          }
+        }
+
+        if (!fused_gate_up_silu) {
         const std::array<PackedProjectionPlan<T>, 2> ffn_plans = {
             {{gate_raw, d_ffn_gate_, intermediate_size_},
              {up_raw, d_ffn_up_, intermediate_size_}}};
@@ -2074,10 +2088,37 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                 &ffn_summary)) {
           return false;
         }
+        } // end if (!fused_gate_up_silu)
         pt.ffn_proj_ms += pt.Mark();
 
         auto down_raw = weights_->LayerDownProjRaw(layer);
         auto down_mmq = weights_->LayerDownProjMmq(layer);
+
+        if (fused_gate_up_silu) {
+          // SiLU already applied by fused kernel — d_ffn_gate_ has the
+          // post-activation FP16 result.  Just quantize and run down GEMV.
+          bool down_ok =
+              TryQ8_1Gemv<T>(down_raw, d_ffn_gate_, d_ffn_down_, d_act_q8_1_,
+                             B, hidden_size_, intermediate_size_, stream_,
+                             "down_proj", &execution_policy_);
+          if (!down_ok) {
+            down_ok = TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
+                                    d_act_q8_1_, B, hidden_size_,
+                                    intermediate_size_, stream_, "down_proj",
+                                    &execution_policy_);
+          }
+          if (!down_ok) {
+            if (capturing) {
+              capture_abort = true;
+              return false;
+            }
+            const T *down_proj =
+                reinterpret_cast<const T *>(weights_->LayerDownProj(layer));
+            gemm_->GemmTypedAccum<T>(B, hidden_size_, intermediate_size_,
+                                     d_ffn_gate_, down_proj, d_residual_);
+            down_accumulated = true;
+          }
+        } else {
         const auto down_selected_op = SelectInferfluxCudaDownProjOperator(
             down_raw, down_mmq, InferfluxCudaDispatchPhase::kDecode,
             FusedDispatchGeometry{B, hidden_size_, intermediate_size_, 1, true,
@@ -2160,6 +2201,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                 &down_summary)) {
           return false;
         }
+        } // end else (!fused_gate_up_silu)
       }
 
       // Residual add (skip if cuBLAS accumulated directly)

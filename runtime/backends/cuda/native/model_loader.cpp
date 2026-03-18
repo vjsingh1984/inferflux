@@ -57,21 +57,21 @@ CreateModelLoader(const std::filesystem::path &model_path) {
 
   // Case 1: Directory with config.json → safetensors
   if (is_directory) {
-    std::string config_path = model_path / "config.json";
+    auto config_path = (model_path / "config.json").string();
     if (std::filesystem::exists(config_path)) {
       log::Info("model_loader_factory", "Detected safetensors format");
       return std::make_unique<SafetensorsLoaderAdapter>();
     }
 
     // Check for model.safetensors.index.json
-    std::string index_path = model_path / "model.safetensors.index.json";
+    auto index_path = (model_path / "model.safetensors.index.json").string();
     if (std::filesystem::exists(index_path)) {
       log::Info("model_loader_factory", "Detected safetensors format (index)");
       return std::make_unique<SafetensorsLoaderAdapter>();
     }
 
     // Check for single model.safetensors file
-    std::string single_path = model_path / "model.safetensors";
+    auto single_path = (model_path / "model.safetensors").string();
     if (std::filesystem::exists(single_path)) {
       log::Info("model_loader_factory", "Detected safetensors format (single)");
       return std::make_unique<SafetensorsLoaderAdapter>();

@@ -246,6 +246,17 @@ public:
       const void *act_q8_1, int M, int K, cudaStream_t stream);
 
   /**
+   * Fused gate+up+SiLU MMVQ: computes SiLU(gate_proj(x)) * up_proj(x) in one
+   * kernel pass. Both projections must be the same quant type (Q4_K).
+   * Output is FP16; caller must quantize to Q8_1 before down_proj GEMV.
+   */
+  static bool FusedGateUpSiluGemvQ8_1(const QuantizedWeightInfo &gate_raw,
+                                       const QuantizedWeightInfo &up_raw,
+                                       const void *act_q8_1, half *output,
+                                       int M, int N, int K,
+                                       cudaStream_t stream);
+
+  /**
    * Grouped Q8_1 GEMV for three sibling projections (single kernel launch).
    */
   static bool

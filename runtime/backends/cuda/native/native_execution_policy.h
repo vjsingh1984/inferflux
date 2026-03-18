@@ -36,6 +36,10 @@ struct NativeExecutionPolicy {
   bool enable_downproj_mmq{false};
   int downproj_mmq_min_batch_override{-1};
   bool use_vectorized_loads{false};
+  bool enable_fused_gate_up_silu{true};
+  bool enable_adaptive_mmvq_threads{true};
+  int mmvq_min_warps_override{-1};
+  int mmvq_max_warps_override{-1};
 
   static NativeExecutionPolicy FromEnv() {
     NativeExecutionPolicy policy;
@@ -102,6 +106,14 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", -1, 1, 64);
     policy.use_vectorized_loads =
         ParseBoolEnv("INFERFLUX_USE_VECTORIZED_LOADS", false);
+    policy.enable_fused_gate_up_silu =
+        ParseBoolEnv("INFERFLUX_ENABLE_FUSED_GATE_UP_SILU", true);
+    policy.enable_adaptive_mmvq_threads =
+        ParseBoolEnv("INFERFLUX_ENABLE_ADAPTIVE_MMVQ_THREADS", true);
+    policy.mmvq_min_warps_override =
+        ParseIntEnv("INFERFLUX_MMVQ_MIN_WARPS", -1, 1, 8);
+    policy.mmvq_max_warps_override =
+        ParseIntEnv("INFERFLUX_MMVQ_MAX_WARPS", -1, 1, 8);
     return policy;
   }
 

@@ -115,9 +115,15 @@ GpuProfile &GetGpuProfile() {
     if (cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
       profile.sm_major = prop.major;
       profile.sm_minor = prop.minor;
+      // memoryClockRate removed in CUDA 13+; use cudaDeviceGetAttribute.
+      int mem_clock_khz = 0, mem_bus_width = 0;
+      cudaDeviceGetAttribute(&mem_clock_khz,
+                             cudaDevAttrMemoryClockRate, device);
+      cudaDeviceGetAttribute(&mem_bus_width,
+                             cudaDevAttrGlobalMemoryBusWidth, device);
       profile.memory_bandwidth_gb_s =
-          static_cast<float>(prop.memoryClockRate) * 2.0f *
-          static_cast<float>(prop.memoryBusWidth) / 8.0f / 1e6f;
+          static_cast<float>(mem_clock_khz) * 2.0f *
+          static_cast<float>(mem_bus_width) / 8.0f / 1e6f;
       profile.sm_count = prop.multiProcessorCount;
       profile.has_dp4a =
           (prop.major > 6) || (prop.major == 6 && prop.minor >= 1);
@@ -1936,6 +1942,41 @@ bool FusedQuantGemm::GemvQ8_1Pair(
                   act_q8_1, projections[0].output, projections[0].output_cols,
                   projections[1].output, projections[1].output_cols, M, K,
                   stream);
+}
+
+bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
+    const QuantizedWeightInfo &gate_raw, const QuantizedWeightInfo &up_raw,
+    const void *act_q8_1, half *output, int M, int N, int K,
+    cudaStream_t stream) {
+  if (!act_q8_1 || !output || M <= 0 || N <= 0 || K <= 0) {
+    return false;
+  }
+  if (!gate_raw.data || !up_raw.data) {
+    return false;
+  }
+  // Both projections must be Q4_K
+  if (gate_raw.quant_type != static_cast<int>(GGUF::TensorType::Q4_K) ||
+      up_raw.quant_type != static_cast<int>(GGUF::TensorType::Q4_K)) {
+    return false;
+  }
+
+  using namespace runtime::cuda::native;
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    log::Info("fused_quant_gemm",
+              "Using fused gate+up+SiLU Q4_K MMVQ kernel (M=" +
+                  std::to_string(M) + ", N=" + std::to_string(N) +
+                  ", K=" + std::to_string(K) + ")");
+  }
+
+  return DispatchMmvqFusedGateUpSilu<
+      block_q4_k, inferflux_mmvq_q4k_fused_gate_up_silu<1>,
+      inferflux_mmvq_q4k_fused_gate_up_silu<2>,
+      inferflux_mmvq_q4k_fused_gate_up_silu<4>,
+      inferflux_mmvq_q4k_fused_gate_up_silu<8>>(gate_raw.data, up_raw.data,
+                                                 act_q8_1, output, N, M, K,
+                                                 stream);
 }
 
 bool FusedQuantGemm::GemvQ8_1PairRowQuadCandidate(

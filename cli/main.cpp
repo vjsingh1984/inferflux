@@ -4,12 +4,20 @@
 #include <nlohmann/json.hpp>
 
 #include <errno.h>
-#include <fcntl.h>
 #include <signal.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#include <ws2tcpip.h>
+#include <io.h>
+#include <process.h>
+#else
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -1056,6 +1064,19 @@ std::filesystem::path ServerLogFile() {
   return InferfluxHome() / "logs" / "server.log";
 }
 
+#ifdef _WIN32
+// Windows helper: check if a process with the given PID is still running.
+bool IsProcessRunning(DWORD pid) {
+  HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+  if (h == nullptr)
+    return false;
+  DWORD exit_code = 0;
+  bool running = GetExitCodeProcess(h, &exit_code) && exit_code == STILL_ACTIVE;
+  CloseHandle(h);
+  return running;
+}
+#endif
+
 bool IsServerRunning() {
   auto pid_file = ServerPidFile();
   if (!std::filesystem::exists(pid_file)) {
@@ -1067,6 +1088,11 @@ bool IsServerRunning() {
     return false;
   }
 
+#ifdef _WIN32
+  DWORD pid;
+  pid_file_stream >> pid;
+  return IsProcessRunning(pid);
+#else
   pid_t pid;
   pid_file_stream >> pid;
 
@@ -1075,6 +1101,7 @@ bool IsServerRunning() {
     return true; // Process exists
   }
   return false; // Process doesn't exist
+#endif
 }
 
 int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
@@ -1091,6 +1118,22 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
   std::filesystem::create_directories(log_file.parent_path());
 
   // Build server binary path
+#ifdef _WIN32
+  std::string server_bin = ".\\build\\inferfluxd.exe";
+  if (!std::filesystem::exists(server_bin)) {
+    // Try relative path from inferctl
+    char exe_path[MAX_PATH];
+    DWORD len = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+      std::filesystem::path exe_dir =
+          std::filesystem::path(exe_path).parent_path();
+      server_bin = (exe_dir / "inferfluxd.exe").string();
+      if (!std::filesystem::exists(server_bin)) {
+        server_bin = (exe_dir / "..\\inferfluxd.exe").string();
+      }
+    }
+  }
+#else
   std::string server_bin = "./build/inferfluxd";
   if (!std::filesystem::exists(server_bin)) {
     // Try relative path from inferctl
@@ -1100,12 +1143,13 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
       exe_path[len] = '\0';
       std::filesystem::path exe_dir =
           std::filesystem::path(exe_path).parent_path();
-      server_bin = exe_dir / "inferfluxd";
+      server_bin = (exe_dir / "inferfluxd").string();
       if (!std::filesystem::exists(server_bin)) {
-        server_bin = exe_dir / "../inferfluxd";
+        server_bin = (exe_dir / "../inferfluxd").string();
       }
     }
   }
+#endif
 
   if (!std::filesystem::exists(server_bin)) {
     std::cerr << "Error: Server binary not found at " << server_bin << "\n";
@@ -1114,6 +1158,112 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
     return 1;
   }
 
+#ifdef _WIN32
+  // Start server as a detached process with output redirected to log file
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof(sa);
+  sa.lpSecurityDescriptor = nullptr;
+  sa.bInheritHandle = TRUE;
+
+  HANDLE log_handle = CreateFileA(
+      log_file.string().c_str(), FILE_APPEND_DATA,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (log_handle == INVALID_HANDLE_VALUE) {
+    std::cerr << "Error: Failed to open log file: " << log_file << "\n";
+    return 1;
+  }
+
+  STARTUPINFOA si = {};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = INVALID_HANDLE_VALUE;
+  si.hStdOutput = log_handle;
+  si.hStdError = log_handle;
+
+  PROCESS_INFORMATION pi = {};
+  std::string cmd_line = server_bin + " --config " + config_path;
+
+  if (!CreateProcessA(nullptr, const_cast<char *>(cmd_line.c_str()), nullptr,
+                       nullptr, TRUE, DETACHED_PROCESS, nullptr, nullptr, &si,
+                       &pi)) {
+    std::cerr << "Error: Failed to start server process (error "
+              << GetLastError() << ")\n";
+    CloseHandle(log_handle);
+    return 1;
+  }
+
+  DWORD pid = pi.dwProcessId;
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  CloseHandle(log_handle);
+
+  // Write PID file
+  {
+    std::ofstream pid_file_stream(ServerPidFile());
+    pid_file_stream << pid << "\n";
+  }
+
+  std::cout << "Starting InferFlux server (PID: " << pid << ")...\n";
+  std::cout << "Config: " << config_path << "\n";
+  std::cout << "Logs: " << log_file << "\n";
+
+  if (wait_for_ready) {
+    std::cout << "Waiting for server to be ready...";
+    std::cout.flush();
+
+    auto start = std::chrono::steady_clock::now();
+    bool ready = false;
+
+    while (std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now() - start)
+               .count() < timeout_sec) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      std::cout << ".";
+      std::cout.flush();
+
+      // Check if process is still running
+      if (!IsProcessRunning(pid)) {
+        std::cout << "\n";
+        std::cerr << "Error: Server process died unexpectedly\n";
+        std::filesystem::remove(ServerPidFile());
+        return 1;
+      }
+
+      // Try health endpoint
+      try {
+        inferflux::HttpClient client;
+        auto headers = AuthHeaders("");
+        auto resp =
+            client.Get(BuildUrl("127.0.0.1", 8080, "/healthz"), headers);
+        if (resp.status == 200) {
+          ready = true;
+          break;
+        }
+      } catch (...) {
+        // Server not ready yet
+      }
+    }
+
+    std::cout << "\n";
+
+    if (ready) {
+      std::cout << "Server is ready!\n";
+      std::cout << "  API: http://127.0.0.1:8080\n";
+      std::cout << "  Health: http://127.0.0.1:8080/healthz\n";
+      std::cout << "  Metrics: http://127.0.0.1:8080/metrics\n";
+      return 0;
+    } else {
+      std::cerr << "Error: Server failed to become ready after " << timeout_sec
+                << " seconds\n";
+      std::cerr << "Check logs at: " << log_file << "\n";
+      return 1;
+    }
+  }
+
+  return 0;
+}
+#else
   // Start server in background
   pid_t pid = fork();
   if (pid < 0) {
@@ -1209,6 +1359,7 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
 
   return 0;
 }
+#endif
 
 int CmdServerStop(bool wait = true, int timeout_sec = 10) {
   auto pid_file = ServerPidFile();
@@ -1223,6 +1374,43 @@ int CmdServerStop(bool wait = true, int timeout_sec = 10) {
     return 1;
   }
 
+#ifdef _WIN32
+  DWORD pid;
+  pid_file_stream >> pid;
+
+  // Check if process is running
+  if (!IsProcessRunning(pid)) {
+    std::cerr << "Server process (PID " << pid << ") is not running\n";
+    std::filesystem::remove(pid_file);
+    return 0;
+  }
+
+  std::cout << "Stopping server (PID: " << pid << ")...";
+  std::cout.flush();
+
+  // Terminate the process
+  HANDLE proc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+  if (proc == nullptr) {
+    std::cerr << "\nError: Failed to open server process (error "
+              << GetLastError() << ")\n";
+    return 1;
+  }
+
+  if (!TerminateProcess(proc, 0)) {
+    std::cerr << "\nError: Failed to terminate server process (error "
+              << GetLastError() << ")\n";
+    CloseHandle(proc);
+    return 1;
+  }
+
+  if (wait) {
+    WaitForSingleObject(proc, timeout_sec * 1000);
+  }
+
+  CloseHandle(proc);
+
+  std::cout << "\nServer stopped\n";
+#else
   pid_t pid;
   pid_file_stream >> pid;
 
@@ -1268,6 +1456,7 @@ int CmdServerStop(bool wait = true, int timeout_sec = 10) {
   }
 
   std::cout << "\n✓ Server stopped\n";
+#endif
 
   // Clean up PID file
   std::filesystem::remove(pid_file);
@@ -1290,10 +1479,18 @@ int CmdServerStatus(bool verbose = false) {
     return 1;
   }
 
+#ifdef _WIN32
+  DWORD pid;
+#else
   pid_t pid;
+#endif
   pid_file_stream >> pid;
 
+#ifdef _WIN32
+  if (!IsProcessRunning(pid)) {
+#else
   if (kill(pid, 0) != 0) {
+#endif
     std::cout << "Server: " << "\033[31m" << "CRASHED" << "\033[0m"
               << " (PID file exists but process not running)\n";
     std::cout << "Cleaning up stale PID file...\n";
@@ -1365,8 +1562,14 @@ int CmdServerLogs(int tail_lines = 100) {
     return 1;
   }
 
+#ifdef _WIN32
+  std::string command = "powershell -Command \"Get-Content -Path '" +
+                        log_file.string() + "' -Tail " +
+                        std::to_string(tail_lines) + " -Wait\"";
+#else
   std::string command =
       "tail -n " + std::to_string(tail_lines) + " -f " + log_file.string();
+#endif
   int result = std::system(command.c_str());
 
   return (result == 0) ? 0 : 1;

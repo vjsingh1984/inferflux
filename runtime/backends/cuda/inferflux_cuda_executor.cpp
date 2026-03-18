@@ -29,14 +29,25 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <fstream>
 #include <limits>
 #include <set>
+#include <thread>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#ifndef F_OK
+#define F_OK 0
+#endif
+#define access _access
+#define MAP_FAILED ((void *)-1)
+inline void munmap(void *addr, size_t) { UnmapViewOfFile(addr); }
+#else
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <thread>
 #include <unistd.h>
+#endif
 
 #include <nlohmann/json.hpp>
 

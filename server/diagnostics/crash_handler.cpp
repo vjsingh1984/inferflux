@@ -4,7 +4,15 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+#else
 #include <unistd.h>
+#endif
 
 namespace inferflux {
 namespace diagnostics {
@@ -64,11 +72,19 @@ namespace {
 
 // Suppress unused-result warnings for write() in signal handler context.
 // We can't meaningfully handle write failures during a crash dump.
+#ifndef _MSC_VER
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-result"
+#endif
 
 // Async-signal-safe write wrapper.
-void SafeWrite(int fd, const char *buf, size_t len) { ::write(fd, buf, len); }
+void SafeWrite(int fd, const char *buf, size_t len) {
+#ifdef _WIN32
+  _write(fd, buf, static_cast<unsigned int>(len));
+#else
+  ::write(fd, buf, len);
+#endif
+}
 
 // Async-signal-safe integer-to-string for small positive integers.
 void WriteInt(int fd, int64_t value) {
@@ -95,8 +111,10 @@ const char *SignalName(int sig) {
     return "SIGSEGV (Segmentation fault)";
   case SIGABRT:
     return "SIGABRT (Aborted)";
+#ifndef _WIN32
   case SIGBUS:
     return "SIGBUS (Bus error)";
+#endif
   case SIGFPE:
     return "SIGFPE (Floating point exception)";
   default:
@@ -145,18 +163,29 @@ void CrashSignalHandler(int sig) {
   SafeWrite(fd, "=== END CRASH DIAGNOSTIC ===\n", 29);
 
   // Re-raise with default handler so we get a core dump.
+#ifdef _WIN32
+  signal(sig, SIG_DFL);
+#else
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = SIG_DFL;
   sigaction(sig, &sa, nullptr);
+#endif
   raise(sig);
 }
 
+#ifndef _MSC_VER
 #pragma GCC diagnostic pop
+#endif
 
 } // namespace
 
 void InstallCrashHandler() {
+#ifdef _WIN32
+  signal(SIGSEGV, CrashSignalHandler);
+  signal(SIGABRT, CrashSignalHandler);
+  signal(SIGFPE, CrashSignalHandler);
+#else
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = CrashSignalHandler;
@@ -169,6 +198,7 @@ void InstallCrashHandler() {
   sigaction(SIGABRT, &sa, nullptr);
   sigaction(SIGBUS, &sa, nullptr);
   sigaction(SIGFPE, &sa, nullptr);
+#endif
 }
 
 } // namespace diagnostics

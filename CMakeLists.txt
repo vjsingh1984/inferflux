@@ -7,6 +7,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Prevent Windows min/max macros from breaking std::min/std::max.
+if(WIN32)
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 # Load dependencies from cmake/Dependencies.cmake
 include(cmake/Dependencies.cmake)
 
@@ -30,7 +35,7 @@ option(INFERFLUX_CUDA_NATIVE_ARCH "Compile CUDA kernels for local GPU only (fast
 # BackendInterface is the canonical base for all backends.
 add_compile_definitions(INFERFLUX_USE_COMMON_BACKEND_TYPES)
 
-add_library(inferflux_core
+add_library(inferflux_core STATIC
   runtime/device_context.h
   runtime/kv_cache/paged_kv_cache.cpp
   runtime/kv_cache/paged_kv_cache.h
@@ -277,7 +282,9 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/external
   )
-  target_link_libraries(inferflux_cuda_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::curand CUDA::nvToolsExt)
+  # NVTX3 is header-only in CUDA 12+; no library linkage needed.
+  target_link_libraries(inferflux_cuda_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::curand)
+  target_include_directories(inferflux_cuda_kernels PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
 
   # Add native CUDA C++ sources to inferflux_core
   target_sources(inferflux_core PRIVATE
@@ -297,7 +304,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/q8_0_handler.cpp
     runtime/backends/cuda/native/q8_k_handler.cpp
   )
-  target_link_libraries(inferflux_core PUBLIC inferflux_cuda_kernels CUDA::cublas CUDA::nvToolsExt)
+  target_link_libraries(inferflux_core PUBLIC inferflux_cuda_kernels CUDA::cublas)
   set_target_properties(inferflux_core PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
   if(INFERFLUX_CUDA_DEVICE_LTO)
     message(WARNING
@@ -577,7 +584,7 @@ add_executable(inferflux_tests
   tests/unit/test_audit_logger.cpp
   tests/unit/test_metrics.cpp
   tests/unit/test_http_server.cpp
-  tests/unit/test_scheduler.cpp
+  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/unit/test_scheduler.cpp>
   tests/unit/test_session_handle_manager.cpp
   tests/unit/test_sequence_slot_manager.cpp
   tests/unit/test_policy_store.cpp
@@ -616,7 +623,7 @@ add_executable(inferflux_tests
   tests/unit/test_native_forward.cpp
   tests/unit/test_native_rowpair_kernels.cpp
   tests/unit/test_native_bootstrap_config.cpp
-  tests/unit/test_native_dequant_policy.cpp
+  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/unit/test_native_dequant_policy.cpp>
   tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
   tests/unit/test_model_memory_ledger.cpp
@@ -630,9 +637,9 @@ add_executable(inferflux_tests
   tests/unit/test_gguf_parsing.cpp
   tests/unit/test_gguf_model_loader.cpp
   tests/unit/test_quantized_weight_map.cpp
-  tests/unit/test_quantized_weight_map_scratch.cpp
+  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/unit/test_quantized_weight_map_scratch.cpp>
   tests/unit/test_strategy_registry.cpp
-  tests/integration/test_gguf_quantization.cpp
+  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/integration/test_gguf_quantization.cpp>
   tests/integration/test_http_generation_admission.cpp
   external/catch2/catch_amalgamated.cpp
 )
@@ -658,12 +665,18 @@ if(ENABLE_CUDA)
     HINTS ${CUDAToolkit_LIBRARY_DIR}
           ${CUDA_TOOLKIT_ROOT_DIR}/extras/CUPTI/lib64
           ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+          $ENV{CUDA_PATH}/extras/CUPTI/lib64
   )
-  if(CUPTI_LIBRARY)
+  find_path(CUPTI_INCLUDE_DIR cupti.h
+    HINTS ${CUDA_TOOLKIT_ROOT_DIR}/extras/CUPTI/include
+          $ENV{CUDA_PATH}/extras/CUPTI/include
+  )
+  if(CUPTI_LIBRARY AND CUPTI_INCLUDE_DIR)
     target_link_libraries(inferflux_kernel_count_probe PRIVATE ${CUPTI_LIBRARY})
     target_include_directories(inferflux_kernel_count_probe PRIVATE
-      ${CUDA_TOOLKIT_ROOT_DIR}/extras/CUPTI/include
+      ${CUPTI_INCLUDE_DIR}
     )
+    target_compile_definitions(inferflux_kernel_count_probe PRIVATE INFERFLUX_HAS_CUPTI=1)
   endif()
 endif()
 if(ENABLE_MLX)

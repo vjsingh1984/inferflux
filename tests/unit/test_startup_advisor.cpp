@@ -4,6 +4,22 @@
 
 #include <cstdlib>
 
+#ifdef _WIN32
+inline void portable_setenv(const char *name, const char *value) {
+  _putenv_s(name, value);
+}
+inline void portable_unsetenv(const char *name) {
+  _putenv_s(name, "");
+}
+#else
+inline void portable_setenv(const char *name, const char *value) {
+  setenv(name, value, 1);
+}
+inline void portable_unsetenv(const char *name) {
+  unsetenv(name);
+}
+#endif
+
 // Helper to build a well-tuned CUDA context (zero recommendations expected).
 static inferflux::StartupAdvisorContext WellTunedCudaContext() {
   inferflux::StartupAdvisorContext ctx;
@@ -137,9 +153,9 @@ TEST_CASE("Suppression env var disables all recommendations",
   ctx.config.phase_overlap_enabled = false;
 
   // Set suppression env var.
-  setenv("INFERFLUX_DISABLE_STARTUP_ADVISOR", "true", 1);
+  portable_setenv("INFERFLUX_DISABLE_STARTUP_ADVISOR", "true");
   int count = inferflux::RunStartupAdvisor(ctx);
   REQUIRE(count == 0);
   // Clean up.
-  unsetenv("INFERFLUX_DISABLE_STARTUP_ADVISOR");
+  portable_unsetenv("INFERFLUX_DISABLE_STARTUP_ADVISOR");
 }
