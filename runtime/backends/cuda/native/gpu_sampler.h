@@ -12,6 +12,11 @@ namespace inferflux {
  *
  * For greedy (temperature=0): argmax via parallel reduction.
  * For stochastic: softmax -> top-k -> top-p -> multinomial sample.
+ *
+ * Thread-safety contract: NOT thread-safe.  Each inference lane
+ * (prefill/decode) must own its own GpuSampler instance.  This is
+ * correct by construction — InferfluxCudaExecutor creates per-lane
+ * sampler instances (sampler_, decode_lane_sampler_, prefill_lane_sampler_).
  */
 class GpuSampler {
 public:

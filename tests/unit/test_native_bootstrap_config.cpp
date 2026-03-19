@@ -1,59 +1,13 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #include "runtime/backends/cuda/native/native_bootstrap_config.h"
+#include "support/scoped_env.h"
 
 #include <cstdlib>
 #include <string>
 
 namespace inferflux {
-namespace {
-
-inline void portable_setenv(const char *name, const char *value) {
-#ifdef _WIN32
-  _putenv_s(name, value);
-#else
-  setenv(name, value, 1);
-#endif
-}
-
-inline void portable_unsetenv(const char *name) {
-#ifdef _WIN32
-  _putenv_s(name, "");
-#else
-  unsetenv(name);
-#endif
-}
-
-class ScopedEnvVar {
-public:
-  ScopedEnvVar(std::string name, const char *value) : name_(std::move(name)) {
-    const char *existing = std::getenv(name_.c_str());
-    if (existing) {
-      had_original_ = true;
-      original_ = existing;
-    }
-    if (value) {
-      portable_setenv(name_.c_str(), value);
-    } else {
-      portable_unsetenv(name_.c_str());
-    }
-  }
-
-  ~ScopedEnvVar() {
-    if (had_original_) {
-      portable_setenv(name_.c_str(), original_.c_str());
-    } else {
-      portable_unsetenv(name_.c_str());
-    }
-  }
-
-private:
-  std::string name_;
-  std::string original_;
-  bool had_original_{false};
-};
-
-} // namespace
+using test::ScopedEnvVar;
 
 TEST_CASE("NativeBootstrapConfig: uses hinted KV precision and default sizing",
           "[native_bootstrap]") {

@@ -1,8 +1,6 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#define private public
-#include "runtime/backends/cuda/inferflux_cuda_executor.h"
-#undef private
+#include "support/executor_test_access.h"
 
 namespace inferflux {
 namespace {
@@ -56,32 +54,34 @@ private:
 TEST_CASE("InferfluxCudaExecutor dequant policy parser uses none as default",
           "[native_forward][dequant_policy]") {
   InferfluxCudaExecutor executor;
+  ExecutorTestAccess acc(executor);
 
-  REQUIRE(executor.ConfigureDequantizedCachePolicy(""));
-  CHECK(executor.dequantized_cache_policy_ ==
+  REQUIRE(acc.ConfigureDequantizedCachePolicy(""));
+  CHECK(acc.dequantized_cache_policy() ==
         runtime::cuda::native::DequantizedCachePolicy::kNone);
-  CHECK(executor.dequantized_cache_policy_hint_ == "none");
+  CHECK(acc.dequantized_cache_policy_hint() == "none");
 
-  REQUIRE(executor.ConfigureDequantizedCachePolicy("invalid_value"));
-  CHECK(executor.dequantized_cache_policy_ ==
+  REQUIRE(acc.ConfigureDequantizedCachePolicy("invalid_value"));
+  CHECK(acc.dequantized_cache_policy() ==
         runtime::cuda::native::DequantizedCachePolicy::kNone);
-  CHECK(executor.dequantized_cache_policy_hint_ == "none");
+  CHECK(acc.dequantized_cache_policy_hint() == "none");
 }
 
 TEST_CASE("InferfluxCudaExecutor dequant policy parser accepts none batch model",
           "[native_forward][dequant_policy]") {
   InferfluxCudaExecutor executor;
+  ExecutorTestAccess acc(executor);
 
-  REQUIRE(executor.ConfigureDequantizedCachePolicy("none"));
-  CHECK(executor.dequantized_cache_policy_ ==
+  REQUIRE(acc.ConfigureDequantizedCachePolicy("none"));
+  CHECK(acc.dequantized_cache_policy() ==
         runtime::cuda::native::DequantizedCachePolicy::kNone);
 
-  REQUIRE(executor.ConfigureDequantizedCachePolicy("batch"));
-  CHECK(executor.dequantized_cache_policy_ ==
+  REQUIRE(acc.ConfigureDequantizedCachePolicy("batch"));
+  CHECK(acc.dequantized_cache_policy() ==
         runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime);
 
-  REQUIRE(executor.ConfigureDequantizedCachePolicy("model"));
-  CHECK(executor.dequantized_cache_policy_ ==
+  REQUIRE(acc.ConfigureDequantizedCachePolicy("model"));
+  CHECK(acc.dequantized_cache_policy() ==
         runtime::cuda::native::DequantizedCachePolicy::kModelLifetime);
 }
 
@@ -89,21 +89,22 @@ TEST_CASE("InferfluxCudaExecutor releases dequant cache for non-model policies "
           "on GGUF loaders",
           "[native_forward][dequant_policy]") {
   InferfluxCudaExecutor executor;
+  ExecutorTestAccess acc(executor);
 
   // kNone: request-boundary cleanup clears dequantized cache
   auto *none_loader = new MockDequantPolicyLoader("gguf");
-  executor.model_loader_.reset(none_loader);
-  executor.dequantized_cache_policy_ =
+  acc.model_loader().reset(none_loader);
+  acc.dequantized_cache_policy() =
       runtime::cuda::native::DequantizedCachePolicy::kNone;
-  executor.ReleaseBatchScopedDequantizedCache();
+  acc.ReleaseBatchScopedDequantizedCache();
   CHECK(none_loader->clear_calls() == 1);
 
   // kBatchLifetime: clear between batches
   auto *batch_loader = new MockDequantPolicyLoader("gguf");
-  executor.model_loader_.reset(batch_loader);
-  executor.dequantized_cache_policy_ =
+  acc.model_loader().reset(batch_loader);
+  acc.dequantized_cache_policy() =
       runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime;
-  executor.ReleaseBatchScopedDequantizedCache();
+  acc.ReleaseBatchScopedDequantizedCache();
   CHECK(batch_loader->clear_calls() == 1);
 }
 
@@ -111,19 +112,20 @@ TEST_CASE("InferfluxCudaExecutor retains dequant cache for model policy and "
           "non-GGUF loaders",
           "[native_forward][dequant_policy]") {
   InferfluxCudaExecutor executor;
+  ExecutorTestAccess acc(executor);
 
   auto *model_loader = new MockDequantPolicyLoader("gguf");
-  executor.model_loader_.reset(model_loader);
-  executor.dequantized_cache_policy_ =
+  acc.model_loader().reset(model_loader);
+  acc.dequantized_cache_policy() =
       runtime::cuda::native::DequantizedCachePolicy::kModelLifetime;
-  executor.ReleaseBatchScopedDequantizedCache();
+  acc.ReleaseBatchScopedDequantizedCache();
   CHECK(model_loader->clear_calls() == 0);
 
   auto *safetensors_loader = new MockDequantPolicyLoader("safetensors");
-  executor.model_loader_.reset(safetensors_loader);
-  executor.dequantized_cache_policy_ =
+  acc.model_loader().reset(safetensors_loader);
+  acc.dequantized_cache_policy() =
       runtime::cuda::native::DequantizedCachePolicy::kNone;
-  executor.ReleaseBatchScopedDequantizedCache();
+  acc.ReleaseBatchScopedDequantizedCache();
   CHECK(safetensors_loader->clear_calls() == 0);
 }
 

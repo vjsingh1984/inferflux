@@ -523,6 +523,61 @@ template cudaError_t BiasAdd<__nv_bfloat16>(__nv_bfloat16 *,
                                             cudaStream_t);
 
 // ============================================================================
+// Fused Triple Bias Add (Q/K/V in one launch)
+// ============================================================================
+
+template <typename T>
+__global__ void BiasAddTripleKernel(T *__restrict__ q, T *__restrict__ k,
+                                    T *__restrict__ v,
+                                    const T *__restrict__ q_bias,
+                                    const T *__restrict__ k_bias,
+                                    const T *__restrict__ v_bias, int rows,
+                                    int q_dim, int k_dim, int v_dim) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int q_total = rows * q_dim;
+  const int k_total = rows * k_dim;
+  const int total = q_total + k_total + rows * v_dim;
+  if (idx >= total)
+    return;
+
+  if (idx < q_total) {
+    float val = DtypeTraits<T>::to_float(q[idx]);
+    float b = DtypeTraits<T>::to_float(q_bias[idx % q_dim]);
+    q[idx] = DtypeTraits<T>::from_float(val + b);
+  } else if (idx < q_total + k_total) {
+    const int ki = idx - q_total;
+    float val = DtypeTraits<T>::to_float(k[ki]);
+    float b = DtypeTraits<T>::to_float(k_bias[ki % k_dim]);
+    k[ki] = DtypeTraits<T>::from_float(val + b);
+  } else {
+    const int vi = idx - q_total - k_total;
+    float val = DtypeTraits<T>::to_float(v[vi]);
+    float b = DtypeTraits<T>::to_float(v_bias[vi % v_dim]);
+    v[vi] = DtypeTraits<T>::from_float(val + b);
+  }
+}
+
+template <typename T>
+cudaError_t BiasAddTriple(T *q, T *k, T *v, const T *q_bias, const T *k_bias,
+                          const T *v_bias, int rows, int q_dim, int k_dim,
+                          int v_dim, cudaStream_t stream) {
+  const int total = rows * (q_dim + k_dim + v_dim);
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  BiasAddTripleKernel<T><<<blocks, threads, 0, stream>>>(
+      q, k, v, q_bias, k_bias, v_bias, rows, q_dim, k_dim, v_dim);
+  return cudaGetLastError();
+}
+
+template cudaError_t BiasAddTriple<half>(half *, half *, half *, const half *,
+                                         const half *, const half *, int, int,
+                                         int, int, cudaStream_t);
+template cudaError_t BiasAddTriple<__nv_bfloat16>(
+    __nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, const __nv_bfloat16 *,
+    const __nv_bfloat16 *, const __nv_bfloat16 *, int, int, int, int,
+    cudaStream_t);
+
+// ============================================================================
 // Non-templated backward-compatible overloads (delegate to half instantiation)
 // ============================================================================
 
@@ -547,6 +602,14 @@ cudaError_t SiluMul(const half *gate, const half *up, half *output, int count,
 cudaError_t ResidualAdd(half *residual, const half *input, int count,
                         cudaStream_t stream) {
   return ResidualAdd<half>(residual, input, count, stream);
+}
+
+cudaError_t ResidualAddRmsNorm(half *residual, const half *input,
+                               const half *weight, half *output, int count,
+                               int hidden_size, float eps,
+                               cudaStream_t stream) {
+  return ResidualAddRmsNorm<half>(residual, input, weight, output, count,
+                                  hidden_size, eps, stream);
 }
 
 cudaError_t EmbeddingLookup(const half *table, const int *token_ids,

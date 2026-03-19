@@ -66,6 +66,16 @@ template <typename T>
 cudaError_t BiasAdd(T *output, const T *bias, int rows, int bias_dim,
                     cudaStream_t stream);
 
+/**
+ * BiasAddTriple: fused bias addition for three output tensors (Q, K, V).
+ * Replaces three separate BiasAdd launches with a single kernel launch.
+ * Each output tensor can have a different bias dimension.
+ */
+template <typename T>
+cudaError_t BiasAddTriple(T *q, T *k, T *v, const T *q_bias, const T *k_bias,
+                          const T *v_bias, int rows, int q_dim, int k_dim,
+                          int v_dim, cudaStream_t stream);
+
 // ============================================================================
 // Non-templated FP16 overloads (backward compatibility)
 // ============================================================================

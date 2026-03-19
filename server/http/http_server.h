@@ -7,6 +7,7 @@
 #include "server/auth/api_key_auth.h"
 #include "server/auth/oidc_validator.h"
 #include "server/auth/rate_limiter.h"
+#include "server/http/http_utils.h"
 #include "server/logging/audit_logger.h"
 #include "server/metrics/metrics.h"
 #include "server/policy/guardrail.h"
@@ -34,42 +35,10 @@
 
 namespace inferflux {
 
-// Test-visible header lookup helper. Header-name matching is case-insensitive
-// per RFC 9110.
+// Backward-compatible alias — delegates to GetHeaderValue in http_utils.h.
 inline std::string LookupHeaderValueForTest(const std::string &headers,
                                             const std::string &name) {
-  auto lower_name = name;
-  std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
-                 [](unsigned char c) {
-                   return static_cast<char>(std::tolower(c));
-                 });
-
-  std::size_t line_start = 0;
-  while (line_start < headers.size()) {
-    const std::size_t line_end = headers.find("\r\n", line_start);
-    const std::size_t current_end =
-        line_end == std::string::npos ? headers.size() : line_end;
-    const std::size_t colon = headers.find(':', line_start);
-    if (colon != std::string::npos && colon < current_end) {
-      std::string header_name = headers.substr(line_start, colon - line_start);
-      std::transform(header_name.begin(), header_name.end(), header_name.begin(),
-                     [](unsigned char c) {
-                       return static_cast<char>(std::tolower(c));
-                     });
-      if (header_name == lower_name) {
-        std::string value =
-            headers.substr(colon + 1, current_end - (colon + 1));
-        const auto s = value.find_first_not_of(" \t");
-        const auto e = value.find_last_not_of(" \t\r\n");
-        return (s == std::string::npos) ? "" : value.substr(s, e - s + 1);
-      }
-    }
-    if (line_end == std::string::npos) {
-      break;
-    }
-    line_start = line_end + 2;
-  }
-  return {};
+  return GetHeaderValue(headers, name);
 }
 
 class HttpServer {
@@ -150,6 +119,7 @@ private:
   struct ClientSession {
     int fd{-1};
     SSL *ssl{nullptr};
+    bool keep_alive{false}; // Set to true after successful non-streaming response
   };
 
   void Run();

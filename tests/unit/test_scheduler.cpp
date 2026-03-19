@@ -5,18 +5,10 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "scheduler/fairness_controller.h"
 #include "scheduler/request_requeue.h"
-// MSVC includes access specifiers in name mangling, so the
-// "#define private public" trick causes linker errors on MSVC.
-// Tests that access private members are skipped on MSVC.
-#ifndef _MSC_VER
-#define private public
-#endif
 #include "scheduler/scheduler.h"
-#ifndef _MSC_VER
-#undef private
-#endif
 #include "scheduler/single_model_router.h"
 #include "server/metrics/metrics.h"
+#include "support/scheduler_test_access.h"
 
 #include <atomic>
 #include <chrono>
@@ -931,7 +923,7 @@ TEST_CASE("Scheduler routes decode-ready prefill requests directly to decode",
   selection.total_tokens = pending->inference.prompt_tokens.size();
 
   auto future = pending->promise.get_future();
-  scheduler.ProcessBatch(std::move(selection));
+  SchedulerTestAccess(scheduler).ProcessBatch(std::move(selection));
   auto result = future.get();
 
   REQUIRE_FALSE(result.no_backend);
@@ -1107,19 +1099,23 @@ TEST_CASE("Scheduler sticky decode fill skips incompatible queue head",
       "inferflux_scheduler_decode_worker_sticky_merged_requests_total ");
 
   {
-    std::lock_guard<std::mutex> lock(scheduler.queue_mutex_);
-    scheduler.pending_decode_ = {incompatible, compatible_one, compatible_two};
+    SchedulerTestAccess acc(scheduler);
+    std::lock_guard<std::mutex> lock(acc.queue_mutex());
+    acc.pending_decode() = {incompatible, compatible_one, compatible_two};
     const std::size_t merged =
-        scheduler.AppendCompatiblePendingDecodeLocked(&batch, backend_a, 3);
+        acc.AppendCompatiblePendingDecodeLocked(&batch, backend_a, 3);
     REQUIRE(merged == 2);
   }
 
-  REQUIRE(batch.size() == 3);
-  REQUIRE(batch[0] == active);
-  REQUIRE(batch[1] == compatible_one);
-  REQUIRE(batch[2] == compatible_two);
-  REQUIRE(scheduler.pending_decode_.size() == 1);
-  REQUIRE(scheduler.pending_decode_[0] == incompatible);
+  {
+    SchedulerTestAccess acc(scheduler);
+    REQUIRE(batch.size() == 3);
+    REQUIRE(batch[0] == active);
+    REQUIRE(batch[1] == compatible_one);
+    REQUIRE(batch[2] == compatible_two);
+    REQUIRE(acc.pending_decode().size() == 1);
+    REQUIRE(acc.pending_decode()[0] == incompatible);
+  }
   REQUIRE(ReadScalarMetric(
               "inferflux_scheduler_decode_worker_sticky_merge_total{merged=\"2\"} ") -
               sticky_merge_events_before ==
@@ -1160,9 +1156,10 @@ TEST_CASE("Scheduler preserves bound backend for in-flight decode requests",
   decode_pending->inference.first_token = 42;
   decode_pending->resolved_backend = backend;
 
+  SchedulerTestAccess sched_acc(scheduler);
   std::vector<std::shared_ptr<Scheduler::PendingRequest>> decode_batch{
       decode_pending};
-  scheduler.ResolveBackends(decode_batch);
+  sched_acc.ResolveBackends(decode_batch);
 
   REQUIRE(router->ResolveCalls() == 0);
   REQUIRE(decode_pending->resolved_backend.get() == backend.get());
@@ -1176,7 +1173,7 @@ TEST_CASE("Scheduler preserves bound backend for in-flight decode requests",
 
   std::vector<std::shared_ptr<Scheduler::PendingRequest>> fresh_batch{
       fresh_pending};
-  scheduler.ResolveBackends(fresh_batch);
+  sched_acc.ResolveBackends(fresh_batch);
 
   REQUIRE(router->ResolveCalls() == 1);
   REQUIRE(fresh_pending->resolved_backend.get() == backend.get());
@@ -1205,15 +1202,16 @@ TEST_CASE("Scheduler batch selection deduplicates one pending request leaked "
   pending->enqueue_time = std::chrono::steady_clock::now();
 
   {
-    std::lock_guard<std::mutex> lock(scheduler.queue_mutex_);
-    scheduler.pending_prefill_.push_back(pending);
-    scheduler.pending_decode_.push_back(pending);
-    auto selection = scheduler.BuildBatchLocked();
+    SchedulerTestAccess acc(scheduler);
+    std::lock_guard<std::mutex> lock(acc.queue_mutex());
+    acc.pending_prefill().push_back(pending);
+    acc.pending_decode().push_back(pending);
+    auto selection = acc.BuildBatchLocked();
 
     REQUIRE(selection.pending.size() == 1);
     REQUIRE(selection.pending.front().get() == pending.get());
-    REQUIRE(scheduler.pending_prefill_.empty());
-    REQUIRE(scheduler.pending_decode_.empty());
+    REQUIRE(acc.pending_prefill().empty());
+    REQUIRE(acc.pending_decode().empty());
   }
 }
 
@@ -1305,10 +1303,11 @@ TEST_CASE("Scheduler unified mode records decode assembly selection metrics",
       "inferflux_scheduler_decode_assembly_selected_total{mode=\"unified\",bucket=\"2\"} ");
 
   {
-    std::lock_guard<std::mutex> lock(scheduler.queue_mutex_);
-    scheduler.pending_decode_.push_back(make_pending(1));
-    scheduler.pending_decode_.push_back(make_pending(2));
-    auto selection = scheduler.BuildBatchLocked();
+    SchedulerTestAccess acc(scheduler);
+    std::lock_guard<std::mutex> lock(acc.queue_mutex());
+    acc.pending_decode().push_back(make_pending(1));
+    acc.pending_decode().push_back(make_pending(2));
+    auto selection = acc.BuildBatchLocked();
     REQUIRE(selection.pending.size() == 2);
   }
 
@@ -1786,18 +1785,19 @@ TEST_CASE("Scheduler fairness preemption keeps decode requests on decode queue",
   high_pending->inference.id = 202;
   high_pending->inference.phase = RequestPhase::kPending;
 
-  scheduler.pending_prefill_.push_back(high_pending);
+  SchedulerTestAccess acc(scheduler);
+  acc.pending_prefill().push_back(high_pending);
 
   Scheduler::BatchSelection selection;
   selection.pending.push_back(decode_pending);
 
-  scheduler.ApplyFairness(&selection);
+  acc.ApplyFairness(&selection);
 
   REQUIRE(selection.pending.size() == 1);
   REQUIRE(selection.pending[0] == high_pending);
-  REQUIRE(scheduler.pending_prefill_.empty());
-  REQUIRE(scheduler.pending_decode_.size() == 1);
-  REQUIRE(scheduler.pending_decode_[0] == decode_pending);
+  REQUIRE(acc.pending_prefill().empty());
+  REQUIRE(acc.pending_decode().size() == 1);
+  REQUIRE(acc.pending_decode()[0] == decode_pending);
   REQUIRE(decode_pending->inference.phase == RequestPhase::kDecode);
   REQUIRE(decode_pending->inference.sequence_id == 6);
   REQUIRE(decode_pending->inference.sequence_generation == 7);

@@ -1,10 +1,14 @@
 #include "server/http/http_server.h"
 
+#include "server/http/completion_payload.h"
+#include "server/http/model_json.h"
+
 #include "model/model_format.h"
 #include "runtime/backends/backend_capabilities.h"
 #include "runtime/backends/backend_factory.h"
 #include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
+#include "runtime/string_utils.h"
 #include "scheduler/model_selection.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
@@ -21,6 +25,7 @@ inline int inferflux_close_socket(int fd) { return ::closesocket(fd); }
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 inline int inferflux_close_socket(int fd) { return ::close(fd); }
@@ -67,26 +72,8 @@ int ParseNonNegativeEnvInt(const char *name, int default_value) {
   }
 }
 
-bool ParseBoolEnv(const char *name, bool default_value) {
-  const char *raw = std::getenv(name);
-  if (!raw || *raw == '\0') {
-    return default_value;
-  }
-  std::string value(raw);
-  std::transform(
-      value.begin(), value.end(), value.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  if (value == "1" || value == "true" || value == "yes" || value == "on") {
-    return true;
-  }
-  if (value == "0" || value == "false" || value == "no" || value == "off") {
-    return false;
-  }
-  inferflux::log::Warn("http", std::string("Invalid value for ") + name + ": " +
-                                   raw + "; using default " +
-                                   (default_value ? "true" : "false"));
-  return default_value;
-}
+// ParseBoolEnv is provided by runtime/string_utils.h (inferflux::ParseBoolEnv).
+// GetHeaderValue is provided by server/http/http_utils.h.
 
 std::string PoolRoleToString(HttpServer::PoolRole role) {
   switch (role) {
@@ -104,46 +91,16 @@ json OptionalIntToJson(const std::optional<int64_t> &value) {
   return value.has_value() ? json(*value) : json(nullptr);
 }
 
-std::string GetHeaderValue(const std::string &headers,
-                           const std::string &name) {
-  auto lower_name = name;
-  std::transform(
-      lower_name.begin(), lower_name.end(), lower_name.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+} // namespace (close anonymous for BuildResponse/BuildErrorBody to be visible)
 
-  std::size_t line_start = 0;
-  while (line_start < headers.size()) {
-    const std::size_t line_end = headers.find("\r\n", line_start);
-    const std::size_t current_end =
-        line_end == std::string::npos ? headers.size() : line_end;
-    const std::size_t colon = headers.find(':', line_start);
-    if (colon != std::string::npos && colon < current_end) {
-      std::string header_name = headers.substr(line_start, colon - line_start);
-      std::transform(
-          header_name.begin(), header_name.end(), header_name.begin(),
-          [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-      if (header_name == lower_name) {
-        std::string val = headers.substr(colon + 1, current_end - (colon + 1));
-        const auto s = val.find_first_not_of(" \t");
-        const auto e = val.find_last_not_of(" \t\r\n");
-        return (s == std::string::npos) ? "" : val.substr(s, e - s + 1);
-      }
-    }
-    if (line_end == std::string::npos) {
-      break;
-    }
-    line_start = line_end + 2;
-  }
-  return {};
-}
-
-std::string BuildResponse(const std::string &body, int status = 200,
-                          std::string_view status_text = "OK",
-                          const std::string &extra_headers = "") {
+std::string BuildResponse(const std::string &body, int status,
+                          std::string_view status_text,
+                          const std::string &extra_headers) {
   std::string headers = "HTTP/1.1 " + std::to_string(status) + " " +
                         std::string(status_text) + "\r\n";
   headers += "Content-Type: application/json\r\n";
   headers += "Access-Control-Allow-Origin: *\r\n";
+  headers += "Connection: keep-alive\r\n";
   if (!extra_headers.empty()) {
     headers += extra_headers;
   }
@@ -151,34 +108,12 @@ std::string BuildResponse(const std::string &body, int status = 200,
   return headers + body;
 }
 
-struct ChatMessage {
-  std::string role;
-  std::string content;
-};
-
-// §2.3 — tool/function calling types.
-struct ToolFunction {
-  std::string name;
-  std::string description;
-  json parameters; // JSON Schema object (may be null/empty).
-};
-
-struct Tool {
-  std::string type{"function"}; // Only "function" is supported.
-  ToolFunction function;
-};
-
-struct ToolCallResult {
-  bool detected{false};
-  std::string call_id;
-  std::string function_name;
-  std::string arguments_json; // JSON-encoded arguments object.
-};
+// ChatMessage, Tool, ToolCallResult, CompletionRequestPayload are defined
+// in server/http/completion_payload.h.
 
 namespace {
 
-constexpr std::size_t kKiB = 1024ULL;
-constexpr std::size_t kMiB = kKiB * kKiB;
+// kKiB/kMiB/kGiB are provided by runtime/string_utils.h (inferflux namespace).
 
 void LogJsonParseFailure(const char *context, const std::exception &ex) {
   log::Debug("http_server", std::string(context) + ": " + ex.what());
@@ -189,139 +124,10 @@ constexpr std::size_t kMaxResponseFormatBytes =
 
 } // namespace
 
-struct CompletionRequestPayload {
-  std::string prompt;
-  std::string model{"unknown"};
-  std::string session_id;
-  std::string client_request_id;
-  int max_tokens{256};
-  std::vector<ChatMessage> messages;
-  bool stream{false};
-  bool json_mode{false};   // true when response_format.type == "json_object"
-  std::vector<Tool> tools; // §2.3: function definitions available to the model
-  std::string first_tool_name;
-  bool has_tool_schema{false};
-  std::string tool_choice{"auto"}; // "auto" | "none" | "required"
-  // When tool_choice is {"type":"function","function":{"name":"..."}} the
-  // target function name is stored here so the system prompt can enforce it
-  // explicitly.
-  std::string tool_choice_function;
-  bool has_images{
-      false}; // §2.2: true when any message contained image_url parts.
-  std::vector<DecodedImage> images; // §2.2: decoded images in prompt order.
-  bool has_response_format{false};
-  std::string response_format_type;
-  std::string response_format_schema;
-  std::string response_format_grammar;
-  std::string response_format_root{"root"};
-  bool response_format_ok{true};
-  std::string response_format_error;
-  // OpenAI logprobs fields.
-  // Chat: logprobs=true enables per-token logprobs; top_logprobs sets top-N.
-  // Completions: logprobs=N directly sets top-N (0 = selected token only).
-  bool logprobs{false};
-  int top_logprobs{0}; // number of alternatives per token (0-20)
+// CompletionRequestPayload is defined in server/http/completion_payload.h.
 
-  // OpenAI sampling parameters.
-  float temperature{1.0f};
-  float top_p{1.0f};
-  int top_k{0};
-  float min_p{0.0f};
-  float frequency_penalty{0.0f};
-  float presence_penalty{0.0f};
-  float repetition_penalty{1.0f};
-  uint32_t seed{UINT32_MAX};
-
-  // OpenAI `logit_bias` parameter: map token IDs to bias values (-100 to 100).
-  // Format: {token_id: bias_value, ...}
-  std::unordered_map<int, float> logit_bias;
-
-  // OpenAI `stop` parameter: string or array of strings (up to 4).
-  std::vector<std::string> stop;
-  // stream_options.include_usage: emit a final SSE usage chunk before [DONE].
-  bool stream_include_usage{false};
-  // OpenAI `n` and `best_of` for multiple completions.
-  // n: number of completions to return (1-10; not compatible with stream).
-  // best_of: number of completions to generate server-side; only the top n
-  //   (by cumulative log-probability) are returned. best_of >= n.
-  int n{1};
-  int best_of{1};
-};
-
-json BuildCapabilitiesJson(const BackendCapabilities &capabilities) {
-  return json{
-      {"streaming", capabilities.supports_streaming},
-      {"logprobs", capabilities.supports_logprobs},
-      {"structured_output", capabilities.supports_structured_output},
-      {"embeddings", capabilities.supports_embeddings},
-      {"vision", capabilities.supports_vision},
-      {"speculative_decoding", capabilities.supports_speculative_decoding},
-      {"fairness_preemption", capabilities.supports_fairness_preemption},
-      {"kv_prefix_transfer", capabilities.supports_kv_prefix_transfer},
-  };
-}
-
-std::string ModelSourcePath(const ModelInfo &info) {
-  return info.source_path.empty() ? info.path : info.source_path;
-}
-
-std::string ModelEffectiveLoadPath(const ModelInfo &info) {
-  const std::string source = ModelSourcePath(info);
-  return info.effective_load_path.empty() ? source : info.effective_load_path;
-}
-
-json BuildBackendExposureJson(const ModelInfo &info) {
-  const std::string requested =
-      info.requested_backend.empty() ? info.backend : info.requested_backend;
-  const std::string provider =
-      info.backend_provider.empty()
-          ? BackendFactory::ProviderLabel(BackendProvider::kLlamaCpp)
-          : BackendFactory::ProviderLabel(
-                BackendFactory::ParseProviderLabel(info.backend_provider));
-  return json{
-      {"requested_backend", requested},
-      {"exposed_backend", info.backend},
-      {"provider", provider},
-      {"fallback", info.backend_fallback},
-      {"fallback_reason", info.backend_fallback_reason},
-  };
-}
-
-json BuildModelIdentityJson(const ModelInfo &info) {
-  return json{
-      {"id", info.id},
-      {"path", info.path},
-      {"source_path", ModelSourcePath(info)},
-      {"effective_load_path", ModelEffectiveLoadPath(info)},
-      {"format", info.format},
-      {"requested_format", info.requested_format},
-      {"backend", info.backend},
-      {"backend_exposure", BuildBackendExposureJson(info)},
-      {"ready", info.ready},
-      {"capabilities", BuildCapabilitiesJson(info.capabilities)},
-  };
-}
-
-json BuildOpenAIModelJson(const ModelInfo &info, int64_t created_ts) {
-  json model = BuildModelIdentityJson(info);
-  model["object"] = "model";
-  model["created"] = created_ts;
-  model["owned_by"] = "inferflux";
-  return model;
-}
-
-json BuildAdminModelJson(const ModelInfo &info, const std::string &default_id) {
-  json model = BuildModelIdentityJson(info);
-  model["requested_backend"] =
-      info.requested_backend.empty() ? info.backend : info.requested_backend;
-  model["backend_provider"] =
-      info.backend_provider.empty()
-          ? BackendFactory::ProviderLabel(BackendProvider::kLlamaCpp)
-          : BackendFactory::ProviderLabel(
-                BackendFactory::ParseProviderLabel(info.backend_provider));
-  model["default"] = (info.id == default_id);
-  return model;
-}
+// Model JSON builders (BuildCapabilitiesJson, BuildModelIdentityJson, etc.)
+// are defined in server/http/model_json.h/.cpp.
 
 std::string BuildModelNotFoundResponse() {
   return BuildResponse(json({{"error", "model_not_found"}}).dump(), 404,
@@ -1022,6 +828,7 @@ std::string BuildToolCallStreamChunks(const std::string &id,
                                       std::string_view model, std::time_t ts,
                                       const ToolCallResult &tc) {
   std::string out;
+  out.reserve(4096);
   auto base = [&]() -> json {
     json j;
     j["id"] = id;
@@ -1085,7 +892,6 @@ std::string BuildApiKeysPayload(const std::vector<PolicyKeyEntry> &keys) {
   }
   return json({{"api_keys", arr}}).dump();
 }
-} // namespace
 
 HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
                        std::shared_ptr<ApiKeyAuth> auth,
@@ -1330,7 +1136,14 @@ void HttpServer::WorkerLoop() {
       client_queue_.pop();
     }
     if (session.fd >= 0) {
-      HandleClient(session);
+      // HTTP/1.1 keep-alive: process multiple requests on the same
+      // connection until the client closes it or an error occurs.
+      constexpr int kMaxKeepAliveRequests = 100;
+      for (int ka = 0; ka < kMaxKeepAliveRequests && running_; ++ka) {
+        HandleClient(session);
+        if (!session.keep_alive)
+          break;
+      }
       CloseSession(session);
     }
   }
@@ -1398,6 +1211,17 @@ void HttpServer::Run() {
       inferflux_close_socket(client_fd);
       break;
     }
+    // Disable Nagle's algorithm for low-latency responses (especially SSE).
+    {
+      int nodelay = 1;
+#ifdef _WIN32
+      ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
+                   reinterpret_cast<const char *>(&nodelay), sizeof(nodelay));
+#else
+      ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay,
+                   sizeof(nodelay));
+#endif
+    }
     ClientSession session;
     session.fd = client_fd;
     if (tls_enabled_) {
@@ -1455,11 +1279,14 @@ bool HttpServer::ResolveSubject(const std::string &headers,
   std::string token = line.substr(token_pos + 6);
   token.erase(0, token.find_first_not_of(' '));
   token.erase(token.find_last_not_of(' ') + 1);
-  if (auth_ && auth_->HasKeys() && auth_->IsAllowed(token)) {
-    ctx->subject = token;
-    auto scopes = auth_->Scopes(token);
-    ctx->scopes.insert(scopes.begin(), scopes.end());
-    return true;
+  if (auth_ && auth_->HasKeys()) {
+    auto hash = ApiKeyAuth::HashKey(token);
+    if (auth_->IsAllowedByHash(hash)) {
+      ctx->subject = token;
+      auto scopes = auth_->ScopesByHash(hash);
+      ctx->scopes.insert(scopes.begin(), scopes.end());
+      return true;
+    }
   }
   if (oidc_ && oidc_->Enabled()) {
     std::string sub;
@@ -1491,6 +1318,8 @@ bool HttpServer::RequireScope(const AuthContext &ctx, const std::string &scope,
 }
 
 void HttpServer::HandleClient(ClientSession &session) {
+  // Reset keep-alive flag for this request.
+  session.keep_alive = false;
   // RAII guard: decrement connections and record latency on all exit paths.
   auto req_start = std::chrono::steady_clock::now();
   struct ConnectionGuard {
@@ -1601,6 +1430,20 @@ void HttpServer::HandleClient(ClientSession &session) {
   std::string method = first_line.substr(0, method_end);
   std::string path =
       first_line.substr(method_end + 1, path_end - method_end - 1);
+
+  // HTTP/1.1 defaults to keep-alive unless the client sends Connection: close.
+  {
+    auto conn_hdr = GetHeaderValue(headers, "Connection");
+    bool client_wants_close = false;
+    for (auto &c : conn_hdr)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (conn_hdr.find("close") != std::string::npos) {
+      client_wants_close = true;
+    }
+    // Enable keep-alive for non-streaming requests (streaming uses the
+    // connection for the event stream and closes when done).
+    session.keep_alive = !client_wants_close;
+  }
 
 #if INFERFLUX_ENABLE_WEBUI
   if (method == "GET" && path == "/ui") {
@@ -3081,6 +2924,8 @@ void HttpServer::HandleClient(ClientSession &session) {
                       std::chrono::system_clock::now().time_since_epoch())
                       .count();
       stream_active->store(true);
+      // SSE consumes the connection — disable keep-alive for this session.
+      session.keep_alive = false;
       stream_id = std::string("chatcmpl-") + std::to_string(stream_ts);
       std::string stream_headers = "HTTP/1.1 200 OK\r\n"
                                    "Content-Type: text/event-stream\r\n"

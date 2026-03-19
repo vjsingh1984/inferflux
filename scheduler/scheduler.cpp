@@ -517,6 +517,7 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
       prefix_cache_(std::move(prefix_cache)),
       fairness_controller_(fairness_config), fairness_config_(fairness_config),
       disagg_config_(disagg_config), config_(NormalizeSchedulerConfig(config)),
+      metrics_(config_.metrics ? config_.metrics : &GlobalMetrics()),
       model_selection_options_(model_selection_options) {
   BatchExecutor::UnifiedBatchTuning tuning;
   tuning.decode_burst_tokens = config_.decode_burst_tokens;
@@ -562,7 +563,7 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
   eviction_running_ = true;
   eviction_thread_ = std::thread(&Scheduler::EvictionWorkerLoop, this);
 
-  GlobalMetrics().SetSchedulerBatchLimits(config_.max_batch_size,
+  metrics_->SetSchedulerBatchLimits(config_.max_batch_size,
                                           config_.max_batch_tokens);
   RefreshNativeKvMemoryMetrics();
 }
@@ -634,7 +635,7 @@ void Scheduler::SyncSequenceSlotProgress(
 
 void Scheduler::RefreshNativeKvMemoryMetrics() const {
   if (!slot_manager_) {
-    GlobalMetrics().SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/0,
+    metrics_->SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/0,
                                                   /*active_bytes=*/0,
                                                   /*prefix_retained_bytes=*/0,
                                                   /*free_bytes=*/0,
@@ -645,10 +646,10 @@ void Scheduler::RefreshNativeKvMemoryMetrics() const {
     return;
   }
 
-  const uint64_t total_bytes = GlobalMetrics().GetInferfluxCudaKvPlannedBytes();
-  const int max_sequences = GlobalMetrics().GetInferfluxCudaKvMaxSequences();
+  const uint64_t total_bytes = metrics_->GetInferfluxCudaKvPlannedBytes();
+  const int max_sequences = metrics_->GetInferfluxCudaKvMaxSequences();
   if (total_bytes == 0 || max_sequences <= 0) {
-    GlobalMetrics().SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/0,
+    metrics_->SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/0,
                                                   /*active_bytes=*/0,
                                                   /*prefix_retained_bytes=*/0,
                                                   /*free_bytes=*/0,
@@ -686,7 +687,7 @@ void Scheduler::RefreshNativeKvMemoryMetrics() const {
           ? total_bytes - active_bytes - prefix_retained_bytes
           : 0;
 
-  GlobalMetrics().SetInferfluxCudaKvMemoryBytes(
+  metrics_->SetInferfluxCudaKvMemoryBytes(
       total_bytes, active_bytes, prefix_retained_bytes, free_bytes,
       active_sequences, prefix_retained_sequences, free_sequences,
       max_sequences);
@@ -752,7 +753,7 @@ std::size_t Scheduler::AppendCompatiblePendingDecodeLocked(
     it = pending_decode_.erase(it);
   }
   if (merged > 0) {
-    GlobalMetrics().RecordDecodeWorkerStickyMerge(merged);
+    metrics_->RecordDecodeWorkerStickyMerge(merged);
   }
   return merged;
 }
@@ -789,8 +790,11 @@ void Scheduler::DecodeWorkerLoop() {
       std::unique_lock<std::mutex> lock(queue_mutex_);
       constexpr auto kDisaggTransportPollInterval =
           std::chrono::milliseconds(10);
-      const std::size_t accumulation_target = std::max<std::size_t>(
-          2, static_cast<std::size_t>(config_.min_batch_size));
+      const std::size_t accumulation_target =
+          config_.min_batch_size <= 1
+              ? 1
+              : std::max<std::size_t>(
+                    2, static_cast<std::size_t>(config_.min_batch_size));
       const bool sticky_accumulation_wait_enabled =
           StickyDecodeAccumulationWaitEnabled();
 
@@ -874,7 +878,7 @@ void Scheduler::DecodeWorkerLoop() {
         pending_decode_.erase(pending_decode_.begin(),
                               pending_decode_.begin() +
                                   static_cast<std::ptrdiff_t>(n));
-        GlobalMetrics().RecordDecodeAssemblySnapshot(
+        metrics_->RecordDecodeAssemblySnapshot(
             "worker_initial", ready_before, batch.size(), 0, 0);
       } else if (batch.size() < max_batch_size && sticky_step_backend) {
         const std::size_t ready_before = pending_decode_.size();
@@ -912,7 +916,7 @@ void Scheduler::DecodeWorkerLoop() {
         const std::size_t incompatible_before =
             ready_before >= compatible_before ? ready_before - compatible_before
                                               : 0;
-        GlobalMetrics().RecordDecodeAssemblySnapshot(
+        metrics_->RecordDecodeAssemblySnapshot(
             "worker_sticky", ready_before, batch.size(), compatible_before,
             incompatible_before);
       }
@@ -928,7 +932,7 @@ void Scheduler::DecodeWorkerLoop() {
         if (pkt->ticket_id > 0) {
           disagg_config_.kv_transport->UpdateTicketStage(
               pkt->ticket_id, disaggregated::KVTicketStage::kAcknowledged);
-          GlobalMetrics().RecordDisaggKVTicketStage(
+          metrics_->RecordDisaggKVTicketStage(
               disaggregated::KVTicketStageToString(
                   disaggregated::KVTicketStage::kAcknowledged));
         }
@@ -938,7 +942,7 @@ void Scheduler::DecodeWorkerLoop() {
         double transfer_ms = std::chrono::duration<double, std::milli>(
                                  dequeue_time - pkt->enqueue_time)
                                  .count();
-        GlobalMetrics().RecordKVTransfer(transfer_ms);
+        metrics_->RecordKVTransfer(transfer_ms);
 
         // Match the packet to a decode request by request_id and hydrate its
         // KV state. Decode workers remove requests from pending_decode_ into
@@ -1001,7 +1005,7 @@ void Scheduler::DecodeWorkerLoop() {
                                : disaggregated::KVTicketStage::kTimedOut;
           disagg_config_.kv_transport->UpdateTicketStage(pkt->ticket_id,
                                                          ticket_stage);
-          GlobalMetrics().RecordDisaggKVTicketStage(
+          metrics_->RecordDisaggKVTicketStage(
               disaggregated::KVTicketStageToString(ticket_stage));
         }
       }
@@ -1010,7 +1014,7 @@ void Scheduler::DecodeWorkerLoop() {
     if (batch.empty())
       continue;
 
-    GlobalMetrics().RecordDecodeWorkerBatchSize(batch.size());
+    metrics_->RecordDecodeWorkerBatchSize(batch.size());
 
     std::size_t decode_tokens = 0;
     for (const auto &pending : batch) {
@@ -1024,10 +1028,10 @@ void Scheduler::DecodeWorkerLoop() {
       }
       decode_tokens += static_cast<std::size_t>(std::max(1, slice_tokens));
     }
-    GlobalMetrics().RecordSchedulerIteration(
+    metrics_->RecordSchedulerIteration(
         /*prefill_requests=*/0,
         /*decode_requests=*/batch.size(), decode_tokens);
-    GlobalMetrics().RecordSchedulerPolicyIteration(
+    metrics_->RecordSchedulerPolicyIteration(
         SchedulerBatchPolicyToString(config_.batch_policy),
         /*prefill_requests=*/0, /*decode_requests=*/batch.size());
 
@@ -1063,7 +1067,7 @@ void Scheduler::DecodeWorkerLoop() {
     };
 
     if (auto direct_step_backend = resolve_direct_step_backend()) {
-      GlobalMetrics().RecordDecodeWorkerExecutionPath("direct_stepwise");
+      metrics_->RecordDecodeWorkerExecutionPath("direct_stepwise");
 
       RequestBatch step_batch;
       step_batch.batch_id =
@@ -1127,7 +1131,7 @@ void Scheduler::DecodeWorkerLoop() {
       continue;
     }
 
-    GlobalMetrics().RecordDecodeWorkerExecutionPath("general");
+    metrics_->RecordDecodeWorkerExecutionPath("general");
 
     ResolveBackends(batch);
 
@@ -1337,7 +1341,7 @@ void Scheduler::DecodeWorkerLoop() {
         }
         UpdateQueueDepthLocked();
       }
-      queue_cv_.notify_all();
+      queue_cv_.notify_one();
     }
 
     if (!use_stepwise_decode) {
@@ -1418,8 +1422,11 @@ void Scheduler::WorkerLoop() {
     } else {
       {
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        const std::size_t accumulation_target = std::max<std::size_t>(
-            2, static_cast<std::size_t>(config_.min_batch_size));
+        const std::size_t accumulation_target =
+            config_.min_batch_size <= 1
+                ? 1
+                : std::max<std::size_t>(
+                      2, static_cast<std::size_t>(config_.min_batch_size));
 
         // Batch accumulation: wait for minimum batch size or timeout
         // to improve GPU utilization. Trade-off: slightly higher latency
@@ -1570,7 +1577,7 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
       const bool hit =
           prefix_cache_->Lookup(*tokens, backend_hint.get(), &lookup);
       const bool affinity_hit = hit && lookup.matched_tokens > 0;
-      GlobalMetrics().RecordPrefixAffinityProbe(
+      metrics_->RecordPrefixAffinityProbe(
           affinity_hit, affinity_hit ? lookup.matched_tokens : 0);
       if (affinity_hit) {
         item.prefix_affinity_tokens =
@@ -1618,7 +1625,7 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
     if (!selection.pending.empty() &&
         token_budget + tokens >
             static_cast<std::size_t>(config_.max_batch_tokens)) {
-      GlobalMetrics().RecordBatchTokenBudgetSkip();
+      metrics_->RecordBatchTokenBudgetSkip();
       continue;
     }
 
@@ -1668,7 +1675,7 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
   erase_indices(&pending_prefill_, std::move(to_remove_prefill));
   erase_indices(&pending_decode_, std::move(to_remove_decode));
   if (!decode_workers_own_decode && decode_available_before > 0) {
-    GlobalMetrics().RecordDecodeAssemblySnapshot("unified", decode_available_before,
+    metrics_->RecordDecodeAssemblySnapshot("unified", decode_available_before,
                                                  decode_selected, 0, 0);
   }
   UpdateQueueDepthLocked();
@@ -1690,7 +1697,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     }
   }
 
-  GlobalMetrics().SetDecodeQueueDepth(
+  metrics_->SetDecodeQueueDepth(
       static_cast<int>(selection.pending.size()));
   ApplyFairness(&selection);
   ResolveBackends(selection.pending);
@@ -1926,7 +1933,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
             inf.first_piece.clear();
             SyncSequenceSlotProgress(inf);
             if (copied_prefix && prefill_start > 0) {
-              GlobalMetrics().RecordKVPrefixReuse(prefill_start);
+              metrics_->RecordKVPrefixReuse(prefill_start);
             }
             staged_decode_local.push_back(pending);
             queued_via_unified_prefill = true;
@@ -1970,7 +1977,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               }
             }
             if (pr.ok && copied_prefix) {
-              GlobalMetrics().RecordKVPrefixReuse(prefill_start);
+              metrics_->RecordKVPrefixReuse(prefill_start);
             }
 
             if (pr.ok) {
@@ -2042,7 +2049,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       if (enqueued) {
         inf.disagg_enqueue_retries = 0;
         if (use_split_decode_workers) {
-          GlobalMetrics().RecordDisaggKVTicketStage(
+          metrics_->RecordDisaggKVTicketStage(
               disaggregated::KVTicketStageToString(
                   disaggregated::KVTicketStage::kEnqueued));
           staged_decode_worker.push_back(pending);
@@ -2054,7 +2061,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         inf.disagg_enqueue_retries += 1;
         const bool retries_exhausted =
             inf.disagg_enqueue_retries > disagg_config_.kv_enqueue_max_retries;
-        GlobalMetrics().RecordDisaggKVEnqueueRejected(retries_exhausted);
+        metrics_->RecordDisaggKVEnqueueRejected(retries_exhausted);
 
         // Channel rejected the packet (full).  Undo any phased state so the
         // request retries cleanly and does not hold a stale slot or stale
@@ -2108,7 +2115,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         pending_decode_.push_back(pending);
       }
       UpdateQueueDepthLocked();
-      queue_cv_.notify_all();
+      queue_cv_.notify_one();
     } else {
       for (auto &pending : staged_decode_worker) {
         pending->inference.phase = RequestPhase::kDecode;
@@ -2128,14 +2135,14 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     // accounting.
     metrics_decode_requests = decode_ready.size();
   }
-  GlobalMetrics().RecordSchedulerIteration(
+  metrics_->RecordSchedulerIteration(
       prefill_requests, metrics_decode_requests, selection.total_tokens);
-  GlobalMetrics().RecordSchedulerPolicyIteration(
+  metrics_->RecordSchedulerPolicyIteration(
       SchedulerBatchPolicyToString(config_.batch_policy), prefill_requests,
       metrics_decode_requests);
 
   if (use_decode_workers_) {
-    GlobalMetrics().SetDecodeQueueDepth(
+    metrics_->SetDecodeQueueDepth(
         static_cast<int>(pending_decode_.size()));
   }
   if (use_decode_workers_ && decode_ready.empty()) {
@@ -2143,7 +2150,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   }
 
   if (decode_ready.empty()) {
-    GlobalMetrics().SetDecodeQueueDepth(0);
+    metrics_->SetDecodeQueueDepth(0);
     return;
   }
 
@@ -2152,7 +2159,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     double wait_ms = std::chrono::duration<double, std::milli>(
                          batch_start - req->enqueue_time)
                          .count();
-    GlobalMetrics().RecordQueueLatency(wait_ms);
+    metrics_->RecordQueueLatency(wait_ms);
   }
 
   if (selection.total_tokens == 0) {
@@ -2161,7 +2168,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       selection.total_tokens += req->output_tokens.size();
     }
   }
-  GlobalMetrics().RecordBatch(selection.batch.requests.size(),
+  metrics_->RecordBatch(selection.batch.requests.size(),
                               selection.total_tokens);
 
   RequestBatch exec_batch;
@@ -2237,7 +2244,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   }
 
   if (exec_pending.empty()) {
-    GlobalMetrics().SetDecodeQueueDepth(0);
+    metrics_->SetDecodeQueueDepth(0);
     return;
   }
 
@@ -2342,22 +2349,22 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       }
       UpdateQueueDepthLocked();
     }
-    queue_cv_.notify_all();
+    queue_cv_.notify_one();
   }
   auto batch_exec_end = std::chrono::steady_clock::now();
   double exec_ms =
       std::chrono::duration<double, std::milli>(batch_exec_end - batch_start)
           .count();
-  GlobalMetrics().RecordBatchExecution(exec_ms);
-  GlobalMetrics().SetDecodeQueueDepth(0);
+  metrics_->RecordBatchExecution(exec_ms);
+  metrics_->SetDecodeQueueDepth(0);
 }
 
 void Scheduler::UpdateQueueDepthLocked() const {
   int prefill_depth = static_cast<int>(pending_prefill_.size());
   int decode_depth = static_cast<int>(pending_decode_.size());
-  GlobalMetrics().SetQueueDepth(prefill_depth + decode_depth);
-  GlobalMetrics().SetPrefillQueueDepth(prefill_depth);
-  GlobalMetrics().SetDecodeQueueDepth(decode_depth);
+  metrics_->SetQueueDepth(prefill_depth + decode_depth);
+  metrics_->SetPrefillQueueDepth(prefill_depth);
+  metrics_->SetDecodeQueueDepth(decode_depth);
 }
 
 void Scheduler::ApplyFairness(BatchSelection *selection) {
@@ -2372,7 +2379,7 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
     pending->inference.priority_level = pending->inference.priority;
     if (pending->inference.total_completion_tokens > 0 &&
         pending->inference.remaining_decode_tokens > 0) {
-      GlobalMetrics().RecordFairnessResume(pending->inference.priority_level);
+      metrics_->RecordFairnessResume(pending->inference.priority_level);
       SpanContext parent_ctx;
       parent_ctx.trace_id = pending->inference.trace_id;
       Span resume_span(
@@ -2437,7 +2444,7 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
       pending_prefill_.push_back(displaced);
     }
     batch_entries[decision.batch_index].request = &queued->inference;
-    GlobalMetrics().RecordFairnessPreemption(queued->inference.priority_level);
+    metrics_->RecordFairnessPreemption(queued->inference.priority_level);
     UpdateQueueDepthLocked();
   }
   fairness_controller_.ApplyTimeslice(&batch_entries);
@@ -2485,11 +2492,11 @@ void Scheduler::PollDeferredSequenceRetirements() {
     const auto lag_ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - it->retired_at)
                             .count();
-    GlobalMetrics().RecordSchedulerDeferredSequenceRetirement(lag_ms);
+    metrics_->RecordSchedulerDeferredSequenceRetirement(lag_ms);
     it = deferred_sequence_retirements_.erase(it);
     changed = true;
   }
-  GlobalMetrics().SetSchedulerDeferredSequenceRetirements(
+  metrics_->SetSchedulerDeferredSequenceRetirements(
       static_cast<int>(deferred_sequence_retirements_.size()));
   if (changed) {
     RefreshNativeKvMemoryMetrics();
@@ -2539,7 +2546,7 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
         deferred_sequence_retirements_.push_back(
             DeferredSequenceRetirement{std::move(backend), lease, fence,
                                        std::chrono::steady_clock::now()});
-        GlobalMetrics().SetSchedulerDeferredSequenceRetirements(
+        metrics_->SetSchedulerDeferredSequenceRetirements(
             static_cast<int>(deferred_sequence_retirements_.size()));
       }
       RefreshNativeKvMemoryMetrics();
@@ -2737,7 +2744,7 @@ void Scheduler::ResolveBackends(
                               requirements, selection_options);
 
     if (selection.status == ModelSelectionStatus::kNotFound) {
-      GlobalMetrics().RecordModelRoute(pending->inference.model, "", false);
+      metrics_->RecordModelRoute(pending->inference.model, "", false);
       continue;
     }
     if (selection.status == ModelSelectionStatus::kUnsupported) {
@@ -2746,19 +2753,19 @@ void Scheduler::ResolveBackends(
           selection.reason.empty()
               ? "Selected model does not support requested features"
               : selection.reason;
-      GlobalMetrics().RecordModelRoute(selection.info.id,
+      metrics_->RecordModelRoute(selection.info.id,
                                        selection.info.backend, false);
       continue;
     }
     if (selection.status == ModelSelectionStatus::kBackendUnavailable) {
       pending->inference.resolved_model = selection.info.id;
-      GlobalMetrics().RecordModelRoute(selection.info.id,
+      metrics_->RecordModelRoute(selection.info.id,
                                        selection.info.backend, false);
       continue;
     }
 
     if (selection.used_fallback) {
-      GlobalMetrics().RecordCapabilityRouteFallback(
+      metrics_->RecordCapabilityRouteFallback(
           selection.fallback_from_backend, selection.info.backend,
           selection.fallback_feature.empty() ? "unsupported_feature"
                                              : selection.fallback_feature);
@@ -2768,14 +2775,14 @@ void Scheduler::ResolveBackends(
       pending->resolved_backend =
           std::static_pointer_cast<LlamaCppBackend>(selection.backend);
       pending->inference.resolved_model = selection.info.id;
-      GlobalMetrics().RecordModelRoute(selection.info.id,
+      metrics_->RecordModelRoute(selection.info.id,
                                        selection.info.backend, true);
       if (selection.info.is_moe) {
-        GlobalMetrics().RecordMoERequest();
+        metrics_->RecordMoERequest();
       }
     } else {
       pending->inference.resolved_model = selection.info.id;
-      GlobalMetrics().RecordModelRoute(selection.info.id,
+      metrics_->RecordModelRoute(selection.info.id,
                                        selection.info.backend, false);
     }
   }
@@ -2809,7 +2816,7 @@ bool Scheduler::TrySwapOut(InferenceRequest &inf) {
     inf.swapped_host_handles = cache_->SwapOut(inf.block_table);
     inf.block_table.clear();
     inf.is_swapped = true;
-    GlobalMetrics().RecordFairnessPreemption(
+    metrics_->RecordFairnessPreemption(
         inf.priority_level); // Reuse preemption metric for swap
     return true;
   } catch (...) {

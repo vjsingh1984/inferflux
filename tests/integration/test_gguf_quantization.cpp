@@ -12,11 +12,10 @@
 
 #include <catch2/catch_amalgamated.hpp>
 
-#define private public
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
-#undef private
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/quantization_handler.h"
+#include "support/model_loader_test_access.h"
 
 #include <cstring>
 #include <cuda_runtime_api.h>
@@ -540,6 +539,7 @@ TEST_CASE("GGUF Integration: F16 accessor returns direct GPU pointer without "
           cudaSuccess);
 
   GGUFModelLoader loader;
+  ModelLoaderTestAccess lacc(loader);
   const std::string gguf_name = "blk.0.attn_q.weight";
   const std::string internal_name = "model.layers.0.self_attn.q_proj.weight";
   const std::vector<uint64_t> shape = {64, 64};
@@ -553,15 +553,15 @@ TEST_CASE("GGUF Integration: F16 accessor returns direct GPU pointer without "
   tensor.info.byte_size = f16_bytes;
   tensor.cpu_data.assign(f16_bytes, 0U);
 
-  REQUIRE(cudaMalloc(&loader.d_quantized_buffer_, f16_bytes) == cudaSuccess);
-  loader.quantized_buffer_size_ = f16_bytes;
-  REQUIRE(cudaMemset(loader.d_quantized_buffer_, 0, f16_bytes) == cudaSuccess);
+  REQUIRE(cudaMalloc(&lacc.d_quantized_buffer(), f16_bytes) == cudaSuccess);
+  lacc.quantized_buffer_size() = f16_bytes;
+  REQUIRE(cudaMemset(lacc.d_quantized_buffer(), 0, f16_bytes) == cudaSuccess);
 
-  tensor.gpu_data = loader.d_quantized_buffer_;
+  tensor.gpu_data = lacc.d_quantized_buffer();
   tensor.gpu_offset = 0;
-  loader.tensors_.emplace(gguf_name, std::move(tensor));
-  loader.gguf_to_internal_name_map_[gguf_name] = internal_name;
-  loader.internal_to_gguf_name_map_[internal_name] = gguf_name;
+  lacc.tensors().emplace(gguf_name, std::move(tensor));
+  lacc.gguf_to_internal_name_map()[gguf_name] = internal_name;
+  lacc.internal_to_gguf_name_map()[internal_name] = gguf_name;
 
   auto accessor = loader.GetWeightAccessor(internal_name);
   REQUIRE(accessor != nullptr);
@@ -603,6 +603,7 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
             cudaSuccess);
 
     GGUFModelLoader loader;
+    ModelLoaderTestAccess lacc(loader);
     loader.SetDequantizedCachePolicy(policy);
 
     const std::string gguf_name = "blk.0.attn_q.weight";
@@ -623,18 +624,18 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
     tensor.info.byte_size = quantized_bytes;
     tensor.cpu_data.assign(quantized_bytes, 0U); // Valid all-zero quant blocks
 
-    REQUIRE(cudaMalloc(&loader.d_quantized_buffer_, quantized_bytes) ==
+    REQUIRE(cudaMalloc(&lacc.d_quantized_buffer(), quantized_bytes) ==
             cudaSuccess);
-    loader.quantized_buffer_size_ = quantized_bytes;
-    REQUIRE(cudaMemcpy(loader.d_quantized_buffer_, tensor.cpu_data.data(),
+    lacc.quantized_buffer_size() = quantized_bytes;
+    REQUIRE(cudaMemcpy(lacc.d_quantized_buffer(), tensor.cpu_data.data(),
                        quantized_bytes, cudaMemcpyHostToDevice) ==
             cudaSuccess);
 
-    tensor.gpu_data = loader.d_quantized_buffer_;
+    tensor.gpu_data = lacc.d_quantized_buffer();
     tensor.gpu_offset = 0;
-    loader.tensors_.emplace(gguf_name, std::move(tensor));
-    loader.gguf_to_internal_name_map_[gguf_name] = internal_name;
-    loader.internal_to_gguf_name_map_[internal_name] = gguf_name;
+    lacc.tensors().emplace(gguf_name, std::move(tensor));
+    lacc.gguf_to_internal_name_map()[gguf_name] = internal_name;
+    lacc.internal_to_gguf_name_map()[internal_name] = gguf_name;
 
     auto accessor = loader.GetWeightAccessor(internal_name);
     REQUIRE(accessor != nullptr);
@@ -694,6 +695,7 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
             cudaSuccess);
 
     GGUFModelLoader loader;
+    ModelLoaderTestAccess lacc(loader);
     loader.SetDequantizedCachePolicy(DequantizedCachePolicy::kModelLifetime);
 
     const std::string gguf_name = "blk.0.attn_q.weight";
@@ -712,18 +714,18 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
     tensor.info.byte_size = quantized_bytes;
     tensor.cpu_data.assign(quantized_bytes, 0U);
 
-    REQUIRE(cudaMalloc(&loader.d_quantized_buffer_, quantized_bytes) ==
+    REQUIRE(cudaMalloc(&lacc.d_quantized_buffer(), quantized_bytes) ==
             cudaSuccess);
-    loader.quantized_buffer_size_ = quantized_bytes;
-    REQUIRE(cudaMemcpy(loader.d_quantized_buffer_, tensor.cpu_data.data(),
+    lacc.quantized_buffer_size() = quantized_bytes;
+    REQUIRE(cudaMemcpy(lacc.d_quantized_buffer(), tensor.cpu_data.data(),
                        quantized_bytes, cudaMemcpyHostToDevice) ==
             cudaSuccess);
 
-    tensor.gpu_data = loader.d_quantized_buffer_;
+    tensor.gpu_data = lacc.d_quantized_buffer();
     tensor.gpu_offset = 0;
-    loader.tensors_.emplace(gguf_name, std::move(tensor));
-    loader.gguf_to_internal_name_map_[gguf_name] = internal_name;
-    loader.internal_to_gguf_name_map_[internal_name] = gguf_name;
+    lacc.tensors().emplace(gguf_name, std::move(tensor));
+    lacc.gguf_to_internal_name_map()[gguf_name] = internal_name;
+    lacc.internal_to_gguf_name_map()[internal_name] = gguf_name;
 
     auto accessor = loader.GetWeightAccessor(internal_name);
     REQUIRE(accessor != nullptr);

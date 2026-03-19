@@ -1,24 +1,12 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #include "server/startup_advisor.h"
+#include "support/scoped_env.h"
 
 #include <cstdlib>
 
-#ifdef _WIN32
-inline void portable_setenv(const char *name, const char *value) {
-  _putenv_s(name, value);
-}
-inline void portable_unsetenv(const char *name) {
-  _putenv_s(name, "");
-}
-#else
-inline void portable_setenv(const char *name, const char *value) {
-  setenv(name, value, 1);
-}
-inline void portable_unsetenv(const char *name) {
-  unsetenv(name);
-}
-#endif
+using inferflux::test::portable_setenv;
+using inferflux::test::portable_unsetenv;
 
 // Helper to build a well-tuned CUDA context (zero recommendations expected).
 static inferflux::StartupAdvisorContext WellTunedCudaContext() {

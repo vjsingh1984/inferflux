@@ -44,55 +44,44 @@ struct ModelInfo {
   int n_active_experts{0}; // Active experts per token (llm.expert_used_count).
 };
 
-// ModelRouter is the plugin interface for multi-model serving.
-// It decouples the HTTP layer from the physical model topology, enabling
-// future features like model sharding, A/B serving, and per-tenant routing.
-//
-// The default implementation wraps a single LlamaCppBackend. Future backends
-// (CUDA, ROCm, disaggregated prefill/decode) implement this same interface.
-//
-// Thread safety: all methods must be safe to call concurrently.
-class ModelRouter {
+// --- Segregated model router interfaces (Phase D2) ---
+// ModelResolver provides read-only query operations (used by Scheduler).
+// ModelLifecycle adds mutation operations (used by admin endpoints).
+// ModelRouter = ModelLifecycle for backward compatibility.
+
+/// Read-only model resolution and query interface.
+/// Scheduler and inference paths depend only on this narrow interface,
+/// enabling simpler test stubs.
+class ModelResolver {
 public:
-  virtual ~ModelRouter() = default;
+  virtual ~ModelResolver() = default;
 
-  // List all models known to the router (loaded and unloaded).
   virtual std::vector<ModelInfo> ListModels() const = 0;
+  virtual ModelInfo *Resolve(const std::string &requested_model) = 0;
+  virtual ModelInfo *ResolveExact(const std::string &model_id) = 0;
+  virtual std::shared_ptr<BackendInterface>
+  GetBackend(const std::string &model_id) = 0;
+  virtual std::string DefaultModelId() const = 0;
+  virtual std::string Name() const = 0;
+};
 
-  // Load a model from the given path, returning its assigned ID.
-  // The optional requested_id is treated as a hint; routers may adjust it to
-  // ensure uniqueness. Returns empty string on failure.
+/// Model lifecycle management (load/unload/set-default).
+/// Extends ModelResolver with mutation operations.
+class ModelLifecycle : public ModelResolver {
+public:
+  ~ModelLifecycle() override = default;
+
   virtual std::string LoadModel(const std::string &path,
                                 const std::string &backend_hint = "",
                                 const std::string &requested_id = "",
                                 const std::string &model_format = "auto") = 0;
-
-  // Optional diagnostics for the last LoadModel failure. Empty on success or
-  // when unavailable in a specific router implementation.
   virtual std::string LastLoadError() const { return ""; }
-
-  // Unload a model by ID. Returns false if the model was not found.
   virtual bool UnloadModel(const std::string &id) = 0;
-
-  // Resolve which model should handle a request. The caller provides
-  // the model ID from the API request (may be empty for default routing).
-  // Returns nullptr if no suitable model is available.
-  virtual ModelInfo *Resolve(const std::string &requested_model) = 0;
-
-  // Resolve an explicit model ID without applying default fallback behavior.
-  // Returns nullptr when the exact model ID is unknown.
-  virtual ModelInfo *ResolveExact(const std::string &model_id) = 0;
-
-  // Retrieve the backend instance associated with a resolved model ID.
-  virtual std::shared_ptr<BackendInterface>
-  GetBackend(const std::string &model_id) = 0;
-
-  // Set or query the default routing target.
   virtual bool SetDefaultModel(const std::string &model_id) = 0;
-  virtual std::string DefaultModelId() const = 0;
-
-  // Identity — useful for logging and diagnostics.
-  virtual std::string Name() const = 0;
 };
+
+/// Full model router — backward compatibility alias for ModelLifecycle.
+/// Existing implementations (SingleModelRouter) inherit ModelRouter unchanged.
+using ModelRouter = ModelLifecycle;
 
 } // namespace inferflux

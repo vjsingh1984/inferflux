@@ -18,6 +18,8 @@
 #include "runtime/backends/cuda/native/weight_map.h"
 #endif
 
+#include "support/scoped_env.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -27,54 +29,17 @@
 
 namespace inferflux {
 
-namespace {
+using test::ScopedEnvVar;
 
+// 3-arg portable_setenv wrapper for backward compatibility with existing tests.
 inline int portable_setenv(const char *name, const char *value, int) {
-#ifdef _WIN32
-  return _putenv_s(name, value);
-#else
-  return setenv(name, value, 1);
-#endif
+  test::portable_setenv(name, value);
+  return 0;
 }
-
 inline int portable_unsetenv(const char *name) {
-#ifdef _WIN32
-  return _putenv_s(name, "");
-#else
-  return unsetenv(name);
-#endif
+  test::portable_unsetenv(name);
+  return 0;
 }
-
-class ScopedEnvVar {
-public:
-  ScopedEnvVar(std::string name, const char *value) : name_(std::move(name)) {
-    const char *existing = std::getenv(name_.c_str());
-    if (existing) {
-      had_original_ = true;
-      original_ = existing;
-    }
-    if (value) {
-      REQUIRE(portable_setenv(name_.c_str(), value, 1) == 0);
-    } else {
-      REQUIRE(portable_unsetenv(name_.c_str()) == 0);
-    }
-  }
-
-  ~ScopedEnvVar() {
-    if (had_original_) {
-      portable_setenv(name_.c_str(), original_.c_str(), 1);
-    } else {
-      portable_unsetenv(name_.c_str());
-    }
-  }
-
-private:
-  std::string name_;
-  std::string original_;
-  bool had_original_{false};
-};
-
-} // namespace
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
 namespace {

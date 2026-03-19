@@ -7,6 +7,7 @@
 #include <cuda_runtime_api.h>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -59,6 +60,9 @@ public:
  * - GPU caching of dequantized weights
  */
 class GGUFModelLoader : public IModelLoader {
+#ifdef INFERFLUX_TESTING
+  friend class ModelLoaderTestAccess;
+#endif
 public:
   GGUFModelLoader();
   ~GGUFModelLoader() override;
@@ -175,7 +179,10 @@ private:
   // File path
   std::filesystem::path model_path_;
 
-  // Weight accessor cache
+  // Weight accessor cache.  Guarded by weight_cache_mutex_ because
+  // concurrent GetWeightAccessor() calls from multiple threads (e.g.
+  // overlap-lane init) would otherwise corrupt the map.
+  mutable std::mutex weight_cache_mutex_;
   mutable std::unordered_map<std::string, std::shared_ptr<IWeightAccessor>>
       weight_accessor_cache_;
 };

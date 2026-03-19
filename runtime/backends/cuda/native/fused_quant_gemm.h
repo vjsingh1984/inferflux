@@ -164,6 +164,26 @@ public:
                        const NativeExecutionPolicy *policy = nullptr);
 
   /**
+   * GEMV using pre-quantized Q8_1 activations with accumulate mode.
+   * output[i] += gemv_result[i] instead of output[i] = gemv_result[i].
+   * Used to accumulate O-proj and down-proj directly into the residual stream,
+   * eliminating a separate ResidualAdd kernel launch.
+   *
+   * @param weight  Raw quantized weight info (GPU pointer + quant type)
+   * @param act_q8_1  Pre-quantized Q8_1 activations (block_q8_1, device)
+   * @param output  Output matrix [M, N] (half, device) — read-modify-write
+   * @param M  Number of rows
+   * @param N  Number of output columns
+   * @param K  Inner dimension (must be multiple of 32)
+   * @param stream  CUDA stream
+   * @return true if accumulate kernel was launched, false if unsupported
+   */
+  static bool GemvQ8_1Accum(const QuantizedWeightInfo &weight,
+                             const void *act_q8_1, half *output, int M, int N,
+                             int K, cudaStream_t stream,
+                             const NativeExecutionPolicy *policy = nullptr);
+
+  /**
    * MMQ-style tiled down-projection path for transformed GGUF weights.
    *
    * This is an additive migration path used only for native GGUF decode on

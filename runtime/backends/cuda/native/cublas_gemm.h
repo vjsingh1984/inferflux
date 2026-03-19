@@ -70,8 +70,17 @@ public:
                         long long stride_A, long long stride_B,
                         long long stride_C, int batch_count);
 
+  /**
+   * Pre-allocate cuBLAS workspace to avoid dynamic allocation during
+   * CUDA graph capture. Must be called after Initialize() and before
+   * any graph capture begins.
+   */
+  bool PreallocateWorkspace(size_t workspace_bytes = 4 * 1024 * 1024);
+
 private:
   cublasHandle_t handle_{nullptr};
+  void *workspace_{nullptr};
+  size_t workspace_size_{0};
 };
 
 } // namespace inferflux

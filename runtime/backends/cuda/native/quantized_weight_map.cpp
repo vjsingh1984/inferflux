@@ -150,12 +150,20 @@ const half *QuantizedWeightMap::GetDequantizedWeights(
     return nullptr;
   }
 
-  // Return cached if available
+  // Fast path: return cached if already populated (read is safe once written).
   if (cache_ptr) {
     return cache_ptr;
   }
 
-  // Lazy dequantization
+  // Slow path: lazy dequantization under lock to prevent concurrent races
+  // when multiple threads populate the same cache slot.
+  std::lock_guard<std::mutex> lock(dequant_cache_mu_);
+
+  // Double-check after acquiring lock.
+  if (cache_ptr) {
+    return cache_ptr;
+  }
+
   cache_ptr = accessor->GetDequantizedGpuWeights(stream_);
 
   if (!cache_ptr) {
@@ -237,24 +245,36 @@ const half *QuantizedWeightMap::DequantizeToScratch(
 const half *QuantizedWeightMap::LayerQProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].q_proj_accessor,
+                                 layers_[layer].q_proj);
   return DequantizeToScratch(layers_[layer].q_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerKProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].k_proj_accessor,
+                                 layers_[layer].k_proj);
   return DequantizeToScratch(layers_[layer].k_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerVProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].v_proj_accessor,
+                                 layers_[layer].v_proj);
   return DequantizeToScratch(layers_[layer].v_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerOProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].o_proj_accessor,
+                                 layers_[layer].o_proj);
   return DequantizeToScratch(layers_[layer].o_proj_accessor);
 }
 
@@ -277,18 +297,27 @@ const half *QuantizedWeightMap::LayerPostAttnNorm(int layer) const {
 const half *QuantizedWeightMap::LayerGateProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].gate_proj_accessor,
+                                 layers_[layer].gate_proj);
   return DequantizeToScratch(layers_[layer].gate_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerUpProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].up_proj_accessor,
+                                 layers_[layer].up_proj);
   return DequantizeToScratch(layers_[layer].up_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerDownProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].down_proj_accessor,
+                                 layers_[layer].down_proj);
   return DequantizeToScratch(layers_[layer].down_proj_accessor);
 }
 

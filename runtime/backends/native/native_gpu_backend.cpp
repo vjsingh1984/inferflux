@@ -4,6 +4,7 @@
 #include "model/tokenizer.h"
 #include "runtime/backends/backend_utils.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
+#include "runtime/string_utils.h"
 #include "server/logging/logger.h"
 
 #include <algorithm>
@@ -15,19 +16,6 @@
 namespace inferflux {
 
 namespace {
-
-bool ParseBoolEnv(const char *name, bool default_value) {
-  const char *raw = std::getenv(name);
-  if (!raw) {
-    return default_value;
-  }
-  std::string lowered(raw);
-  for (auto &ch : lowered) {
-    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-  }
-  return lowered == "1" || lowered == "true" || lowered == "yes" ||
-         lowered == "on";
-}
 
 bool IsVisibleNativePiece(std::string_view piece) { return !piece.empty(); }
 

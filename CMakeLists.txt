@@ -142,6 +142,10 @@ add_library(inferflux_core STATIC
   scheduler/model_registry.h
   server/http/http_server.cpp
   server/http/http_server.h
+  server/http/model_json.cpp
+  server/http/model_json.h
+  server/http/completion_payload.h
+  server/http/http_utils.h
   server/auth/api_key_auth.cpp
   server/auth/api_key_auth.h
   server/metrics/metrics.cpp
@@ -241,7 +245,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures" FORCE)
     message(STATUS "CUDA native arch: probing local GPU architecture")
   elseif(NOT CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING "CUDA architectures" FORCE)
+    set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90" CACHE STRING "CUDA architectures" FORCE)
   endif()
   enable_language(CUDA)
   if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
@@ -252,7 +256,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
           "CUDA architectures" FORCE)
       message(STATUS "CUDA native arch resolved to ${CMAKE_CUDA_ARCHITECTURES}")
     else()
-      set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING
+      set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90" CACHE STRING
           "CUDA architectures" FORCE)
       message(WARNING
         "Failed to resolve native CUDA architecture; falling back to standard multi-arch build")
@@ -562,6 +566,21 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   target_include_directories(benchmark_grouped_q81_pair PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_grouped_q81_pair PRIVATE inferflux_core)
+
+  # Fused kernel parity tests (Catch2, .cu)
+  add_executable(inferflux_fused_kernel_tests
+    tests/unit/test_fused_kernels.cu
+    external/catch2/catch_amalgamated.cpp
+  )
+  target_include_directories(inferflux_fused_kernel_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/external
+  )
+  target_link_libraries(inferflux_fused_kernel_tests PRIVATE inferflux_core)
+  set_target_properties(inferflux_fused_kernel_tests PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  )
 endif()
 
 install(TARGETS inferfluxd inferctl
@@ -584,7 +603,7 @@ add_executable(inferflux_tests
   tests/unit/test_audit_logger.cpp
   tests/unit/test_metrics.cpp
   tests/unit/test_http_server.cpp
-  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/unit/test_scheduler.cpp>
+  tests/unit/test_scheduler.cpp
   tests/unit/test_session_handle_manager.cpp
   tests/unit/test_sequence_slot_manager.cpp
   tests/unit/test_policy_store.cpp
@@ -623,7 +642,7 @@ add_executable(inferflux_tests
   tests/unit/test_native_forward.cpp
   tests/unit/test_native_rowpair_kernels.cpp
   tests/unit/test_native_bootstrap_config.cpp
-  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/unit/test_native_dequant_policy.cpp>
+  tests/unit/test_native_dequant_policy.cpp
   tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
   tests/unit/test_model_memory_ledger.cpp
@@ -637,13 +656,17 @@ add_executable(inferflux_tests
   tests/unit/test_gguf_parsing.cpp
   tests/unit/test_gguf_model_loader.cpp
   tests/unit/test_quantized_weight_map.cpp
-  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/unit/test_quantized_weight_map_scratch.cpp>
+  tests/unit/test_quantized_weight_map_scratch.cpp
   tests/unit/test_strategy_registry.cpp
-  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/integration/test_gguf_quantization.cpp>
+  tests/unit/test_result.cpp
+  tests/integration/test_gguf_quantization.cpp
   tests/integration/test_http_generation_admission.cpp
   external/catch2/catch_amalgamated.cpp
 )
-target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
+target_include_directories(inferflux_tests PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/external
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_compile_definitions(inferflux_tests PRIVATE INFERFLUX_TESTING)
 target_link_libraries(inferflux_tests PRIVATE inferflux_core)
 if(ENABLE_CUDA)
   add_executable(inferflux_first_token_probe
@@ -772,6 +795,10 @@ if(ENABLE_MLX)
     set_tests_properties(MlxExecutionTests PROPERTIES
       ENVIRONMENT "DYLD_LIBRARY_PATH=${MLX_C_LIB_DIR}:$ENV{DYLD_LIBRARY_PATH}")
   endif()
+endif()
+if(ENABLE_CUDA AND CUDAToolkit_FOUND)
+  add_test(NAME FusedKernelTests COMMAND inferflux_fused_kernel_tests)
+  set_tests_properties(FusedKernelTests PROPERTIES LABELS "cuda;fused_kernels")
 endif()
 
 set(CPACK_PACKAGE_NAME "inferflux")

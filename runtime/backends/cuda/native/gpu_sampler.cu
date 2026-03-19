@@ -5,6 +5,7 @@
 
 #include "server/logging/logger.h"
 #include <algorithm>
+#include <cassert>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
@@ -137,6 +138,7 @@ __global__ void TopKMaskKernel(float *__restrict__ probs, int vocab_size,
 
 // Top-p: zero out entries where cumulative sum exceeds p
 // Requires sorted probs. Simple single-thread approach for correctness.
+// LEGACY: kept for reference/other call sites. Use ParallelTopPMaskKernel.
 __global__ void TopPMaskKernel(float *__restrict__ probs, int vocab_size,
                                float top_p) {
   // Single thread scans sorted probs
@@ -169,6 +171,125 @@ __global__ void TopPMaskKernel(float *__restrict__ probs, int vocab_size,
 
   // Restore marked entries, zero those below threshold
   for (int i = 0; i < vocab_size; i++) {
+    if (probs[i] < 0.0f) {
+      probs[i] = -probs[i]; // Restore
+    } else {
+      probs[i] = 0.0f; // Zero out
+    }
+  }
+}
+
+// Fused softmax: temperature scale + max + exp-sum + normalize in one kernel.
+// Single block, blockDim.x threads. Reads from `logits`, writes to `probs`.
+// Shared memory: blockDim.x floats for reductions.
+__global__ void FusedSoftmaxKernel(const float *__restrict__ logits,
+                                   float *__restrict__ probs, int vocab_size,
+                                   float temperature) {
+  extern __shared__ float smem[];
+  const int tid = threadIdx.x;
+  const int T = blockDim.x;
+  const float inv_temp =
+      (temperature != 1.0f) ? (1.0f / temperature) : 1.0f;
+
+  // --- Pass 1: find max (with temperature scaling applied) ---
+  float local_max = -FLT_MAX;
+  for (int i = tid; i < vocab_size; i += T) {
+    float v = logits[i] * inv_temp;
+    if (v > local_max) local_max = v;
+  }
+  smem[tid] = local_max;
+  __syncthreads();
+
+  for (int s = T / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+    }
+    __syncthreads();
+  }
+  float global_max = smem[0];
+  __syncthreads();
+
+  // --- Pass 2: compute exp(scaled_logit - max) and partial sums ---
+  float local_sum = 0.0f;
+  for (int i = tid; i < vocab_size; i += T) {
+    float e = expf(logits[i] * inv_temp - global_max);
+    probs[i] = e;
+    local_sum += e;
+  }
+  smem[tid] = local_sum;
+  __syncthreads();
+
+  for (int s = T / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      smem[tid] += smem[tid + s];
+    }
+    __syncthreads();
+  }
+  float global_sum = smem[0];
+  __syncthreads();
+
+  // --- Pass 3: normalize ---
+  float inv_sum = 1.0f / global_sum;
+  for (int i = tid; i < vocab_size; i += T) {
+    probs[i] *= inv_sum;
+  }
+}
+
+// Parallel top-p nucleus mask: single block, 256 threads.
+// Iteratively finds the max probability in parallel, accumulates cumsum,
+// marks visited entries by negating. Reduces O(V²) serial to O(V²/T).
+// Shared memory: blockDim.x * (sizeof(float) + sizeof(int)) bytes.
+__global__ void ParallelTopPMaskKernel(float *__restrict__ probs,
+                                       int vocab_size, float top_p) {
+  extern __shared__ char smem_raw[];
+  float *s_max_vals = reinterpret_cast<float *>(smem_raw);
+  int *s_max_idxs =
+      reinterpret_cast<int *>(s_max_vals + blockDim.x);
+
+  const int tid = threadIdx.x;
+  const int T = blockDim.x;
+
+  float cumsum = 0.0f;
+
+  while (cumsum < top_p) {
+    // --- Parallel max reduction ---
+    float local_max = -1.0f;
+    int local_idx = -1;
+    for (int i = tid; i < vocab_size; i += T) {
+      if (probs[i] > local_max) {
+        local_max = probs[i];
+        local_idx = i;
+      }
+    }
+    s_max_vals[tid] = local_max;
+    s_max_idxs[tid] = local_idx;
+    __syncthreads();
+
+    for (int s = T / 2; s > 0; s >>= 1) {
+      if (tid < s) {
+        if (s_max_vals[tid + s] > s_max_vals[tid]) {
+          s_max_vals[tid] = s_max_vals[tid + s];
+          s_max_idxs[tid] = s_max_idxs[tid + s];
+        }
+      }
+      __syncthreads();
+    }
+
+    // No positive probability remaining
+    if (s_max_vals[0] <= 0.0f) break;
+
+    cumsum += s_max_vals[0];
+
+    // Mark the winning element as visited by negating it
+    if (tid == 0) {
+      probs[s_max_idxs[0]] = -probs[s_max_idxs[0]];
+    }
+    __syncthreads();
+  }
+
+  // --- Restore/zero pass: visited entries (negative) are restored,
+  //     unvisited entries are zeroed ---
+  for (int i = tid; i < vocab_size; i += T) {
     if (probs[i] < 0.0f) {
       probs[i] = -probs[i]; // Restore
     } else {
@@ -397,34 +518,15 @@ int GpuSampler::GreedyArgmax(const float *d_logits) {
 int GpuSampler::StochasticSample(const float *d_logits, float temperature,
                                  int top_k, float top_p) {
   NVTX_SCOPE("Sampler_Stochastic");
-  int threads = 256;
-  int blocks = (vocab_size_ + threads - 1) / threads;
+  const int threads = 256;
 
-  // Step 1: Copy logits to probs buffer
-  runtime::cuda::native::TracedCudaMemcpyAsync(
-      runtime::cuda::native::CopyTraceSite::kSamplerLogitsToProbsD2D, d_probs_,
-      d_logits, vocab_size_ * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
-
-  // Step 2: Temperature scaling
-  if (temperature != 1.0f) {
-    TemperatureScaleKernel<<<blocks, threads, 0, stream_>>>(
-        d_probs_, vocab_size_, temperature);
-  }
-
-  // Step 3: Softmax (no host sync — sum is always positive for valid logits)
+  // Step 1+2+3: Fused softmax (temperature scale + max + exp-sum + normalize)
+  // Reads d_logits directly, writes normalized probs to d_probs_.
+  // Single kernel replaces: D2D copy + TemperatureScale + SoftmaxMax +
+  // SoftmaxExpSum + SoftmaxNorm + D2D copy back (7 ops → 1 kernel).
   int smem = threads * sizeof(float);
-  SoftmaxMaxKernel<<<1, threads, smem, stream_>>>(d_probs_, d_max_val_,
-                                                  vocab_size_);
-  SoftmaxExpSumKernel<<<1, threads, smem, stream_>>>(
-      d_probs_, d_temp_, d_max_val_, d_max_val_, vocab_size_);
-  // d_max_val_ reused as sum_val — SoftmaxNormKernel reads it on device
-  SoftmaxNormKernel<<<blocks, threads, 0, stream_>>>(d_temp_, d_max_val_,
-                                                     vocab_size_);
-
-  // Copy normalized probs back
-  runtime::cuda::native::TracedCudaMemcpyAsync(
-      runtime::cuda::native::CopyTraceSite::kSamplerTempToProbsD2D, d_probs_,
-      d_temp_, vocab_size_ * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
+  FusedSoftmaxKernel<<<1, threads, smem, stream_>>>(d_logits, d_probs_,
+                                                    vocab_size_, temperature);
 
   // Step 4: Top-k filtering (if enabled)
   if (top_k > 0 && top_k < vocab_size_) {
@@ -433,9 +535,11 @@ int GpuSampler::StochasticSample(const float *d_logits, float temperature,
     // For now, skip top-k and rely on top-p
   }
 
-  // Step 5: Top-p / nucleus filtering (if enabled)
+  // Step 5: Top-p / nucleus filtering (parallel, 256 threads)
   if (top_p < 1.0f && top_p > 0.0f) {
-    TopPMaskKernel<<<1, 1, 0, stream_>>>(d_probs_, vocab_size_, top_p);
+    int top_p_smem = threads * (sizeof(float) + sizeof(int));
+    ParallelTopPMaskKernel<<<1, threads, top_p_smem, stream_>>>(
+        d_probs_, vocab_size_, top_p);
   }
 
   // Step 6: Generate random uniform
@@ -462,6 +566,9 @@ int GpuSampler::Sample(const float *d_logits, float temperature, int top_k,
 
 void GpuSampler::EnqueueSample(const float *d_logits, float temperature,
                                int top_k, float top_p, uint32_t seed) {
+  assert(!completion_pending_ &&
+         "GpuSampler::EnqueueSample called while a previous sample is "
+         "still pending — each lane must own its own GpuSampler instance");
   if (seed != UINT32_MAX && rng_initialized_) {
     curandSetPseudoRandomGeneratorSeed(rng_, seed);
   }
@@ -485,32 +592,19 @@ void GpuSampler::EnqueueSample(const float *d_logits, float temperature,
   }
 
   NVTX_SCOPE("Sampler_Stochastic");
-  int threads = 256;
-  int blocks = (vocab_size_ + threads - 1) / threads;
+  const int threads = 256;
 
-  runtime::cuda::native::TracedCudaMemcpyAsync(
-      runtime::cuda::native::CopyTraceSite::kSamplerLogitsToProbsD2D, d_probs_,
-      d_logits, vocab_size_ * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
-
-  if (temperature != 1.0f) {
-    TemperatureScaleKernel<<<blocks, threads, 0, stream_>>>(
-        d_probs_, vocab_size_, temperature);
-  }
-
+  // Fused softmax: temperature scale + max + exp-sum + normalize in one kernel.
+  // Reads d_logits directly, writes normalized probs to d_probs_.
   int smem = threads * sizeof(float);
-  SoftmaxMaxKernel<<<1, threads, smem, stream_>>>(d_probs_, d_max_val_,
-                                                  vocab_size_);
-  SoftmaxExpSumKernel<<<1, threads, smem, stream_>>>(
-      d_probs_, d_temp_, d_max_val_, d_max_val_, vocab_size_);
-  SoftmaxNormKernel<<<blocks, threads, 0, stream_>>>(d_temp_, d_max_val_,
-                                                     vocab_size_);
+  FusedSoftmaxKernel<<<1, threads, smem, stream_>>>(d_logits, d_probs_,
+                                                    vocab_size_, temperature);
 
-  runtime::cuda::native::TracedCudaMemcpyAsync(
-      runtime::cuda::native::CopyTraceSite::kSamplerTempToProbsD2D, d_probs_,
-      d_temp_, vocab_size_ * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
-
+  // Top-p / nucleus filtering (parallel, 256 threads)
   if (top_p < 1.0f && top_p > 0.0f) {
-    TopPMaskKernel<<<1, 1, 0, stream_>>>(d_probs_, vocab_size_, top_p);
+    int top_p_smem = threads * (sizeof(float) + sizeof(int));
+    ParallelTopPMaskKernel<<<1, threads, top_p_smem, stream_>>>(
+        d_probs_, vocab_size_, top_p);
   }
 
   curandGenerateUniform(rng_, d_uniform_, 1);

@@ -76,6 +76,47 @@ enum class RequestPhase {
 // It replaces the legacy GenerateRequest DTO with a richer structure that
 // supports scheduler-driven batching, priority scheduling, and per-request
 // accounting.
+// Sub-structs grouping related InferenceRequest fields.
+// Defined outside InferenceRequest so callers can name the types directly
+// (e.g. ResponseFormatState) without the owning struct prefix.
+
+/// Structured-output / response_format state.
+struct ResponseFormatState {
+  bool has_format{false};
+  std::string type;    // "json_object", "grammar", etc.
+  std::string schema;  // Raw JSON schema string (if provided).
+  std::string grammar; // Resolved GBNF string.
+  std::string root{"root"};
+  bool ready{false};     // True once grammar string compiled/resolved.
+  bool supported{true};  // Feature gate for capability checks.
+  std::string error;
+  StructuredConstraint constraint;
+};
+
+/// Step-wise batch execution state (pause/resume across token steps).
+struct ExecutionState {
+  bool initialized{false};
+  bool active{true};
+  int tokens_generated{0};
+  int decode_limit{0};
+  int current_token{-1};
+  bool slice_active{false};
+  bool in_prefill{false};
+  InferenceResult result{};
+};
+
+/// Per-request fairness accounting.
+struct FairnessState {
+  int priority_level{0};
+  int service_tokens{0};
+  int timeslice_tokens{0};
+  int remaining_decode_tokens{-1};
+  int reported_prompt_tokens{-1};
+  int total_completion_tokens{0};
+  int last_timeslice_tokens{0};
+  bool yielded{false};
+};
+
 struct InferenceRequest {
   uint64_t id{0};
   std::string model;          // Requested model ID (empty = default).
@@ -207,6 +248,14 @@ struct InferenceRequest {
   // OpenAI `stop` parameter: up to 4 strings at which generation halts.
   // The matched stop sequence is NOT included in the completion text.
   std::vector<std::string> stop;
+
+  // --- Grouped sub-struct views (Phase C1) ---
+  // These aggregate related flat fields into logical groups.  Callers
+  // should migrate from flat fields to these sub-structs file-by-file.
+  // Eventually the flat fields above will be deprecated.
+  ResponseFormatState response_format{};
+  ExecutionState execution{};
+  FairnessState fairness{};
 };
 
 // RequestBatch groups requests that will execute together in a single

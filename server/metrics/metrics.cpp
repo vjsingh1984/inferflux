@@ -9,6 +9,15 @@
 
 namespace inferflux {
 
+void MetricsRegistry::Reset() {
+  // Reconstruct in-place to reset all counters, gauges, maps, and histograms
+  // to their default-constructed values.  This is safe because no external
+  // code holds references to individual metric fields — all access goes
+  // through MetricsRegistry methods.
+  this->~MetricsRegistry();
+  new (this) MetricsRegistry();
+}
+
 namespace {
 MetricsRegistry g_metrics;
 

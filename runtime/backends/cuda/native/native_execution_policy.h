@@ -1,7 +1,7 @@
 #pragma once
 
-#include <algorithm>
-#include <cctype>
+#include "runtime/string_utils.h"
+
 #include <cstdlib>
 #include <limits>
 #include <string>
@@ -40,6 +40,10 @@ struct NativeExecutionPolicy {
   bool enable_adaptive_mmvq_threads{true};
   int mmvq_min_warps_override{-1};
   int mmvq_max_warps_override{-1};
+  bool enable_fused_residual_norm{true};
+  bool enable_fused_bias_add{true};
+  bool enable_gemv_accumulate{true};
+  bool enable_batch_dequant_cache{false};
 
   static NativeExecutionPolicy FromEnv() {
     NativeExecutionPolicy policy;
@@ -114,40 +118,17 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_MMVQ_MIN_WARPS", -1, 1, 8);
     policy.mmvq_max_warps_override =
         ParseIntEnv("INFERFLUX_MMVQ_MAX_WARPS", -1, 1, 8);
+    policy.enable_fused_residual_norm =
+        ParseBoolEnv("INFERFLUX_ENABLE_FUSED_RESIDUAL_NORM", true);
+    policy.enable_fused_bias_add =
+        ParseBoolEnv("INFERFLUX_ENABLE_FUSED_BIAS_ADD", true);
+    policy.enable_gemv_accumulate =
+        ParseBoolEnv("INFERFLUX_ENABLE_GEMV_ACCUMULATE", true);
+    policy.enable_batch_dequant_cache =
+        ParseBoolEnv("INFERFLUX_BATCH_DEQUANT_CACHE", false);
     return policy;
   }
 
-private:
-  static bool ParseBoolEnv(const char *name, bool default_value) {
-    const char *raw = std::getenv(name);
-    if (!raw) {
-      return default_value;
-    }
-    std::string lowered(raw);
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-                   [](unsigned char ch) {
-                     return static_cast<char>(std::tolower(ch));
-                   });
-    return lowered == "1" || lowered == "true" || lowered == "yes" ||
-           lowered == "on";
-  }
-
-  static int ParseIntEnv(const char *name, int default_value, int min_value,
-                         int max_value) {
-    const char *raw = std::getenv(name);
-    if (!raw || *raw == '\0') {
-      return default_value;
-    }
-    char *end = nullptr;
-    const long parsed = std::strtol(raw, &end, 10);
-    if (end == raw || (end && *end != '\0')) {
-      return default_value;
-    }
-    if (parsed < min_value || parsed > max_value) {
-      return default_value;
-    }
-    return static_cast<int>(parsed);
-  }
 };
 
 } // namespace inferflux

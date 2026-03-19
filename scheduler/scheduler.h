@@ -30,6 +30,7 @@
 namespace inferflux {
 
 class BatchExecutor;
+class MetricsRegistry;
 
 enum class SchedulerBatchPolicy {
   kPriorityAge,
@@ -55,6 +56,9 @@ struct DisaggregatedConfig {
 
 // Scheduler: handles request queuing, batch selection, and fairness.
 class Scheduler {
+#ifdef INFERFLUX_TESTING
+  friend class SchedulerTestAccess;
+#endif
 public:
   struct Config {
     struct SessionHandleConfig {
@@ -78,6 +82,9 @@ public:
     int chunked_prefill_tokens{512};
     double mixed_prefill_budget_ratio{1.0};
     SessionHandleConfig session_handles{};
+    // Optional metrics registry for dependency injection.
+    // nullptr (default) falls back to GlobalMetrics().
+    MetricsRegistry *metrics{nullptr};
   };
 
   explicit Scheduler(
@@ -134,7 +141,14 @@ public:
     return slot_manager_.get();
   }
 
+  // PendingRequest and BatchSelection are implementation details exposed
+  // under INFERFLUX_TESTING to enable friend-class test access without the
+  // `#define private public` hack.
+#ifdef INFERFLUX_TESTING
+public:
+#else
 private:
+#endif
   struct PendingRequest {
     InferenceRequest inference;
     std::promise<InferenceResult> promise;
@@ -150,6 +164,8 @@ private:
     std::vector<std::shared_ptr<PendingRequest>> pending;
     std::size_t total_tokens{0};
   };
+
+private:
 
   void WorkerLoop();
   void ProcessBatch(BatchSelection selection);
@@ -200,6 +216,13 @@ private:
   std::shared_ptr<RadixPrefixCache> prefix_cache_;
   std::vector<std::shared_ptr<PendingRequest>> pending_prefill_;
   std::vector<std::shared_ptr<PendingRequest>> pending_decode_;
+
+  // Lock ordering (acquire in this order to prevent deadlock):
+  //   1. queue_mutex_
+  //   2. model_selection_options_mutex_  (never co-held with queue_mutex_)
+  //   3. deferred_sequence_retirements_mutex_
+  //   4. eviction_mutex_
+  // Cross-component: HttpServer locks are never held when calling Scheduler.
   mutable std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::thread worker_;
@@ -213,6 +236,7 @@ private:
   FairnessConfig fairness_config_;
   DisaggregatedConfig disagg_config_;
   Config config_;
+  MetricsRegistry *metrics_; // Non-owning; defaults to &GlobalMetrics().
   mutable std::mutex model_selection_options_mutex_;
   ModelSelectionOptions model_selection_options_;
 

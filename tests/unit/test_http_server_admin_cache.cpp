@@ -12,13 +12,7 @@
 #include <unistd.h>
 #endif
 
-#ifndef _MSC_VER
-#define private public
-#endif
 #include "server/http/http_server.h"
-#ifndef _MSC_VER
-#undef private
-#endif
 
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"

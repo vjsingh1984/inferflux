@@ -28,6 +28,10 @@ struct LatencyHistogram {
 
 class MetricsRegistry {
 public:
+  /// Reset all counters and gauges to zero.  Intended for test isolation
+  /// so state doesn't leak between test cases that use the global instance.
+  void Reset();
+
   void SetBackend(const std::string &backend);
 
   // Counters (existing).

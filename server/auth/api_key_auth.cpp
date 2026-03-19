@@ -52,8 +52,12 @@ void ApiKeyAuth::AddKeyHashed(const std::string &hash,
 }
 
 bool ApiKeyAuth::IsAllowed(const std::string &key) const {
+  return IsAllowedByHash(HashKey(key));
+}
+
+bool ApiKeyAuth::IsAllowedByHash(const std::string &hash) const {
   std::shared_lock lock(mutex_);
-  return keys_.find(HashKey(key)) != keys_.end();
+  return keys_.find(hash) != keys_.end();
 }
 
 bool ApiKeyAuth::HasKeys() const {
@@ -62,8 +66,13 @@ bool ApiKeyAuth::HasKeys() const {
 }
 
 std::vector<std::string> ApiKeyAuth::Scopes(const std::string &key) const {
+  return ScopesByHash(HashKey(key));
+}
+
+std::vector<std::string>
+ApiKeyAuth::ScopesByHash(const std::string &hash) const {
   std::shared_lock lock(mutex_);
-  auto it = keys_.find(HashKey(key));
+  auto it = keys_.find(hash);
   if (it == keys_.end()) {
     return {};
   }

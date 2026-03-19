@@ -1091,6 +1091,8 @@ std::string GGUFModelLoader::GetQuantizationType() const {
 
 std::shared_ptr<IWeightAccessor>
 GGUFModelLoader::GetWeightAccessor(const std::string &tensor_name) {
+  std::lock_guard<std::mutex> lock(weight_cache_mutex_);
+
   // Check cache first
   auto it = weight_accessor_cache_.find(tensor_name);
   if (it != weight_accessor_cache_.end()) {

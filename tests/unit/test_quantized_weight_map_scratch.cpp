@@ -1,9 +1,9 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#define private public
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
 #include "runtime/backends/cuda/native/quantized_weight_map.h"
-#undef private
+#include "support/model_loader_test_access.h"
+#include "support/weight_map_test_access.h"
 
 #include <unordered_map>
 
@@ -118,12 +118,13 @@ TEST_CASE("QuantizedWeightMap scratch sizing ignores quantized lm_head",
                          kLargeRows, kLargeCols, /*quantized=*/true));
 
   QuantizedWeightMap map;
+  WeightMapTestAccess acc(map);
   REQUIRE(map.Build(&loader, info, nullptr));
 
 #ifdef INFERFLUX_HAS_CUDA
-  REQUIRE(map.scratch_buffer_elements_ == (kSmallRows * kSmallCols));
+  REQUIRE(acc.scratch_buffer_elements() == (kSmallRows * kSmallCols));
 #else
-  REQUIRE(map.scratch_buffer_elements_ == 0);
+  REQUIRE(acc.scratch_buffer_elements() == 0);
 #endif
 }
 
@@ -139,12 +140,13 @@ TEST_CASE(
                                            32000, 4096, /*quantized=*/true));
 
   QuantizedWeightMap map;
+  WeightMapTestAccess acc(map);
   REQUIRE(map.Build(&loader, info, nullptr));
 
 #ifdef INFERFLUX_HAS_CUDA
-  REQUIRE(map.scratch_buffer_elements_ == 0);
+  REQUIRE(acc.scratch_buffer_elements() == 0);
 #else
-  REQUIRE(map.scratch_buffer_elements_ == 0);
+  REQUIRE(acc.scratch_buffer_elements() == 0);
 #endif
 }
 
@@ -157,26 +159,27 @@ TEST_CASE("QuantizedWeightMap ClearCache preserves embedding and final norm "
   loader.SetModelInfo(info);
 
   QuantizedWeightMap map;
+  WeightMapTestAccess acc(map);
   REQUIRE(map.Build(&loader, info, nullptr));
 
   const half *embed = reinterpret_cast<const half *>(0x1110);
   const half *norm = reinterpret_cast<const half *>(0x2220);
   const half *lm_head = reinterpret_cast<const half *>(0x3330);
-  map.embed_tokens_ = embed;
-  map.final_norm_ = norm;
-  map.lm_head_ = lm_head;
-  map.embed_tokens_accessor =
+  acc.embed_tokens() = embed;
+  acc.final_norm() = norm;
+  acc.lm_head() = lm_head;
+  acc.embed_tokens_accessor() =
       std::make_shared<ScratchMockAccessor>(4, 4, /*quantized=*/true);
-  map.final_norm_accessor =
+  acc.final_norm_accessor() =
       std::make_shared<ScratchMockAccessor>(1, 4, /*quantized=*/false);
-  map.lm_head_accessor =
+  acc.lm_head_accessor() =
       std::make_shared<ScratchMockAccessor>(4, 4, /*quantized=*/true);
 
   map.ClearCache();
 
-  REQUIRE(map.embed_tokens_ == embed);
-  REQUIRE(map.final_norm_ == norm);
-  REQUIRE(map.lm_head_ == nullptr);
+  REQUIRE(acc.embed_tokens() == embed);
+  REQUIRE(acc.final_norm() == norm);
+  REQUIRE(acc.lm_head() == nullptr);
 }
 
 TEST_CASE("GGUFModelLoader ClearDequantizedCache retains quantized token "
@@ -190,20 +193,21 @@ TEST_CASE("GGUFModelLoader ClearDequantizedCache retains quantized token "
   }
 
   runtime::cuda::native::GGUFModelLoader loader;
-  auto &embed = loader.tensors_["token_embd.weight"];
+  runtime::cuda::native::ModelLoaderTestAccess lacc(loader);
+  auto &embed = lacc.tensors()["token_embd.weight"];
   embed.info.name = "token_embd.weight";
   embed.info.type = runtime::cuda::native::GGUF::TensorType::Q4_K;
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&embed.dequantized_gpu),
                      16 * sizeof(half)) == cudaSuccess);
 
-  auto &proj = loader.tensors_["blk.0.attn_q.weight"];
+  auto &proj = lacc.tensors()["blk.0.attn_q.weight"];
   proj.info.name = "blk.0.attn_q.weight";
   proj.info.type = runtime::cuda::native::GGUF::TensorType::Q4_K;
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&proj.dequantized_gpu),
                      16 * sizeof(half)) == cudaSuccess);
 
   // Dirty flag must be set since we bypassed GGUFWeightAccessor.
-  loader.has_dequantized_entries_ = true;
+  lacc.has_dequantized_entries() = true;
   loader.ClearDequantizedCache();
 
   REQUIRE(embed.dequantized_gpu != nullptr);

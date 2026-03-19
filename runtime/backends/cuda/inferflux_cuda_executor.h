@@ -168,6 +168,9 @@ private:
  * - NO llama.cpp dependency
  */
 class InferfluxCudaExecutor final : public InferfluxCudaRuntime {
+#ifdef INFERFLUX_TESTING
+  friend class ExecutorTestAccess;
+#endif
 public:
   InferfluxCudaExecutor();
   ~InferfluxCudaExecutor() override;
@@ -208,6 +211,9 @@ public:
 
   // Timing helper: 0 disables event timing, N>0 records every Nth native work
   // item (decode batch or prefill request). Exposed for contract tests.
+  static bool ShouldRecordTimingSample(int sample_rate,
+                                       std::atomic<int> *counter);
+  // Non-atomic overload for tests and single-threaded callers.
   static bool ShouldRecordTimingSample(int sample_rate, int *counter);
 
   // Native* overrides — provide tokenization/readiness without llama.cpp
@@ -365,7 +371,7 @@ private:
   // Timing sample rate: 0 = disabled, N>0 = record every Nth batch.
   // Loaded through NativeExecutionPolicy during model initialization.
   int timing_sample_rate_{0};
-  int timing_batch_counter_{0};
+  std::atomic<int> timing_batch_counter_{0};
   NativeExecutionPolicy execution_policy_{};
 
   struct NativePerfAccumulator {

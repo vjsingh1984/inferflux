@@ -827,7 +827,7 @@ InferfluxCudaExecutor::~InferfluxCudaExecutor() {
   quantized_weight_map_.reset();
   if (d_logits_) {
     if (cudaFree(d_logits_) != cudaSuccess) {
-      log::Warn("inferflux_cuda_executor", "cudaFree(d_logits_) failed");
+      log::Error("inferflux_cuda_executor", "cudaFree(d_logits_) failed");
     }
     d_logits_ = nullptr;
   }
@@ -1218,13 +1218,13 @@ void InferfluxCudaExecutor::DestroyLaneOverlapResourcesUnlocked() {
   prefill_lane_quantized_weight_map_.reset();
   if (d_decode_logits_) {
     if (cudaFree(d_decode_logits_) != cudaSuccess) {
-      log::Warn("inferflux_cuda_executor", "cudaFree(d_decode_logits_) failed");
+      log::Error("inferflux_cuda_executor", "cudaFree(d_decode_logits_) failed");
     }
     d_decode_logits_ = nullptr;
   }
   if (d_prefill_logits_) {
     if (cudaFree(d_prefill_logits_) != cudaSuccess) {
-      log::Warn("inferflux_cuda_executor", "cudaFree(d_prefill_logits_) failed");
+      log::Error("inferflux_cuda_executor", "cudaFree(d_prefill_logits_) failed");
     }
     d_prefill_logits_ = nullptr;
   }
@@ -1313,6 +1313,8 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
     DestroyLaneOverlapResources();
     return false;
   }
+  decode_lane_gemm_->PreallocateWorkspace(4 * 1024 * 1024);
+  prefill_lane_gemm_->PreallocateWorkspace(4 * 1024 * 1024);
 
   if (is_gguf_path) {
     // GGUF path currently feeds FP16 into the forward path.
@@ -1351,8 +1353,12 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
         runtime::cuda::native::MatmulExecutionMode::kFusedDequantTileGemm;
     decode_lane_quantized_weight_map_->SetAllowFusedQuantizedMatmul(
         allow_fused_quantized_matmul);
+    decode_lane_quantized_weight_map_->SetBatchDequantCacheEnabled(
+        execution_policy_.enable_batch_dequant_cache);
     prefill_lane_quantized_weight_map_->SetAllowFusedQuantizedMatmul(
         allow_fused_quantized_matmul);
+    prefill_lane_quantized_weight_map_->SetBatchDequantCacheEnabled(
+        execution_policy_.enable_batch_dequant_cache);
 
     decode_lane_quantized_weight_adapter_ =
         std::make_unique<QuantizedWeightMapAdapter>(
@@ -1538,6 +1544,9 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
     log::Error("inferflux_cuda_executor", "Failed to initialize cuBLAS");
     return false;
   }
+  // Pre-allocate cuBLAS workspace to avoid dynamic allocation during
+  // CUDA graph capture. 4 MB is sufficient for typical decode geometries.
+  gemm_->PreallocateWorkspace(4 * 1024 * 1024);
 
   // 2. Allocate KV cache (independent precision policy)
   // Defaults can be overridden via env vars to reduce GPU memory usage.
@@ -1768,6 +1777,8 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
     }
     quantized_weight_map_->SetAllowFusedQuantizedMatmul(
         allow_fused_quantized_matmul);
+    quantized_weight_map_->SetBatchDequantCacheEnabled(
+        execution_policy_.enable_batch_dequant_cache);
     quantized_weight_adapter_ = std::make_unique<QuantizedWeightMapAdapter>(
         quantized_weight_map_.get());
     // GGUF always dequantizes to FP16, so use LlamaForwardTyped<half>
@@ -3205,6 +3216,15 @@ InferfluxCudaRuntime::PerfSnapshot InferfluxCudaExecutor::NativeTakePerf() {
   snap.generated_tokens = perf_accum_.generated_tokens.exchange(0);
 #endif
   return snap;
+}
+
+bool InferfluxCudaExecutor::ShouldRecordTimingSample(
+    int sample_rate, std::atomic<int> *counter) {
+  if (sample_rate <= 0 || !counter) {
+    return false;
+  }
+  int val = counter->fetch_add(1, std::memory_order_relaxed) + 1;
+  return (val % sample_rate) == 0;
 }
 
 bool InferfluxCudaExecutor::ShouldRecordTimingSample(int sample_rate,

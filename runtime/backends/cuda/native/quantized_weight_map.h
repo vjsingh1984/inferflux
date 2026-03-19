@@ -32,6 +32,9 @@ using runtime::cuda::native::ModelInfo;
  * - Compatible with existing forward pass code
  */
 class QuantizedWeightMap {
+#ifdef INFERFLUX_TESTING
+  friend class WeightMapTestAccess;
+#endif
 public:
   QuantizedWeightMap() = default;
   ~QuantizedWeightMap();
@@ -125,6 +128,16 @@ public:
     return allow_fused_quantized_matmul_;
   }
 
+  // When enabled, projection weights use permanent per-tensor caching
+  // instead of the shared scratch buffer.  Trades GPU memory for prefill
+  // performance by eliminating dequantization kernel launches per layer.
+  void SetBatchDequantCacheEnabled(bool enable) {
+    batch_dequant_cache_enabled_ = enable;
+  }
+  bool BatchDequantCacheEnabled() const {
+    return batch_dequant_cache_enabled_;
+  }
+
   // --- Raw quantized weight accessors (for fused dequant-GEMV) ---
 
   QuantizedWeightInfo GetRawLayerQProj(int layer) const;
@@ -209,7 +222,9 @@ private:
     std::shared_ptr<IWeightAccessor> v_proj_bias_accessor;
   };
 
-  // Helper to get dequantized weights (lazy evaluation, permanent cache)
+  // Helper to get dequantized weights (lazy evaluation, permanent cache).
+  // Guarded by dequant_cache_mu_ to prevent races when multiple threads
+  // (e.g. prefill/decode overlap lanes) lazily populate cache pointers.
   const half *GetDequantizedWeights(std::shared_ptr<IWeightAccessor> accessor,
                                     const half *&cache_ptr) const;
 
@@ -232,8 +247,10 @@ private:
   mutable half *scratch_buffer_{nullptr};
   mutable size_t scratch_buffer_elements_{0};
   mutable size_t scratch_high_water_bytes_{0};
+  mutable std::mutex dequant_cache_mu_;
   mutable std::mutex mmq_cache_mu_;
   bool allow_fused_quantized_matmul_{true};
+  bool batch_dequant_cache_enabled_{false};
 
   // Global weight accessors
   std::shared_ptr<IWeightAccessor> embed_tokens_accessor;
