@@ -22,8 +22,12 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import unittest
+
+sys.path.insert(0, os.path.dirname(__file__))
+from process_helper import start_server_process, stop_server_process
 
 SERVER_PORT = 18082  # Distinct from StubIntegration (18081) and IntegrationSSE (18080)
 API_KEY = "shm-smoke-key-321"
@@ -35,14 +39,9 @@ _SERVER_BIN = os.environ.get(
 
 
 def start_server(env: dict) -> subprocess.Popen:
-    return subprocess.Popen(
+    return start_server_process(
         [_SERVER_BIN, "--config", "config/server.yaml"],
-        cwd=_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        preexec_fn=os.setsid,
+        env=env, cwd=_ROOT, text=True, merge_stderr=True,
     )
 
 
@@ -92,12 +91,7 @@ class ShmSmokeTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if cls.proc:
-            try:
-                os.killpg(os.getpgid(cls.proc.pid), signal.SIGTERM)
-                cls.proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                os.killpg(os.getpgid(cls.proc.pid), signal.SIGKILL)
-                cls.proc.wait(timeout=5)
+            stop_server_process(cls.proc, timeout=15)
 
     # ------------------------------------------------------------------
     # Helpers

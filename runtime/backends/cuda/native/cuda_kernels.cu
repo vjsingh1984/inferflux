@@ -867,5 +867,64 @@ template cudaError_t MeanPool<half>(const half *, float *, int, int,
 template cudaError_t MeanPool<__nv_bfloat16>(const __nv_bfloat16 *, float *,
                                               int, int, cudaStream_t);
 
+// ============================================================================
+// Device-side token relay for zero-copy decode loop
+// ============================================================================
+
+__global__ void DeviceTokenRelayKernel(const int *__restrict__ sampled_tokens,
+                                       int *__restrict__ batch_meta,
+                                       int batch_size, int max_batch_size) {
+  const int b = threadIdx.x;
+  if (b >= batch_size)
+    return;
+
+  // batch_meta layout: [token_ids(max_B)][n_past(max_B)][seq_ids(max_B)][kv_lens(max_B)]
+  int *token_ids = batch_meta;
+  int *n_past = batch_meta + max_batch_size;
+  // seq_ids stays unchanged (same sequences)
+  int *kv_lens = batch_meta + max_batch_size * 3;
+
+  // Copy sampled token to graph input buffer
+  token_ids[b] = sampled_tokens[b];
+  // Increment position for next forward pass
+  n_past[b] += 1;
+  // kv_lens = n_past + 1
+  kv_lens[b] = n_past[b] + 1;
+}
+
+cudaError_t DeviceTokenRelay(const int *sampled_tokens, int *batch_meta,
+                              int batch_size, int max_batch_size,
+                              cudaStream_t stream) {
+  if (batch_size <= 0)
+    return cudaSuccess;
+  // Single block, B threads — tiny kernel, runs in <1us
+  DeviceTokenRelayKernel<<<1, batch_size, 0, stream>>>(
+      sampled_tokens, batch_meta, batch_size, max_batch_size);
+  return cudaGetLastError();
+}
+
+__global__ void DeviceCheckEosKernel(const int *__restrict__ sampled_tokens,
+                                     int batch_size, int eos_token_id,
+                                     int *__restrict__ d_has_eos) {
+  const int b = threadIdx.x;
+  if (b >= batch_size)
+    return;
+  if (sampled_tokens[b] == eos_token_id) {
+    atomicOr(d_has_eos, 1);
+  }
+}
+
+cudaError_t DeviceCheckEos(const int *sampled_tokens, int batch_size,
+                            int eos_token_id, int *d_has_eos,
+                            cudaStream_t stream) {
+  if (batch_size <= 0)
+    return cudaSuccess;
+  // Reset flag, then check
+  cudaMemsetAsync(d_has_eos, 0, sizeof(int), stream);
+  DeviceCheckEosKernel<<<1, batch_size, 0, stream>>>(
+      sampled_tokens, batch_size, eos_token_id, d_has_eos);
+  return cudaGetLastError();
+}
+
 } // namespace cuda_kernel
 } // namespace inferflux

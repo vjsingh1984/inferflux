@@ -166,6 +166,15 @@ Only structured output (grammar-constrained generation) still delegates to the l
 - `INFERFLUX_DISABLE_CUDA_GRAPH=1` — disable CUDA graph capture (default-on; cudaDeviceSynchronize before capture prevents heap corruption)
 - `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` — disable pre-quantized Q8_1 activation path
 - `INFERFLUX_ENABLE_FUSED_GATE_UP_SILU=0|1` — toggle fused gate+up+SiLU MMVQ kernel (default on)
+- `INFERFLUX_ENABLE_FUSED_RESIDUAL_NORM=0|1` — fuse ResidualAdd+RmsNorm into one kernel at layer boundaries (default on)
+- `INFERFLUX_ENABLE_FUSED_BIAS_ADD=0|1` — fuse Q/K/V bias adds into single kernel (default on, Qwen2 only)
+- `INFERFLUX_ENABLE_GEMV_ACCUMULATE=0|1` — MMVQ accumulate mode for O-proj/down-proj, eliminates separate ResidualAdd (default on)
+- `INFERFLUX_ENABLE_FUSED_ROPE_KV_APPEND=0|1` — fuse RoPE+KvAppend into single kernel (default on, P1 validated)
+- `INFERFLUX_ENABLE_FUSED_GEMV_NORM_QUANT_EPILOGUE=0|1` — fuse RmsNorm+Q8_1 quant after GEMV accum (default on, P2 validated)
+- `INFERFLUX_ENABLE_MMVQ_BIAS_EPILOGUE=0|1` — fuse bias into MMVQ writeback, eliminates BiasAddTriple (default off, P3)
+- `INFERFLUX_ENABLE_Q6K_VECTORIZED=0|1` — use vectorized Q6_K MMVQ kernel with __ldg (default off, P4)
+- `INFERFLUX_ENABLE_GATE_UP_SILU_Q81_EPILOGUE=0|1` — fuse Q8_1 quant into gate+up+SiLU MMVQ (default off, P5)
+- `INFERFLUX_BATCH_DEQUANT_CACHE=0|1` — permanently cache dequantized projection weights instead of using scratch buffer (trades GPU memory for prefill performance, default off)
 - `INFERFLUX_GEMV_V2=1` — enable v2 cooperative-warp GEMV kernels (experimental, slower on Ada)
 - `INFERFLUX_CUDA_TIMING_SAMPLE_RATE=N` — record CUDA event timing every Nth batch (0=off)
 - `INFERFLUX_CUDA_PHASE_OVERLAP` — enable prefill/decode lane overlap
@@ -174,12 +183,14 @@ Only structured output (grammar-constrained generation) still delegates to the l
 
 **InferFlux CUDA kernel files:**
 - `runtime/backends/cuda/native/kernels/fused_dequant_gemv.cuh` — V1 GEMV kernels (column-major, 8 warps/block, used for pair/triple M>8 fallback)
-- `runtime/backends/cuda/native/kernels/mmvq.cuh` — MMVQ weight-read-first kernels (batch 1-8, primary dispatch path)
+- `runtime/backends/cuda/native/kernels/mmvq.cuh` — MMVQ weight-read-first kernels (batch 1-8, primary dispatch path) + accumulate variants for residual-stream fusion
 - `runtime/backends/cuda/native/kernels/mmq.cuh` — MMQ tiled quantized GEMM kernels (batch 9-64)
 - `runtime/backends/cuda/native/kernels/quant_common.cuh` — shared quantization primitives (Dp4aS8, Vsubss4, LoadPacked*)
 - `runtime/backends/cuda/native/fused_quant_gemm.cu` — dispatch tables, MMVQ/MMQ selection, threshold logic
 - `runtime/backends/cuda/native/transformer_forward.cu` — forward pass wiring
 - `runtime/backends/cuda/native/cuda_kernels.cu` — batched RoPE/KvAppend, MeanPool, utility kernels
+- `runtime/backends/cuda/native/kernels/fused_rope_kv_append.cuh` — fused RoPE+KvAppend kernel (P1)
+- `runtime/backends/cuda/native/kernels/fused_gemv_accum_norm_quant.cuh` — fused RmsNorm+Q8_1 quant epilogue (P2)
 - `runtime/backends/cuda/kernels/flash_attention.cu` — FlashAttention-2 and FlashDecodeMultiSeq
 - `runtime/backends/cuda/kernels/flash_attention_mma.cuh` — MMA tensor-core prefill kernel (m16n8k16, Br=16, auto-selected for query_len≥16)
 

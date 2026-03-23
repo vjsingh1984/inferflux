@@ -56,6 +56,32 @@ public:
    * @param batch_size   Number of sequences
    * @return true on success
    */
+  /**
+   * Replay the CUDA graph without uploading batch metadata from host.
+   *
+   * Used after DeviceTokenRelay has updated the graph's input buffers
+   * directly on device. Skips the H2D metadata copy, eliminating the
+   * per-token WDDM scheduling round-trip (~10ms on Windows).
+   *
+   * @param d_logits     Output: [batch_size * vocab_size] FP32 logits
+   * @param batch_size   Number of sequences (must match captured graph)
+   * @return true if graph replayed; false if graph not available
+   */
+  virtual bool BatchForwardReplay(float *d_logits, int batch_size) {
+    return false; // Default: not supported (requires captured graph)
+  }
+
+  /**
+   * Get the device-side batch metadata pointer for DeviceTokenRelay.
+   * Returns nullptr if device-side relay is not supported.
+   */
+  virtual int *GetBatchMetaDevice() { return nullptr; }
+
+  /**
+   * Get the maximum batch size for the pre-allocated metadata buffers.
+   */
+  virtual int GetMaxBatchSize() const { return 0; }
+
   virtual bool BatchForward(const std::vector<int> &token_ids,
                             const std::vector<int> &n_past,
                             const std::vector<int> &sequence_ids,

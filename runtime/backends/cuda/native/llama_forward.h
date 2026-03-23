@@ -103,6 +103,10 @@ public:
                     const std::vector<int> &sequence_ids, float *d_logits,
                     int batch_size) override;
 
+  bool BatchForwardReplay(float *d_logits, int batch_size) override;
+  int *GetBatchMetaDevice() override;
+  int GetMaxBatchSize() const override;
+
   void WarmWeightCaches() override;
   void SetStream(cudaStream_t stream) override;
   void SetExecutionPolicy(const NativeExecutionPolicy &policy) override;

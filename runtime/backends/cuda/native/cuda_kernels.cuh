@@ -168,5 +168,30 @@ template <typename T>
 cudaError_t MeanPool(const T *input, float *output, int seq_len,
                      int hidden_size, cudaStream_t stream);
 
+/**
+ * DeviceTokenRelay: Copy sampled token IDs from sampler output to the
+ * BatchForward metadata buffer, and increment n_past — entirely on device.
+ *
+ * This eliminates the per-token D2H → host processing → H2D round-trip
+ * that otherwise adds ~10ms of WDDM scheduling latency on Windows.
+ *
+ * batch_meta layout: [token_ids(B)][n_past(B)][seq_ids(B)][kv_lens(B)]
+ * sampled_tokens: output from BatchedArgmaxKernel (B ints)
+ *
+ * After this kernel, the graph can be replayed immediately without host sync.
+ */
+cudaError_t DeviceTokenRelay(const int *sampled_tokens, int *batch_meta,
+                              int batch_size, int max_batch_size,
+                              cudaStream_t stream);
+
+/**
+ * DeviceCheckEos: Check if any sampled token matches the EOS token ID.
+ * Writes 1 to d_has_eos if any token matches, 0 otherwise.
+ * The host can poll this flag periodically instead of syncing per token.
+ */
+cudaError_t DeviceCheckEos(const int *sampled_tokens, int batch_size,
+                            int eos_token_id, int *d_has_eos,
+                            cudaStream_t stream);
+
 } // namespace cuda_kernel
 } // namespace inferflux

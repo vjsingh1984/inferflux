@@ -277,12 +277,35 @@ public:
                                        cudaStream_t stream);
 
   /**
+   * Fused gate+up+SiLU MMVQ with Q8_1 quantization epilogue.
+   * Produces both FP16 output and Q8_1 quantized output in a single kernel,
+   * eliminating the separate QuantizeQ8_1 step before down-proj GEMV.
+   * When act_q8_1_out is non-null, writes Q8_1 blocks alongside FP16.
+   */
+  static bool FusedGateUpSiluGemvQ8_1WithEpilogue(
+      const QuantizedWeightInfo &gate_raw, const QuantizedWeightInfo &up_raw,
+      const void *act_q8_1, half *output, void *act_q8_1_out, int M, int N,
+      int K, cudaStream_t stream);
+
+  /**
    * Grouped Q8_1 GEMV for three sibling projections (single kernel launch).
    */
   static bool
   GemvQ8_1Triple(const std::array<PackedProjectionSpec, 3> &projections,
                  const void *act_q8_1, int M, int K, cudaStream_t stream,
                  const NativeExecutionPolicy *policy = nullptr);
+
+  /**
+   * GEMV with bias epilogue: output = dot(W, x) + bias.
+   * Fuses the bias addition into the MMVQ writeback, eliminating a
+   * separate BiasAdd kernel launch. Bias may be nullptr (no-op).
+   * Currently supports Q4_K only.
+   */
+  static bool GemvQ8_1WithBias(const QuantizedWeightInfo &weight,
+                                const void *act_q8_1, half *output,
+                                const half *bias, int M, int N, int K,
+                                cudaStream_t stream,
+                                const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Returns true when a quant type supports Q8_1 activation GEMV.

@@ -1318,12 +1318,33 @@ bool DispatchQ8_1MmvqQ4K(const void *data, const void *act_q8_1, half *output,
       data, act_q8_1, output, M, N, K, stream);
 }
 
+// MMVQ single-output dispatch for Q4_K with bias epilogue
+bool DispatchQ8_1MmvqQ4KBias(const void *data, const void *act_q8_1,
+                              half *output, const half *bias, int M, int N,
+                              int K, cudaStream_t stream) {
+  return DispatchMmvqBias<block_q4_k, inferflux_mmvq_q4k_bias<1>,
+                           inferflux_mmvq_q4k_bias<2>,
+                           inferflux_mmvq_q4k_bias<4>,
+                           inferflux_mmvq_q4k_bias<8>>(data, act_q8_1, output,
+                                                        bias, M, N, K, stream);
+}
+
 // MMVQ single-output dispatch for Q6_K
 bool DispatchQ8_1MmvqQ6K(const void *data, const void *act_q8_1, half *output,
                           int M, int N, int K, cudaStream_t stream) {
   return DispatchMmvq<block_q6_k, inferflux_mmvq_q6k<1>, inferflux_mmvq_q6k<2>,
                       inferflux_mmvq_q6k<4>, inferflux_mmvq_q6k<8>>(
       data, act_q8_1, output, M, N, K, stream);
+}
+
+// MMVQ vectorized dispatch for Q6_K (uses __ldg + wider loads)
+bool DispatchQ8_1MmvqQ6KVec(const void *data, const void *act_q8_1,
+                             half *output, int M, int N, int K,
+                             cudaStream_t stream) {
+  return DispatchMmvq<block_q6_k, inferflux_mmvq_q6k_vec<1>,
+                      inferflux_mmvq_q6k_vec<2>, inferflux_mmvq_q6k_vec<4>,
+                      inferflux_mmvq_q6k_vec<8>>(data, act_q8_1, output, M, N,
+                                                  K, stream);
 }
 
 // MMVQ single-output dispatch for Q8_0
@@ -1522,8 +1543,14 @@ bool DispatchQ8_1GemvQ4K(const void *data, const void *act_q8_1, half *output,
 
 bool DispatchQ8_1GemvQ6K(const void *data, const void *act_q8_1, half *output,
                           int M, int N, int K, cudaStream_t stream) {
-  if (M <= 8)
+  if (M <= 8) {
+    // NOTE: Q6_K vectorized variant (DispatchQ8_1MmvqQ6KVec) is disabled
+    // pending optimization — __ldg on unaligned Q6_K ql/qh fields and
+    // pre-computed scale factors increase register pressure without
+    // improving bandwidth on Ada architecture. Needs ncu profiling
+    // to identify a correct vectorization strategy.
     return DispatchQ8_1MmvqQ6K(data, act_q8_1, output, M, N, K, stream);
+  }
   if (M <= 64)
     return DispatchMmqQ6K(data, act_q8_1, output, M, N, K, stream);
   return false;
@@ -1966,6 +1993,40 @@ bool FusedQuantGemm::GemvQ8_1Accum(const QuantizedWeightInfo &weight,
   return entry.fn(weight.data, act_q8_1, output, M, N, K, stream);
 }
 
+bool FusedQuantGemm::GemvQ8_1WithBias(const QuantizedWeightInfo &weight,
+                                       const void *act_q8_1, half *output,
+                                       const half *bias, int M, int N, int K,
+                                       cudaStream_t stream,
+                                       const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
+  if (!weight.data || weight.quant_type < 0 || !act_q8_1)
+    return false;
+  if (ResolveExecutionPolicy(policy).disable_fused_gemv)
+    return false;
+
+  auto qtype = static_cast<GGUF::TensorType>(weight.quant_type);
+
+  // Currently only Q4_K has bias-enabled MMVQ kernels.
+  if (qtype != GGUF::TensorType::Q4_K)
+    return false;
+
+  const FusedDispatchGeometry geometry{M, N, K, 1, true, false};
+  if (!ShouldUseFusedPath(weight.quant_type, geometry))
+    return false;
+
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    log::Info("fused_quant_gemm",
+              std::string("Using MMVQ bias epilogue for Q4_K (M=") +
+                  std::to_string(M) + ", N=" + std::to_string(N) +
+                  ", K=" + std::to_string(K) + ")");
+  }
+
+  return DispatchQ8_1MmvqQ4KBias(weight.data, act_q8_1, output, bias, M, N, K,
+                                  stream);
+}
+
 static bool GemvQ8_1PairMmq3(
     const std::array<PackedProjectionSpec, 2> &projections,
     const void *act_q8_1, int M, int K, cudaStream_t stream);
@@ -2113,6 +2174,72 @@ bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
       inferflux_mmvq_q4k_fused_gate_up_silu<8>>(gate_raw.data, up_raw.data,
                                                  act_q8_1, output, N, M, K,
                                                  stream);
+}
+
+bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1WithEpilogue(
+    const QuantizedWeightInfo &gate_raw, const QuantizedWeightInfo &up_raw,
+    const void *act_q8_1, half *output, void *act_q8_1_out, int M, int N,
+    int K, cudaStream_t stream) {
+  if (!act_q8_1 || !output || M <= 0 || N <= 0 || K <= 0) {
+    return false;
+  }
+  if (!gate_raw.data || !up_raw.data) {
+    return false;
+  }
+  if (gate_raw.quant_type != static_cast<int>(GGUF::TensorType::Q4_K) ||
+      up_raw.quant_type != static_cast<int>(GGUF::TensorType::Q4_K)) {
+    return false;
+  }
+
+  using namespace runtime::cuda::native;
+
+  // Dispatch the Q8_1 epilogue variant
+  const auto *gate_w = reinterpret_cast<const block_q4_k *>(gate_raw.data);
+  const auto *up_w = reinterpret_cast<const block_q4_k *>(up_raw.data);
+  const auto *act = reinterpret_cast<const block_q8_1 *>(act_q8_1);
+  auto *q8_out = reinterpret_cast<block_q8_1 *>(act_q8_1_out);
+
+  int ncols;
+  if (M <= 1)
+    ncols = 1;
+  else if (M <= 2)
+    ncols = 2;
+  else if (M <= 4)
+    ncols = 4;
+  else
+    ncols = 8;
+  const dim3 grid(N, (M + ncols - 1) / ncols);
+  const int threads = calc_mmvq_threads(ncols);
+  const dim3 block(threads);
+  switch (ncols) {
+  case 1:
+    inferflux_mmvq_q4k_fused_gate_up_silu_q81<1>
+        <<<grid, block, 0, stream>>>(gate_w, up_w, act, output, q8_out, N, K, M);
+    break;
+  case 2:
+    inferflux_mmvq_q4k_fused_gate_up_silu_q81<2>
+        <<<grid, block, 0, stream>>>(gate_w, up_w, act, output, q8_out, N, K, M);
+    break;
+  case 4:
+    inferflux_mmvq_q4k_fused_gate_up_silu_q81<4>
+        <<<grid, block, 0, stream>>>(gate_w, up_w, act, output, q8_out, N, K, M);
+    break;
+  case 8:
+    inferflux_mmvq_q4k_fused_gate_up_silu_q81<8>
+        <<<grid, block, 0, stream>>>(gate_w, up_w, act, output, q8_out, N, K, M);
+    break;
+  }
+
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    log::Info("fused_quant_gemm",
+              "Using fused gate+up+SiLU+Q8_1 epilogue Q4_K kernel (M=" +
+                  std::to_string(M) + ", N=" + std::to_string(N) +
+                  ", K=" + std::to_string(K) + ")");
+  }
+
+  return cudaGetLastError() == cudaSuccess;
 }
 
 bool FusedQuantGemm::GemvQ8_1PairRowQuadCandidate(

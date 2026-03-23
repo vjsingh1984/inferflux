@@ -9,6 +9,7 @@
 #include <string>
 
 #include <cuda_runtime.h>
+#include <thread>
 
 namespace inferflux::runtime::cuda::native {
 
@@ -79,14 +80,40 @@ inline void EnsureSyncTraceRegistered() {
   std::call_once(once, []() { std::atexit(LogSyncTraceSummaryAtExit); });
 }
 
+/// Spin-wait on cudaEventQuery instead of cudaEventSynchronize.
+/// On Windows WDDM, cudaEventSynchronize enters a kernel-level sleep that
+/// adds ~5-10ms of driver overhead per call. Spinning on cudaEventQuery
+/// avoids this by polling in user-space, reducing sync latency from ~10ms
+/// to ~0.1ms at the cost of CPU utilization during the wait.
+/// Disable with INFERFLUX_CUDA_DISABLE_SPIN_WAIT=1 to use blocking sync.
+inline bool SpinWaitEnabled() {
+  static const bool enabled = []() {
+    const char *raw = std::getenv("INFERFLUX_CUDA_DISABLE_SPIN_WAIT");
+    return !(raw && std::string(raw) != "0" && std::string(raw) != "false");
+  }();
+  return enabled;
+}
+
+inline cudaError_t SpinWaitEvent(cudaEvent_t event) {
+  cudaError_t err;
+  while ((err = cudaEventQuery(event)) == cudaErrorNotReady) {
+    // Yield to other threads but stay in user-space.
+    // On WDDM this avoids the ~5ms kernel sleep of cudaEventSynchronize.
+    std::this_thread::yield();
+  }
+  return err;
+}
+
 inline cudaError_t TracedCudaEventSynchronize(SyncTraceSite site,
                                               cudaEvent_t event) {
   if (!SyncTraceEnabled()) {
-    return cudaEventSynchronize(event);
+    return SpinWaitEnabled() ? SpinWaitEvent(event)
+                             : cudaEventSynchronize(event);
   }
   EnsureSyncTraceRegistered();
   const auto start = std::chrono::steady_clock::now();
-  const cudaError_t err = cudaEventSynchronize(event);
+  const cudaError_t err = SpinWaitEnabled() ? SpinWaitEvent(event)
+                                            : cudaEventSynchronize(event);
   const auto end = std::chrono::steady_clock::now();
   auto &entry = kSyncTraceEntries[static_cast<size_t>(site)];
   entry.calls.fetch_add(1, std::memory_order_relaxed);

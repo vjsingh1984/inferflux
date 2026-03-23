@@ -45,6 +45,13 @@ struct NativeExecutionPolicy {
   bool enable_gemv_accumulate{true};
   bool enable_batch_dequant_cache{false};
 
+  // Fused kernel redesign flags (P1+P2 validated: parity-exact, zero regression)
+  bool enable_fused_rope_kv_append{true};              // P1: validated
+  bool enable_fused_gemv_norm_quant_epilogue{true};     // P2: validated
+  bool enable_mmvq_bias_epilogue{false};                // P3
+  bool enable_q6k_vectorized{false};                    // P4
+  bool enable_gate_up_silu_q81_epilogue{false};         // P5
+
   static NativeExecutionPolicy FromEnv() {
     NativeExecutionPolicy policy;
     policy.enable_batched_decode =
@@ -126,6 +133,16 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_GEMV_ACCUMULATE", true);
     policy.enable_batch_dequant_cache =
         ParseBoolEnv("INFERFLUX_BATCH_DEQUANT_CACHE", false);
+    policy.enable_fused_rope_kv_append =
+        ParseBoolEnv("INFERFLUX_ENABLE_FUSED_ROPE_KV_APPEND", true);
+    policy.enable_fused_gemv_norm_quant_epilogue =
+        ParseBoolEnv("INFERFLUX_ENABLE_FUSED_GEMV_NORM_QUANT_EPILOGUE", true);
+    policy.enable_mmvq_bias_epilogue =
+        ParseBoolEnv("INFERFLUX_ENABLE_MMVQ_BIAS_EPILOGUE", false);
+    policy.enable_q6k_vectorized =
+        ParseBoolEnv("INFERFLUX_ENABLE_Q6K_VECTORIZED", false);
+    policy.enable_gate_up_silu_q81_epilogue =
+        ParseBoolEnv("INFERFLUX_ENABLE_GATE_UP_SILU_Q81_EPILOGUE", false);
     return policy;
   }
 

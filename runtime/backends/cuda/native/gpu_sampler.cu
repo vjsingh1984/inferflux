@@ -668,16 +668,56 @@ void GpuSampler::EnqueueSampleBatch(const float *d_logits, int batch_size,
     return;
   }
 
-  for (int i = 0; i < batch_size; ++i) {
-    const float *logits_i = d_logits + i * vocab_size_;
-    const uint32_t seed =
-        i < static_cast<int>(seeds.size()) ? seeds[static_cast<size_t>(i)]
-                                           : UINT32_MAX;
-    EnqueueSample(logits_i, temperatures[i], top_ks[i], top_ps[i], seed);
-    h_result_batch_pinned_[i] = CollectSample();
+  // Async batched stochastic: enqueue all sampling kernels without
+  // synchronizing between sequences, then do a single D2H memcpy + event
+  // sync. Each sequence's kernels run sequentially on the same stream (so
+  // sharing d_probs_ scratch is safe), but we avoid B host-GPU round-trips.
+  {
+    NVTX_SCOPE("Sampler_BatchedStochastic");
+    int B = std::min(batch_size, kMaxBatchSize);
+    const int threads = 256;
+
+    for (int i = 0; i < B; ++i) {
+      const float *logits_i = d_logits + i * vocab_size_;
+      const uint32_t seed =
+          i < static_cast<int>(seeds.size()) ? seeds[static_cast<size_t>(i)]
+                                             : UINT32_MAX;
+      if (seed != UINT32_MAX && rng_initialized_) {
+        curandSetPseudoRandomGeneratorSeed(rng_, seed);
+      }
+
+      if (temperatures[i] <= 0.0f) {
+        // Greedy: argmax directly to batch result slot
+        int smem = threads * (sizeof(float) + sizeof(int));
+        ArgmaxKernel<<<1, threads, smem, stream_>>>(
+            logits_i, d_result_batch_ + i, vocab_size_);
+      } else {
+        // Stochastic: softmax → top-p → multinomial → batch result slot
+        int smem = threads * sizeof(float);
+        FusedSoftmaxKernel<<<1, threads, smem, stream_>>>(
+            logits_i, d_probs_, vocab_size_, temperatures[i]);
+
+        if (top_ps[i] < 1.0f && top_ps[i] > 0.0f) {
+          int top_p_smem = threads * (sizeof(float) + sizeof(int));
+          ParallelTopPMaskKernel<<<1, threads, top_p_smem, stream_>>>(
+              d_probs_, vocab_size_, top_ps[i]);
+        }
+
+        curandGenerateUniform(rng_, d_uniform_, 1);
+        MultinomialSampleKernel<<<1, 1, 0, stream_>>>(
+            d_probs_, d_uniform_, d_result_batch_ + i, vocab_size_);
+      }
+    }
+
+    // Single async D2H copy + event for all B results
+    runtime::cuda::native::TracedCudaMemcpyAsync(
+        runtime::cuda::native::CopyTraceSite::kSamplerBatchResultD2H,
+        h_result_batch_pinned_, d_result_batch_, B * sizeof(int),
+        cudaMemcpyDeviceToHost, stream_);
+    cudaEventRecord(completion_event_, stream_);
+    completion_pending_ = true;
+    pending_batch_size_ = B;
   }
-  completion_pending_ = false;
-  pending_batch_size_ = batch_size;
 }
 
 void GpuSampler::CollectSampleBatch(std::vector<int> *out_tokens) {

@@ -567,9 +567,11 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_grouped_q81_pair PRIVATE inferflux_core)
 
-  # Fused kernel parity tests (Catch2, .cu)
+  # Fused kernel parity tests: .cpp (Catch2, MSVC) + .cu (test-only kernels, nvcc)
+  # Split avoids nvcc/Catch2 operator== conflict with cuda_bf16.hpp on CUDA 13.2.
   add_executable(inferflux_fused_kernel_tests
-    tests/unit/test_fused_kernels.cu
+    tests/unit/test_fused_kernels.cpp
+    tests/unit/test_fused_kernels_cuda.cu
     external/catch2/catch_amalgamated.cpp
   )
   target_include_directories(inferflux_fused_kernel_tests PRIVATE
@@ -799,6 +801,28 @@ endif()
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   add_test(NAME FusedKernelTests COMMAND inferflux_fused_kernel_tests)
   set_tests_properties(FusedKernelTests PROPERTIES LABELS "cuda;fused_kernels")
+endif()
+
+# On Windows, llama.cpp/ggml build DLLs into bin/Release/. Tests that link
+# inferflux_core need these DLLs on PATH. CUDA runtime DLLs are at
+# CUDA_PATH/bin/x64/. Set PATH for all test targets via ctest ENVIRONMENT.
+if(WIN32)
+  set(_DLL_DIRS "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
+  if(DEFINED ENV{CUDA_PATH})
+    set(_DLL_DIRS "${_DLL_DIRS}\;$ENV{CUDA_PATH}/bin/x64")
+  endif()
+  # Collect all test names that use inferflux_tests or inferflux_fused_kernel_tests
+  get_property(_ALL_TESTS DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY TESTS)
+  foreach(_TEST ${_ALL_TESTS})
+    get_test_property(${_TEST} ENVIRONMENT _EXISTING_ENV)
+    if(_EXISTING_ENV)
+      set_tests_properties(${_TEST} PROPERTIES
+        ENVIRONMENT "${_EXISTING_ENV};PATH=${_DLL_DIRS}\;$ENV{PATH}")
+    else()
+      set_tests_properties(${_TEST} PROPERTIES
+        ENVIRONMENT "PATH=${_DLL_DIRS}\;$ENV{PATH}")
+    endif()
+  endforeach()
 endif()
 
 set(CPACK_PACKAGE_NAME "inferflux")

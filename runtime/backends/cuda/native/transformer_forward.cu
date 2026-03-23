@@ -3,6 +3,8 @@
 #include "runtime/backends/cuda/native/cuda_copy_trace.h"
 #include "runtime/backends/cuda/native/cuda_kernels.cuh"
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
+#include "runtime/backends/cuda/native/kernels/fused_gemv_accum_norm_quant.cuh"
+#include "runtime/backends/cuda/native/kernels/fused_rope_kv_append.cuh"
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/llama_forward.h"
 #include "runtime/backends/cuda/native/model_loader.h"
@@ -1748,6 +1750,27 @@ template <typename T> void LlamaForwardTyped<T>::WarmWeightCaches() {
 }
 
 template <typename T>
+bool LlamaForwardTyped<T>::BatchForwardReplay(float *d_logits, int batch_size) {
+  if (!decode_graph_exec_ || graph_batch_size_ != batch_size) {
+    return false; // Graph not captured or batch size mismatch
+  }
+  // Skip H2D metadata upload — DeviceTokenRelay already updated d_batch_meta_
+  // on device. Just replay the graph.
+  cudaError_t err = cudaGraphLaunch(decode_graph_exec_, stream_);
+  return err == cudaSuccess;
+}
+
+template <typename T>
+int *LlamaForwardTyped<T>::GetBatchMetaDevice() {
+  return d_batch_meta_;
+}
+
+template <typename T>
+int LlamaForwardTyped<T>::GetMaxBatchSize() const {
+  return max_batch_size_;
+}
+
+template <typename T>
 bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                                         const std::vector<int> &n_past,
                                         const std::vector<int> &sequence_ids,
@@ -2065,36 +2088,55 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       }
       pt.qkv_ms += pt.Mark();
 
-      // Batched RoPE
-      {
-        NVTX_SCOPE("RoPE");
-        err = cuda_kernel::BatchedRoPE<T>(
-            d_q_, d_k_new_, B, num_heads_, num_kv_heads_, head_dim_,
-            d_batch_n_past_, rope_freq_base_, stream_, rope_type_);
-        if (err != cudaSuccess) {
-          log::Error("llama_forward", "BatchedRoPE launch failed: " +
-                                          std::string(cudaGetErrorString(err)));
-          return false;
-        }
-      }
-      pt.rope_ms += pt.Mark();
-
-      // KV append: derive K/V destinations on device from the regular KV
-      // layout using the already-uploaded seq_id and n_past metadata.
-      {
-        NVTX_SCOPE("KV_Append");
-        err = cuda_kernel::BatchedKvAppendStrided<T>(
-            d_k_new_, d_v_new_, typed_cache->Buffer(), d_batch_seq_ids_,
-            d_batch_n_past_, layer, B, typed_cache->KvDim(),
+      // RoPE + KV append (fused or separate)
+      if (execution_policy_.enable_fused_rope_kv_append) {
+        NVTX_SCOPE("FusedRoPE_KV_Append");
+        err = cuda_kernel::FusedRoPEKvAppendStrided<T>(
+            d_q_, d_k_new_, d_v_new_, typed_cache->Buffer(),
+            d_batch_seq_ids_, d_batch_n_past_, layer, B, num_heads_,
+            num_kv_heads_, head_dim_, typed_cache->KvDim(),
             typed_cache->SlotStride(), typed_cache->LayerStride(),
-            typed_cache->KvStride(), stream_);
+            typed_cache->KvStride(), rope_freq_base_, stream_, rope_type_);
         if (err != cudaSuccess) {
-          log::Error("llama_forward", "BatchedKvAppendStrided launch failed: " +
-                                          std::string(cudaGetErrorString(err)));
+          log::Error("llama_forward",
+                     "FusedRoPEKvAppendStrided launch failed: " +
+                         std::string(cudaGetErrorString(err)));
           return false;
         }
+        pt.rope_ms += pt.Mark();
+        pt.kv_ms = 0;
+      } else {
+        // Unfused path: separate RoPE + KvAppend
+        {
+          NVTX_SCOPE("RoPE");
+          err = cuda_kernel::BatchedRoPE<T>(
+              d_q_, d_k_new_, B, num_heads_, num_kv_heads_, head_dim_,
+              d_batch_n_past_, rope_freq_base_, stream_, rope_type_);
+          if (err != cudaSuccess) {
+            log::Error("llama_forward",
+                       "BatchedRoPE launch failed: " +
+                           std::string(cudaGetErrorString(err)));
+            return false;
+          }
+        }
+        pt.rope_ms += pt.Mark();
+
+        {
+          NVTX_SCOPE("KV_Append");
+          err = cuda_kernel::BatchedKvAppendStrided<T>(
+              d_k_new_, d_v_new_, typed_cache->Buffer(), d_batch_seq_ids_,
+              d_batch_n_past_, layer, B, typed_cache->KvDim(),
+              typed_cache->SlotStride(), typed_cache->LayerStride(),
+              typed_cache->KvStride(), stream_);
+          if (err != cudaSuccess) {
+            log::Error("llama_forward",
+                       "BatchedKvAppendStrided launch failed: " +
+                           std::string(cudaGetErrorString(err)));
+            return false;
+          }
+        }
+        pt.kv_ms += pt.Mark();
       }
-      pt.kv_ms += pt.Mark();
 
       // FlashDecode: derive K/V bases on device from the regular KV layout.
       {
@@ -2116,6 +2158,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
 
       // O projection + residual accumulation
       bool ffn_norm_precomputed = false;
+      bool ffn_q81_precomputed = false;
       {
         NVTX_SCOPE("O_Projection");
         auto o_raw = weights_->LayerOProjRaw(layer);
@@ -2158,11 +2201,28 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                                         B * hidden_size_, stream_);
           }
         }
+
+        // P2 epilogue: after O-proj accumulate, fuse norm+quant into one kernel
+        // instead of separate RmsNorm + QuantizeQ8_1. Produces BOTH FP16
+        // norm_output AND Q8_1 activations from FP32 shared memory (no FP16
+        // roundtrip), matching the production fused_rmsnorm_quantize_q8_1_kernel.
+        if constexpr (std::is_same_v<T, half>) {
+          if (o_accumulated && !ffn_norm_precomputed &&
+              execution_policy_.enable_fused_gemv_norm_quant_epilogue &&
+              d_act_q8_1_) {
+            cuda_kernel::FinishNormQuantQ8_1(
+                d_residual_, post_attn_norm, d_norm_out_, d_act_q8_1_, B,
+                hidden_size_, rms_norm_eps_, stream_);
+            ffn_norm_precomputed = true;
+            ffn_q81_precomputed = true; // skip re-quantize in FFN block
+          }
+        }
       }
       pt.o_proj_ms += pt.Mark();
 
       // FFN block
       // When ffn_norm_precomputed, d_norm_out_ already has post-attn norm result.
+      // When ffn_q81_precomputed, d_act_q8_1_ already has valid Q8_1 activations.
       const T *ffn_input = ffn_norm_precomputed
                                ? static_cast<const T *>(d_norm_out_)
                                : static_cast<const T *>(d_residual_);
@@ -2188,7 +2248,9 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                   FusedDispatchGeometry{B, intermediate_size_, hidden_size_, 2,
                                         true, !ffn_norm_precomputed})) {
             NVTX_SCOPE("FusedGateUpSiLU");
-            if (ffn_norm_precomputed) {
+            if (ffn_q81_precomputed) {
+              // P2 already produced valid Q8_1 — skip re-quantization
+            } else if (ffn_norm_precomputed) {
               FusedQuantGemm::QuantizeRowQ8_1(d_norm_out_, d_act_q8_1_, B,
                                               hidden_size_, stream_);
             } else {
@@ -2196,12 +2258,31 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
                   d_residual_, post_attn_norm, d_act_q8_1_, B, hidden_size_,
                   rms_norm_eps_, stream_);
             }
-            fused_gate_up_silu = FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
-                gate_raw, up_raw, d_act_q8_1_, d_ffn_gate_, B,
-                intermediate_size_, hidden_size_, stream_);
-            if (fused_gate_up_silu) {
-              LogPackedGemmPath("ffn_gate_up",
-                                "using fused gate+up+SiLU MMVQ kernel");
+            // P5: Try gate+up+SiLU with Q8_1 epilogue first — produces
+            // pre-quantized Q8_1 output for down-proj, saving a separate
+            // QuantizeRowQ8_1 kernel launch.
+            bool gate_up_q81_epilogue = false;
+            if (execution_policy_.enable_gate_up_silu_q81_epilogue) {
+              fused_gate_up_silu =
+                  FusedQuantGemm::FusedGateUpSiluGemvQ8_1WithEpilogue(
+                      gate_raw, up_raw, d_act_q8_1_, d_ffn_gate_,
+                      d_act_q8_1_, B, intermediate_size_, hidden_size_,
+                      stream_);
+              if (fused_gate_up_silu) {
+                gate_up_q81_epilogue = true;
+                LogPackedGemmPath(
+                    "ffn_gate_up",
+                    "using fused gate+up+SiLU+Q8_1 epilogue MMVQ kernel");
+              }
+            }
+            if (!fused_gate_up_silu) {
+              fused_gate_up_silu = FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
+                  gate_raw, up_raw, d_act_q8_1_, d_ffn_gate_, B,
+                  intermediate_size_, hidden_size_, stream_);
+              if (fused_gate_up_silu) {
+                LogPackedGemmPath("ffn_gate_up",
+                                  "using fused gate+up+SiLU MMVQ kernel");
+              }
             }
           }
         }
@@ -2448,6 +2529,20 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
         } else {
           cuda_kernel::ResidualAdd<T>(d_residual_, d_ffn_down_,
                                       B * hidden_size_, stream_);
+        }
+      }
+
+      // P2 epilogue: after down-proj accumulate, fuse norm+quant for next layer
+      if constexpr (std::is_same_v<T, half>) {
+        if (down_accumulated && !input_norm_precomputed &&
+            execution_policy_.enable_fused_gemv_norm_quant_epilogue &&
+            d_act_q8_1_ && layer < num_layers_ - 1) {
+          const T *next_input_norm = reinterpret_cast<const T *>(
+              weights_->LayerInputNorm(layer + 1));
+          cuda_kernel::FinishNormQuantQ8_1(
+              d_residual_, next_input_norm, d_norm_out_, d_act_q8_1_, B,
+              hidden_size_, rms_norm_eps_, stream_);
+          input_norm_precomputed = true;
         }
       }
       pt.ffn_down_ms += pt.Mark();

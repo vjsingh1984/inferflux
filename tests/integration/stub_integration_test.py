@@ -3,9 +3,13 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import unittest
 import http.client
+
+sys.path.insert(0, os.path.dirname(__file__))
+from process_helper import start_server_process, stop_server_process
 
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 18081
@@ -22,12 +26,8 @@ class StubIntegrationTests(unittest.TestCase):
         env["INFERFLUX_PORT_OVERRIDE"] = str(SERVER_PORT)
         env["INFERFLUX_MODEL_PATH"] = ""
         # We assume the binary is in the build directory and we are in the project root.
-        cls.server_proc = subprocess.Popen(
-            [SERVER_BIN, "--config", "config/server.yaml"],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid
+        cls.server_proc = start_server_process(
+            [SERVER_BIN, "--config", "config/server.yaml"], env=env
         )
         deadline = time.time() + 20.0
         ready = False
@@ -59,8 +59,7 @@ class StubIntegrationTests(unittest.TestCase):
     def tearDownClass(cls):
         if hasattr(cls, 'server_proc') and cls.server_proc:
             try:
-                os.killpg(os.getpgid(cls.server_proc.pid), signal.SIGTERM)
-                cls.server_proc.wait(timeout=5)
+                stop_server_process(cls.server_proc)
             except:
                 pass
 
@@ -841,13 +840,12 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
         env["INFERFLUX_HOST_OVERRIDE"] = SERVER_HOST
         env["INFERFLUX_PORT_OVERRIDE"] = str(SERVER_FAIL_PORT)
         env["INFERFLUX_MODEL_PATH"] = ""
-        env["INFERFLUX_POLICY_STORE"] = "/proc/inferflux_policy_unwritable.conf"
-        cls.server_proc = subprocess.Popen(
-            [SERVER_BIN, "--config", "config/server.yaml"],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid
+        if sys.platform == "win32":
+            env["INFERFLUX_POLICY_STORE"] = "Z:\\nonexistent_volume\\inferflux_policy_unwritable.conf"
+        else:
+            env["INFERFLUX_POLICY_STORE"] = "/proc/inferflux_policy_unwritable.conf"
+        cls.server_proc = start_server_process(
+            [SERVER_BIN, "--config", "config/server.yaml"], env=env
         )
         deadline = time.time() + 20.0
         ready = False
@@ -879,8 +877,7 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
     def tearDownClass(cls):
         if hasattr(cls, 'server_proc') and cls.server_proc:
             try:
-                os.killpg(os.getpgid(cls.server_proc.pid), signal.SIGTERM)
-                cls.server_proc.wait(timeout=5)
+                stop_server_process(cls.server_proc)
             except:
                 pass
 
@@ -999,12 +996,8 @@ class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
         env["INFERFLUX_PORT_OVERRIDE"] = str(SERVER_STRICT_PORT)
         env["INFERFLUX_MODEL_PATH"] = ""
         env["INFERFLUX_BACKEND_STRICT_INFERFLUX_REQUEST"] = "true"
-        cls.server_proc = subprocess.Popen(
-            [SERVER_BIN, "--config", "config/server.yaml"],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid
+        cls.server_proc = start_server_process(
+            [SERVER_BIN, "--config", "config/server.yaml"], env=env
         )
         deadline = time.time() + 20.0
         ready = False
@@ -1036,8 +1029,7 @@ class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
     def tearDownClass(cls):
         if hasattr(cls, 'server_proc') and cls.server_proc:
             try:
-                os.killpg(os.getpgid(cls.server_proc.pid), signal.SIGTERM)
-                cls.server_proc.wait(timeout=5)
+                stop_server_process(cls.server_proc)
             except:
                 pass
 

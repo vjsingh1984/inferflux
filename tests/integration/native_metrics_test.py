@@ -17,8 +17,12 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import time
 import unittest
+
+sys.path.insert(0, os.path.dirname(__file__))
+from process_helper import start_server_process, stop_server_process
 
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 18083
@@ -36,14 +40,9 @@ SERVER_BIN = _default_server_bin()
 
 
 def _start_server(env):
-    proc = subprocess.Popen(
-        [SERVER_BIN, "--config", "config/server.yaml"],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setsid,
+    return start_server_process(
+        [SERVER_BIN, "--config", "config/server.yaml"], env=env
     )
-    return proc
 
 
 def _wait_for_ready(proc, timeout=20.0):
@@ -89,11 +88,7 @@ class NativeMetricsStubTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "server_proc") and cls.server_proc:
-            try:
-                os.killpg(os.getpgid(cls.server_proc.pid), signal.SIGTERM)
-                cls.server_proc.wait(timeout=5)
-            except Exception:
-                pass
+            stop_server_process(cls.server_proc)
 
     def _get(self, path):
         conn = http.client.HTTPConnection(SERVER_HOST, SERVER_PORT, timeout=10)
