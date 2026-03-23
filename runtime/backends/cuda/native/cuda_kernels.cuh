@@ -185,6 +185,14 @@ cudaError_t DeviceTokenRelay(const int *sampled_tokens, int *batch_meta,
                               cudaStream_t stream);
 
 /**
+ * AppendTokenToBuffer: Copy one sampled token to a position in an
+ * accumulation buffer. Used by BurstDecodeGreedy to collect all N tokens
+ * on device without per-token D2H sync.
+ */
+cudaError_t AppendTokenToBuffer(const int *sampled_token, int *token_buffer,
+                                 int position, cudaStream_t stream);
+
+/**
  * DeviceCheckEos: Check if any sampled token matches the EOS token ID.
  * Writes 1 to d_has_eos if any token matches, 0 otherwise.
  * The host can poll this flag periodically instead of syncing per token.

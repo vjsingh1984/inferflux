@@ -85,6 +85,10 @@ public:
   std::size_t DeviceWorkspaceBytes() const;
   std::size_t HostWorkspaceBytes() const;
 
+  /// Device-side batch result pointer for DeviceTokenRelay integration.
+  /// Valid after EnqueueSampleBatch; invalidated by next EnqueueSampleBatch.
+  const int *DeviceResultBatch() const { return d_result_batch_; }
+
 private:
   int GreedyArgmax(const float *d_logits);
   int StochasticSample(const float *d_logits, float temperature, int top_k,

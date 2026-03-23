@@ -903,6 +903,20 @@ cudaError_t DeviceTokenRelay(const int *sampled_tokens, int *batch_meta,
   return cudaGetLastError();
 }
 
+__global__ void AppendTokenToBufferKernel(const int *__restrict__ src,
+                                          int *__restrict__ dst, int pos) {
+  if (threadIdx.x == 0) {
+    dst[pos] = src[0];
+  }
+}
+
+cudaError_t AppendTokenToBuffer(const int *sampled_token, int *token_buffer,
+                                 int position, cudaStream_t stream) {
+  AppendTokenToBufferKernel<<<1, 1, 0, stream>>>(sampled_token, token_buffer,
+                                                   position);
+  return cudaGetLastError();
+}
+
 __global__ void DeviceCheckEosKernel(const int *__restrict__ sampled_tokens,
                                      int batch_size, int eos_token_id,
                                      int *__restrict__ d_has_eos) {

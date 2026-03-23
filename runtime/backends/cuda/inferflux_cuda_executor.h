@@ -382,6 +382,25 @@ private:
   };
   NativePerfAccumulator perf_accum_;
 
+  // Device-side token relay: avoids H2D metadata upload between decode tokens.
+  // When active, DeviceTokenRelay updates graph input buffers on device,
+  // and BatchForwardReplay replays the graph without host round-trip.
+  bool decode_relay_active_{false};
+  int decode_relay_batch_size_{0};
+  int *d_eos_flag_{nullptr}; // [1] device flag for EOS detection
+
+  /**
+   * Multi-token burst decode: runs N greedy forward+sample steps entirely
+   * on GPU using graph replay + DeviceTokenRelay, syncing to host only once
+   * at the end. Eliminates N-1 WDDM round-trips.
+   *
+   * Returns actual tokens generated (may be < n_tokens if EOS hit).
+   * Tokens written to out_tokens[0..return_value-1].
+   */
+  int BurstDecodeGreedy(int sequence_id, int n_past_start,
+                        int first_token_id, int n_tokens,
+                        int eos_token_id, std::vector<int> *out_tokens);
+
   // Phase overlap configuration
   bool overlap_enabled_{true};
   int min_prefill_tokens_{256};

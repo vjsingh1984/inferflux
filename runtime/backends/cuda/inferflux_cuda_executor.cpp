@@ -14,6 +14,7 @@
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
 #include "runtime/backends/cuda/native/cublas_gemm.h"
+#include "runtime/backends/cuda/native/cuda_kernels.cuh"
 #include "runtime/backends/cuda/native/cuda_sync_trace.h"
 #include "runtime/backends/cuda/native/gpu_sampler.h"
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
@@ -2754,6 +2755,13 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
     }
   }
 
+  // Invalidate device-side relay if any prefills are pending (they change
+  // KV cache state and sequence positions, making the relay's on-device
+  // metadata stale).
+  if (!prefill_indices.empty()) {
+    decode_relay_active_ = false;
+  }
+
   // === Batched decode group ===
   const int decode_batch_capacity =
       kv_cache_ ? std::max(1, kv_cache_->MaxBatchSize()) : 32;
@@ -2797,8 +2805,23 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         cudaEventRecord(forward_start_, compute_stream_);
       }
 
-      bool fwd_ok = model_forward_->BatchForward(batch_tokens, batch_n_past,
-                                                 batch_seq_ids, d_logits_, B);
+      // Device-side token relay: if the relay is active and batch config
+      // matches, replay the CUDA graph without H2D metadata upload.
+      // DeviceTokenRelay already updated the graph input buffers on device
+      // during the previous token's post-sampling step.
+      bool fwd_ok = false;
+      if (decode_relay_active_ && decode_relay_batch_size_ == B) {
+        fwd_ok = model_forward_->BatchForwardReplay(d_logits_, B);
+        if (!fwd_ok) {
+          // Graph replay failed — fall back to full BatchForward
+          decode_relay_active_ = false;
+        }
+      }
+      if (!fwd_ok) {
+        fwd_ok = model_forward_->BatchForward(batch_tokens, batch_n_past,
+                                              batch_seq_ids, d_logits_, B);
+        decode_relay_active_ = false;
+      }
       if (record_timing) {
         cudaEventRecord(forward_stop_, compute_stream_);
       }
@@ -2810,12 +2833,26 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
           outputs[entry.input_idx].ok = false;
           outputs[entry.input_idx].token = -1;
         }
+        decode_relay_active_ = false;
         continue;
       }
 
       sampler_->EnqueueSampleBatch(d_logits_, B, batch_temps, batch_top_ks,
                                    batch_top_ps, batch_seeds);
       sampler_->CollectSampleBatch(&sampled_tokens);
+
+      // Set up device-side relay for the NEXT decode token: copy sampled
+      // token IDs directly to the graph's input buffer on device and
+      // increment n_past, avoiding the H2D metadata upload next iteration.
+      if (model_forward_->GetBatchMetaDevice() &&
+          model_forward_->GetMaxBatchSize() > 0) {
+        cuda_kernel::DeviceTokenRelay(
+            sampler_->DeviceResultBatch(),
+            model_forward_->GetBatchMetaDevice(), B,
+            model_forward_->GetMaxBatchSize(), compute_stream_);
+        decode_relay_active_ = true;
+        decode_relay_batch_size_ = B;
+      }
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
       if (NativeLogitsDebugEnabled(execution_policy_)) {
@@ -3570,6 +3607,132 @@ int InferfluxCudaExecutor::CopyLastLogitsToHost(float *host_buf, int buf_size) {
 #else
   (void)host_buf;
   (void)buf_size;
+  return 0;
+#endif
+}
+
+int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id,
+                                              int n_past_start,
+                                              int first_token_id, int n_tokens,
+                                              int eos_token_id,
+                                              std::vector<int> *out_tokens) {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!model_forward_ || !sampler_ || n_tokens <= 0) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(shared_pipeline_mutex_);
+
+  out_tokens->clear();
+  out_tokens->reserve(n_tokens);
+
+  int *d_meta = model_forward_->GetBatchMetaDevice();
+  const int max_B = model_forward_->GetMaxBatchSize();
+  if (!d_meta || max_B <= 0) {
+    return 0; // Device-side relay not supported
+  }
+
+  // Allocate device-side EOS flag if needed
+  if (!d_eos_flag_) {
+    cudaMalloc(&d_eos_flag_, sizeof(int));
+  }
+
+  // Allocate device-side token accumulation buffer
+  int *d_token_buf = nullptr;
+  cudaMalloc(&d_token_buf, n_tokens * sizeof(int));
+  if (!d_token_buf) {
+    return 0;
+  }
+
+  const int B = 1;
+  std::vector<int> batch_tokens = {first_token_id};
+  std::vector<int> batch_n_past = {n_past_start};
+  std::vector<int> batch_seq_ids = {sequence_id};
+  std::vector<float> batch_temps = {0.0f}; // greedy
+  std::vector<int> batch_top_ks = {0};
+  std::vector<float> batch_top_ps = {1.0f};
+  std::vector<uint32_t> batch_seeds = {UINT32_MAX};
+
+  // First token: normal BatchForward (uploads metadata, captures/replays graph)
+  bool fwd_ok = model_forward_->BatchForward(batch_tokens, batch_n_past,
+                                              batch_seq_ids, d_logits_, B);
+  if (!fwd_ok) {
+    cudaFree(d_token_buf);
+    return 0;
+  }
+
+  // Sample first token (greedy argmax on GPU)
+  sampler_->EnqueueSampleBatch(d_logits_, B, batch_temps, batch_top_ks,
+                                batch_top_ps, batch_seeds);
+
+  // Accumulate token on device
+  cuda_kernel::AppendTokenToBuffer(sampler_->DeviceResultBatch(), d_token_buf,
+                                    0, compute_stream_);
+
+  // Set up relay: copy sampled token to graph input + increment n_past
+  cuda_kernel::DeviceTokenRelay(sampler_->DeviceResultBatch(), d_meta, B,
+                                 max_B, compute_stream_);
+
+  // Check EOS on device
+  cuda_kernel::DeviceCheckEos(sampler_->DeviceResultBatch(), B, eos_token_id,
+                               d_eos_flag_, compute_stream_);
+
+  int tokens_generated = 1;
+
+  // Burst loop: graph replay + sample + relay — NO host sync between tokens.
+  // All work enqueued on the same GPU stream, executed sequentially on device.
+  for (int t = 1; t < n_tokens; ++t) {
+    // Graph replay (no H2D upload — DeviceTokenRelay already updated input)
+    if (!model_forward_->BatchForwardReplay(d_logits_, B)) {
+      break;
+    }
+
+    // Greedy argmax (stays on GPU)
+    sampler_->EnqueueSampleBatch(d_logits_, B, batch_temps, batch_top_ks,
+                                  batch_top_ps, batch_seeds);
+
+    // Accumulate this token on device
+    cuda_kernel::AppendTokenToBuffer(sampler_->DeviceResultBatch(),
+                                      d_token_buf, t, compute_stream_);
+
+    // Relay to next iteration's graph input
+    cuda_kernel::DeviceTokenRelay(sampler_->DeviceResultBatch(), d_meta, B,
+                                   max_B, compute_stream_);
+
+    // EOS check (accumulates into d_eos_flag_)
+    cuda_kernel::DeviceCheckEos(sampler_->DeviceResultBatch(), B, eos_token_id,
+                                 d_eos_flag_, compute_stream_);
+
+    ++tokens_generated;
+  }
+
+  // Single sync: collect ALL tokens from device in one D2H copy
+  cudaStreamSynchronize(compute_stream_);
+
+  std::vector<int> h_tokens(tokens_generated);
+  cudaMemcpy(h_tokens.data(), d_token_buf, tokens_generated * sizeof(int),
+             cudaMemcpyDeviceToHost);
+
+  // Check EOS flag
+  int h_eos = 0;
+  cudaMemcpy(&h_eos, d_eos_flag_, sizeof(int), cudaMemcpyDeviceToHost);
+
+  // Copy to output, truncating at EOS if hit
+  for (int i = 0; i < tokens_generated; ++i) {
+    if (h_tokens[i] == eos_token_id) {
+      break;
+    }
+    out_tokens->push_back(h_tokens[i]);
+  }
+
+  cudaFree(d_token_buf);
+  return static_cast<int>(out_tokens->size());
+#else
+  (void)sequence_id;
+  (void)n_past_start;
+  (void)first_token_id;
+  (void)n_tokens;
+  (void)eos_token_id;
+  (void)out_tokens;
   return 0;
 #endif
 }
