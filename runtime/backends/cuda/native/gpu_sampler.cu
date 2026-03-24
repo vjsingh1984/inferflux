@@ -747,6 +747,16 @@ void GpuSampler::SampleBatch(const float *d_logits, int batch_size,
   CollectSampleBatch(out_tokens);
 }
 
+void GpuSampler::EnqueueGreedyArgmaxDeviceOnly(const float *d_logits,
+                                                int batch_size) {
+  int B = std::min(batch_size, kMaxBatchSize);
+  int threads = 256;
+  int smem = threads * (sizeof(float) + sizeof(int));
+  BatchedArgmaxKernel<<<B, threads, smem, stream_>>>(d_logits, d_result_batch_,
+                                                      vocab_size_, B);
+  // No D2H memcpy, no event record — result stays on device only.
+}
+
 void GpuSampler::CopyLogitsToHost(const float *d_logits, float *host_buf) {
   NVTX_SCOPE("Sampler_CopyLogits");
   runtime::cuda::native::TracedCudaMemcpyAsync(

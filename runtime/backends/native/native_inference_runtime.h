@@ -134,6 +134,24 @@ public:
   }
 
   virtual int NativeEmbedDims() const { return 0; }
+
+  /**
+   * Burst decode: run N greedy tokens on device without per-token host sync.
+   * Returns actual tokens generated (may be < n_tokens if EOS hit).
+   * Default: not supported (returns 0). Overridden by CUDA executor.
+   */
+  virtual int BurstDecodeGreedy(int sequence_id, int n_past_start,
+                                int first_token_id, int n_tokens,
+                                int eos_token_id,
+                                std::vector<int> *out_tokens) {
+    (void)sequence_id;
+    (void)n_past_start;
+    (void)first_token_id;
+    (void)n_tokens;
+    (void)eos_token_id;
+    (void)out_tokens;
+    return 0;
+  }
 };
 
 } // namespace inferflux

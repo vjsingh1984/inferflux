@@ -89,6 +89,11 @@ public:
   /// Valid after EnqueueSampleBatch; invalidated by next EnqueueSampleBatch.
   const int *DeviceResultBatch() const { return d_result_batch_; }
 
+  /// Lightweight greedy argmax that stays entirely on device — no D2H memcpy,
+  /// no event record. Used by BurstDecodeGreedy for zero-sync-overhead decode.
+  /// Result written to d_result_batch_[0..batch_size-1].
+  void EnqueueGreedyArgmaxDeviceOnly(const float *d_logits, int batch_size);
+
 private:
   int GreedyArgmax(const float *d_logits);
   int StochasticSample(const float *d_logits, float temperature, int top_k,

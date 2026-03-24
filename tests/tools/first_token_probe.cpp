@@ -30,6 +30,7 @@ struct Options {
   int gpu_layers{99};
   bool use_flash_attention{true};
   int max_parallel_sequences{16};
+  bool no_logprobs{false}; // burst decode benchmark mode
 };
 
 void PrintUsage(const char *argv0) {
@@ -121,6 +122,8 @@ bool ParseArgs(int argc, char **argv, Options *out) {
         return false;
       }
       out->max_parallel_sequences = std::stoi(value);
+    } else if (arg == "--no-logprobs") {
+      out->no_logprobs = true;
     } else if (arg == "--help" || arg == "-h") {
       PrintUsage(argv[0]);
       std::exit(0);
@@ -233,11 +236,13 @@ int Run(const Options &options) {
 
   backend->SetupSampler("", "", sampling);
   std::vector<TokenLogprob> logprobs;
+  const int effective_top_n = options.no_logprobs ? 0 : options.top_n;
   const std::string output =
-      backend->Generate(prompt, options.max_tokens, {}, {}, options.top_n,
-                        &logprobs, {});
+      backend->Generate(prompt, options.max_tokens, {}, {}, effective_top_n,
+                        options.no_logprobs ? nullptr : &logprobs, {});
   const std::vector<TopLogitEntry> top_logits =
-      backend->TopLogitsForParity(options.top_n);
+      options.no_logprobs ? std::vector<TopLogitEntry>{}
+                          : backend->TopLogitsForParity(options.top_n);
   backend->TeardownSampler();
 
   json payload = {

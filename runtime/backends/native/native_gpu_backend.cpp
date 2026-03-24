@@ -473,10 +473,55 @@ std::string NativeGpuBackend::Generate(
     }
   }
 
+  // Burst decode fast path: when greedy (temperature <= 0), no logprobs,
+  // and no streaming callback, run chunks of tokens on device without
+  // per-token host sync. This eliminates WDDM scheduling latency (~10ms)
+  // between tokens on Windows.
+  const bool can_burst = !collect_lp && !on_chunk &&
+                         sampling.temperature <= 0.0f &&
+                         stop_seqs.empty() && tokenizer;
+  const int eos_id = tokenizer ? tokenizer->EosTokenId() : -1;
+  constexpr int kBurstSize = 16; // tokens per burst chunk
+
   while (visible_tokens_generated < max_tokens) {
     if (should_stop && should_stop()) {
       break;
     }
+
+    // Try burst decode path
+    if (can_burst) {
+      const int remaining = max_tokens - visible_tokens_generated;
+      const int burst_n = std::min(remaining, kBurstSize);
+      std::vector<int> burst_tokens;
+
+      int generated = runtime_->BurstDecodeGreedy(
+          sequence_id, n_past, current_token, burst_n, eos_id, &burst_tokens);
+
+      if (generated > 0) {
+        // Process burst results on host
+        bool stop = false;
+        for (int i = 0; i < static_cast<int>(burst_tokens.size()); ++i) {
+          ++n_past;
+          current_token = burst_tokens[i];
+          if (tokenizer->IsTerminalGeneratedToken(current_token)) {
+            stop = true;
+            break;
+          }
+          std::string piece = tokenizer->TokenToString(current_token);
+          if (!piece.empty()) {
+            output += piece;
+            ++visible_tokens_generated;
+          }
+        }
+        if (stop || burst_tokens.empty()) {
+          break;
+        }
+        continue; // next burst
+      }
+      // BurstDecodeGreedy returned 0 — fall through to standard path
+    }
+
+    // Standard per-token path (with logprobs, streaming, or stochastic)
     UnifiedBatchInput step_input;
     step_input.sequence_id = sequence_id;
     step_input.n_past = n_past;

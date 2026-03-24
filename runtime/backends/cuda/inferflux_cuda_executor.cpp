@@ -3660,48 +3660,32 @@ int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id,
     return 0;
   }
 
-  // Sample first token (greedy argmax on GPU)
-  sampler_->EnqueueSampleBatch(d_logits_, B, batch_temps, batch_top_ks,
-                                batch_top_ps, batch_seeds);
+  // Sample first token — lightweight device-only argmax (no D2H, no event)
+  sampler_->EnqueueGreedyArgmaxDeviceOnly(d_logits_, B);
 
-  // Accumulate token on device
+  // Accumulate + relay + EOS check — all on device
   cuda_kernel::AppendTokenToBuffer(sampler_->DeviceResultBatch(), d_token_buf,
                                     0, compute_stream_);
-
-  // Set up relay: copy sampled token to graph input + increment n_past
   cuda_kernel::DeviceTokenRelay(sampler_->DeviceResultBatch(), d_meta, B,
                                  max_B, compute_stream_);
-
-  // Check EOS on device
   cuda_kernel::DeviceCheckEos(sampler_->DeviceResultBatch(), B, eos_token_id,
                                d_eos_flag_, compute_stream_);
 
   int tokens_generated = 1;
 
-  // Burst loop: graph replay + sample + relay — NO host sync between tokens.
-  // All work enqueued on the same GPU stream, executed sequentially on device.
+  // Burst loop: graph replay + argmax + relay — entire pipeline on device.
+  // No host sync, no D2H memcpy, no event records between tokens.
   for (int t = 1; t < n_tokens; ++t) {
-    // Graph replay (no H2D upload — DeviceTokenRelay already updated input)
     if (!model_forward_->BatchForwardReplay(d_logits_, B)) {
       break;
     }
-
-    // Greedy argmax (stays on GPU)
-    sampler_->EnqueueSampleBatch(d_logits_, B, batch_temps, batch_top_ks,
-                                  batch_top_ps, batch_seeds);
-
-    // Accumulate this token on device
+    sampler_->EnqueueGreedyArgmaxDeviceOnly(d_logits_, B);
     cuda_kernel::AppendTokenToBuffer(sampler_->DeviceResultBatch(),
                                       d_token_buf, t, compute_stream_);
-
-    // Relay to next iteration's graph input
     cuda_kernel::DeviceTokenRelay(sampler_->DeviceResultBatch(), d_meta, B,
                                    max_B, compute_stream_);
-
-    // EOS check (accumulates into d_eos_flag_)
     cuda_kernel::DeviceCheckEos(sampler_->DeviceResultBatch(), B, eos_token_id,
                                  d_eos_flag_, compute_stream_);
-
     ++tokens_generated;
   }
 
