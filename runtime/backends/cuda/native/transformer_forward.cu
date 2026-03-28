@@ -704,6 +704,72 @@ bool TryQ8_1GemvAccum<half>(const QuantizedWeightInfo &raw, const half *input,
   return ok;
 }
 
+template <typename T>
+bool TryQ8_1GemvPrequantized(const QuantizedWeightInfo &, const void *, T *, int,
+                             int, int, cudaStream_t,
+                             const char * = nullptr,
+                             const NativeExecutionPolicy * = nullptr) {
+  return false;
+}
+
+template <>
+bool TryQ8_1GemvPrequantized<half>(const QuantizedWeightInfo &raw,
+                                   const void *act_q8_1, half *output, int M,
+                                   int N, int K, cudaStream_t stream,
+                                   const char *proj_name,
+                                   const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
+  if (Q81ActivationsDisabled(policy_ref) || !raw.data || !act_q8_1 || !output ||
+      M <= 0 || N <= 0 || K <= 0 ||
+      !FusedQuantGemm::SupportsQ8_1Activations(raw.quant_type) ||
+      !FusedQuantGemm::ShouldUseFusedPath(
+          raw.quant_type, FusedDispatchGeometry{M, N, K, 1, true, false})) {
+    return false;
+  }
+
+  const bool ok =
+      FusedQuantGemm::GemvQ8_1(raw, act_q8_1, output, M, N, K, stream, policy);
+  if (ok && proj_name) {
+    LogPackedGemmPath(proj_name,
+                      "using pre-quantized Q8_1 GEMV from epilogue");
+  }
+  return ok;
+}
+
+template <typename T>
+bool TryQ8_1GemvPrequantizedAccum(const QuantizedWeightInfo &, const void *, T *,
+                                  int, int, int, cudaStream_t,
+                                  const char * = nullptr,
+                                  const NativeExecutionPolicy * = nullptr) {
+  return false;
+}
+
+template <>
+bool TryQ8_1GemvPrequantizedAccum<half>(const QuantizedWeightInfo &raw,
+                                        const void *act_q8_1, half *output,
+                                        int M, int N, int K,
+                                        cudaStream_t stream,
+                                        const char *proj_name,
+                                        const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
+  if (!policy_ref.enable_gemv_accumulate ||
+      Q81ActivationsDisabled(policy_ref) || !raw.data || !act_q8_1 || !output ||
+      M <= 0 || N <= 0 || K <= 0 ||
+      !FusedQuantGemm::SupportsQ8_1Activations(raw.quant_type) ||
+      !FusedQuantGemm::ShouldUseFusedPath(
+          raw.quant_type, FusedDispatchGeometry{M, N, K, 1, true, false})) {
+    return false;
+  }
+
+  const bool ok = FusedQuantGemm::GemvQ8_1Accum(raw, act_q8_1, output, M, N, K,
+                                                stream, policy);
+  if (ok && proj_name) {
+    LogPackedGemmPath(proj_name,
+                      "using pre-quantized Q8_1 accumulate GEMV from epilogue");
+  }
+  return ok;
+}
+
 // Accumulate-mode Q8_1 SiLU+Mul+GEMV for down-proj: residual += down(silu(gate)*up)
 template <typename T>
 bool TryQ8_1SiluMulGemvAccum(const QuantizedWeightInfo &, const T *,
@@ -735,6 +801,33 @@ bool TryQ8_1SiluMulGemvAccum<half>(const QuantizedWeightInfo &raw,
                                            stream, policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using Q8_1 accumulate SiLU+Mul+GEMV");
+  }
+  return ok;
+}
+
+template <typename T>
+bool TryMmqGemvPrequantized(const MmqWeightInfo &, const void *, T *, int, int,
+                            int, cudaStream_t, const char * = nullptr,
+                            const NativeExecutionPolicy * = nullptr) {
+  return false;
+}
+
+template <>
+bool TryMmqGemvPrequantized<half>(const MmqWeightInfo &weight,
+                                  const void *act_q8_1, half *output, int M,
+                                  int N, int K, cudaStream_t stream,
+                                  const char *proj_name,
+                                  const NativeExecutionPolicy *policy) {
+  if (!weight.data || !act_q8_1 || !output || M <= 0 || N <= 0 || K <= 0 ||
+      N != weight.rows || K != weight.cols) {
+    return false;
+  }
+
+  const bool ok = FusedQuantGemm::DownProjMmq(weight, act_q8_1, output, M, N, K,
+                                              stream, policy);
+  if (ok && proj_name) {
+    LogPackedGemmPath(
+        proj_name, "using MMQ-style tiled Q8_1 down-proj from epilogue");
   }
   return ok;
 }
@@ -874,6 +967,16 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
       return false;
     device_workspace_bytes_ += rows * blocks_per_row * q8_1_block_size;
   }
+  {
+    const size_t blocks_per_row =
+        (static_cast<size_t>(intermediate_size_) + 31) / 32;
+    const size_t q8_1_block_size = 36;
+    err =
+        cudaMalloc(&d_ffn_act_q8_1_, rows * blocks_per_row * q8_1_block_size);
+    if (err != cudaSuccess)
+      return false;
+    device_workspace_bytes_ += rows * blocks_per_row * q8_1_block_size;
+  }
   // Logits buffer sized for batched decode: [max_batch_size, vocab_size]
   if (!alloc(&d_logits_typed_,
              static_cast<size_t>(max_batch_size_) * vocab_size_))
@@ -934,6 +1037,10 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
   if (d_act_q8_1_) {
     cudaFree(d_act_q8_1_);
     d_act_q8_1_ = nullptr;
+  }
+  if (d_ffn_act_q8_1_) {
+    cudaFree(d_ffn_act_q8_1_);
+    d_ffn_act_q8_1_ = nullptr;
   }
 
   if (d_token_ids_) {
@@ -2229,6 +2336,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       const T *ffn_norm_weight = ffn_norm_precomputed ? nullptr : post_attn_norm;
       bool down_accumulated = false;
       bool fused_gate_up_silu = false;
+      bool gate_up_q81_epilogue = false;
       {
         NVTX_SCOPE("FFN");
         auto gate_raw = weights_->LayerGateProjRaw(layer);
@@ -2261,12 +2369,11 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             // P5: Try gate+up+SiLU with Q8_1 epilogue first — produces
             // pre-quantized Q8_1 output for down-proj, saving a separate
             // QuantizeRowQ8_1 kernel launch.
-            bool gate_up_q81_epilogue = false;
             if (execution_policy_.enable_gate_up_silu_q81_epilogue) {
               fused_gate_up_silu =
                   FusedQuantGemm::FusedGateUpSiluGemvQ8_1WithEpilogue(
                       gate_raw, up_raw, d_act_q8_1_, d_ffn_gate_,
-                      d_act_q8_1_, B, intermediate_size_, hidden_size_,
+                      d_ffn_act_q8_1_, B, intermediate_size_, hidden_size_,
                       stream_);
               if (fused_gate_up_silu) {
                 gate_up_q81_epilogue = true;
@@ -2389,25 +2496,49 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
 
         if (fused_gate_up_silu) {
           // SiLU already applied by fused kernel — d_ffn_gate_ has the
-          // post-activation FP16 result.  Try accumulate first, then quantize
-          // and run down GEMV.
-          bool down_ok = TryQ8_1GemvAccum<T>(
-              down_raw, d_ffn_gate_, d_residual_, d_act_q8_1_, B, hidden_size_,
-              intermediate_size_, stream_, "down_proj", &execution_policy_);
+          // post-activation FP16 result.  When P5 is active, consume the
+          // epilogue's pre-quantized Q8_1 buffer directly before falling back
+          // to the legacy re-quantization path.
+          bool down_ok = false;
+          if (gate_up_q81_epilogue) {
+            down_ok = TryQ8_1GemvPrequantizedAccum<T>(
+                down_raw, d_ffn_act_q8_1_, d_residual_, B, hidden_size_,
+                intermediate_size_, stream_, "down_proj", &execution_policy_);
+          }
+          if (!down_ok) {
+            down_ok = TryQ8_1GemvAccum<T>(
+                down_raw, d_ffn_gate_, d_residual_, d_act_q8_1_, B,
+                hidden_size_, intermediate_size_, stream_, "down_proj",
+                &execution_policy_);
+          }
           if (down_ok) {
             down_accumulated = true;
           }
           if (!down_ok) {
-            down_ok =
-                TryQ8_1Gemv<T>(down_raw, d_ffn_gate_, d_ffn_down_, d_act_q8_1_,
-                               B, hidden_size_, intermediate_size_, stream_,
-                               "down_proj", &execution_policy_);
+            if (gate_up_q81_epilogue) {
+              down_ok = TryQ8_1GemvPrequantized<T>(
+                  down_raw, d_ffn_act_q8_1_, d_ffn_down_, B, hidden_size_,
+                  intermediate_size_, stream_, "down_proj", &execution_policy_);
+            }
+            if (!down_ok) {
+              down_ok = TryQ8_1Gemv<T>(
+                  down_raw, d_ffn_gate_, d_ffn_down_, d_act_q8_1_, B,
+                  hidden_size_, intermediate_size_, stream_, "down_proj",
+                  &execution_policy_);
+            }
           }
           if (!down_ok) {
-            down_ok = TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
-                                    d_act_q8_1_, B, hidden_size_,
-                                    intermediate_size_, stream_, "down_proj",
-                                    &execution_policy_);
+            if (gate_up_q81_epilogue) {
+              down_ok = TryMmqGemvPrequantized<T>(
+                  down_mmq, d_ffn_act_q8_1_, d_ffn_down_, B, hidden_size_,
+                  intermediate_size_, stream_, "down_proj", &execution_policy_);
+            }
+            if (!down_ok) {
+              down_ok = TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
+                                      d_act_q8_1_, B, hidden_size_,
+                                      intermediate_size_, stream_, "down_proj",
+                                      &execution_policy_);
+            }
           }
           if (!down_ok) {
             if (capturing) {

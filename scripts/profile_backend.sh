@@ -37,7 +37,7 @@ DECODE_BURST_TOKENS="${DECODE_BURST_TOKENS:-0}"
 ENABLE_BATCHED_DECODE="${ENABLE_BATCHED_DECODE:-1}"
 BENCH_LOG_LEVEL="${BENCH_LOG_LEVEL:-warning}"
 REQUEST_TIMEOUT_SEC="${REQUEST_TIMEOUT_SEC:-180}"
-STARTUP_TIMEOUT_SEC="${STARTUP_TIMEOUT_SEC:-60}"
+STARTUP_TIMEOUT_SEC="${STARTUP_TIMEOUT_SEC:-}"
 PROFILE_STEADY_STATE_ONLY="${PROFILE_STEADY_STATE_ONLY:-1}"
 PROFILE_LOCK_FILE="${INFERFLUX_PROFILE_LOCK_FILE:-/tmp/inferflux_profile_backend.lock}"
 PROFILE_LOCK_WAIT_SEC="${INFERFLUX_PROFILE_LOCK_WAIT_SEC:-300}"
@@ -68,6 +68,16 @@ normalize_backend() {
       ;;
   esac
   PORT="${INFERFLUX_PROFILE_PORT:-$BACKEND_PORT_DEFAULT}"
+}
+
+resolve_startup_timeout() {
+  if [ -n "$STARTUP_TIMEOUT_SEC" ]; then
+    echo "$STARTUP_TIMEOUT_SEC"
+  elif [ "$BACKEND_ID" = "llama_cpp_cuda" ]; then
+    echo 180
+  else
+    echo 60
+  fi
 }
 
 require_tools() {
@@ -141,8 +151,10 @@ tail_log() {
 }
 
 wait_ready() {
+  local startup_timeout
+  startup_timeout=$(resolve_startup_timeout)
   local waited=0
-  while [ "$waited" -lt "$STARTUP_TIMEOUT_SEC" ]; do
+  while [ "$waited" -lt "$startup_timeout" ]; do
     if [ -n "$PROFILE_PID" ] && ! kill -0 "$PROFILE_PID" 2>/dev/null; then
       return 1
     fi
@@ -428,6 +440,7 @@ main() {
   echo "  Workload:    requests=$REQUESTS concurrency=$CONCURRENCY max_tokens=$MAX_TOKENS"
   echo "  Prompt:      $WORKLOAD_PROMPT"
   echo "  Scheduler:   min_batch=$MIN_BATCH_SIZE accum_ms=$BATCH_ACCUMULATION_MS decode_burst=$DECODE_BURST_TOKENS batched_decode=$ENABLE_BATCHED_DECODE"
+  echo "  Startup:     $(resolve_startup_timeout)s timeout"
   echo "  Profile:     $([ "$PROFILE_STEADY_STATE_ONLY" = "1" ] && echo steady-state-only || echo includes-startup)"
   echo "  Lock file:   $PROFILE_LOCK_FILE"
 

@@ -45,6 +45,10 @@
 #   PORT_LLAMA            - Port for llama_cpp_cuda (default: 18091)
 #   RESET_CUDA_BETWEEN_BACKENDS - Reset CUDA device after local InferFlux/llama.cpp
 #                                 backend teardown (default: true)
+#   BACKEND_STARTUP_TIMEOUT_SEC - Seconds to wait for local backend readiness
+#                                 (default: backend-aware; 60, llama_cpp_cuda=180)
+#   BENCH_VALIDATE_STREAMING - Require both non-streaming and streaming
+#                              completion probes before benchmarking (default: 1)
 
 set -euo pipefail
 
@@ -97,6 +101,8 @@ SGLANG_PYTHON="${SGLANG_PYTHON:-$REPO_ROOT/.venv-sglang/bin/python}"
 SGLANG_LAUNCH_ARGS="${SGLANG_LAUNCH_ARGS:-}"
 AUTOSTART_SGLANG="${AUTOSTART_SGLANG:-false}"
 RESET_CUDA_BETWEEN_BACKENDS="${RESET_CUDA_BETWEEN_BACKENDS:-true}"
+BACKEND_STARTUP_TIMEOUT_SEC="${BACKEND_STARTUP_TIMEOUT_SEC:-}"
+BENCH_VALIDATE_STREAMING="${BENCH_VALIDATE_STREAMING:-1}"
 INFERFLUX_BENCH_CHILD_MODE="${INFERFLUX_BENCH_CHILD_MODE:-0}"
 INFERFLUX_BENCH_SINGLE_BACKEND="${INFERFLUX_BENCH_SINGLE_BACKEND:-}"
 
@@ -139,19 +145,43 @@ resolve_build_dir() {
 # ============================================================================
 
 gpu_mem_mb() {
-    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '
+    local value
+    value=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
+    else
+        echo "0"
+    fi
 }
 
 gpu_mem_total_mb() {
-    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '
+    local value
+    value=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
+    else
+        echo "unknown"
+    fi
 }
 
 gpu_name() {
-    nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1
+    local value
+    value=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+    if [ -n "$value" ]; then
+        echo "$value"
+    else
+        echo "unknown"
+    fi
 }
 
 gpu_utilization() {
-    nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '
+    local value
+    value=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
+    else
+        echo "0"
+    fi
 }
 
 port_has_listener() {
@@ -664,6 +694,7 @@ start_inferflux_server() {
     local backend=$1 port=$2
     local config_file="$OUTPUT_DIR/config_${backend}.yaml"
     local log_file="$OUTPUT_DIR/server_${backend}.log"
+    local startup_timeout=60
 
     stop_inferflux_server "$backend" >/dev/null 2>&1 || true
     if ! wait_for_port_free "$port"; then
@@ -672,6 +703,15 @@ start_inferflux_server() {
     fi
     if ! require_port_free "$backend" "$port"; then
         return 1
+    fi
+
+    if [ -n "$BACKEND_STARTUP_TIMEOUT_SEC" ]; then
+        startup_timeout="$BACKEND_STARTUP_TIMEOUT_SEC"
+    elif [ "$backend" = "llama_cpp_cuda" ]; then
+        # Cold GGUF llama.cpp loads on WSL2 can exceed 60s even when the backend
+        # is healthy. Give the compatibility path a larger default window so
+        # startup latency does not masquerade as a throughput failure.
+        startup_timeout=180
     fi
 
     write_inferflux_config "$backend" "$port" "$config_file"
@@ -696,9 +736,11 @@ start_inferflux_server() {
     local pid=$!
     echo "$pid" > "$OUTPUT_DIR/${backend}.pid"
 
-    # Wait for readiness (max 60s)
+    # Wait for readiness. llama.cpp loads can exceed 60s on cold or partially
+    # cached WSL2 runs, so make the timeout configurable for apples-to-apples
+    # benchmark sweeps.
     local waited=0
-    while [ $waited -lt 60 ]; do
+    while [ $waited -lt "$startup_timeout" ]; do
         if ! kill -0 $pid 2>/dev/null; then
             log_err "$backend server exited early. Last log lines:"
             tail -20 "$log_file"
@@ -719,7 +761,7 @@ start_inferflux_server() {
         waited=$((waited + 1))
     done
 
-    log_err "$backend did not start in 60s. Last log lines:"
+    log_err "$backend did not start in ${startup_timeout}s. Last log lines:"
     tail -20 "$log_file"
     kill $pid 2>/dev/null || true
     return 1
@@ -820,6 +862,58 @@ has_fatal_runtime_signature() {
     local log_file=$1
     [ -f "$log_file" ] || return 1
     grep -Eqi 'double free|corruption \(|segmentation fault|addresssanitizer|terminate called after throwing|fatal glibc error|aborted \(core dumped\)' "$log_file"
+}
+
+probe_backend_api_mode() {
+    local backend=$1 backend_kind=$2 endpoint=$3 model=$4 mode=$5
+    local probe_dir="$OUTPUT_DIR/probes_${backend}/${mode}"
+    local summary=""
+    local -a probe_cmd=(
+        python3 "$SCRIPT_DIR/benchmark_request_driver.py"
+        --backend-kind "$backend_kind"
+        --endpoint "$endpoint"
+        --model "$model"
+        --api-key "$API_KEY"
+        --single-prompt "Reply with the single word ready."
+        --num-requests 1
+        --max-tokens 4
+        --concurrency 1
+        --output-dir "$probe_dir"
+        --skip-warmup
+    )
+    if [ "$mode" = "streaming" ]; then
+        probe_cmd+=(--stream)
+    fi
+
+    if ! summary=$("${probe_cmd[@]}" 2>/dev/null); then
+        log_err "$backend $mode probe failed"
+        return 1
+    fi
+
+    local success_count
+    success_count=$(printf '%s' "$summary" | python3 -c "import json,sys; print(json.load(sys.stdin).get('success_count', 0))" 2>/dev/null || echo 0)
+    if [ "${success_count:-0}" -ne 1 ]; then
+        log_err "$backend $mode probe did not return a valid completion"
+        return 1
+    fi
+    log_ok "$backend $mode probe passed"
+    return 0
+}
+
+validate_backend_api_modes() {
+    local backend=$1 backend_kind=$2 endpoint=$3 model=$4
+    local stamp="$OUTPUT_DIR/.validated_${backend}.stamp"
+    if [ -f "$stamp" ]; then
+        return 0
+    fi
+
+    probe_backend_api_mode "$backend" "$backend_kind" "$endpoint" "$model" "nonstreaming" || return 1
+    if [ "$BENCH_VALIDATE_STREAMING" = "1" ]; then
+        probe_backend_api_mode "$backend" "$backend_kind" "$endpoint" "$model" "streaming" || return 1
+    fi
+
+    printf 'ok\n' > "$stamp"
+    return 0
 }
 
 capture_inferflux_admin_cache_snapshot() {
@@ -1174,6 +1268,14 @@ run_benchmark() {
         driver_cmd+=(--prompt-suite "$PROMPT_SUITE_PATH")
     fi
 
+    if ! validate_backend_api_modes "$backend" "$driver_backend_kind" \
+        "$driver_endpoint" "$driver_model"; then
+        log_err "  $backend API validation failed; refusing to benchmark a non-comparable backend"
+        kill $monitor_pid 2>/dev/null || true
+        wait $monitor_pid 2>/dev/null || true
+        return 1
+    fi
+
     local driver_summary
     driver_summary=$("${driver_cmd[@]}")
 
@@ -1484,6 +1586,7 @@ main() {
 
     if [ "$INFERFLUX_BENCH_CHILD_MODE" != "1" ]; then
         local requested_backends=("${ALL_BACKENDS[@]}")
+        local child_failed=false
         if [ -n "$INFERFLUX_BENCH_SINGLE_BACKEND" ]; then
             requested_backends=("$INFERFLUX_BENCH_SINGLE_BACKEND")
         fi
@@ -1492,6 +1595,7 @@ main() {
         for backend in "${requested_backends[@]}"; do
             if ! invoke_isolated_backend_child "$backend"; then
                 log_warn "Isolated backend benchmark failed for $backend"
+                child_failed=true
             fi
         done
 
@@ -1502,10 +1606,14 @@ main() {
         generate_report
         save_combined_results
         log_ok "Benchmark complete! Results saved to $OUTPUT_DIR"
+        if [ "$child_failed" = "true" ]; then
+            return 1
+        fi
         return 0
     fi
 
     local mem_baseline=$(gpu_mem_mb)
+    local benchmark_failed=false
     log "GPU baseline memory: ${mem_baseline} MB"
     log "InferFlux backends will run one at a time."
     log "Each backend is torn down before the next one starts."
@@ -1666,6 +1774,7 @@ main() {
 
             if ! run_benchmark "$backend" "$concurrency" "$port_or_url" "$backend_kind"; then
                 log_warn "  Some requests failed for $backend @ c=$concurrency"
+                benchmark_failed=true
             fi
 
             # Let GPU memory settle between runs
@@ -1676,6 +1785,7 @@ main() {
             local mem_before_stop=$(gpu_mem_mb)
             if ! stop_inferflux_server "$backend"; then
                 log_warn "  $backend shutdown reported a fatal runtime signature"
+                benchmark_failed=true
             fi
             if [ "$RESET_CUDA_BETWEEN_BACKENDS" = "true" ]; then
                 reset_cuda_device
@@ -1702,6 +1812,9 @@ main() {
     done
 
     log_ok "Isolated backend benchmark complete for ${requested_backends[*]}"
+    if [ "$benchmark_failed" = "true" ]; then
+        return 1
+    fi
 }
 
 # ============================================================================

@@ -59,6 +59,37 @@ void FillRandomHalfRange(std::vector<half> &buf, std::mt19937 &rng, float lo,
     v = __float2half(dist(rng));
 }
 
+void FillRandomQ4KBlocks(
+    std::vector<runtime::cuda::native::block_q4_k> &buf, std::mt19937 &rng) {
+  std::uniform_real_distribution<float> scale_dist(0.002f, 0.05f);
+  std::uniform_int_distribution<int> byte_dist(0, 255);
+  std::uniform_int_distribution<int> scale_byte_dist(0, 63);
+  for (auto &block : buf) {
+    block.d = __half_as_ushort(__float2half(scale_dist(rng)));
+    block.dmin = __half_as_ushort(__float2half(scale_dist(rng)));
+    for (auto &scale : block.scales) {
+      scale = static_cast<unsigned char>(scale_byte_dist(rng));
+    }
+    for (auto &q : block.qs) {
+      q = static_cast<unsigned char>(byte_dist(rng));
+    }
+  }
+}
+
+void FillRandomQ81Blocks(
+    std::vector<runtime::cuda::native::block_q8_1> &buf, std::mt19937 &rng) {
+  std::uniform_real_distribution<float> scale_dist(0.002f, 0.05f);
+  std::uniform_int_distribution<int> q_dist(-127, 127);
+  for (auto &block : buf) {
+    const half d = __float2half(scale_dist(rng));
+    const half s = __float2half(scale_dist(rng));
+    block.ds = __halves2half2(d, s);
+    for (auto &q : block.qs) {
+      q = static_cast<int8_t>(q_dist(rng));
+    }
+  }
+}
+
 void FillRandomFloat(std::vector<float> &buf, std::mt19937 &rng, float lo,
                      float hi) {
   std::uniform_real_distribution<float> dist(lo, hi);
@@ -500,6 +531,84 @@ TEST_CASE("FusedGateUpSiluGemvQ8_1WithEpilogue returns false for null inputs",
       empty, empty, nullptr, nullptr, nullptr, 0, 0, 0, nullptr));
 }
 
+TEST_CASE("FusedGateUpSiluGemvQ8_1WithEpilogue matches fused gate/up output and "
+          "quantized epilogue",
+          "[cuda][fused_kernels][gate_up_q81]") {
+  using runtime::cuda::native::GGUF::TensorType;
+  using runtime::cuda::native::QK8_1;
+  using runtime::cuda::native::QK_K;
+  using runtime::cuda::native::block_q4_k;
+  using runtime::cuda::native::block_q8_1;
+
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count == 0)
+    SKIP("No CUDA device available");
+
+  constexpr int kM = 4;
+  constexpr int kN = 256;
+  constexpr int kK = 256;
+  constexpr float kTol = 0.01f;
+  static_assert(kK % QK_K == 0);
+  static_assert(kK % QK8_1 == 0);
+  static_assert(kN % QK8_1 == 0);
+
+  std::mt19937 rng(20260327);
+  cudaStream_t s;
+  CUDA_CHECK(cudaStreamCreate(&s));
+
+  const int weight_blocks_per_row = kK / QK_K;
+  const int input_blocks = kM * (kK / QK8_1);
+  const int output_blocks = kM * (kN / QK8_1);
+
+  std::vector<block_q4_k> h_gate(kN * weight_blocks_per_row);
+  std::vector<block_q4_k> h_up(kN * weight_blocks_per_row);
+  std::vector<block_q8_1> h_act(input_blocks);
+  FillRandomQ4KBlocks(h_gate, rng);
+  FillRandomQ4KBlocks(h_up, rng);
+  FillRandomQ81Blocks(h_act, rng);
+
+  DeviceBuf<block_q4_k> d_gate(static_cast<int>(h_gate.size()));
+  DeviceBuf<block_q4_k> d_up(static_cast<int>(h_up.size()));
+  DeviceBuf<block_q8_1> d_act(input_blocks);
+  DeviceBuf<block_q8_1> d_q8_ref(output_blocks);
+  DeviceBuf<block_q8_1> d_q8_epi(output_blocks);
+  DeviceBuf<half> d_out_ref(kM * kN);
+  DeviceBuf<half> d_out_epi(kM * kN);
+  d_gate.Upload(h_gate);
+  d_up.Upload(h_up);
+  d_act.Upload(h_act);
+  d_q8_ref.Zero();
+  d_q8_epi.Zero();
+  d_out_ref.Zero();
+  d_out_epi.Zero();
+
+  const QuantizedWeightInfo gate_raw{
+      d_gate.ptr, static_cast<int>(TensorType::Q4_K), kN * kK};
+  const QuantizedWeightInfo up_raw{
+      d_up.ptr, static_cast<int>(TensorType::Q4_K), kN * kK};
+
+  REQUIRE(FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
+      gate_raw, up_raw, d_act.ptr, d_out_ref.ptr, kM, kN, kK, s));
+  FusedQuantGemm::QuantizeRowQ8_1(d_out_ref.ptr, d_q8_ref.ptr, kM, kN, s);
+
+  REQUIRE(FusedQuantGemm::FusedGateUpSiluGemvQ8_1WithEpilogue(
+      gate_raw, up_raw, d_act.ptr, d_out_epi.ptr, d_q8_epi.ptr, kM, kN, kK, s));
+  CUDA_CHECK(cudaStreamSynchronize(s));
+
+  REQUIRE(MaxAbsDiffHalf(d_out_ref.ptr, d_out_epi.ptr, kM * kN) < kTol);
+
+  std::vector<block_q8_1> h_q8_ref;
+  std::vector<block_q8_1> h_q8_epi;
+  d_q8_ref.Download(h_q8_ref);
+  d_q8_epi.Download(h_q8_epi);
+  REQUIRE(h_q8_ref.size() == h_q8_epi.size());
+  REQUIRE(std::memcmp(h_q8_ref.data(), h_q8_epi.data(),
+                      h_q8_ref.size() * sizeof(block_q8_1)) == 0);
+
+  CUDA_CHECK(cudaStreamDestroy(s));
+}
+
 TEST_CASE("BiasAdd matches CPU reference", "[cuda][fused_kernels][mmvq_bias]") {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -898,4 +1007,3 @@ TEST_CASE("Policy flags can be overridden via env vars",
 } // namespace inferflux
 
 #endif // INFERFLUX_HAS_CUDA
-

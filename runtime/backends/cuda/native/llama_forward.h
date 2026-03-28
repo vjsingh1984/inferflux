@@ -161,6 +161,7 @@ private:
   int8_t *d_packed_activation_{nullptr};
   float *d_packed_activation_scales_{nullptr};
   void *d_act_q8_1_{nullptr}; // Pre-quantized Q8_1 activation buffer
+  void *d_ffn_act_q8_1_{nullptr}; // FFN epilogue Q8_1 buffer (post-SiLU)
   int *d_token_ids_{nullptr};
   T *d_logits_typed_{nullptr};
 

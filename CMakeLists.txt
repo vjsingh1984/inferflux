@@ -561,6 +561,11 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   target_include_directories(benchmark_downproj_q81 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_downproj_q81 PRIVATE inferflux_core)
+  add_executable(benchmark_fused_gate_up_q81
+                 tests/unit/benchmark_fused_gate_up_q81.cu)
+  target_include_directories(benchmark_fused_gate_up_q81 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(benchmark_fused_gate_up_q81 PRIVATE inferflux_core)
   add_executable(benchmark_grouped_q81_pair
                  tests/unit/benchmark_grouped_q81_pair.cu)
   target_include_directories(benchmark_grouped_q81_pair PRIVATE
@@ -652,6 +657,7 @@ add_executable(inferflux_tests
   tests/unit/test_gpu_kv_cache.cpp
   tests/unit/test_gpu_sampler.cpp
   tests/unit/test_native_batching.cpp
+  tests/unit/test_native_gpu_backend.cpp
   tests/unit/test_batched_decode.cpp
   tests/unit/test_startup_advisor.cpp
   tests/unit/test_gguf_tokenizer.cpp

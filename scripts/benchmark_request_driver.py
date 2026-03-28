@@ -22,13 +22,56 @@ def load_prompts(prompt_suite_path: str, single_prompt: str, num_requests: int) 
     return [prompts[i % len(prompts)] for i in range(num_requests)]
 
 
+def _extract_openai_text(choice: Dict) -> str:
+    if not isinstance(choice, dict):
+        return ""
+    text = choice.get("text")
+    if isinstance(text, str) and text:
+        return text
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            return content
+    message = choice.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            return content
+    return ""
+
+
+def _parse_openai_stream(stdout: str) -> Dict:
+    pieces: List[str] = []
+    usage_tokens = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        payload = json.loads(data)
+        choices = payload.get("choices", [])
+        if choices:
+            pieces.append(_extract_openai_text(choices[0]))
+        usage = payload.get("usage", {})
+        if isinstance(usage, dict):
+            usage_tokens = max(usage_tokens, int(usage.get("completion_tokens", 0) or 0))
+    text = "".join(pieces).strip()
+    tokens = usage_tokens or (len(text.split()) if text else 0)
+    return {"text": text, "tokens": tokens}
+
+
 def request_openai(endpoint: str, model: str, prompt: str, max_tokens: int,
-                   request_id: str, api_key: str, inferflux_style: bool) -> Dict:
+                   request_id: str, api_key: str, inferflux_style: bool,
+                   stream: bool) -> Dict:
     payload = {
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0.0,
+        "stream": stream,
     }
     cmd = [
         "curl",
@@ -54,12 +97,17 @@ def request_openai(endpoint: str, model: str, prompt: str, max_tokens: int,
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "curl request failed")
-    body = json.loads(proc.stdout)
     latency_ms = (time.time_ns() - started) // 1_000_000
-    text = body.get("choices", [{}])[0].get("text", "").strip()
-    tokens = body.get("usage", {}).get("completion_tokens", 0)
-    if not tokens and text:
-        tokens = len(text.split())
+    if stream:
+        parsed = _parse_openai_stream(proc.stdout)
+        text = parsed["text"]
+        tokens = parsed["tokens"]
+    else:
+        body = json.loads(proc.stdout)
+        text = _extract_openai_text(body.get("choices", [{}])[0]).strip()
+        tokens = body.get("usage", {}).get("completion_tokens", 0)
+        if not tokens and text:
+            tokens = len(text.split())
     return {
         "request_id": request_id,
         "text": text,
@@ -68,13 +116,27 @@ def request_openai(endpoint: str, model: str, prompt: str, max_tokens: int,
     }
 
 
+def _parse_ollama_stream(stdout: str) -> Dict:
+    pieces: List[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        payload = json.loads(line)
+        piece = payload.get("response", "")
+        if isinstance(piece, str) and piece:
+            pieces.append(piece)
+    text = "".join(pieces).strip()
+    return {"text": text, "tokens": len(text.split()) if text else 0}
+
+
 def request_ollama(endpoint: str, model: str, prompt: str, max_tokens: int,
-                   request_id: str) -> Dict:
+                   request_id: str, stream: bool) -> Dict:
     payload = {
         "model": model,
         "prompt": prompt,
         "options": {"num_predict": max_tokens, "temperature": 0.0},
-        "stream": False,
+        "stream": stream,
     }
     cmd = [
         "curl",
@@ -97,10 +159,15 @@ def request_ollama(endpoint: str, model: str, prompt: str, max_tokens: int,
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "curl request failed")
-    body = json.loads(proc.stdout)
     latency_ms = (time.time_ns() - started) // 1_000_000
-    text = body.get("response", "").strip()
-    tokens = len(text.split())
+    if stream:
+        parsed = _parse_ollama_stream(proc.stdout)
+        text = parsed["text"]
+        tokens = parsed["tokens"]
+    else:
+        body = json.loads(proc.stdout)
+        text = body.get("response", "").strip()
+        tokens = len(text.split())
     return {
         "request_id": request_id,
         "text": text,
@@ -119,7 +186,7 @@ def worker(index: int, prompt: str, args: argparse.Namespace) -> Dict:
     try:
         if args.backend_kind == "ollama":
             result = request_ollama(args.endpoint, args.model, prompt, args.max_tokens,
-                                    request_id)
+                                    request_id, args.stream)
         else:
             result = request_openai(
                 args.endpoint,
@@ -129,6 +196,7 @@ def worker(index: int, prompt: str, args: argparse.Namespace) -> Dict:
                 request_id,
                 args.api_key,
                 inferflux_style=(args.backend_kind == "inferflux"),
+                stream=args.stream,
             )
         output_path.write_text(json.dumps(result), encoding="utf-8")
         return result
@@ -146,7 +214,7 @@ def run_warmup(prompts: List[str], args: argparse.Namespace) -> None:
         try:
             if args.backend_kind == "ollama":
                 request_ollama(args.endpoint, args.model, prompts[i], args.max_tokens,
-                               request_id)
+                               request_id, args.stream)
             else:
                 request_openai(
                     args.endpoint,
@@ -156,6 +224,7 @@ def run_warmup(prompts: List[str], args: argparse.Namespace) -> None:
                     request_id,
                     args.api_key,
                     inferflux_style=(args.backend_kind == "inferflux"),
+                    stream=args.stream,
                 )
         except Exception:
             pass
@@ -174,6 +243,8 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, required=True)
     parser.add_argument("--concurrency", type=int, required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--stream", action="store_true")
+    parser.add_argument("--skip-warmup", action="store_true")
     args = parser.parse_args()
 
     if not args.single_prompt and not args.prompt_suite:
@@ -181,8 +252,9 @@ def main() -> int:
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     prompts = load_prompts(args.prompt_suite, args.single_prompt, args.num_requests)
-    run_warmup(prompts, args)
-    time.sleep(1)
+    if not args.skip_warmup:
+        run_warmup(prompts, args)
+        time.sleep(1)
 
     results: List[Dict] = []
     wall_started = time.perf_counter_ns()
