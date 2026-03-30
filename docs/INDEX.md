@@ -44,7 +44,7 @@ graph TD
 | Runtime architecture | [Architecture](Architecture.md) |
 | API surface | [API_SURFACE](API_SURFACE.md) |
 | Configuration | [CONFIG_REFERENCE](CONFIG_REFERENCE.md) |
-| **Benchmark results (validated vs Ollama)** | **[benchmarks](benchmarks.md)** ⭐ |
+| Benchmark results and current CUDA reading | [benchmarks](benchmarks.md) |
 | Monitoring and tuning | [MONITORING](MONITORING.md) |
 | Archived throughput investigations | [ARCHIVE_INDEX](ARCHIVE_INDEX.md) |
 | Developer workflow + CI contracts | [DeveloperGuide](DeveloperGuide.md) |

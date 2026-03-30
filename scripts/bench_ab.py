@@ -11,6 +11,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -34,9 +35,11 @@ BACKENDS = {
 
 
 def write_config(backend: str, port: int, prefer: bool, fallback: bool) -> str:
-    path = f"/tmp/bench_{backend}.yaml"
+    temp_dir = Path(tempfile.gettempdir()) / "inferflux_bench_ab"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    path = temp_dir / f"bench_{backend}.yaml"
     gpu_layers = 99 if backend == "llama_cpp_cuda" else 0
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(f"""server:
   host: "127.0.0.1"
   http_port: {port}
@@ -74,7 +77,7 @@ logging:
   level: warning
   format: text
 """)
-    return path
+    return str(path)
 
 
 def start_server(backend: str, cfg: dict) -> subprocess.Popen:
@@ -99,8 +102,15 @@ def start_server(backend: str, cfg: dict) -> subprocess.Popen:
             return proc
         except Exception:
             time.sleep(0.5)
+    stderr = ""
+    if proc.stderr is not None:
+        try:
+            stderr = proc.stderr.read().decode(errors="replace").strip()
+        except Exception:
+            stderr = ""
     proc.kill()
-    raise RuntimeError(f"{backend} failed to start")
+    detail = f": {stderr}" if stderr else ""
+    raise RuntimeError(f"{backend} failed to start{detail}")
 
 
 def get_model_name(port: int) -> str:

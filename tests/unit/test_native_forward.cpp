@@ -6443,18 +6443,19 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes exact Q4_K hot geometry "
               true) == FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed);
 }
 
-TEST_CASE("FusedQuantGemm: down-proj selector keeps exact Q6_K hot geometry on "
-          "generic Q8_1 path by default",
+TEST_CASE("FusedQuantGemm: down-proj selector promotes exact Q6_K hot geometry "
+          "to fixed-block Q8_1 by default",
           "[native_forward]") {
   const int quant_type =
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{1, 2048, 11008, 1, true, false},
-              true, true, true) == FusedQuantGemm::DownProjOperator::kQ81Gemv);
+              true, true,
+              true) == FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed);
 }
 
-TEST_CASE("FusedQuantGemm: down-proj selector promotes exact Q6_K decode hot "
-          "shape to fixed-block Q8_1 GEMV when explicitly enabled",
+TEST_CASE("FusedQuantGemm: down-proj selector keeps exact Q6_K decode hot "
+          "shape on fixed-block Q8_1 GEMV when explicitly enabled",
           "[native_forward]") {
   const int quant_type =
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
@@ -6539,6 +6540,17 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes two-row Q6_K decode "
             "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED") ==
         0);
   }
+}
+
+TEST_CASE("FusedQuantGemm: down-proj selector promotes exact two-row Q6_K "
+          "decode to fixed-block row-pair by default",
+          "[native_forward]") {
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
+  REQUIRE(FusedQuantGemm::SelectDownProjOperator(
+              quant_type, FusedDispatchGeometry{2, 2048, 11008, 1, true, false},
+              true, true, true) ==
+          FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
 }
 
 TEST_CASE("FusedQuantGemm: down-proj selector promotes four-row Q6_K decode "
@@ -6991,6 +7003,37 @@ TEST_CASE("InferfluxCudaLinearExecutor: FFN helper falls back from Q8_1 to packe
   REQUIRE(summary.actual_op == FusedQuantGemm::FfnProjOperator::kPackedGroup);
 }
 
+TEST_CASE("InferfluxCudaLinearExecutor: FFN helper executes MMQ3 grouped Q8_1 "
+          "path before packed fallback",
+          "[native_forward]") {
+  std::vector<std::string> calls;
+  NativeFfnExecutionSummary summary;
+
+  const bool ok = ExecuteInferfluxCudaFfnProjectionStage(
+      FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3, "decode", "q4_k",
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K), 4, 11008,
+      2048,
+      [&]() {
+        calls.emplace_back("q81");
+        return true;
+      },
+      [&]() {
+        calls.emplace_back("packed");
+        return false;
+      },
+      [&]() {
+        calls.emplace_back("fallback");
+        return false;
+      },
+      &summary);
+
+  REQUIRE(ok);
+  REQUIRE(calls == std::vector<std::string>{"q81"});
+  REQUIRE(summary.used_q81);
+  REQUIRE_FALSE(summary.used_packed);
+  REQUIRE(summary.actual_op == FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3);
+}
+
 TEST_CASE("InferfluxCudaLinearExecutor: normalized projection helper computes norm "
           "once before dense fallback",
           "[native_forward]") {
@@ -7103,6 +7146,9 @@ TEST_CASE("FusedQuantGemm: metric names distinguish V2 hot-path variants",
   REQUIRE(FusedQuantGemm::FfnProjOperatorMetricName(
               FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4, q4k, 4, 2048) ==
           std::string("q8_1_group_row_quad_m4"));
+  REQUIRE(FusedQuantGemm::FfnProjOperatorMetricName(
+              FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3, q4k, 4, 2048) ==
+          std::string("q8_1_group_mmq3"));
   REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
               FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed, q4k, 2,
               11008) == std::string("q8_1_gemv_row_pair_hot_fixed"));

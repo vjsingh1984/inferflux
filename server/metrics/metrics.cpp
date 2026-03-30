@@ -2148,14 +2148,11 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_cuda_ffn_proj_operator_total counter\n";
   {
     static constexpr const char *kPhases[] = {"prefill", "decode"};
-    static constexpr const char *kOps[] = {"q8_1_group_hot_q4k",
-                                           "q8_1_group_row_pair_w4",
-                                           "q8_1_group_row_quad_m4",
-                                           "q8_1_group_v2",
-                                           "q8_1_group_generic",
-                                           "q8_1_group_row_pair",
-                                           "q8_1_group_row_quad",
-                                           "packed_group", "fallback"};
+    static constexpr const char *kOps[] = {
+        "q8_1_group_mmvq",      "q8_1_group_mmq",
+        "q8_1_group_hot_q4k",   "q8_1_group_row_pair_w4",
+        "q8_1_group_row_quad_m4", "q8_1_group_mmq3",
+        "packed_group",         "fallback"};
     std::lock_guard<std::mutex> lock(inferflux_cuda_ffn_proj_operator_mutex_);
     for (const char *phase : kPhases) {
       for (const char *op : kOps) {

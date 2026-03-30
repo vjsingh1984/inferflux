@@ -765,10 +765,15 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
   SECTION("ExecuteUnifiedBatchStep uses native burst helper for singleton decode") {
     GlobalMetrics().Reset();
     auto burst_backend = std::make_shared<MockBurstUnifiedBackend>();
-    burst_backend->burst_outputs = {
-        {.token = 43, .piece = "x", .terminal = false},
-        {.token = 44, .piece = "y", .terminal = false},
-    };
+    LlamaCppBackend::BurstDecodeOutput burst0;
+    burst0.token = 43;
+    burst0.piece = "x";
+    burst0.terminal = false;
+    LlamaCppBackend::BurstDecodeOutput burst1;
+    burst1.token = 44;
+    burst1.piece = "y";
+    burst1.terminal = false;
+    burst_backend->burst_outputs = {burst0, burst1};
 
     InferenceRequest req_decode;
     req_decode.model = "mock";

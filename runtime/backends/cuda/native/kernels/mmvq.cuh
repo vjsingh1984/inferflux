@@ -701,6 +701,109 @@ __global__ void inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
   }
 }
 
+// Q6_K x Q8_1 MMVQ accumulate variant with vectorized weight loads.
+template <int ncols>
+__global__ void inferflux_mmvq_q6k_accum_vec(
+    const block_q6_k *__restrict__ weight,
+    const block_q8_1 *__restrict__ act_q8_1, half *__restrict__ output, int N,
+    int K, int M) {
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x;
+  const int col_base = blockIdx.y * ncols;
+  if (out_idx >= N)
+    return;
+
+  const int num_super_blocks = K / QK_K;
+  const block_q6_k *wrow = weight + out_idx * num_super_blocks;
+  const int num_q8_per_row = K / QK8_1;
+
+  const int sub_pair = lane >> 3;
+  const int e_base = (lane & 7) << 2;
+  const int g = sub_pair >> 1;
+  const int sub_base = sub_pair & 1;
+  const int qh_shift_lo = sub_base * 2;
+  const int qh_shift_hi = qh_shift_lo + 4;
+  const int sc_lo = g * 8 + sub_base * 2 + e_base / 16;
+  const int sc_hi = g * 8 + (sub_base + 2) * 2 + e_base / 16;
+
+  float acc[ncols] = {};
+
+  for (int blk = warp_id; blk < num_super_blocks; blk += kMmvqWarps) {
+    const block_q6_k &b = wrow[blk];
+    const float d =
+        __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+
+    const int ql4 =
+        LoadPackedInt32Unaligned(&b.ql[g * 64 + sub_base * 32 + e_base]);
+    const int qh4 = LoadPackedInt32Unaligned(&b.qh[g * 32 + e_base]);
+
+    int vl_lo = ql4 & 0x0F0F0F0F;
+    int vh_lo = ((qh4 >> qh_shift_lo) << 4) & 0x30303030;
+    int vi_lo = Vsubss4(vl_lo | vh_lo, 0x20202020);
+
+    int vl_hi = (ql4 >> 4) & 0x0F0F0F0F;
+    int vh_hi = ((qh4 >> qh_shift_hi) << 4) & 0x30303030;
+    int vi_hi = Vsubss4(vl_hi | vh_hi, 0x20202020);
+
+    const float scale_lo = d * static_cast<float>(__ldg(&b.scales[sc_lo]));
+    const float scale_hi = d * static_cast<float>(__ldg(&b.scales[sc_hi]));
+
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      const int row = col_base + c;
+      if (row >= M)
+        break;
+
+      const block_q8_1 *a_row = act_q8_1 + row * num_q8_per_row;
+      const block_q8_1 &a_lo = a_row[blk * 8 + g * 4 + sub_base];
+      const block_q8_1 &a_hi = a_row[blk * 8 + g * 4 + sub_base + 2];
+
+      const int x_lo = *reinterpret_cast<const int *>(&a_lo.qs[e_base]);
+      const int x_hi = *reinterpret_cast<const int *>(&a_hi.qs[e_base]);
+
+      const float d8_lo = __half2float(__low2half(a_lo.ds));
+      const float d8_hi = __half2float(__low2half(a_hi.ds));
+
+      const int dot_lo = Dp4aS8(vi_lo, x_lo, 0);
+      const int dot_hi = Dp4aS8(vi_hi, x_hi, 0);
+
+      acc[c] += scale_lo * d8_lo * static_cast<float>(dot_lo) +
+                scale_hi * d8_hi * static_cast<float>(dot_hi);
+    }
+  }
+
+#pragma unroll
+  for (int c = 0; c < ncols; ++c) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      acc[c] += __shfl_down_sync(0xFFFFFFFF, acc[c], offset);
+    }
+  }
+
+  __shared__ float warp_sums[kMmvqWarps * ncols];
+  if (lane == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      const int row = col_base + c;
+      if (row >= M)
+        break;
+      float sum = 0.0f;
+      for (int w = 0; w < kMmvqWarps; ++w)
+        sum += warp_sums[c * kMmvqWarps + w];
+      output[row * N + out_idx] =
+          __float2half(sum + __half2float(output[row * N + out_idx]));
+    }
+  }
+}
+
 // ============================================================================
 // Q8_0 × Q8_1 MMVQ kernel
 // ============================================================================

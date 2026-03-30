@@ -68,11 +68,14 @@ def request_openai(endpoint: str, model: str, prompt: str, max_tokens: int,
                    stream: bool) -> Dict:
     payload = {
         "model": model,
-        "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": stream,
     }
+    if endpoint.rstrip("/").endswith("/v1/chat/completions"):
+        payload["messages"] = [{"role": "user", "content": prompt}]
+    else:
+        payload["prompt"] = prompt
     cmd = [
         "curl",
         "-sf",

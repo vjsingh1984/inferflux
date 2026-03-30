@@ -100,7 +100,10 @@ template <typename Block>
 float RunBenchmark(const std::vector<Block> &weights, int quant_type,
                    const char *label, int m,
                    bool enable_row_hot_fixed,
-                   bool enable_rowpair_hot_fixed) {
+                   bool enable_rowpair_hot_fixed,
+                   bool enable_q6k_vectorized = false,
+                   bool enable_downproj_mmq = false,
+                   int downproj_mmq_min_batch_override = -1) {
   std::printf("\nCase: %s M=%d N=%d K=%d\n", label, m, kN, kK);
 
   Block *d_w = nullptr;
@@ -135,6 +138,9 @@ float RunBenchmark(const std::vector<Block> &weights, int quant_type,
   hot_policy.enable_experimental_q81_downproj_hot_fixed = enable_row_hot_fixed;
   hot_policy.enable_experimental_q81_downproj_rowpair_hot_fixed =
       enable_rowpair_hot_fixed;
+  hot_policy.enable_q6k_vectorized = enable_q6k_vectorized;
+  hot_policy.enable_downproj_mmq = enable_downproj_mmq;
+  hot_policy.downproj_mmq_min_batch_override = downproj_mmq_min_batch_override;
 
   const auto generic_op = FusedQuantGemm::SelectDownProjOperator(
       quant_type, FusedDispatchGeometry{m, kN, kK, 1, true, false}, true, true,
@@ -220,7 +226,7 @@ int main() {
   const float q6_m1_speedup = RunBenchmark(
       MakeQ6Rows(kN, kBlocksPerRow, 7),
       static_cast<int>(GGUF::TensorType::Q6_K), "Q6_K single-row", 1, true,
-      false);
+      false, true);
   const float q4_m2_speedup = RunBenchmark(
       MakeQ4Rows(kN, kBlocksPerRow, 11),
       static_cast<int>(GGUF::TensorType::Q4_K), "Q4_K row-pair", 2, false,
@@ -228,13 +234,33 @@ int main() {
   const float q6_m2_speedup = RunBenchmark(
       MakeQ6Rows(kN, kBlocksPerRow, 13),
       static_cast<int>(GGUF::TensorType::Q6_K), "Q6_K row-pair", 2, false,
-      true);
+      true, true);
+  const float q4_m4_speedup = RunBenchmark(
+      MakeQ4Rows(kN, kBlocksPerRow, 17),
+      static_cast<int>(GGUF::TensorType::Q4_K), "Q4_K row-quad vs MMQ", 4,
+      false, false, false, true, 1);
+  const float q4_m8_speedup = RunBenchmark(
+      MakeQ4Rows(kN, kBlocksPerRow, 19),
+      static_cast<int>(GGUF::TensorType::Q4_K), "Q4_K eight-row vs MMQ", 8,
+      false, false, false, true, 1);
+  const float q6_m4_speedup = RunBenchmark(
+      MakeQ6Rows(kN, kBlocksPerRow, 23),
+      static_cast<int>(GGUF::TensorType::Q6_K), "Q6_K row-quad vs MMQ", 4,
+      false, false, false, true, 1);
+  const float q6_m8_speedup = RunBenchmark(
+      MakeQ6Rows(kN, kBlocksPerRow, 29),
+      static_cast<int>(GGUF::TensorType::Q6_K), "Q6_K eight-row vs MMQ", 8,
+      false, false, false, true, 1);
 
   std::puts("\nSummary:");
   std::printf("  Q4_K M=1 speedup: %.3fx\n", q4_m1_speedup);
   std::printf("  Q6_K M=1 speedup: %.3fx\n", q6_m1_speedup);
   std::printf("  Q4_K M=2 speedup: %.3fx\n", q4_m2_speedup);
   std::printf("  Q6_K M=2 speedup: %.3fx\n", q6_m2_speedup);
+  std::printf("  Q4_K M=4 speedup: %.3fx\n", q4_m4_speedup);
+  std::printf("  Q4_K M=8 speedup: %.3fx\n", q4_m8_speedup);
+  std::printf("  Q6_K M=4 speedup: %.3fx\n", q6_m4_speedup);
+  std::printf("  Q6_K M=8 speedup: %.3fx\n", q6_m8_speedup);
   return 0;
 #endif
 }

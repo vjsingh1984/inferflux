@@ -365,11 +365,9 @@ bool ShouldUseSpecializedQ8_1GroupedFastPathImpl(
 
 bool ShouldUseSpecializedQ8_1DownProjHotPathImpl(
     int quant_type, const FusedDispatchGeometry &geometry) {
-  const auto &policy = ResolveExecutionPolicy(nullptr);
   const bool q4k = quant_type == static_cast<int>(GGUF::TensorType::Q4_K);
   const bool q6k = quant_type == static_cast<int>(GGUF::TensorType::Q6_K);
-  if ((!q4k && !q6k) ||
-      (q6k && !policy.enable_experimental_q81_downproj_hot_fixed)) {
+  if (!q4k && !q6k) {
     return false;
   }
   return geometry.grouped_outputs == 1 && geometry.M == 1 &&
@@ -378,11 +376,9 @@ bool ShouldUseSpecializedQ8_1DownProjHotPathImpl(
 
 bool ShouldUseSpecializedQ8_1DownProjRowPairHotPathImpl(
     int quant_type, const FusedDispatchGeometry &geometry) {
-  const auto &policy = ResolveExecutionPolicy(nullptr);
   const bool q4k = quant_type == static_cast<int>(GGUF::TensorType::Q4_K);
   const bool q6k = quant_type == static_cast<int>(GGUF::TensorType::Q6_K);
-  if ((!q4k && !q6k) ||
-      (q6k && !policy.enable_experimental_q81_downproj_rowpair_hot_fixed)) {
+  if (!q4k && !q6k) {
     return false;
   }
   return geometry.grouped_outputs == 1 && geometry.M == 2 &&
@@ -1388,6 +1384,16 @@ bool DispatchQ8_1MmvqAccumQ6K(const void *data, const void *act_q8_1,
                                                         M, N, K, stream);
 }
 
+bool DispatchQ8_1MmvqAccumQ6KVec(const void *data, const void *act_q8_1,
+                                  half *output, int M, int N, int K,
+                                  cudaStream_t stream) {
+  return DispatchMmvqAccum<block_q6_k, inferflux_mmvq_q6k_accum_vec<1>,
+                           inferflux_mmvq_q6k_accum_vec<2>,
+                           inferflux_mmvq_q6k_accum_vec<4>,
+                           inferflux_mmvq_q6k_accum_vec<8>>(
+      data, act_q8_1, output, M, N, K, stream);
+}
+
 bool DispatchQ8_1MmvqAccumQ8_0(const void *data, const void *act_q8_1,
                                 half *output, int M, int N, int K,
                                 cudaStream_t stream) {
@@ -1419,8 +1425,17 @@ bool DispatchQ8_1GemvAccumQ4K(const void *data, const void *act_q8_1,
 bool DispatchQ8_1GemvAccumQ6K(const void *data, const void *act_q8_1,
                                half *output, int M, int N, int K,
                                cudaStream_t stream) {
-  if (M <= 8)
+  if (M <= 8) {
+    const auto &policy = ResolveExecutionPolicy(nullptr);
+    const auto &gpu = GetGpuProfile();
+    const bool auto_enable_small_ada =
+        gpu.initialized && gpu.sm_major == 8 && gpu.sm_minor == 9 && M <= 2;
+    if (policy.enable_q6k_vectorized || auto_enable_small_ada) {
+      return DispatchQ8_1MmvqAccumQ6KVec(data, act_q8_1, output, M, N, K,
+                                         stream);
+    }
     return DispatchQ8_1MmvqAccumQ6K(data, act_q8_1, output, M, N, K, stream);
+  }
   return false;
 }
 
@@ -1544,11 +1559,13 @@ bool DispatchQ8_1GemvQ4K(const void *data, const void *act_q8_1, half *output,
 bool DispatchQ8_1GemvQ6K(const void *data, const void *act_q8_1, half *output,
                           int M, int N, int K, cudaStream_t stream) {
   if (M <= 8) {
-    // NOTE: Q6_K vectorized variant (DispatchQ8_1MmvqQ6KVec) is disabled
-    // pending optimization — __ldg on unaligned Q6_K ql/qh fields and
-    // pre-computed scale factors increase register pressure without
-    // improving bandwidth on Ada architecture. Needs ncu profiling
-    // to identify a correct vectorization strategy.
+    const auto &policy = ResolveExecutionPolicy(nullptr);
+    const auto &gpu = GetGpuProfile();
+    const bool auto_enable_small_ada =
+        gpu.initialized && gpu.sm_major == 8 && gpu.sm_minor == 9 && M <= 2;
+    if (policy.enable_q6k_vectorized || auto_enable_small_ada) {
+      return DispatchQ8_1MmvqQ6KVec(data, act_q8_1, output, M, N, K, stream);
+    }
     return DispatchQ8_1MmvqQ6K(data, act_q8_1, output, M, N, K, stream);
   }
   if (M <= 64)
@@ -2056,6 +2073,13 @@ bool FusedQuantGemm::GemvQ8_1Pair(
       M,    std::max(projections[0].output_cols, projections[1].output_cols),
       K,    2,
       true, false};
+  if (selected_op == FusedQuantGemm::FfnProjOperator::kFallback && policy) {
+    // Keep non-runtime callers aligned with the same policy-driven grouped FFN
+    // operator selection used by transformer_forward.
+    selected_op = SelectFfnProjOperator(
+        quant_type, quant_type, geometry, /*allow_q81=*/true,
+        /*allow_packed=*/false, policy);
+  }
   if (selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3) {
     static bool mmq3_logged[kMaxTensorType] = {};
     if (idx < kMaxTensorType && !mmq3_logged[idx] && entry.name) {

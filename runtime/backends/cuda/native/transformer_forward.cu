@@ -2341,12 +2341,26 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
         NVTX_SCOPE("FFN");
         auto gate_raw = weights_->LayerGateProjRaw(layer);
         auto up_raw = weights_->LayerUpProjRaw(layer);
+        const auto ffn_selected_op = SelectInferfluxCudaFfnProjOperator(
+            gate_raw, up_raw, InferfluxCudaDispatchPhase::kDecode,
+            FusedDispatchGeometry{B, intermediate_size_, hidden_size_, 2, true,
+                                  !ffn_norm_precomputed},
+            g_allow_fused_quantized_matmul, execution_policy_);
 
         // Try fused gate+up+SiLU MMVQ: single kernel reads both weight
         // matrices and applies SiLU activation at write-back, halving
-        // weight memory traffic vs separate gate+up projections.
+        // weight memory traffic vs separate gate+up projections. However,
+        // measured decode throughput on the live grouped FFN path shows the
+        // MMQ3/row-quad grouped kernels overtaking fusion at M>=4, so keep
+        // those specialized grouped operators on the critical path.
         if constexpr (std::is_same_v<T, half>) {
+          const bool prefer_grouped_q81_pair_fast_path =
+              ffn_selected_op ==
+                  FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3 ||
+              ffn_selected_op ==
+                  FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4;
           if (execution_policy_.enable_fused_gate_up_silu &&
+              !prefer_grouped_q81_pair_fast_path &&
               !Q81ActivationsDisabled(execution_policy_) && d_act_q8_1_ &&
               gate_raw.data && up_raw.data &&
               gate_raw.quant_type == up_raw.quant_type &&
@@ -2398,11 +2412,6 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
         const std::array<PackedProjectionPlan<T>, 2> ffn_plans = {
             {{gate_raw, d_ffn_gate_, intermediate_size_},
              {up_raw, d_ffn_up_, intermediate_size_}}};
-        const auto ffn_selected_op = SelectInferfluxCudaFfnProjOperator(
-            gate_raw, up_raw, InferfluxCudaDispatchPhase::kDecode,
-            FusedDispatchGeometry{B, intermediate_size_, hidden_size_, 2, true,
-                                  !ffn_norm_precomputed},
-            g_allow_fused_quantized_matmul, execution_policy_);
         const std::string ffn_quant =
             ProjectionGroupQuantLabel(gate_raw, up_raw);
         NativeFfnExecutionSummary ffn_summary;

@@ -96,6 +96,7 @@ BenchmarkResult RunSeparatePathBenchmark(const QuantizedWeightInfo &gate_info,
                                          const QuantizedWeightInfo &up_info,
                                          const void *d_act_q8_1, int m,
                                          const NativeExecutionPolicy &policy,
+                                         FusedQuantGemm::FfnProjOperator op,
                                          cudaStream_t stream) {
   half *d_gate = nullptr;
   half *d_up = nullptr;
@@ -119,7 +120,7 @@ BenchmarkResult RunSeparatePathBenchmark(const QuantizedWeightInfo &gate_info,
     cudaEventCreate(&stop);
     for (int i = 0; i < kWarmupIters; ++i) {
       FusedQuantGemm::GemvQ8_1Pair(projections, d_act_q8_1, m, kHiddenSize,
-                                   stream, &policy);
+                                   stream, &policy, op);
       inferflux::cuda_kernel::SiluMul(d_gate, d_up, d_out,
                                       m * kIntermediateSize, stream);
     }
@@ -127,7 +128,7 @@ BenchmarkResult RunSeparatePathBenchmark(const QuantizedWeightInfo &gate_info,
     cudaEventRecord(start, stream);
     for (int i = 0; i < kBenchmarkIters; ++i) {
       FusedQuantGemm::GemvQ8_1Pair(projections, d_act_q8_1, m, kHiddenSize,
-                                   stream, &policy);
+                                   stream, &policy, op);
       inferflux::cuda_kernel::SiluMul(d_gate, d_up, d_out,
                                       m * kIntermediateSize, stream);
     }
@@ -286,7 +287,7 @@ void RunCase(int m) {
 
   const BenchmarkResult separate =
       RunSeparatePathBenchmark(gate_info, up_info, d_act_q8_1, m,
-                               default_policy, stream);
+                               default_policy, separate_op, stream);
   const BenchmarkResult fused =
       RunFusedPathBenchmark(gate_info, up_info, d_act_q8_1, m, stream);
   const BenchmarkResult epilogue =

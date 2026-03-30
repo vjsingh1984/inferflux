@@ -34,6 +34,7 @@ class _RequestHandler(http.server.BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         payload = json.loads(raw.decode("utf-8"))
         if self.path == "/v1/completions":
+            assert payload.get("prompt") == "ping"
             if payload.get("stream"):
                 body = (
                     'data: {"choices":[{"text":"ready"}]}\n\n'
@@ -49,6 +50,35 @@ class _RequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             body = json.dumps(
                 {"choices": [{"text": "ready steady"}], "usage": {"completion_tokens": 2}}
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if self.path == "/v1/chat/completions":
+            messages = payload.get("messages", [])
+            assert isinstance(messages, list)
+            assert messages[0]["role"] == "user"
+            assert messages[0]["content"] == "ping"
+            if payload.get("stream"):
+                body = (
+                    'data: {"choices":[{"delta":{"content":"ready"}}]}\n\n'
+                    'data: {"choices":[{"delta":{"content":" stream"}}]}\n\n'
+                    'data: {"usage":{"completion_tokens":2}}\n\n'
+                    "data: [DONE]\n\n"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = json.dumps(
+                {"choices": [{"message": {"content": "ready steady"}}],
+                 "usage": {"completion_tokens": 2}}
             ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -120,6 +150,34 @@ class BenchmarkRequestDriverTests(unittest.TestCase):
             "ping",
             4,
             "req-2",
+            "",
+            inferflux_style=False,
+            stream=True,
+        )
+        self.assertEqual(result["text"], "ready stream")
+        self.assertEqual(result["tokens"], 2)
+
+    def test_openai_chat_non_streaming_request(self):
+        result = driver.request_openai(
+            f"{self.base_url}/v1/chat/completions",
+            "stub-model",
+            "ping",
+            4,
+            "req-2b",
+            "",
+            inferflux_style=False,
+            stream=False,
+        )
+        self.assertEqual(result["text"], "ready steady")
+        self.assertEqual(result["tokens"], 2)
+
+    def test_openai_chat_streaming_request(self):
+        result = driver.request_openai(
+            f"{self.base_url}/v1/chat/completions",
+            "stub-model",
+            "ping",
+            4,
+            "req-2c",
             "",
             inferflux_style=False,
             stream=True,

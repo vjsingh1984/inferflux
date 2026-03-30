@@ -1,100 +1,80 @@
 # InferFlux Tech Debt and Competitive Roadmap
 
-**Snapshot date:** March 27, 2026
-**Current overall grade:** B
-**Purpose:** Rank the debt that most directly blocks best-in-class runtime credibility.
+**Snapshot date:** March 29, 2026  
+**Current overall grade:** B-
 
 ```mermaid
 flowchart TB
-    A[Current B] --> B[Strengths]
+    A[Current B-] --> B[Strengths]
     A --> C[Debt hotspots]
     B --> B1[Control-plane rigor]
-    B --> B2[Explicit backend identity]
-    B --> B3[Native feature ownership]
-    C --> C1[Quantized native throughput]
-    C --> C2[Distributed ownership maturity]
-    C --> C3[Required GPU release enforcement]
+    B --> B2[Backend identity]
+    B --> B3[Real native CUDA path]
+    C --> C1[Decode down-proj throughput]
+    C --> C2[GPU CI and release enforcement]
+    C --> C3[Distributed ownership maturity]
+    C --> C4[Release-surface hygiene]
 ```
 
 ## 1) Dimension Grades
 
 | Dimension | Grade | Strong today | Weak today |
 |---|---|---|---|
-| Vision/product coherence | B+ | Clear server-first product shape and explicit dual-CUDA strategy | Native-throughput story still runs ahead of proof on quantized GGUF |
-| Capabilities | A- | Logprobs (native), embeddings (native), streaming, structured output (delegate), strong API/admin/CLI contracts | Structured output still delegates to llama.cpp fallback |
-| Scalability/economy | C+ | Fairness, phased execution, prefix reuse, split roles, batched decode default-on, and transport-health semantics | Distributed ownership/cleanup semantics are still shallow |
-| Resource efficiency | B+ | KV planner, load-scoped precision, memory-first dequant, 50+ fused GEMV kernels, batched decode default-on with CUDA graph capture, execution policy refactor. Sequential parity 0.83x llama.cpp on Qwen2.5-3B Q4_K_M (P0 gate met). Stepwise native burst decode is now reachable in live phased decode traffic. | Long-run WSL2 comparison still trails materially: `0.69x` llama.cpp at `c=4`, `0.74x` at `c=8`, and `0.42x` at `c=16`; memory peak remains ~`2.6 GB` higher than llama.cpp on the same matrix |
-| Design/implementation | B | Clean provider split, bounded session-state model, native-owned logprobs and embeddings | Transitional complexity remains until throughput and structured output close |
-| TDD/CI maturity | B+ | 100+ kernel tests, 25+ sampling/logprob tests, contract suites explicit | Required GPU/provider lane is still missing |
-| OSS docs/operator clarity | A- | Canonical docs are compact and code-aligned | None significant |
+| Vision and product coherence | B+ | Clear server-first product with explicit dual-CUDA strategy | Native CUDA story still needs stronger sustained-concurrency proof |
+| Capabilities | A- | Streaming, embeddings, admin APIs, logprobs, metrics, fallback identity | Structured-output dependence on compatibility paths is still not fully retired |
+| Scalability and economy | C+ | Scheduler, batching, KV planning, operator metrics, memory-first GGUF direction | Native CUDA still loses ground at higher concurrency; distributed ownership semantics remain shallow |
+| Resource efficiency | B- | GGUF stays quantized, KV planner is real, native metrics expose operator choices | Decode down-proj still burns too much time in live `c=8` style traffic |
+| Design and implementation | B | Runtime/provider split is coherent and testable; native CUDA kernels are real, not scaffold-only | Transitional complexity is still high around dispatch policy, benchmark harnesses, and compatibility overlap |
+| TDD and CI maturity | B | Good focused tests and source-aligned docs gate | Required GPU/provider lane is still missing |
+| OSS release readiness | B- | Canonical docs, release workflow, and repo-root OSS files can now be made explicit | Artifact clutter, local benchmark sprawl, and release hygiene still require ongoing discipline |
 
-## 2) Revalidated Evidence
+## 2) Current Competitive Reading
 
-| Evidence | Result | Implication |
-|---|---|---|
-| Backend/provider contract | Explicit provider/fallback semantics in runtime, API, CLI, admin, and metrics | Strong automation and policy posture |
-| Native logprobs | Logprobs computed natively (GPU logits D2H + log-softmax + top-N). `SupportsLogprobsContract() = true`. No parity delegate needed. | OpenAI logprobs/top_logprobs spec fully supported on native path |
-| InferFlux CUDA embeddings | Mean-pooled embedding extraction via full forward + final RmsNorm + MeanPool kernel. `SupportsEmbeddingsContract() = true`. Falls back to delegate only if InferFlux CUDA extraction fails. | `/v1/embeddings` works on InferFlux CUDA without llama.cpp delegate |
-| Batched decode default-on | Batched kernels (BatchedRoPE, KvAppend, FlashDecodeMultiSeq) are now default-on. Opt-out via `INFERFLUX_DISABLE_BATCHED_DECODE=1`. Verified with 8 concurrent Qwen2.5-3B requests + CUDA graphs for B=1-4. | 40% throughput gain for concurrent workloads without operator action |
-| Native memory-economy foundation | `dequant_cache_policy=none`, KV planner, and native KV metrics are wired | Good edge-device direction; Q8_1 path improved TinyLlama throughput 49% (161 -> 240 tok/s) |
-| Native kernel maturity | 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp), 3 batched decode kernels, adaptive dispatch geometry, 100+ TDD test cases, execution policy refactor (env vars centralized into `NativeExecutionPolicy`) | Kernel coverage is broad; v2 cooperative-warp architecture targets L2 bandwidth gap |
-| Stepwise native burst decode | Executor-side singleton burst path is now live for phased decode traffic. Current WSL2 long sweep settled on `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS=4` as the balanced default (`64.1/73.4/99.5/109.8/123.9 tok/s` at `c=1/2/4/8/16`). | Throughput tuning is now evidence-backed. The remaining gap is no longer a harness blind spot: matching long-run llama.cpp results are `111.2/110.5/144.2/148.8/293.7 tok/s` |
-| Session handle foundation | Optional TTL-based session leases exist in unified scheduler mode | Correct contract direction without changing default stateless behavior |
-| Distributed transport foundation | Ticket lifecycle, timeout streak/debt, readiness impact, admin pools visibility, and optional fail-closed generation admission are implemented | Moves distributed runtime beyond scaffold-only claims, but not yet to robust ownership maturity |
+| Area | Current reading |
+|---|---|
+| `llama_cpp_cuda` vs Ollama | Strong published repo advantage; keep this as the stable public benchmark claim |
+| `inferflux_cuda` vs `llama_cpp_cuda` | Native is competitive around `c=4` in the current Windows harness, but still behind at `c=8` |
+| Native hot path reality | FFN grouped MMQ3 is live; the remaining gap is centered on decode down-proj row-pair/row-quad cost |
+| Distributed runtime | Honest foundation exists, but not enough for strong ownership-safe claims |
 
 ## 3) Debt Register
 
 | Priority | Debt item | Why it matters | Retirement gate | Status |
 |---|---|---|---|---|
-| ~~P0~~ | ~~Quantized GGUF native throughput parity~~ | **Done**: V1 column-major GEMV achieves 0.83x llama.cpp sequential on Qwen2.5-3B Q4_K_M (72.8 vs 88.6 tok/s). V2 cooperative-warp available via `INFERFLUX_GEMV_V2=1` but slower on Ada (0.79x). | ~~Native sequential decode reaches >= 0.8x llama.cpp~~ | **Done** |
-| P1 | Distributed sequence ownership cleanup | Transport signaling without deterministic cleanup still limits real distributed credibility | Eviction, timeout, and worker-loss cleanup are explicit and tested | Not started |
-| P1 | Native structured output | Delegate coupling remains for grammar-constrained generation | Grammar constraint sampler runs natively on CUDA | Not started |
-| P1 | GPU KV/page allocator maturity | Memory economy must hold under concurrency, not only at load time | Stable reuse metrics and predictable planner behavior under load | Not started |
-| P1 | Mandatory GPU behavior lane | Native regressions should block merges, not be discovered later | Required CI block for native/provider/runtime gates | Not started |
-| ~~P1~~ | ~~Long-run competitive harness parity~~ | ~~Throughput grade changes should not depend on short or stale comparison runs~~ | ~~`llama_cpp_cuda` long-run benchmark completes under the same harness and request matrix as native burst runs~~ | **Done** |
+| P0 | Decode down-proj row-pair and row-quad throughput | Current live `c=8` operator metrics point here as the remaining native bottleneck | Native decode down-proj kernels improve sustained concurrent serving without regressing `c=4` | In progress |
+| P0 | Required GPU/provider CI lane | Native CUDA regressions are still too easy to discover late | Release-blocking GPU/provider runtime lane exists and is enforced | Not started |
+| P1 | Native structured output independence | Compatibility fallback still owns some important generation behavior | Grammar-constrained generation runs natively on the CUDA path | Not started |
+| P1 | Distributed sequence ownership cleanup | Transport health exists, but cleanup and worker-loss semantics are still not operations-grade | Ownership transfer, cleanup, and failure handling are deterministic and tested | Not started |
+| P1 | Release-surface hygiene | OSS release credibility drops when local profiling artifacts and stale claims leak into the tree | Local benchmark/profiling noise stays ignored and release docs remain code-aligned | In progress |
+| P2 | Benchmark harness unification | Windows-native and older Linux/WSL benchmark narratives had diverged | One maintained, source-aligned benchmark story is used for release-facing docs | In progress |
 
-## 4) Retired Debt (This Session)
+## 4) Tech Debt Grade Notes
 
-| Item | What changed |
-|---|---|
-| Batched decode default-on | Promoted from opt-in to default-on. `INFERFLUX_DISABLE_BATCHED_DECODE=1` for opt-out. |
-| Native logprobs | Implemented natively — GPU logits copy + `ComputeLogprob()`. No parity delegate needed. |
-| Native embeddings | Mean-pooled embedding extraction via `EmbedForward()` + `MeanPool` kernel. Delegate fallback only if native fails. |
-| Native-first parity independence | Logprobs and embeddings are now native-owned. Only structured output still delegates. |
-| Stepwise native burst integration | Native singleton burst decode now runs from the live phased decode path, not only the standalone `Generate()` flow. |
-
-## 5) Outdated Patterns To Retire
-
-| Pattern | Better practice |
-|---|---|
-| Treating async support as proof of throughput | Measure batch quality, graph residency, and native hot-path residency instead |
-| Static VRAM reservations | Plan KV sizing against budget and publish the decision |
-| Treating `/readyz` as passive-only observability | Allow transport-health to influence admission where operators choose fail-closed mode |
-| Claiming distributed readiness from topology scaffolding alone | Require ticket lifecycle, ownership semantics, and failure-path tests |
-
-See [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) for the migration table.
-
-## 6) Two-CUDA-Backend Value Split
-
-| Axis | `inferflux_cuda` provider | `llama_cpp_cuda` provider |
+| Grade | Why it is not lower | Why it is not higher |
 |---|---|---|
-| Why it exists | Native performance/control path | Stable compatibility and fallback path |
-| What it does well now | Policy-visible identity, native loaders, memory-economy foundation, 50+ fused GEMV kernels, batched decode default-on, native logprobs, native embeddings, CUDA graph capture, execution policy refactor, 0.83x sequential parity, 100+ TDD tests | Mature GGUF compatibility |
-| What still lags | Concurrent throughput still trails at sustained concurrency (`0.69x` at `c=4`, `0.74x` at `c=8`, `0.42x` at `c=16`); memory overhead (~`2.6 GB`); structured output still delegates | InferFlux-specific kernel/runtime headroom |
-| Why both stay | They solve different operational risks today | They keep the control plane stable while native matures |
+| B- overall | The codebase has a real server, real tests, real native kernels, and explicit backend identity | Native CUDA still lacks a clean sustained-concurrency win over the compatibility backend, and GPU CI is still optional |
 
-## 7) Competitive Direction
+## 5) Recommended Next Execution Order
 
-| Area | Keep | Close next |
+| Order | Work item | Reason |
 |---|---|---|
-| Control plane | API/admin/CLI rigor, routing policy, observability, admin pools | Keep current lead |
-| Native runtime | Loader detection, memory policy, provider identity, native logprobs/embeddings, batched decode, CUDA graphs, 0.83x sequential parity, stepwise native burst decode, execution policy refactor | Close the remaining concurrent throughput gap, reduce the ~`2.6 GB` memory delta, native structured output, arena scratch allocator |
-| Distributed runtime | Honest bounded claims plus transport-health semantics | Close ownership cleanup, worker-loss handling, and failure CI before broadening claims |
+| 1 | Optimize decode down-proj row-pair and row-quad kernels | This is the hottest remaining live path in current metrics |
+| 2 | Add a required GPU/provider behavior lane | Prevent performance and routing regressions from landing unnoticed |
+| 3 | Reduce compatibility dependence for structured output | Shrink the last major capability gap between native and compatibility paths |
+| 4 | Harden release hygiene | Keep release docs and artifact policy aligned with real repo state |
 
-## 8) Canonical References
+## 6) OSS Release Readiness Review
 
+| Area | Grade | Reading |
+|---|---|---|
+| Licensing and root metadata | B | Root OSS metadata can be explicit and conventional |
+| Canonical docs | B | Good structure, but several CUDA claims needed updating to current measurements |
+| Release process | B | Workflow and process docs exist, but release quality still depends too much on manual GPU validation |
+| Repository hygiene | C+ | Local benchmark/profiling artifact churn is still easy to accumulate |
+
+## 7) Canonical References
+
+- [README](../README.md)
+- [benchmarks](benchmarks.md)
 - [Roadmap](Roadmap.md)
-- [Architecture](Architecture.md)
-- [GEMV_KERNEL_ARCHITECTURE](GEMV_KERNEL_ARCHITECTURE.md)
 - [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md)
-- [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md)

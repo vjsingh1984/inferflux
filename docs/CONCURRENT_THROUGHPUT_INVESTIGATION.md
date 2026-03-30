@@ -1,5 +1,7 @@
 # Concurrent Throughput Investigation: Batch Size Analysis
 
+**Status class**: Archived deep dive. Use [benchmarks](benchmarks.md) and [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) for the current public reading.
+
 **Date**: March 10, 2026
 **Task**: Investigate 0.50x concurrent throughput gap (0.83x sequential)
 **Status**: ✅ COMPLETE - Key finding: NOT a batch size limit issue

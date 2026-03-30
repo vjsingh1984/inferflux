@@ -185,11 +185,15 @@ class NativeMetricsStubTests(unittest.TestCase):
             body,
         )
         self.assertIn(
-            'inferflux_cuda_ffn_proj_operator_total{phase="prefill",operator="q8_1_group_v2"}',
+            'inferflux_cuda_ffn_proj_operator_total{phase="prefill",operator="q8_1_group_mmvq"}',
             body,
         )
         self.assertIn(
-            'inferflux_cuda_ffn_proj_operator_total{phase="prefill",operator="q8_1_group_generic"}',
+            'inferflux_cuda_ffn_proj_operator_total{phase="prefill",operator="q8_1_group_mmq"}',
+            body,
+        )
+        self.assertIn(
+            'inferflux_cuda_ffn_proj_operator_total{phase="decode",operator="q8_1_group_mmq3"}',
             body,
         )
         self.assertIn(

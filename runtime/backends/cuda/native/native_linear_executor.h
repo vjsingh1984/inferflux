@@ -72,7 +72,8 @@ bool ExecuteInferfluxCudaFfnProjectionStage(
   if (selected_op == FusedQuantGemm::FfnProjOperator::kQ81Group ||
       selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K ||
       selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4 ||
-      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4) {
+      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4 ||
+      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3) {
     local_summary.used_q81 = std::forward<TryQ81Fn>(try_q81_group)();
     if (local_summary.used_q81) {
       local_summary.actual_op = selected_op;
