@@ -1068,6 +1068,11 @@ void Scheduler::DecodeWorkerLoop() {
 
     if (auto direct_step_backend = resolve_direct_step_backend()) {
       metrics_->RecordDecodeWorkerExecutionPath("direct_stepwise");
+      const bool native_direct_step_backend =
+          direct_step_backend->Name() == "inferflux_cuda";
+      if (native_direct_step_backend) {
+        metrics_->RecordDecodeWorkerExecutionPath("direct_stepwise_native");
+      }
 
       RequestBatch step_batch;
       step_batch.batch_id =
@@ -1130,8 +1135,6 @@ void Scheduler::DecodeWorkerLoop() {
           batch.empty() ? nullptr : std::move(direct_step_backend);
       continue;
     }
-
-    metrics_->RecordDecodeWorkerExecutionPath("general");
 
     ResolveBackends(batch);
 
@@ -1213,6 +1216,9 @@ void Scheduler::DecodeWorkerLoop() {
     if (exec_pending.empty())
       continue;
 
+    metrics_->RecordDecodeWorkerExecutionPath(
+        "general");
+
     bool use_stepwise_decode = config_.decode_burst_tokens == 0;
     std::shared_ptr<LlamaCppBackend> step_backend;
     if (use_stepwise_decode) {
@@ -1237,6 +1243,11 @@ void Scheduler::DecodeWorkerLoop() {
 
     std::vector<InferenceResult> responses;
     if (use_stepwise_decode) {
+      const bool native_step_backend =
+          step_backend && step_backend->Name() == "inferflux_cuda";
+      if (native_step_backend) {
+        metrics_->RecordDecodeWorkerExecutionPath("direct_stepwise_native");
+      }
       RequestBatch step_batch;
       step_batch.batch_id = exec_batch.batch_id;
       step_batch.requests.reserve(exec_pending.size());
@@ -1258,6 +1269,17 @@ void Scheduler::DecodeWorkerLoop() {
         SyncSequenceSlotProgress(pending->inference);
       }
     } else {
+      bool native_backend_decode = !overrides.empty();
+      for (const auto &backend : overrides) {
+        if (!backend || backend->Name() != "inferflux_cuda") {
+          native_backend_decode = false;
+          break;
+        }
+      }
+      if (native_backend_decode) {
+        metrics_->RecordDecodeWorkerExecutionPath(
+            "general_native_backend_decode");
+      }
       responses = executor_->ExecuteBatch(exec_batch, overrides);
     }
 

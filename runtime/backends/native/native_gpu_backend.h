@@ -35,6 +35,11 @@ public:
   std::vector<UnifiedBatchOutput>
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override;
   bool SupportsAsyncUnifiedBatch() const override;
+  bool TryGreedyBurstDecodeTokens(
+      int sequence_id, int n_past_start, int first_token_id,
+      const SamplingParams &sampling, int max_tokens,
+      std::vector<BurstDecodeOutput> *outputs,
+      std::string *reason = nullptr) override;
   bool SupportsSplitPrefillDecodeHandoff() const override;
   bool SupportsProcessLocalSequenceTransfer() const override;
   UnifiedBatchHandle SubmitUnifiedBatchAsync(
@@ -126,6 +131,12 @@ private:
   SamplingParams SnapshotSamplingParams() const;
   TokenLogprob CollectNativeLogprob(int token_id, const std::string &piece,
                                     int top_n);
+  int NativeBurstChunkTokens() const;
+  const char *NativeBurstDecodeIneligibleReason(
+      const SamplingParams &sampling, bool collect_logprobs,
+      bool has_chunk_callback,
+      const std::vector<std::string> &stop_seqs,
+      const ITokenizer *tokenizer) const;
 
   std::unique_ptr<NativeInferenceRuntime> runtime_;
   std::filesystem::path loaded_model_path_;

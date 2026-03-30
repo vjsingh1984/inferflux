@@ -212,6 +212,10 @@ Session handle contract:
 - KV dtype stays server/model-load scoped (`runtime.cuda.kv_cache_dtype`), not per request/session.
 - `runtime.scheduler.policy` can be overridden with `INFERFLUX_SCHED_POLICY`.
 - Scheduler mixed-step env overrides: `INFERFLUX_SCHED_DECODE_BURST_TOKENS`, `INFERFLUX_SCHED_CHUNKED_PREFILL_TOKENS`, `INFERFLUX_SCHED_MIXED_PREFILL_BUDGET_RATIO`.
+- Native stepwise burst env override: `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS`.
+  Current sensible default for the March 27 WSL2/native CUDA burst solution is `4`.
+  Use `2` for low-concurrency interactive traffic and keep `8` for explicit high-concurrency experiments only.
+- Keep `runtime.scheduler.decode_burst_tokens=0` unless you are explicitly testing scheduler fairness slices; it is not the same knob as `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS`.
 
 ### KV cache
 

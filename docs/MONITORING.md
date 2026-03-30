@@ -94,6 +94,14 @@ Benchmark harness knobs:
 - `INFERFLUX_BENCH_MIN_BATCH_SIZE=<n>`
 - `INFERFLUX_BENCH_BATCH_ACCUMULATION_MS=<ms>`
 - `INFERFLUX_BENCH_DECODE_BURST_TOKENS=<n>`
+- `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS=<n>`
+  Tunes the executor-side singleton native burst path used by stepwise decode. This is the current throughput knob for the production burst integration, distinct from `decode_burst_tokens`.
+  Current WSL2 guidance:
+  - `4` for balanced throughput
+  - `2` for lower-concurrency serving
+  - `8` only for explicit high-concurrency experiments
+- `BACKEND_STARTUP_TIMEOUT_SEC=<sec>`
+  Benchmark-harness only. Default is backend-aware (`60s`, `llama_cpp_cuda=180s`). Increase only when cold-start `llama_cpp_cuda` load time would otherwise masquerade as a throughput failure.
 - `INFERFLUX_BENCH_NATIVE_TIMING_SAMPLE_RATE=<n>`
   `0` disables InferFlux CUDA event timing; `N>0` records every `N`th InferFlux CUDA work item across both decode batches and prefill requests.
   The harness default for `INFERFLUX_BENCH_DECODE_BURST_TOKENS` is `0`; use `>1` only for explicit throughput experiments because native exact-match parity is not closed there yet.
@@ -110,7 +118,15 @@ Logging control:
 Measured starting point, not a global default:
 - On RTX 4000 Ada with `qwen2.5-3b-instruct-q4_k_m.gguf`, a short `concurrency=4` probe improved native throughput when moving from `min_batch_size=1,batch_accumulation_ms=2` to `min_batch_size=2,batch_accumulation_ms=6`.
 - Raising the window further to `10ms` increased `decode` multi-row buckets slightly but reduced net throughput.
-- Raising `decode_burst_tokens` from the harness-safe default `0` to `8` improved native throughput only modestly on the same probe but regressed exact match from `8/10` to `6/10`, so treat `>1` as experiment-only until native batched decode parity is proven.
+- Keep `runtime.scheduler.decode_burst_tokens=0` for the current native-burst solution. That scheduler slice knob is not the same as the executor-side native burst path and should remain experiment-only.
+- March 27 WSL2 long sweep for the executor-side native burst path (`32` requests, `32` max tokens, `1/2/4/8/16` concurrency):
+  - `chunk=2`: better at `c=2` / `c=4`
+  - `chunk=4`: best balanced default
+  - `chunk=8`: better only at `c=8`, regressive at lower concurrency
+- Matching long-run `llama_cpp_cuda` comparison after the harness startup-timeout fix:
+  - native `chunk=4` ratios vs `llama_cpp_cuda`: `0.58x / 0.66x / 0.69x / 0.74x / 0.42x` at `c=1/2/4/8/16`
+  - use this as the current competitive baseline until a new run supersedes it
+- `INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT=1` remains A/B-only. Keep it disabled by default unless a measured workload proves otherwise.
 - Use the native forward batch-size and geometry metrics to validate that a tuning change improved the actual live decode envelope before changing defaults.
 
 ## 5) Throughput Gate Contract

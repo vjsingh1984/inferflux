@@ -198,7 +198,7 @@ private:
   std::atomic<int> hydrate_calls_{0};
 };
 
-class AsyncLaneStubBackend final : public ReadyStubBackend {
+class AsyncLaneStubBackend : public ReadyStubBackend {
 public:
   explicit AsyncLaneStubBackend(std::string output)
       : ReadyStubBackend(std::move(output)) {}
@@ -335,6 +335,7 @@ private:
 
   static std::atomic<int> global_submission_ticket_;
 };
+
 
 class PromptRecordingSliceBackend final : public LlamaCppBackend {
 public:
@@ -1125,6 +1126,7 @@ TEST_CASE("Scheduler sticky decode fill skips incompatible queue head",
               sticky_merged_requests_before ==
           2);
 }
+
 
 TEST_CASE("Scheduler preserves bound backend for in-flight decode requests",
           "[scheduler]") {

@@ -247,6 +247,9 @@ TEST_CASE("MetricsRegistry records decode worker batch-size counters",
   registry.RecordDecodeWorkerExecutionPath("direct_stepwise");
   registry.RecordDecodeWorkerExecutionPath("general");
   registry.RecordDecodeWorkerExecutionPath("direct_stepwise");
+  registry.RecordDecodeWorkerExecutionPath("direct_stepwise_native");
+  registry.RecordDecodeWorkerExecutionPath("direct_stepwise_native_burst");
+  registry.RecordDecodeWorkerExecutionPath("general_native_backend_decode");
   registry.RecordDecodeWorkerStickyMerge(2);
   registry.RecordDecodeWorkerStickyMerge(1);
   registry.RecordDecodeWorkerStickyMerge(2);
@@ -266,6 +269,15 @@ TEST_CASE("MetricsRegistry records decode worker batch-size counters",
                       "path=\"direct_stepwise\"} 2") != std::string::npos);
   REQUIRE(output.find("inferflux_scheduler_decode_worker_execution_path_total{"
                       "path=\"general\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_decode_worker_execution_path_total{"
+                      "path=\"direct_stepwise_native\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_decode_worker_execution_path_total{"
+                      "path=\"direct_stepwise_native_burst\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_decode_worker_execution_path_total{"
+                      "path=\"general_native_backend_decode\"} 1") !=
+          std::string::npos);
   REQUIRE(output.find("# HELP inferflux_scheduler_decode_worker_sticky_merge_total") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_scheduler_decode_worker_sticky_merge_total{"

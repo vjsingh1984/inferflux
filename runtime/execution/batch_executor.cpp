@@ -1320,6 +1320,85 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     return;
   }
   GlobalMetrics().RecordDecodeStepLoops("unified_step", 1);
+  const bool native_step_backend = backend->Name() == "inferflux_cuda";
+
+  if (active_prefill_reqs == 0 && active_decode_reqs == 1) {
+    InferenceRequest *burst_req = nullptr;
+    for (auto *req : active_reqs) {
+      if (!req->exec_in_prefill &&
+          req->exec_tokens_generated < req->exec_decode_limit) {
+        burst_req = req;
+        break;
+      }
+    }
+    if (burst_req) {
+      std::vector<LlamaCppBackend::BurstDecodeOutput> burst_outputs;
+      std::string burst_reason;
+      const int remaining_tokens =
+          std::max(1, burst_req->exec_decode_limit - burst_req->exec_tokens_generated);
+      if (backend->TryGreedyBurstDecodeTokens(
+              burst_req->sequence_id, burst_req->n_past,
+              burst_req->exec_current_token, burst_req->sampling,
+              remaining_tokens, &burst_outputs, &burst_reason)) {
+        GlobalMetrics().RecordDecodeWorkerExecutionPath(
+            "direct_stepwise_native_burst");
+        for (const auto &burst_out : burst_outputs) {
+          burst_req->n_past += 1;
+          burst_req->exec_current_token = burst_out.token;
+
+          if (burst_out.terminal || burst_out.token < 0) {
+            burst_req->exec_active = false;
+            break;
+          }
+
+          bool stop_hit = false;
+          if (IsVisibleGeneratedPiece(burst_out.piece)) {
+            burst_req->exec_tokens_generated++;
+            burst_req->exec_result.completion += burst_out.piece;
+            std::string emit_piece;
+            stop_hit = ApplyStop(burst_out.piece, burst_req->exec_result.completion,
+                                 burst_req->stop, &emit_piece);
+            if (burst_req->on_token && !emit_piece.empty()) {
+              GlobalMetrics().RecordStreamTokens(1);
+              burst_req->on_token(emit_piece, nullptr);
+              if (burst_req->cancellation_flag &&
+                  burst_req->cancellation_flag->load()) {
+                burst_req->exec_active = false;
+              }
+            }
+          }
+          if (stop_hit) {
+            burst_req->exec_active = false;
+          }
+          if (burst_req->exec_tokens_generated >= burst_req->exec_decode_limit) {
+            burst_req->exec_active = false;
+          }
+          if (!burst_req->exec_active) {
+            break;
+          }
+        }
+        return;
+      }
+      (void)burst_reason;
+    }
+  }
+
+  if (native_step_backend) {
+    for (auto *req : batch.requests) {
+      if (!req || !req->exec_active || req->exec_in_prefill ||
+          req->phase == RequestPhase::kFinished ||
+          req->phase == RequestPhase::kAborted) {
+        continue;
+      }
+      if (req->cancellation_flag && req->cancellation_flag->load()) {
+        continue;
+      }
+      if (req->exec_tokens_generated < req->exec_decode_limit) {
+        GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
+            "decode", "scheduler_stepwise");
+      }
+    }
+  }
 
   std::vector<LlamaCppBackend::UnifiedBatchOutput> step_outputs;
   if (backend->SupportsAsyncUnifiedBatch()) {

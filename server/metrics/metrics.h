@@ -204,6 +204,12 @@ public:
                                double forward_ms);
   void RecordInferfluxCudaSampling(int batch_size, double sampling_ms);
   void RecordInferfluxCudaBatchDecode(int batch_size, double total_ms);
+  void RecordInferfluxCudaBurstDecodeChunk(std::string_view phase,
+                                           int requested_tokens,
+                                           int produced_tokens);
+  void RecordInferfluxCudaBurstDecodeFallback(std::string_view phase);
+  void RecordInferfluxCudaBurstDecodeIneligible(std::string_view phase,
+                                                std::string_view reason);
   void RecordInferfluxCudaForwardBatchSize(std::string_view phase, int batch_size);
   void RecordInferfluxCudaFfnProjOperator(std::string_view phase,
                                    std::string_view op);
@@ -442,8 +448,24 @@ private:
   std::atomic<uint64_t> inferflux_cuda_forward_prefill_total_{0};
   std::atomic<uint64_t> inferflux_cuda_forward_decode_total_{0};
   std::atomic<uint64_t> inferflux_cuda_forward_batch_tokens_total_{0};
+  std::atomic<uint64_t> inferflux_cuda_burst_decode_chunks_decode_total_{0};
+  std::atomic<uint64_t> inferflux_cuda_burst_decode_chunks_generate_total_{0};
+  std::atomic<uint64_t> inferflux_cuda_burst_decode_requested_tokens_decode_total_{
+      0};
+  std::atomic<uint64_t>
+      inferflux_cuda_burst_decode_requested_tokens_generate_total_{0};
+  std::atomic<uint64_t> inferflux_cuda_burst_decode_produced_tokens_decode_total_{
+      0};
+  std::atomic<uint64_t>
+      inferflux_cuda_burst_decode_produced_tokens_generate_total_{0};
+  std::atomic<uint64_t> inferflux_cuda_burst_decode_fallbacks_decode_total_{0};
+  std::atomic<uint64_t> inferflux_cuda_burst_decode_fallbacks_generate_total_{
+      0};
   LatencyHistogram inferflux_cuda_forward_latency_;
   LatencyHistogram inferflux_cuda_sampling_latency_;
+  mutable std::mutex inferflux_cuda_burst_decode_ineligible_mutex_;
+  std::unordered_map<std::string, uint64_t>
+      inferflux_cuda_burst_decode_ineligible_counts_;
   mutable std::mutex inferflux_cuda_forward_batch_size_mutex_;
   std::unordered_map<std::string, uint64_t> inferflux_cuda_forward_batch_size_counts_;
   mutable std::mutex inferflux_cuda_ffn_proj_operator_mutex_;

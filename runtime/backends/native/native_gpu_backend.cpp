@@ -5,6 +5,7 @@
 #include "runtime/backends/backend_utils.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
 #include "runtime/string_utils.h"
+#include "server/metrics/metrics.h"
 #include "server/logging/logger.h"
 
 #include <algorithm>
@@ -18,6 +19,11 @@ namespace inferflux {
 namespace {
 
 bool IsVisibleNativePiece(std::string_view piece) { return !piece.empty(); }
+
+int ClampBurstChunkTokens(int value) {
+  constexpr int kMaxBurstChunkTokens = 64;
+  return std::max(0, std::min(value, kMaxBurstChunkTokens));
+}
 
 std::string NormalizeNativeOutputPiece(const ITokenizer *tokenizer,
                                        int token_id,
@@ -138,6 +144,87 @@ bool NativeGpuBackend::SupportsAsyncUnifiedBatch() const {
     return false;
   }
   return runtime_->SupportsAsyncUnifiedBatch();
+}
+
+bool NativeGpuBackend::TryGreedyBurstDecodeTokens(
+    int sequence_id, int n_past_start, int first_token_id,
+    const SamplingParams &sampling, int max_tokens,
+    std::vector<BurstDecodeOutput> *outputs, std::string *reason) {
+  if (outputs) {
+    outputs->clear();
+  }
+
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
+  if (!runtime_) {
+    if (reason) {
+      *reason = "missing_runtime";
+    }
+    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
+        "decode", "missing_runtime");
+    return false;
+  }
+
+  const ITokenizer *tokenizer = runtime_->NativeGetTokenizer();
+  if (!tokenizer) {
+    if (reason) {
+      *reason = "missing_tokenizer";
+    }
+    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
+        "decode", "missing_tokenizer");
+    return false;
+  }
+
+  const int burst_chunk_tokens = NativeBurstChunkTokens();
+  if (burst_chunk_tokens <= 0) {
+    if (reason) {
+      *reason = "disabled";
+    }
+    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
+        "decode", "disabled");
+    return false;
+  }
+
+  if (sampling.temperature > 0.0f) {
+    if (reason) {
+      *reason = "temperature";
+    }
+    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
+        "decode", "temperature");
+    return false;
+  }
+
+  const int burst_n = std::min(std::max(1, max_tokens), burst_chunk_tokens);
+  std::vector<int> token_ids;
+  const int eos_id = tokenizer->EosTokenId();
+  const int generated = runtime_->BurstDecodeGreedy(
+      sequence_id, n_past_start, first_token_id, burst_n, eos_id, &token_ids);
+  if (generated <= 0 || token_ids.empty()) {
+    if (reason) {
+      *reason = "fallback";
+    }
+    GlobalMetrics().RecordInferfluxCudaBurstDecodeFallback("decode");
+    return false;
+  }
+
+  if (outputs) {
+    outputs->reserve(token_ids.size());
+    for (int token_id : token_ids) {
+      BurstDecodeOutput out;
+      out.token = token_id;
+      out.terminal = tokenizer->IsTerminalGeneratedToken(token_id);
+      if (!out.terminal) {
+        out.piece =
+            NormalizeNativeOutputPiece(tokenizer, token_id, std::string_view{});
+      }
+      outputs->push_back(std::move(out));
+    }
+  }
+  if (reason) {
+    reason->clear();
+  }
+  GlobalMetrics().RecordInferfluxCudaBurstDecodeChunk("decode", burst_n,
+                                                      generated);
+  return true;
 }
 
 bool NativeGpuBackend::SupportsSplitPrefillDecodeHandoff() const {
@@ -317,10 +404,68 @@ std::string NativeGpuBackend::Decode(
     }
   }
 
+  const int burst_chunk_tokens = NativeBurstChunkTokens();
+  const char *burst_ineligible_reason =
+      burst_chunk_tokens > 0
+          ? NativeBurstDecodeIneligibleReason(sampling, collect_lp,
+                                             static_cast<bool>(on_chunk),
+                                             stop_seqs, tokenizer)
+          : "disabled";
+  const bool can_burst = burst_chunk_tokens > 0 &&
+                         burst_ineligible_reason == nullptr;
+  if (burst_ineligible_reason != nullptr) {
+    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
+        "decode", burst_ineligible_reason);
+  }
+  const int eos_id = tokenizer ? tokenizer->EosTokenId() : -1;
+
   while (visible_tokens_generated < max_tokens) {
     if (should_stop && should_stop()) {
       break;
     }
+
+    if (can_burst) {
+      const int remaining = max_tokens - visible_tokens_generated;
+      const int burst_n = std::min(remaining, burst_chunk_tokens);
+      std::vector<int> burst_tokens;
+      const int generated = runtime_->BurstDecodeGreedy(
+          sequence_id, n_past, current_token, burst_n, eos_id, &burst_tokens);
+      if (generated > 0) {
+        GlobalMetrics().RecordInferfluxCudaBurstDecodeChunk(
+            "decode", burst_n, generated);
+        bool stop = false;
+        for (int token_id : burst_tokens) {
+          ++n_past;
+          current_token = token_id;
+          if (tokenizer->IsTerminalGeneratedToken(current_token)) {
+            stop = true;
+            break;
+          }
+          std::string piece = NormalizeNativeOutputPiece(
+              tokenizer, current_token, std::string_view{});
+          if (!IsVisibleNativePiece(piece)) {
+            if (++non_emitting_steps >= max_non_emitting_steps) {
+              log::Warn(LogTag(),
+                        "native decode aborted after too many non-emitting "
+                        "tokens");
+              stop = true;
+              break;
+            }
+            continue;
+          }
+
+          non_emitting_steps = 0;
+          output += piece;
+          ++visible_tokens_generated;
+        }
+        if (stop || burst_tokens.empty()) {
+          break;
+        }
+        continue;
+      }
+      GlobalMetrics().RecordInferfluxCudaBurstDecodeFallback("decode");
+    }
+
     UnifiedBatchInput step_input;
     step_input.sequence_id = sequence_id;
     step_input.n_past = n_past;
@@ -475,13 +620,22 @@ std::string NativeGpuBackend::Generate(
 
   // Burst decode fast path: when greedy (temperature <= 0), no logprobs,
   // and no streaming callback, run chunks of tokens on device without
-  // per-token host sync. This eliminates WDDM scheduling latency (~10ms)
-  // between tokens on Windows.
-  const bool can_burst = !collect_lp && !on_chunk &&
-                         sampling.temperature <= 0.0f &&
-                         stop_seqs.empty() && tokenizer;
+  // per-token host sync. This eliminates WDDM scheduling latency on Windows
+  // while preserving the standard path for logprobs/streaming/stop control.
+  const int burst_chunk_tokens = NativeBurstChunkTokens();
+  const char *burst_ineligible_reason =
+      burst_chunk_tokens > 0
+          ? NativeBurstDecodeIneligibleReason(sampling, collect_lp,
+                                             static_cast<bool>(on_chunk),
+                                             stop_seqs, tokenizer)
+          : "disabled";
+  const bool can_burst = burst_chunk_tokens > 0 &&
+                         burst_ineligible_reason == nullptr;
+  if (burst_ineligible_reason != nullptr) {
+    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
+        "generate", burst_ineligible_reason);
+  }
   const int eos_id = tokenizer ? tokenizer->EosTokenId() : -1;
-  constexpr int kBurstSize = 16; // tokens per burst chunk
 
   while (visible_tokens_generated < max_tokens) {
     if (should_stop && should_stop()) {
@@ -491,13 +645,15 @@ std::string NativeGpuBackend::Generate(
     // Try burst decode path
     if (can_burst) {
       const int remaining = max_tokens - visible_tokens_generated;
-      const int burst_n = std::min(remaining, kBurstSize);
+      const int burst_n = std::min(remaining, burst_chunk_tokens);
       std::vector<int> burst_tokens;
 
       int generated = runtime_->BurstDecodeGreedy(
           sequence_id, n_past, current_token, burst_n, eos_id, &burst_tokens);
 
       if (generated > 0) {
+        GlobalMetrics().RecordInferfluxCudaBurstDecodeChunk("generate", burst_n,
+                                                            generated);
         // Process burst results on host
         bool stop = false;
         for (int i = 0; i < static_cast<int>(burst_tokens.size()); ++i) {
@@ -507,17 +663,28 @@ std::string NativeGpuBackend::Generate(
             stop = true;
             break;
           }
-          std::string piece = tokenizer->TokenToString(current_token);
-          if (!piece.empty()) {
-            output += piece;
-            ++visible_tokens_generated;
+          std::string piece = NormalizeNativeOutputPiece(
+              tokenizer, current_token, std::string_view{});
+          if (!IsVisibleNativePiece(piece)) {
+            if (++non_emitting_steps >= max_non_emitting_steps) {
+              log::Warn(LogTag(),
+                        "native generate aborted after too many non-emitting "
+                        "tokens");
+              stop = true;
+              break;
+            }
+            continue;
           }
+          non_emitting_steps = 0;
+          output += piece;
+          ++visible_tokens_generated;
         }
         if (stop || burst_tokens.empty()) {
           break;
         }
         continue; // next burst
       }
+      GlobalMetrics().RecordInferfluxCudaBurstDecodeFallback("generate");
       // BurstDecodeGreedy returned 0 — fall through to standard path
     }
 
@@ -834,6 +1001,47 @@ SamplingParams NativeGpuBackend::SnapshotSamplingParams() const {
     return {};
   }
   return active_sampling_;
+}
+
+int NativeGpuBackend::NativeBurstChunkTokens() const {
+  const char *raw = std::getenv("INFERFLUX_NATIVE_BURST_CHUNK_TOKENS");
+  if (!raw || *raw == '\0') {
+#ifdef _WIN32
+    return 8;
+#else
+    return 0;
+#endif
+  }
+  try {
+    return ClampBurstChunkTokens(std::stoi(raw));
+  } catch (...) {
+    return 0;
+  }
+}
+
+const char *NativeGpuBackend::NativeBurstDecodeIneligibleReason(
+    const SamplingParams &sampling, bool collect_logprobs,
+    bool has_chunk_callback, const std::vector<std::string> &stop_seqs,
+    const ITokenizer *tokenizer) const {
+  if (!runtime_) {
+    return "missing_runtime";
+  }
+  if (!tokenizer) {
+    return "missing_tokenizer";
+  }
+  if (collect_logprobs) {
+    return "logprobs";
+  }
+  if (has_chunk_callback) {
+    return "streaming_callback";
+  }
+  if (sampling.temperature > 0.0f) {
+    return "temperature";
+  }
+  if (!stop_seqs.empty()) {
+    return "stop_sequences";
+  }
+  return nullptr;
 }
 
 TokenLogprob NativeGpuBackend::CollectNativeLogprob(int token_id,

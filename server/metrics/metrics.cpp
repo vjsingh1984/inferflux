@@ -27,6 +27,38 @@ std::string NormalizeNativePhase(std::string_view phase) {
                                : "unknown";
 }
 
+std::string NormalizeBurstPhase(std::string_view phase) {
+  return phase == "generate" ? "generate" : "decode";
+}
+
+std::string NormalizeBurstIneligibleReason(std::string_view reason) {
+  if (reason == "disabled") {
+    return "disabled";
+  }
+  if (reason == "missing_runtime") {
+    return "missing_runtime";
+  }
+  if (reason == "missing_tokenizer") {
+    return "missing_tokenizer";
+  }
+  if (reason == "logprobs") {
+    return "logprobs";
+  }
+  if (reason == "streaming_callback") {
+    return "streaming_callback";
+  }
+  if (reason == "temperature") {
+    return "temperature";
+  }
+  if (reason == "stop_sequences") {
+    return "stop_sequences";
+  }
+  if (reason == "scheduler_stepwise") {
+    return "scheduler_stepwise";
+  }
+  return "other";
+}
+
 std::string NativeForwardBatchSizeBucket(int batch_size) {
   if (batch_size <= 1) {
     return "1";
@@ -803,6 +835,47 @@ void MetricsRegistry::RecordInferfluxCudaBatchDecode(int batch_size, double tota
   (void)batch_size;
   (void)total_ms;
   // Tracked via forward + sampling histograms; this is for future use.
+}
+
+void MetricsRegistry::RecordInferfluxCudaBurstDecodeChunk(
+    std::string_view phase, int requested_tokens, int produced_tokens) {
+  const std::string phase_label = NormalizeBurstPhase(phase);
+  if (phase_label == "generate") {
+    inferflux_cuda_burst_decode_chunks_generate_total_.fetch_add(
+        1, std::memory_order_relaxed);
+    inferflux_cuda_burst_decode_requested_tokens_generate_total_.fetch_add(
+        std::max(0, requested_tokens), std::memory_order_relaxed);
+    inferflux_cuda_burst_decode_produced_tokens_generate_total_.fetch_add(
+        std::max(0, produced_tokens), std::memory_order_relaxed);
+    return;
+  }
+
+  inferflux_cuda_burst_decode_chunks_decode_total_.fetch_add(
+      1, std::memory_order_relaxed);
+  inferflux_cuda_burst_decode_requested_tokens_decode_total_.fetch_add(
+      std::max(0, requested_tokens), std::memory_order_relaxed);
+  inferflux_cuda_burst_decode_produced_tokens_decode_total_.fetch_add(
+      std::max(0, produced_tokens), std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordInferfluxCudaBurstDecodeFallback(
+    std::string_view phase) {
+  const std::string phase_label = NormalizeBurstPhase(phase);
+  if (phase_label == "generate") {
+    inferflux_cuda_burst_decode_fallbacks_generate_total_.fetch_add(
+        1, std::memory_order_relaxed);
+    return;
+  }
+  inferflux_cuda_burst_decode_fallbacks_decode_total_.fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordInferfluxCudaBurstDecodeIneligible(
+    std::string_view phase, std::string_view reason) {
+  const std::string key = NormalizeBurstPhase(phase) + "|" +
+                          NormalizeBurstIneligibleReason(reason);
+  std::lock_guard<std::mutex> lock(inferflux_cuda_burst_decode_ineligible_mutex_);
+  inferflux_cuda_burst_decode_ineligible_counts_[key] += 1;
 }
 
 void MetricsRegistry::RecordInferfluxCudaForwardBatchSize(std::string_view phase,
@@ -1995,6 +2068,78 @@ std::string MetricsRegistry::RenderPrometheus() const {
           it == inferflux_cuda_forward_batch_size_counts_.end() ? 0 : it->second;
       out << "inferflux_cuda_forward_batch_size_total{phase=\"unknown\",bucket=\""
           << bucket << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_cuda_burst_decode_chunks_total InferFlux CUDA "
+         "device-side burst decode chunks completed by phase\n";
+  out << "# TYPE inferflux_cuda_burst_decode_chunks_total counter\n";
+  out << "inferflux_cuda_burst_decode_chunks_total{phase=\"decode\"} "
+      << inferflux_cuda_burst_decode_chunks_decode_total_.load() << "\n";
+  out << "inferflux_cuda_burst_decode_chunks_total{phase=\"generate\"} "
+      << inferflux_cuda_burst_decode_chunks_generate_total_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_burst_decode_requested_tokens_total Requested "
+         "tokens passed into InferFlux CUDA burst decode chunks by phase\n";
+  out << "# TYPE inferflux_cuda_burst_decode_requested_tokens_total counter\n";
+  out << "inferflux_cuda_burst_decode_requested_tokens_total{phase=\"decode\"} "
+      << inferflux_cuda_burst_decode_requested_tokens_decode_total_.load()
+      << "\n";
+  out << "inferflux_cuda_burst_decode_requested_tokens_total{phase=\"generate\"} "
+      << inferflux_cuda_burst_decode_requested_tokens_generate_total_.load()
+      << "\n";
+
+  out << "# HELP inferflux_cuda_burst_decode_produced_tokens_total Produced "
+         "tokens returned by InferFlux CUDA burst decode chunks by phase\n";
+  out << "# TYPE inferflux_cuda_burst_decode_produced_tokens_total counter\n";
+  out << "inferflux_cuda_burst_decode_produced_tokens_total{phase=\"decode\"} "
+      << inferflux_cuda_burst_decode_produced_tokens_decode_total_.load()
+      << "\n";
+  out
+      << "inferflux_cuda_burst_decode_produced_tokens_total{phase=\"generate\"} "
+      << inferflux_cuda_burst_decode_produced_tokens_generate_total_.load()
+      << "\n";
+
+  out << "# HELP inferflux_cuda_burst_decode_fallbacks_total Burst decode "
+         "attempts that fell back to the standard token path by phase\n";
+  out << "# TYPE inferflux_cuda_burst_decode_fallbacks_total counter\n";
+  out << "inferflux_cuda_burst_decode_fallbacks_total{phase=\"decode\"} "
+      << inferflux_cuda_burst_decode_fallbacks_decode_total_.load() << "\n";
+  out << "inferflux_cuda_burst_decode_fallbacks_total{phase=\"generate\"} "
+      << inferflux_cuda_burst_decode_fallbacks_generate_total_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_burst_decode_ineligible_total Burst decode "
+         "requests rejected before launch by phase and reason\n";
+  out << "# TYPE inferflux_cuda_burst_decode_ineligible_total counter\n";
+  {
+    std::vector<std::string> keys;
+    {
+      std::lock_guard<std::mutex> lock(
+          inferflux_cuda_burst_decode_ineligible_mutex_);
+      keys.reserve(inferflux_cuda_burst_decode_ineligible_counts_.size());
+      for (const auto &entry : inferflux_cuda_burst_decode_ineligible_counts_) {
+        keys.push_back(entry.first);
+      }
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    for (const auto &key : keys) {
+      const auto delimiter = key.find('|');
+      if (delimiter == std::string::npos) {
+        continue;
+      }
+      uint64_t count = 0;
+      {
+        std::lock_guard<std::mutex> lock(
+            inferflux_cuda_burst_decode_ineligible_mutex_);
+        const auto it = inferflux_cuda_burst_decode_ineligible_counts_.find(key);
+        if (it != inferflux_cuda_burst_decode_ineligible_counts_.end()) {
+          count = it->second;
+        }
+      }
+      out << "inferflux_cuda_burst_decode_ineligible_total{phase=\""
+          << key.substr(0, delimiter) << "\",reason=\""
+          << key.substr(delimiter + 1) << "\"} " << count << "\n";
     }
   }
 

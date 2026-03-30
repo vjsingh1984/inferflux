@@ -1,6 +1,6 @@
 # InferFlux Vision
 
-**Snapshot date:** March 9, 2026
+**Snapshot date:** March 27, 2026
 
 ```mermaid
 flowchart LR
@@ -26,8 +26,8 @@ flowchart LR
 | State | Code-aligned reading |
 |---|---|
 | Strong today | API/admin/CLI contracts, backend/provider identity, policy-visible fallback, prefix/KV reuse, admin pools visibility, and operator observability |
-| Foundation now | Native loader detection, memory-first GGUF dequant policy, KV auto-tune planning/metrics, optional session leases, distributed ticket lifecycle, timeout debt, and optional fail-closed generation admission |
-| Still not leadership | Quantized native GGUF throughput, graph-captured decode/prefill envelopes, native-owned endpoint independence everywhere, deterministic distributed ownership cleanup, mandatory GPU release lane |
+| Foundation now | Native loader detection, memory-first GGUF dequant policy, KV auto-tune planning/metrics, optional session leases, distributed ticket lifecycle, timeout debt, optional fail-closed generation admission, and stepwise native burst decode on the live phased path |
+| Still not leadership | Quantized native GGUF throughput still trails in the fresh long-run comparison (`0.69x` at `c=4`, `0.74x` at `c=8`, `0.42x` at `c=16`), graph-captured decode/prefill envelopes, native-owned endpoint independence everywhere, deterministic distributed ownership cleanup, mandatory GPU release lane |
 
 ## 3) Modern Serving Posture
 
@@ -57,7 +57,7 @@ flowchart LR
 |---|---|
 | Overall | `B-` |
 | Why not lower | Control-plane, identity, observability, and memory-policy foundations are real and tested |
-| Why not higher | Native throughput and distributed ownership semantics are not yet best-in-class or release-enforced |
+| Why not higher | Native burst integration improved the live phased path and produced a sensible WSL2 default (`INFERFLUX_NATIVE_BURST_CHUNK_TOKENS=4`), but the fresh long-run llama.cpp comparison still shows a meaningful concurrent-performance and memory-efficiency gap, and distributed ownership semantics are not yet release-enforced |
 
 ## 6) Canonical Source Map
 

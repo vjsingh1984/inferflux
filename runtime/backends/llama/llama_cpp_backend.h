@@ -61,6 +61,11 @@ public:
     int token{-1};
     std::string piece;
   };
+  struct BurstDecodeOutput {
+    int token{-1};
+    std::string piece;
+    bool terminal{false};
+  };
 
   // Execute a mixed batch of prefill and decode sequences.
   std::vector<UnifiedBatchOutput>
@@ -113,6 +118,14 @@ public:
   // Execute one shared decode step for N sequences simultaneously.
   std::vector<BatchDecodeOutput>
   BatchDecodeStep(std::vector<BatchDecodeInput> &inputs);
+
+  // Advance a single greedy sequence by a small burst of tokens. The default
+  // implementation returns false; native backends can override this to expose
+  // lower-overhead singleton decode paths to the executor.
+  virtual bool TryGreedyBurstDecodeTokens(
+      int sequence_id, int n_past_start, int first_token_id,
+      const SamplingParams &sampling, int max_tokens,
+      std::vector<BurstDecodeOutput> *outputs, std::string *reason = nullptr);
 
   bool IsMoE() const override;
   int ExpertCount() const override;

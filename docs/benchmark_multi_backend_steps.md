@@ -6,6 +6,30 @@ This doc captures the repeatable steps and instrumentation that keep `run_gguf_c
 * `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4` now defaults to `false` in `NativeExecutionPolicy`. Keep it opt-in for controlled experiments only; exact-shape isolated benchmarking on Ada RTX 4000 showed the `M=2,N=11008,K=2048` row-pair FFN kernel was numerically clean but slower than the generic grouped path.
 * Keep `INFERFLUX_ENABLE_BATCHED_DECODE=1` in the benchmark so multi-row decode batches naturally occur and exercise the row-pair operator per the metrics below.
 * `INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT=1` is an experimental scheduler knob only. Keep default benchmarking on `wait=0`; use `wait=1` only as an A/B comparison because the effect is workload-sensitive and not stable enough for default serving policy.
+* `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS` is the active singleton native decode tuning knob for the current stepwise-path burst implementation.
+  * `2`: favors lower-concurrency interactive serving (`c=2`/`c=4`)
+  * `4`: current balanced default for WSL2/native CUDA benchmarking
+  * `8`: only use for explicit high-concurrency probes; it regressed lower-concurrency runs in March 27 long-sweep data
+* Keep `runtime.scheduler.decode_burst_tokens=0` during these probes unless you are explicitly testing fairness-slice behavior. That scheduler burst cap is not the same as the native singleton burst path.
+* `BACKEND_STARTUP_TIMEOUT_SEC` is benchmark-harness only. Default is backend-aware: `60s` for most local backends and `180s` for `llama_cpp_cuda`. Raise it further only for explicit cold-start investigations; do not treat it as a serving/runtime tuning knob.
+
+## 1.1 Current sensible defaults for this solution
+
+For the current native singleton burst path on Qwen2.5-3B Q4_K_M under WSL2:
+
+* `INFERFLUX_ENABLE_BATCHED_DECODE=1`
+* `runtime.scheduler.min_batch_size=1`
+* `runtime.scheduler.batch_accumulation_ms=2`
+* `runtime.scheduler.decode_burst_tokens=0`
+* `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS=4`
+* `INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT=0`
+
+Rationale:
+
+* `chunk=4` was the best balanced result across the March 27 long sweep (`32` requests, `32` max tokens, `1/2/4/8/16` concurrency).
+* `chunk=2` was better at `c=2` and `c=4`, but weaker at `c=8` and `c=16`.
+* `chunk=8` improved `c=8` only and regressed low/mid concurrency too sharply to serve as the default.
+* Sticky wait remains useful as an explicit A/B probe, but not as the default serving policy.
 
 ## 2. Harness contract
 `run_gguf_comparison_benchmark.sh` now supports multi-concurrency sweeps from one invocation:
@@ -74,6 +98,55 @@ Interpretation:
 * `wait=1` is not universally regressive, but the gain is modest and workload-specific.
 * Keep it available for benchmark matrices.
 * Do not treat it as the recommended default scheduler policy.
+
+## 6.1 March 27 native burst sweep
+
+Long WSL2/native CUDA sweep (`32` requests, `32` max tokens, `1/2/4/8/16` concurrency):
+
+* `chunk=2`
+  * `c=1`: `64.8 tok/s`
+  * `c=2`: `78.8 tok/s`
+  * `c=4`: `103.8 tok/s`
+  * `c=8`: `107.9 tok/s`
+  * `c=16`: `111.3 tok/s`
+* `chunk=4`
+  * `c=1`: `64.1 tok/s`
+  * `c=2`: `73.4 tok/s`
+  * `c=4`: `99.5 tok/s`
+  * `c=8`: `109.8 tok/s`
+  * `c=16`: `123.9 tok/s`
+* `chunk=8`
+  * `c=1`: `65.2 tok/s`
+  * `c=2`: `68.0 tok/s`
+  * `c=4`: `98.6 tok/s`
+  * `c=8`: `114.8 tok/s`
+  * `c=16`: `122.2 tok/s`
+
+Interpretation:
+
+* `chunk=4` is the best balanced benchmark default.
+* `chunk=2` is the better low-latency / low-concurrency tuning point.
+* `chunk=8` is a high-concurrency experiment only.
+Matching long-run `llama_cpp_cuda` run under the same harness after the startup-timeout fix:
+
+* `c=1`: `111.2 tok/s`
+* `c=2`: `110.5 tok/s`
+* `c=4`: `144.2 tok/s`
+* `c=8`: `148.8 tok/s`
+* `c=16`: `293.7 tok/s`
+
+InferFlux `chunk=4` competitive ratios:
+
+* `c=1`: `0.58x`
+* `c=2`: `0.66x`
+* `c=4`: `0.69x`
+* `c=8`: `0.74x`
+* `c=16`: `0.42x`
+
+Interpretation:
+
+* The singleton burst work materially improved native concurrent behavior, especially through `c=8`.
+* The remaining competitive problem is now concentrated in higher sustained concurrency and memory efficiency, not in “burst path unreachable” control-flow debt.
 
 ## 7. Release-note checklist
 When promoting the row-pair flag for release:

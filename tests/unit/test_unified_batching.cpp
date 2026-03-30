@@ -128,6 +128,65 @@ public:
   int TokenCount(const std::string &) const override { return 5; }
 };
 
+class MockBurstUnifiedBackend : public LlamaCppBackend {
+public:
+  int burst_calls{0};
+  int unified_calls{0};
+  bool burst_enabled{true};
+  std::vector<BurstDecodeOutput> burst_outputs;
+
+  bool TryGreedyBurstDecodeTokens(int sequence_id, int n_past_start,
+                                  int first_token_id,
+                                  const SamplingParams &sampling, int max_tokens,
+                                  std::vector<BurstDecodeOutput> *outputs,
+                                  std::string *reason) override {
+    (void)sequence_id;
+    (void)n_past_start;
+    (void)first_token_id;
+    (void)sampling;
+    (void)max_tokens;
+    ++burst_calls;
+    if (!burst_enabled) {
+      if (outputs) {
+        outputs->clear();
+      }
+      if (reason) {
+        *reason = "disabled";
+      }
+      return false;
+    }
+    if (outputs) {
+      *outputs = burst_outputs;
+    }
+    if (reason) {
+      reason->clear();
+    }
+    return true;
+  }
+
+  std::vector<UnifiedBatchOutput>
+  ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override {
+    ++unified_calls;
+    std::vector<UnifiedBatchOutput> outputs;
+    outputs.reserve(inputs.size());
+    for (const auto &in : inputs) {
+      UnifiedBatchOutput out;
+      out.ok = true;
+      if (in.request_logits) {
+        out.token = 42;
+        out.piece = "x";
+      }
+      outputs.push_back(out);
+    }
+    return outputs;
+  }
+
+  bool IsReady() const override { return true; }
+  int TokenCount(const std::string &text) const override {
+    return static_cast<int>(text.size());
+  }
+};
+
 class EmptyGenerateBackend : public LlamaCppBackend {
 public:
   bool IsReady() const override { return true; }
@@ -204,6 +263,23 @@ int64_t ReadEmptyGenerationsTotal() {
   const std::string output = GlobalMetrics().RenderPrometheus();
   const std::string key =
       "inferflux_empty_generations_total{backend=\"cpu\"} ";
+  auto pos = output.find(key);
+  if (pos == std::string::npos) {
+    return 0;
+  }
+  pos += key.size();
+  auto line_end = output.find('\n', pos);
+  const std::string value = output.substr(
+      pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+  try {
+    return std::stoll(value);
+  } catch (const std::exception &) {
+    return 0;
+  }
+}
+
+int64_t ReadMetricTotal(const std::string &key) {
+  const std::string output = GlobalMetrics().RenderPrometheus();
   auto pos = output.find(key);
   if (pos == std::string::npos) {
     return 0;
@@ -684,6 +760,77 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     REQUIRE(async_backend->submit_calls.front().inputs.size() == 2);
     REQUIRE(async_backend->submit_calls.front().inputs[0].tokens.size() == 3);
     REQUIRE(async_backend->submit_calls.front().inputs[1].tokens.size() == 3);
+  }
+
+  SECTION("ExecuteUnifiedBatchStep uses native burst helper for singleton decode") {
+    GlobalMetrics().Reset();
+    auto burst_backend = std::make_shared<MockBurstUnifiedBackend>();
+    burst_backend->burst_outputs = {
+        {.token = 43, .piece = "x", .terminal = false},
+        {.token = 44, .piece = "y", .terminal = false},
+    };
+
+    InferenceRequest req_decode;
+    req_decode.model = "mock";
+    req_decode.sequence_id = 12;
+    req_decode.n_past = 8;
+    req_decode.exec_active = true;
+    req_decode.exec_in_prefill = false;
+    req_decode.exec_decode_limit = 3;
+    req_decode.exec_tokens_generated = 0;
+    req_decode.exec_current_token = 42;
+
+    RequestBatch step_batch;
+    step_batch.requests = {&req_decode};
+
+    executor->ExecuteUnifiedBatchStep(step_batch, burst_backend);
+
+    REQUIRE(burst_backend->burst_calls == 1);
+    REQUIRE(burst_backend->unified_calls == 0);
+    REQUIRE(req_decode.n_past == 10);
+    REQUIRE(req_decode.exec_tokens_generated == 2);
+    REQUIRE(req_decode.exec_current_token == 44);
+    REQUIRE(req_decode.exec_result.completion == "xy");
+    REQUIRE(req_decode.exec_active);
+    REQUIRE(ReadMetricTotal(
+                "inferflux_scheduler_decode_worker_execution_path_total{path=\""
+                "direct_stepwise_native_burst\"} ") == 1);
+    REQUIRE(ReadMetricTotal(
+                "inferflux_cuda_burst_decode_ineligible_total{phase=\"decode\","
+                "reason=\"scheduler_stepwise\"} ") == 0);
+  }
+
+  SECTION("ExecuteUnifiedBatchStep records scheduler_stepwise only when burst is blocked by batch shape") {
+    GlobalMetrics().Reset();
+    auto burst_backend = std::make_shared<MockBurstUnifiedBackend>();
+
+    InferenceRequest req_a;
+    req_a.model = "mock";
+    req_a.sequence_id = 12;
+    req_a.n_past = 8;
+    req_a.exec_active = true;
+    req_a.exec_in_prefill = false;
+    req_a.exec_decode_limit = 3;
+    req_a.exec_tokens_generated = 0;
+    req_a.exec_current_token = 42;
+
+    InferenceRequest req_b = req_a;
+    req_b.sequence_id = 13;
+    req_b.exec_current_token = 52;
+
+    RequestBatch step_batch;
+    step_batch.requests = {&req_a, &req_b};
+
+    executor->ExecuteUnifiedBatchStep(step_batch, burst_backend);
+
+    REQUIRE(burst_backend->burst_calls == 0);
+    REQUIRE(burst_backend->unified_calls == 1);
+    REQUIRE(ReadMetricTotal(
+                "inferflux_cuda_burst_decode_ineligible_total{phase=\"decode\","
+                "reason=\"scheduler_stepwise\"} ") == 2);
+    REQUIRE(ReadMetricTotal(
+                "inferflux_scheduler_decode_worker_execution_path_total{path=\""
+                "direct_stepwise_native_burst\"} ") == 0);
   }
 }
 

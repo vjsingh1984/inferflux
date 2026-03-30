@@ -57,6 +57,41 @@ TEST_CASE("Native metrics record sampling", "[native_batch]") {
           std::string::npos);
 }
 
+TEST_CASE("Native metrics record burst decode usage and fallbacks",
+          "[native_batch]") {
+  inferflux::MetricsRegistry registry;
+
+  registry.RecordInferfluxCudaBurstDecodeChunk("decode", /*requested=*/8,
+                                               /*produced=*/6);
+  registry.RecordInferfluxCudaBurstDecodeChunk("generate", /*requested=*/4,
+                                               /*produced=*/4);
+  registry.RecordInferfluxCudaBurstDecodeFallback("decode");
+  registry.RecordInferfluxCudaBurstDecodeIneligible("decode",
+                                                    "scheduler_stepwise");
+  registry.RecordInferfluxCudaBurstDecodeIneligible("generate",
+                                                    "streaming_callback");
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find(
+              "inferflux_cuda_burst_decode_chunks_total{phase=\"decode\"} 1") !=
+          std::string::npos);
+  REQUIRE(
+      output.find("inferflux_cuda_burst_decode_chunks_total{phase=\"generate\"} "
+                  "1") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_burst_decode_requested_tokens_total{phase="
+                      "\"decode\"} 8") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_burst_decode_produced_tokens_total{phase="
+                      "\"decode\"} 6") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_burst_decode_fallbacks_total{phase="
+                      "\"decode\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_burst_decode_ineligible_total{phase="
+                      "\"decode\",reason=\"scheduler_stepwise\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_burst_decode_ineligible_total{phase="
+                      "\"generate\",reason=\"streaming_callback\"} 1") !=
+          std::string::npos);
+}
+
 TEST_CASE("Native KV cache occupancy gauges", "[native_batch]") {
   inferflux::MetricsRegistry registry;
 

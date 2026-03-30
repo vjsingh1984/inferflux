@@ -1253,6 +1253,24 @@ bool LlamaCppBackend::TryCollectUnifiedBatchAsync(
   return true;
 }
 
+bool LlamaCppBackend::TryGreedyBurstDecodeTokens(
+    int sequence_id, int n_past_start, int first_token_id,
+    const SamplingParams &sampling, int max_tokens,
+    std::vector<BurstDecodeOutput> *outputs, std::string *reason) {
+  (void)sequence_id;
+  (void)n_past_start;
+  (void)first_token_id;
+  (void)sampling;
+  (void)max_tokens;
+  if (outputs) {
+    outputs->clear();
+  }
+  if (reason) {
+    *reason = "unsupported";
+  }
+  return false;
+}
+
 std::vector<LlamaCppBackend::UnifiedBatchOutput>
 LlamaCppBackend::ExecuteUnifiedBatch(
     const std::vector<UnifiedBatchInput> &inputs) {
