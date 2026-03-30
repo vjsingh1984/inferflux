@@ -27,8 +27,8 @@ flowchart LR
 
 | Path | What it is best at today | Current caution |
 |---|---|---|
-| `inferflux_cuda` | First-party runtime control, native metrics, memory policy control, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp) with Q8_1/dp4a/RmsNorm fusion, batched decode default-on, adaptive dispatch geometry, native logprobs, native embeddings, execution policy refactor | Single-sequence throughput gap vs llama.cpp compatibility path (~0.35-0.76x); v2 cooperative-warp GEMV targeting ≥55% bandwidth utilization |
-| `llama_cpp_cuda` | Stable GGUF compatibility and lower operational risk, higher single-sequence throughput today | Lower ceiling for InferFlux-specific runtime innovation |
+| `inferflux_cuda` | First-party runtime control, native metrics, memory policy control, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp) with Q8_1/dp4a/RmsNorm fusion, batched decode default-on, adaptive dispatch geometry, native logprobs, native embeddings, FlashAttention-2 with GQA, CUDA graph capture/replay, execution policy refactor | Single-sequence now exceeds llama.cpp (~1.1x after Q8_1 fix); concurrent serving at c=4 parity but still 0.78x at c=8 — decode down-proj row-pair/row-quad is the remaining bottleneck |
+| `llama_cpp_cuda` | Stable GGUF compatibility and lower operational risk, higher concurrent throughput at c≥8 today | Lower ceiling for InferFlux-specific runtime innovation |
 
 ## 3) Runtime Components
 

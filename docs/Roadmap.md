@@ -15,13 +15,13 @@ flowchart LR
 
 | Dimension | Current | Evidence in code today | Blocker to next grade |
 |---|---|---|---|
-| Throughput | C+ | Native CUDA path is real, profiled, and benchmarked; FFN grouped MMQ3 is active on live decode | Decode down-proj row-pair and row-quad paths still leave native behind at sustained concurrency |
-| Continuous batching | C+ | Sync-first batch execution and operator metrics exist; live decode cohorts are measurable | Better decode hot-path cost is still needed to translate batch formation into sustained serving wins |
+| Throughput | B- | Native CUDA exceeds llama.cpp on single-sequence (~1.1x), reaches c=4 parity; CUDA graph capture, FlashAttention-2 with GQA, 50+ fused GEMV kernels, FFN grouped MMQ3 active on live decode | Decode down-proj row-pair/row-quad still leaves native at 0.78x at c=8 |
+| Continuous batching | B- | Granular scheduler locks with fairness, prefix-affinity scoring, decode-worker pools, disaggregated KV channel; live decode cohorts are measurable | Better decode hot-path cost still needed for sustained c≥8 wins |
 | Capability identity | A- | Provider/fallback identity is explicit across API, admin, CLI, and metrics | Some advanced behavior still depends on compatibility fallback |
-| Resource efficiency | B- | Memory-first GGUF direction, KV planner, and quantized execution are real | Native decode still spends too much work in its current down-proj kernels |
-| CI and release enforcement | B- | Good unit/integration coverage and docs contract gate | Required GPU/provider lane is still not a release blocker |
-| Distributed runtime | C | Transport-health semantics, pool visibility, and failure signaling exist | Sequence ownership cleanup and worker-loss handling still need hardening |
-| OSS release readiness | B | Canonical docs and release process exist, and the repo can expose conventional OSS metadata | Release surface still needs tighter benchmark/doc hygiene and stronger GPU validation |
+| Resource efficiency | B- | Memory-first GGUF direction, KV planner with multi-tier cache (GPU→host→disk), radix prefix cache, quantized execution are real | Native decode still spends too much work in its current down-proj kernels |
+| CI and release enforcement | B- | 827 unit + 137 integration tests, docs contract gate, SBOM generation | Required GPU/provider lane is still not a release blocker |
+| Distributed runtime | C+ | KV channel and SHM transport are production-tested, disaggregated health probes with timeout tracking, transport-aware readiness | Sequence ownership cleanup and worker-loss handling still need hardening |
+| OSS release readiness | B | Canonical docs, release process, SBOM, CI contract gates, and conventional OSS metadata (LICENSE, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT) are in place | Release surface still needs tighter benchmark/doc hygiene and stronger GPU validation |
 
 ## 2) Roadmap Priorities
 

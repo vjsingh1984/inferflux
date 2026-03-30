@@ -91,10 +91,10 @@ The CMake target `inferflux_core` links all modules into a single library consum
 - `RequestBatch` (`scheduler/request_batch.h`) — per-request state and batch grouping for continuous batching. Interface only.
 
 **Key modules:**
-- `runtime/` — Device abstraction (`DeviceContext`), paged KV cache with LRU/Clock eviction, speculative decoding (draft + validator), NVMe offload via async file writer (io/), crash diagnostics with signal handler and breadcrumbs
+- `runtime/` — Device abstraction (`DeviceContext`), paged KV cache with LRU/Clock eviction and host-RAM secondary tier, radix prefix cache for KV reuse, speculative decoding (draft + validator, partially integrated), disk offload via async file writer (io/), crash diagnostics with signal handler and breadcrumbs
 - `runtime/backends/` — Backend factory with native/universal provider paths, CUDA phase overlap and flash attention tuning, backend exposure policy with capability-based routing
 - `model/` — GGUF loader (via llama.cpp submodule in external/), tokenizer, model format auto-detection (`model_format.cpp` supports gguf/safetensors/hf with HuggingFace URI resolution)
-- `scheduler/` — Scheduler with global mutex (to be replaced by continuous batching via `RequestBatch`), `ModelRouter` with multi-model serving and backend provider tracking
+- `scheduler/` — Scheduler with granular lock ordering (queue, model-selection, sequence-retirement, eviction), fairness-aware batch construction, decode-worker pools for disaggregated deployments, `ModelRouter` with multi-model serving and backend provider tracking
 - `server/` — Multi-threaded HTTP server (thread pool), auth (API-key, OIDC, rate limiter), metrics (Prometheus /metrics), audit logging, guardrails, health probes (/healthz, /readyz, /livez)
 - `policy/` — `PolicyBackend` interface, `PolicyStore` (encrypted INI with AES-GCM via OpenSSL), OPA client
 - `cli/` — `inferctl` client (chat, completion, admin commands) using shared `HttpClient` and nlohmann/json
@@ -156,7 +156,7 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 ## CUDA Development
 
 **Two-backend architecture:** The CUDA path has two providers that both accept GGUF models:
-- `inferflux_cuda` (`runtime/backends/cuda/inferflux_cuda_backend.cpp`, `inferflux_cuda_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp). Use for **single-request optimization** and native feature development. Currently ~0.63x llama.cpp throughput on single-sequence decode (75.5 vs 119.9 tok/s on Qwen2.5-3B Q4_K_M).
+- `inferflux_cuda` (`runtime/backends/cuda/inferflux_cuda_backend.cpp`, `inferflux_cuda_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp), FlashAttention-2 with GQA and multi-sequence decode, CUDA graph capture/replay. Use for **single-request optimization** and native feature development. Single-sequence decode exceeds llama.cpp after Q8_1 fix (~133-140 vs ~120 tok/s on Qwen2.5-3B Q4_K_M). Concurrent serving at c=4 parity (182.9 tok/s), but still 0.78x at c=8 (210 vs 268 tok/s).
 - `llama_cpp_cuda` — delegates to llama.cpp for inference. **Use for concurrent workloads** (validated 3.7x faster than Ollama at 16 agents). Higher throughput today, lower ceiling for InferFlux-specific innovation.
 
 Only structured output (grammar-constrained generation) still delegates to the llama.cpp parity backend. Logprobs and embeddings are native.

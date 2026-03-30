@@ -2,7 +2,7 @@
 
 **Date**: March 10, 2026
 **Task**: #12 - Implement FFN kernel fusion (gate+up+SiLU+down)
-**Status**: ⏳ IN PROGRESS - Tiled bring-up kernel working, benchmarked slower than baseline
+**Status**: Partially superseded — FFN grouped MMQ3 is now active on the live decode path. See [benchmarks](benchmarks.md) for current operator readings.
 
 ---
 

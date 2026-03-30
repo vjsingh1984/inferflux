@@ -19,9 +19,9 @@ quadrantChart
 | Category | Current InferFlux reading |
 |---|---|
 | Compatibility-first CUDA serving | Strong today via `llama_cpp_cuda` |
-| Native-kernel-first CUDA serving | Real and improving, but still behind the compatibility backend at sustained concurrency |
+| Native-kernel-first CUDA serving | Exceeds llama.cpp on single-sequence (~1.1x), c=4 parity, but still 0.78x at c≥8 sustained concurrency |
 | Operator/control-plane rigor | Strong and release-worthy |
-| Distributed runtime credibility | Honest foundation exists, but it is not yet a broad competitive claim |
+| Distributed runtime credibility | KV channel and SHM transport are production-tested; ownership cleanup still needs hardening |
 
 ## 2) What Is Distinctive
 
@@ -29,8 +29,9 @@ quadrantChart
 |---|---|
 | Two-CUDA-backend strategy | Separates compatibility risk from native-kernel iteration without hiding fallback behavior |
 | Machine-visible backend identity | Makes policy, benchmarking, and automation deterministic |
+| Production-grade native CUDA | FlashAttention-2 with GQA, CUDA graph capture/replay, 50+ fused GEMV kernels, GPU-adaptive dispatch thresholds |
 | API/admin/CLI contract rigor | Release-facing behavior is explicit and testable |
-| Transport-aware ops semantics | `/readyz`, admin pools, and failure-sensitive admission already reflect runtime health |
+| Transport-aware ops semantics | `/readyz`, admin pools, KV channel with SHM transport, and failure-sensitive admission already reflect runtime health |
 
 ## 3) Best-In-Class Gap Map
 
@@ -45,8 +46,8 @@ quadrantChart
 | Comparison | Current reading |
 |---|---|
 | InferFlux vs Ollama | Strong repo-level win via `llama_cpp_cuda` on the published benchmark matrix |
-| InferFlux native vs compatibility | `inferflux_cuda` is competitive in some current Windows-native envelopes, but `llama_cpp_cuda` still wins the sustained concurrency story |
-| InferFlux vs native-kernel leaders | Control plane is credible; native throughput still needs more proof on decode-heavy GGUF traffic |
+| InferFlux native vs compatibility | `inferflux_cuda` exceeds llama.cpp on single-sequence and matches at c=4, but `llama_cpp_cuda` still wins the c≥8 sustained concurrency story |
+| InferFlux vs native-kernel leaders | Control plane is credible; native single-sequence throughput now competitive, but sustained high-concurrency decode still needs improvement |
 
 ## 5) Release-Facing Guidance
 

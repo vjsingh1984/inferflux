@@ -22,9 +22,9 @@ flowchart TB
 |---|---|---|---|
 | Vision and product coherence | B+ | Clear server-first product with explicit dual-CUDA strategy | Native CUDA story still needs stronger sustained-concurrency proof |
 | Capabilities | A- | Streaming, embeddings, admin APIs, logprobs, metrics, fallback identity | Structured-output dependence on compatibility paths is still not fully retired |
-| Scalability and economy | C+ | Scheduler, batching, KV planning, operator metrics, memory-first GGUF direction | Native CUDA still loses ground at higher concurrency; distributed ownership semantics remain shallow |
+| Scalability and economy | B- | Scheduler with granular lock ordering and fairness, radix prefix cache, multi-tier KV (GPU→host→disk), disaggregated KV channel with SHM transport, memory-first GGUF direction | Native CUDA still loses ground at c≥8 concurrency; distributed ownership semantics need hardening |
 | Resource efficiency | B- | GGUF stays quantized, KV planner is real, native metrics expose operator choices | Decode down-proj still burns too much time in live `c=8` style traffic |
-| Design and implementation | B | Runtime/provider split is coherent and testable; native CUDA kernels are real, not scaffold-only | Transitional complexity is still high around dispatch policy, benchmark harnesses, and compatibility overlap |
+| Design and implementation | B+ | Runtime/provider split is coherent and testable; CUDA graph capture, FlashAttention-2 with GQA, GPU-adaptive dispatch, and 50+ fused kernels are production-grade | Transitional complexity still high around dispatch policy and compatibility overlap |
 | TDD and CI maturity | B | Good focused tests and source-aligned docs gate | Required GPU/provider lane is still missing |
 | OSS release readiness | B- | Canonical docs, release workflow, and repo-root OSS files can now be made explicit | Artifact clutter, local benchmark sprawl, and release hygiene still require ongoing discipline |
 
@@ -33,9 +33,9 @@ flowchart TB
 | Area | Current reading |
 |---|---|
 | `llama_cpp_cuda` vs Ollama | Strong published repo advantage; keep this as the stable public benchmark claim |
-| `inferflux_cuda` vs `llama_cpp_cuda` | Native is competitive around `c=4` in the current Windows harness, but still behind at `c=8` |
+| `inferflux_cuda` vs `llama_cpp_cuda` | Native exceeds llama.cpp on single-sequence (~1.1x), at parity for c=4 (182.9 tok/s), but still 0.78x at c=8 (210 vs 268 tok/s) |
 | Native hot path reality | FFN grouped MMQ3 is live; the remaining gap is centered on decode down-proj row-pair/row-quad cost |
-| Distributed runtime | Honest foundation exists, but not enough for strong ownership-safe claims |
+| Distributed runtime | KV channel and SHM transport are production-tested; ownership cleanup and worker-loss handling still need hardening |
 
 ## 3) Debt Register
 
@@ -52,7 +52,7 @@ flowchart TB
 
 | Grade | Why it is not lower | Why it is not higher |
 |---|---|---|
-| B- overall | The codebase has a real server, real tests, real native kernels, and explicit backend identity | Native CUDA still lacks a clean sustained-concurrency win over the compatibility backend, and GPU CI is still optional |
+| B- overall | Real server, 827 unit tests + 137 integration tests, production-grade native CUDA path (FA2, graph capture, 50+ fused kernels), explicit backend identity, granular scheduler with fairness | Native CUDA still lacks a clean sustained-concurrency win at c≥8, GPU CI is still optional, and speculative decoding is only partially integrated |
 
 ## 5) Recommended Next Execution Order
 
@@ -67,10 +67,10 @@ flowchart TB
 
 | Area | Grade | Reading |
 |---|---|---|
-| Licensing and root metadata | B | Root OSS metadata can be explicit and conventional |
-| Canonical docs | B | Good structure, but several CUDA claims needed updating to current measurements |
-| Release process | B | Workflow and process docs exist, but release quality still depends too much on manual GPU validation |
-| Repository hygiene | C+ | Local benchmark/profiling artifact churn is still easy to accumulate |
+| Licensing and root metadata | A- | Apache 2.0 LICENSE, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT all in place and clean |
+| Canonical docs | B+ | Good structure, CUDA claims now updated to current measurements, doc index provides clear navigation |
+| Release process | B | Workflow and process docs exist, CI has docs contract gate and SBOM generation, but release quality still depends too much on manual GPU validation |
+| Repository hygiene | B- | Profiler/benchmark artifacts properly gitignored, personal references removed, stale claims updated |
 
 ## 7) Canonical References
 
