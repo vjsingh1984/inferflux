@@ -385,8 +385,9 @@ private:
   // Device-side token relay: avoids H2D metadata upload between decode tokens.
   // When active, DeviceTokenRelay updates graph input buffers on device,
   // and BatchForwardReplay replays the graph without host round-trip.
-  bool decode_relay_active_{false};
-  int decode_relay_batch_size_{0};
+  // Atomic to prevent TOCTOU races with concurrent scheduler threads.
+  std::atomic<bool> decode_relay_active_{false};
+  std::atomic<int> decode_relay_batch_size_{0};
   int *d_eos_flag_{nullptr}; // [1] device flag for EOS detection
 
   /**
