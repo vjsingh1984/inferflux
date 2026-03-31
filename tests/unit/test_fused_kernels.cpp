@@ -44,6 +44,37 @@
     }                                                                          \
   } while (0)
 
+using namespace inferflux;
+
+// Block type declarations for .cpp compilation context.
+// These structs are defined in dequantization.cuh (CUDA-only header) inside
+// inferflux::runtime::cuda::native. Replicated here because dequantization.cuh
+// uses #define macros that conflict with C++ compilation by g++.
+namespace inferflux {
+namespace runtime {
+namespace cuda {
+namespace native {
+
+struct block_q4_k {
+  unsigned short d;
+  unsigned short dmin;
+  unsigned char scales[12];
+  unsigned char qs[128];
+};
+
+struct block_q8_1 {
+  half2 ds;
+  signed char qs[32];
+};
+
+constexpr int QK_K = 256;
+constexpr int QK8_1 = 32;
+
+} // namespace native
+} // namespace cuda
+} // namespace runtime
+} // namespace inferflux
+
 namespace {
 
 void FillRandomHalf(std::vector<half> &buf, std::mt19937 &rng) {

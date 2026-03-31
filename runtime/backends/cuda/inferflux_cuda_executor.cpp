@@ -1151,6 +1151,10 @@ void InferfluxCudaExecutor::ReleaseBatchScopedDequantizedCache() {
     return;
   }
 
+  // Acquire lane_overlap_mutex_ to ensure no lane threads are still using
+  // quantized weight maps or scratch buffers when we clear/release them.
+  std::lock_guard<std::mutex> lane_guard(lane_overlap_mutex_);
+
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   // Skip expensive stream synchronization when no dequant scratch is in use.
   // With MMVQ/MMQ as the primary dispatch path, dequant scratch is only
@@ -1400,19 +1404,22 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
     prefill_lane_forward_->SetExecutionPolicy(execution_policy_);
   }
 
-  // CUDA graphs are unsafe with lane overlap: decode and prefill workers run
-  // on separate threads with varying batch sizes, causing graph
-  // destroy/capture races on shared stream state.  Disable graphs on all
-  // lane-specific forward instances and on the primary forward to prevent
-  // "double free or corruption" crashes during batch-size transitions.
+  // CUDA graphs are unsafe with lane overlap workers: decode and prefill
+  // workers run on separate threads with varying batch sizes, causing graph
+  // destroy/capture races. Disable graphs on lane-specific forwards only.
+  // The primary forward keeps graphs enabled for non-overlapped execution
+  // (single-sequence decode or when lane overlap is not triggered).
+  // The lane_overlap_mutex_ in ExecuteLaneBatchForAsync and
+  // ReleaseBatchScopedDequantizedCache prevents concurrent access to shared
+  // resources during lane execution.
   {
     NativeExecutionPolicy lane_policy = execution_policy_;
     lane_policy.disable_cuda_graph = true;
     decode_lane_forward_->SetExecutionPolicy(lane_policy);
     prefill_lane_forward_->SetExecutionPolicy(lane_policy);
-    model_forward_->SetExecutionPolicy(lane_policy);
     log::Info("inferflux_cuda_executor",
-              "CUDA graphs disabled (lane overlap active)");
+              "CUDA graphs disabled on lane forwards (overlap active); "
+              "primary forward retains graph support");
   }
 
   decode_lane_sampler_ = std::make_unique<GpuSampler>();
@@ -2427,6 +2434,12 @@ InferfluxCudaExecutor::ExecuteLaneBatchForAsync(
   if (inputs.empty()) {
     return result;
   }
+
+  // Hold lane_overlap_mutex_ for the entire lane execution to prevent
+  // concurrent DestroyLaneOverlapResources() or
+  // ReleaseBatchScopedDequantizedCache() from invalidating lane resources
+  // while this lane is still using them.
+  std::lock_guard<std::mutex> lane_guard(lane_overlap_mutex_);
 
   const LaneExecutionResources lane_resources = GetLaneResources(decode_lane);
   const bool shares_quantized_map =

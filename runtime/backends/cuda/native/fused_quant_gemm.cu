@@ -1414,12 +1414,24 @@ bool DispatchQ8_1MmvqAccumQ8K(const void *data, const void *act_q8_1,
                                                         M, N, K, stream);
 }
 
+// Forward declarations for MMQ accumulate dispatch (defined after MMQ section)
+bool DispatchMmqAccumQ4K(const void *data, const void *act_q8_1, half *output,
+                         int M, int N, int K, cudaStream_t stream);
+bool DispatchMmqAccumQ6K(const void *data, const void *act_q8_1, half *output,
+                         int M, int N, int K, cudaStream_t stream);
+bool DispatchMmqAccumQ8_0(const void *data, const void *act_q8_1, half *output,
+                          int M, int N, int K, cudaStream_t stream);
+bool DispatchMmqAccumQ8K(const void *data, const void *act_q8_1, half *output,
+                         int M, int N, int K, cudaStream_t stream);
+
 bool DispatchQ8_1GemvAccumQ4K(const void *data, const void *act_q8_1,
                                half *output, int M, int N, int K,
                                cudaStream_t stream) {
   if (M <= 8)
     return DispatchQ8_1MmvqAccumQ4K(data, act_q8_1, output, M, N, K, stream);
-  return false; // MMQ accumulate not implemented — fall back
+  if (M <= 64)
+    return DispatchMmqAccumQ4K(data, act_q8_1, output, M, N, K, stream);
+  return false;
 }
 
 bool DispatchQ8_1GemvAccumQ6K(const void *data, const void *act_q8_1,
@@ -1436,6 +1448,8 @@ bool DispatchQ8_1GemvAccumQ6K(const void *data, const void *act_q8_1,
     }
     return DispatchQ8_1MmvqAccumQ6K(data, act_q8_1, output, M, N, K, stream);
   }
+  if (M <= 64)
+    return DispatchMmqAccumQ6K(data, act_q8_1, output, M, N, K, stream);
   return false;
 }
 
@@ -1444,6 +1458,8 @@ bool DispatchQ8_1GemvAccumQ8_0(const void *data, const void *act_q8_1,
                                 cudaStream_t stream) {
   if (M <= 8)
     return DispatchQ8_1MmvqAccumQ8_0(data, act_q8_1, output, M, N, K, stream);
+  if (M <= 64)
+    return DispatchMmqAccumQ8_0(data, act_q8_1, output, M, N, K, stream);
   return false;
 }
 
@@ -1452,6 +1468,8 @@ bool DispatchQ8_1GemvAccumQ8K(const void *data, const void *act_q8_1,
                                cudaStream_t stream) {
   if (M <= 8)
     return DispatchQ8_1MmvqAccumQ8K(data, act_q8_1, output, M, N, K, stream);
+  if (M <= 64)
+    return DispatchMmqAccumQ8K(data, act_q8_1, output, M, N, K, stream);
   return false;
 }
 
@@ -1485,6 +1503,38 @@ bool DispatchMmqQ8K(const void *data, const void *act_q8_1, half *output,
   return DispatchMmq<block_q8_k, inferflux_mmq_q8k<16>,
                      inferflux_mmq_q8k<32>>(data, act_q8_1, output, M, N, K, 8,
                                             stream);
+}
+
+// ============================================================================
+// MMQ accumulate dispatch functions (batch 9-64, residual fusion)
+// ============================================================================
+
+bool DispatchMmqAccumQ4K(const void *data, const void *act_q8_1, half *output,
+                         int M, int N, int K, cudaStream_t stream) {
+  return DispatchMmqAccum<block_q4_k, inferflux_mmq_q4k_accum<16>,
+                          inferflux_mmq_q4k_accum<32>>(
+      data, act_q8_1, output, M, N, K, 8, stream);
+}
+
+bool DispatchMmqAccumQ6K(const void *data, const void *act_q8_1, half *output,
+                         int M, int N, int K, cudaStream_t stream) {
+  return DispatchMmqAccum<block_q6_k, inferflux_mmq_q6k_accum<16>,
+                          inferflux_mmq_q6k_accum<32>>(
+      data, act_q8_1, output, M, N, K, 8, stream);
+}
+
+bool DispatchMmqAccumQ8_0(const void *data, const void *act_q8_1, half *output,
+                          int M, int N, int K, cudaStream_t stream) {
+  return DispatchMmqAccum<block_q8_0, inferflux_mmq_q8_0_accum<16>,
+                          inferflux_mmq_q8_0_accum<32>>(
+      data, act_q8_1, output, M, N, K, 4, stream);
+}
+
+bool DispatchMmqAccumQ8K(const void *data, const void *act_q8_1, half *output,
+                         int M, int N, int K, cudaStream_t stream) {
+  return DispatchMmqAccum<block_q8_k, inferflux_mmq_q8k_accum<16>,
+                          inferflux_mmq_q8k_accum<32>>(
+      data, act_q8_1, output, M, N, K, 8, stream);
 }
 
 // MMVQ pair dispatch for Q4_K
@@ -1543,7 +1593,7 @@ bool DispatchQ8_1MmvqTripleQ6K(const void *data0, const void *data1,
 // MMVQ/MMQ dispatch wrappers (sole Q8_1 dispatch path)
 //
 // M <= 8:  MMVQ (weight-read-first batch-amortized)
-// M <= 64: MMQ  (tiled quantized GEMM)
+// M <= 64: MMQ  (tiled quantized GEMM) — now with accumulate variants
 // M > 64:  return false → cuBLAS fallback
 // ============================================================================
 
@@ -1592,7 +1642,6 @@ bool DispatchQ8_1GemvQ8K(const void *data, const void *act_q8_1, half *output,
 }
 
 // Grouped pair dispatch: MMVQ for M<=8, V1 group fallback for M>8
-// (grouped MMQ not yet implemented)
 bool DispatchQ8_1GemvPairQ4K(const void *data0, const void *data1,
                               const void *act_q8_1, half *output0, int N0,
                               half *output1, int N1, int M, int K,
