@@ -156,14 +156,14 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 ## CUDA Development
 
 **Two-backend architecture:** The CUDA path has two providers that both accept GGUF models:
-- `inferflux_cuda` (`runtime/backends/cuda/inferflux_cuda_backend.cpp`, `inferflux_cuda_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp), FlashAttention-2 with GQA and multi-sequence decode, CUDA graph capture/replay. Use for **single-request optimization** and native feature development. Single-sequence decode exceeds llama.cpp after Q8_1 fix (~133-140 vs ~120 tok/s on Qwen2.5-3B Q4_K_M). Concurrent serving at c=4 parity (182.9 tok/s), but still 0.78x at c=8 (210 vs 268 tok/s).
+- `inferflux_cuda` (`runtime/backends/cuda/inferflux_cuda_backend.cpp`, `inferflux_cuda_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp), FlashAttention-2 with GQA and multi-sequence decode, CUDA graph capture/replay, MMQ accumulate kernels (M=9-64 residual fusion). Use for **single-request optimization** and native feature development. Single-sequence decode exceeds llama.cpp after Q8_1 fix (~65-68 tok/s with graphs on Qwen2.5-3B Q4_K_M). Concurrent serving: c=4 at 148 tok/s (crash-free after lane overlap mutex fixes), c=8 at 170-175 tok/s (~75% stability, residual race condition tracked).
 - `llama_cpp_cuda` — delegates to llama.cpp for inference. **Use for concurrent workloads** (validated 3.7x faster than Ollama at 16 agents). Higher throughput today, lower ceiling for InferFlux-specific innovation.
 
 Only structured output (grammar-constrained generation) still delegates to the llama.cpp parity backend. Logprobs and embeddings are native.
 
 **Key CUDA env vars:** (centralized in `NativeExecutionPolicy::FromEnv()`)
 - `INFERFLUX_DISABLE_BATCHED_DECODE=1` — opt out of batched decode (default-on)
-- `INFERFLUX_DISABLE_CUDA_GRAPH=1` — disable CUDA graph capture (default-on; cudaDeviceSynchronize before capture prevents heap corruption)
+- `INFERFLUX_DISABLE_CUDA_GRAPH=1` — disable CUDA graph capture (default-on for primary forward; lane forwards have graphs disabled automatically during overlap; lane overlap mutex fixes in 0ccbad3 prevent heap corruption)
 - `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` — disable pre-quantized Q8_1 activation path
 - `INFERFLUX_ENABLE_FUSED_GATE_UP_SILU=0|1` — toggle fused gate+up+SiLU MMVQ kernel (default on)
 - `INFERFLUX_ENABLE_FUSED_RESIDUAL_NORM=0|1` — fuse ResidualAdd+RmsNorm into one kernel at layer boundaries (default on)

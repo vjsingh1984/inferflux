@@ -37,7 +37,7 @@ quadrantChart
 
 | Gap | What closes it |
 |---|---|
-| Native concurrent GGUF throughput | Better decode down-proj kernels and better sustained hot-path residency |
+| Native concurrent GGUF throughput | Better decode down-proj kernels and better sustained hot-path residency. March 31 improvements (MMQ accumulate M=9-64, lane overlap mutex fixes, CUDA graph re-enable) changed the executor baseline; re-validation against `llama_cpp_cuda` under matched parameters is pending before updating competitive ratios. |
 | Release confidence on GPU paths | Required GPU/provider CI instead of optional manual validation |
 | Distributed runtime credibility | Ownership cleanup, worker-loss handling, and failure-path testing |
 

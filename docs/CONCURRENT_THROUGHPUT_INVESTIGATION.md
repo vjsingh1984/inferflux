@@ -376,6 +376,26 @@ The concurrent throughput gap (0.50x at c=4) is NOT caused by the `max_batch_siz
 
 ---
 
-**Document Version**: 1.1
-**Last Updated**: March 10, 2026
-**Status**: Partially resolved - 4% improvement found, primary bottleneck TBD (likely kernel efficiency)
+---
+
+## Epilogue: Executor-Side Fixes (March 31, 2026)
+
+Commit `0ccbad3` addressed executor-side bottlenecks identified during this investigation:
+
+1. **MMQ accumulate kernels (M=9-64):** Added residual fusion for the MMQ batch range, extending the accumulate optimization that was previously limited to MMVQ single-row paths. This reduces the separate ResidualAdd overhead for medium-batch decode.
+
+2. **Lane overlap race condition fixes:** A heap corruption bug in the lane overlap path was traced to unsynchronized access in `ExecuteLaneBatchForAsync` and `ReleaseBatchScopedDequantizedCache`. A `lane_overlap_mutex_` was introduced to serialize these critical sections.
+
+3. **CUDA graphs re-enabled during lane overlap:** With the mutex fix in place, CUDA graph capture/replay on the primary forward instance was re-enabled for lane overlap workloads. Previously this was disabled as a workaround for the corruption.
+
+4. **Atomic relay state (commit `7561fc7`):** `decode_relay_active_` and `decode_relay_batch_size_` were changed to `std::atomic` to eliminate data races on the relay control path.
+
+These changes moved c=8 from frequent crashes to ~75% stability (32/32 completions in best runs on RTX 4000 Ada, Qwen2.5-3B Q4_K_M, 32 requests, 64 max tokens). A residual intermittent crash at c=8 (~25% failure rate) remains tracked but unresolved.
+
+This confirms the earlier finding that the remaining gap after scheduler investigation was attributable to native backend/operator cost and executor-side race conditions, not decode-worker scaffolding.
+
+---
+
+**Document Version**: 1.2
+**Last Updated**: March 31, 2026
+**Status**: Partially resolved - executor-side fixes improved c=8 stability; residual crash under investigation

@@ -1,6 +1,6 @@
 # InferFlux Tech Debt and Competitive Roadmap
 
-**Snapshot date:** March 29, 2026  
+**Snapshot date:** March 31, 2026
 **Current overall grade:** B-
 
 ```mermaid
@@ -33,15 +33,18 @@ flowchart TB
 | Area | Current reading |
 |---|---|
 | `llama_cpp_cuda` vs Ollama | Strong published repo advantage; keep this as the stable public benchmark claim |
-| `inferflux_cuda` vs `llama_cpp_cuda` | Native exceeds llama.cpp on single-sequence (~1.1x), at parity for c=4 (182.9 tok/s), but still 0.78x at c=8 (210 vs 268 tok/s) |
-| Native hot path reality | FFN grouped MMQ3 is live; the remaining gap is centered on decode down-proj row-pair/row-quad cost |
+| `inferflux_cuda` vs `llama_cpp_cuda` | Native exceeds llama.cpp on single-sequence (~1.1x); c=4 at 148.3 tok/s, c=8 at 174.6 tok/s (March 31 baseline). Lane overlap race fixes (0ccbad3) improved concurrent stability but residual c=8 instability remains (~75% pass rate) |
+| Native hot path reality | MMQ accumulate kernels landed for M=9-64 (0ccbad3); CUDA graphs re-enabled on primary forward path; remaining gap is concurrent stability at c>=8 |
 | Distributed runtime | KV channel and SHM transport are production-tested; ownership cleanup and worker-loss handling still need hardening |
 
 ## 3) Debt Register
 
 | Priority | Debt item | Why it matters | Retirement gate | Status |
 |---|---|---|---|---|
-| P0 | Decode down-proj row-pair and row-quad throughput | Current live `c=8` operator metrics point here as the remaining native bottleneck | Native decode down-proj kernels improve sustained concurrent serving without regressing `c=4` | In progress |
+| P0 | Decode down-proj row-pair and row-quad throughput | MMQ accumulate kernels for M=9-64 landed in 0ccbad3, covering the primary decode down-proj bottleneck | Native decode down-proj kernels improve sustained concurrent serving without regressing `c=4` | COMPLETED (0ccbad3) |
+| P0 | Lane overlap race conditions | GetLaneResources + ReleaseBatchScopedDequantizedCache now protected by lane_overlap_mutex_ (0ccbad3); concurrent stability improved but residual c=8 instability remains (~75% pass rate) | Race-free lane overlap under sustained concurrency | Partially resolved (0ccbad3) |
+| P0 | CUDA graph stability | CUDA graphs were blanket-disabled due to heap corruption risk; now selectively re-enabled on primary forward path with cudaDeviceSynchronize before capture (0ccbad3) | CUDA graphs enabled without heap corruption | COMPLETED (0ccbad3) |
+| P0 | Residual c=8 concurrent instability | Clean runs pass 32/32 but overall pass rate is ~75% at c=8; root cause unknown | c=8 throughput gate passes reliably (>95%) | Open |
 | P0 | Required GPU/provider CI lane | Native CUDA regressions are still too easy to discover late | Release-blocking GPU/provider runtime lane exists and is enforced | Not started |
 | P1 | Native structured output independence | Compatibility fallback still owns some important generation behavior | Grammar-constrained generation runs natively on the CUDA path | Not started |
 | P1 | Distributed sequence ownership cleanup | Transport health exists, but cleanup and worker-loss semantics are still not operations-grade | Ownership transfer, cleanup, and failure handling are deterministic and tested | Not started |
@@ -58,7 +61,7 @@ flowchart TB
 
 | Order | Work item | Reason |
 |---|---|---|
-| 1 | Optimize decode down-proj row-pair and row-quad kernels | This is the hottest remaining live path in current metrics |
+| 1 | Diagnose and fix residual c=8 instability | MMQ accumulate and lane overlap fixes landed but ~75% pass rate at c=8 remains; this is the top remaining runtime risk |
 | 2 | Add a required GPU/provider behavior lane | Prevent performance and routing regressions from landing unnoticed |
 | 3 | Reduce compatibility dependence for structured output | Shrink the last major capability gap between native and compatibility paths |
 | 4 | Harden release hygiene | Keep release docs and artifact policy aligned with real repo state |

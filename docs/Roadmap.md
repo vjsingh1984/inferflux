@@ -1,12 +1,12 @@
 # InferFlux Roadmap
 
-**Snapshot date:** March 29, 2026  
-**Current overall grade:** B-  
-**Target overall grade:** B after native decode-path and release-gate maturity
+**Snapshot date:** March 31, 2026
+**Current overall grade:** B-
+**Target overall grade:** B after concurrent stability and release-gate maturity
 
 ```mermaid
 flowchart LR
-    A[Now: strong contracts and good OSS server shape] --> B[Next: native decode down-proj throughput]
+    A[Now: MMQ accumulate landed, CUDA graphs re-enabled] --> B[Next: fix residual c=8 instability]
     B --> C[Then: required GPU and provider release gates]
     C --> D[Then: distributed ownership and failure maturity]
 ```
@@ -15,8 +15,8 @@ flowchart LR
 
 | Dimension | Current | Evidence in code today | Blocker to next grade |
 |---|---|---|---|
-| Throughput | B- | Native CUDA exceeds llama.cpp on single-sequence (~1.1x), reaches c=4 parity; CUDA graph capture, FlashAttention-2 with GQA, 50+ fused GEMV kernels, FFN grouped MMQ3 active on live decode | Decode down-proj row-pair/row-quad still leaves native at 0.78x at c=8 |
-| Continuous batching | B- | Granular scheduler locks with fairness, prefix-affinity scoring, decode-worker pools, disaggregated KV channel; live decode cohorts are measurable | Better decode hot-path cost still needed for sustained c≥8 wins |
+| Throughput | B- | Native CUDA exceeds llama.cpp on single-sequence (~1.1x); MMQ accumulate kernels landed for M=9-64 (0ccbad3), CUDA graphs re-enabled on primary forward. March 31 baseline: c=1 65.6, c=4 148.3, c=8 174.6 tok/s | Residual c=8 instability (~75% pass rate) prevents a clean concurrent win claim |
+| Continuous batching | B- | Granular scheduler locks with fairness, prefix-affinity scoring, decode-worker pools, disaggregated KV channel; lane overlap race fixes (lane_overlap_mutex_) improved concurrent stability | Residual c=8 instability still not root-caused; sustained c>=8 wins require reliable pass rates |
 | Capability identity | A- | Provider/fallback identity is explicit across API, admin, CLI, and metrics | Some advanced behavior still depends on compatibility fallback |
 | Resource efficiency | B- | Memory-first GGUF direction, KV planner with multi-tier cache (GPU→host→disk), radix prefix cache, quantized execution are real | Native decode still spends too much work in its current down-proj kernels |
 | CI and release enforcement | B- | 827 unit + 137 integration tests, docs contract gate, SBOM generation | Required GPU/provider lane is still not a release blocker |
@@ -27,7 +27,7 @@ flowchart LR
 
 | Priority | Workstream | Exit criteria |
 |---|---|---|
-| P0 | Decode down-proj throughput | Native decode down-proj improvements produce repeated serving wins without regressing nearby envelopes |
+| P0 | Residual c=8 concurrent instability | c=8 throughput gate passes reliably (>95%); clean runs already achieve 174.6 tok/s (32/32) but overall pass rate is ~75% |
 | P0 | Required GPU/provider release lane | Native/provider/runtime checks become mandatory for release confidence |
 | P1 | Structured-output native ownership | Grammar-constrained generation no longer relies on compatibility fallback for the CUDA path |
 | P1 | Distributed ownership maturity | Cleanup and worker-loss behavior are deterministic and covered by tests |
@@ -52,8 +52,8 @@ Grades move only when both are true:
 
 | Step | Why now |
 |---|---|
-| Profile and optimize decode down-proj row-pair and row-quad kernels | Current live metrics point to these as the remaining hot path |
-| Keep FFN optimization work focused on measured serving impact | FFN fusion alone is no longer the main concurrency gap |
+| Diagnose and fix residual c=8 instability | MMQ accumulate and lane overlap mutex landed (0ccbad3) but ~75% pass rate at c=8 remains the top runtime risk |
+| Investigate atomic decode_relay state (7561fc7) interaction with lane overlap | Concurrent state management is the likely area for remaining race conditions |
 | Convert more GPU validation from ad hoc measurement into repeatable gates | Prevent regression churn during continued kernel work |
 
 ## 6) References

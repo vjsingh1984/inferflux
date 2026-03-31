@@ -56,6 +56,27 @@ Interpretation:
 - `llama_cpp_cuda` still has the better sustained concurrency profile.
 - The latest live operator metrics show FFN grouped MMQ3 is already active, so more FFN fusion alone will not close the remaining gap.
 
+### March 31 Snapshot (MMQ Accumulate and Lane Overlap Fixes)
+
+Commit `0ccbad3` added MMQ accumulate kernels for M=9-64 residual fusion, fixed a lane overlap heap corruption race via `lane_overlap_mutex_` in `ExecuteLaneBatchForAsync` and `ReleaseBatchScopedDequantizedCache`, and re-enabled CUDA graphs on the primary forward instance during lane overlap. Commit `7561fc7` made `decode_relay_active_` and `decode_relay_batch_size_` atomic.
+
+Representative Windows-native harness run on March 31, 2026 using:
+- model: `Qwen2.5-3B-Instruct Q4_K_M`
+- requests: `32`
+- max tokens: `64`
+- endpoint: `/v1/chat/completions`
+
+| Metric | `inferflux_cuda` |
+|---|---|
+| c=1 throughput | 65.6 tok/s (32/32 completions) |
+| c=4 throughput | 148.3 tok/s (32/32 completions) |
+| c=8 throughput | 174.6 tok/s (32/32 in best runs, ~75% stability) |
+
+Interpretation:
+- c=8 now completes all 32 requests in best runs, up from frequent failures before the lane overlap mutex fix.
+- A residual intermittent crash at c=8 (~25% failure rate) is tracked but not yet fully resolved.
+- These numbers are not directly comparable to the March 29 snapshot (different request count and max token length). Re-validation against `llama_cpp_cuda` under the same parameters is pending.
+
 ## 4) Live Operator Reading
 
 Recent decode metrics from the same native probe showed:

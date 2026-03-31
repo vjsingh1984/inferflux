@@ -1,6 +1,6 @@
 # InferFlux Vision
 
-**Snapshot date:** March 27, 2026
+**Snapshot date:** March 31, 2026
 
 ```mermaid
 flowchart LR
@@ -27,7 +27,7 @@ flowchart LR
 |---|---|
 | Strong today | API/admin/CLI contracts, backend/provider identity, policy-visible fallback, prefix/KV reuse, admin pools visibility, and operator observability |
 | Foundation now | Native loader detection, memory-first GGUF dequant policy, KV auto-tune planning/metrics, optional session leases, distributed ticket lifecycle, timeout debt, optional fail-closed generation admission, and stepwise native burst decode on the live phased path |
-| Still not leadership | Quantized native GGUF throughput still trails in the fresh long-run comparison (`0.69x` at `c=4`, `0.74x` at `c=8`, `0.42x` at `c=16`), graph-captured decode/prefill envelopes, native-owned endpoint independence everywhere, deterministic distributed ownership cleanup, mandatory GPU release lane |
+| Still not leadership | March 31 baseline: c=1 65.6, c=4 148.3, c=8 174.6 tok/s (32/32 in clean runs). MMQ accumulate kernels (M=9-64) and lane overlap race fixes (lane_overlap_mutex_ in 0ccbad3) improved concurrent stability, and CUDA graphs are re-enabled on primary forward. However, residual c=8 instability (~75% pass rate) prevents a reliable concurrent win claim. Deterministic distributed ownership cleanup and mandatory GPU release lane are still outstanding |
 
 ## 3) Modern Serving Posture
 
@@ -57,7 +57,7 @@ flowchart LR
 |---|---|
 | Overall | `B-` |
 | Why not lower | Control-plane, identity, observability, and memory-policy foundations are real and tested |
-| Why not higher | Native burst integration improved the live phased path and produced a sensible WSL2 default (`INFERFLUX_NATIVE_BURST_CHUNK_TOKENS=4`), but the fresh long-run llama.cpp comparison still shows a meaningful concurrent-performance and memory-efficiency gap, and distributed ownership semantics are not yet release-enforced |
+| Why not higher | MMQ accumulate kernels and lane overlap fixes (0ccbad3) closed the decode down-proj bottleneck and improved concurrent stability. CUDA graphs re-enabled on primary forward. March 31 baseline shows progress (c=1 65.6, c=4 148.3, c=8 174.6 tok/s) but residual c=8 instability (~75% pass rate) and distributed ownership semantics are not yet release-enforced |
 
 ## 6) Canonical Source Map
 

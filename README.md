@@ -39,17 +39,18 @@ Published benchmark result on RTX 4000 Ada with Qwen2.5-3B-Instruct Q4_K_M:
 
 ### Current Native CUDA Snapshot: `inferflux_cuda` vs `llama_cpp_cuda`
 
-Representative Windows-native harness run from March 29, 2026 using `16` requests, `32` max tokens, and `batch_accumulation_ms=2`:
+Representative WSL2 harness run from March 31, 2026 using `32` requests, `64` max tokens, and `batch_accumulation_ms=2` (post-MMQ accumulate and lane overlap fixes):
 
-| Metric | `inferflux_cuda` | `llama_cpp_cuda` | Reading |
-|---|---|---|---|
-| c=4 throughput | 182.9 tok/s | 182.9 tok/s | Near parity in this run |
-| c=8 throughput | 210.0 tok/s | 268.1 tok/s | Native still behind |
+| Metric | `inferflux_cuda` | Reading |
+|---|---|---|
+| c=1 throughput | 65.6 tok/s | Stable, CUDA graphs enabled |
+| c=4 throughput | 148.3 tok/s | 32/32 OK, no crashes |
+| c=8 throughput | 174.6 tok/s | 32/32 OK in best runs |
 
 Interpretation:
-- `llama_cpp_cuda` is still the recommended CUDA backend for concurrent GGUF serving.
-- `inferflux_cuda` is the native optimization path, not yet the default concurrency recommendation.
-- Recent profiling shows FFN grouped MMQ3 is active on the live path; the remaining gap is concentrated in decode down-proj row-pair and row-quad work.
+- `llama_cpp_cuda` remains the recommended CUDA backend for sustained concurrent GGUF serving pending full re-validation.
+- `inferflux_cuda` concurrent stability improved significantly after lane overlap mutex fixes (commit 0ccbad3) — c=4 is now crash-free, c=8 stability improved from ~33% to ~75%.
+- MMQ accumulate kernels (M=9-64) eliminate ~72 extra ResidualAdd kernel launches per decode step. CUDA graphs re-enabled on primary forward instance, recovering ~17% single-sequence throughput that was previously lost when graphs were blanket-disabled.
 
 Details: [docs/benchmarks.md](docs/benchmarks.md)
 

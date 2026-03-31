@@ -75,7 +75,7 @@ Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 | Native logprobs | `logprobs` field in completion response is non-null when `logprobs: true` | Native path computes log-softmax from GPU logits (D2H copy). No parity delegate needed. |
 | Native embeddings | `/v1/embeddings` returns vectors | Native MeanPool kernel extracts embeddings. Falls back to delegate only if native fails. |
 | Q8_1 activation path | startup log shows `using Q8_1 grouped triple GEMV` or `using Q8_1 pre-quantized GEMV` | Confirms pre-quantized Q8_1 activations are active (highest throughput path). Disable with `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` for A/B testing. |
-| Overlap activity | `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_overlap_events_total` | Non-zero deltas confirm mixed-workload lane activity |
+| Overlap activity | `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_overlap_events_total` | Non-zero deltas confirm mixed-workload lane activity. CUDA graphs are now enabled on the primary forward instance during lane overlap after the `lane_overlap_mutex_` fix in commit `0ccbad3` eliminated the heap corruption that previously required disabling them. |
 | Native KV sizing | `inferflux_cuda_kv_requested_max_seq`, `inferflux_cuda_kv_planned_max_seq`, `inferflux_cuda_kv_budget_bytes` | Planned values below requested show KV auto-tune is protecting VRAM |
 | Readiness on decode/disagg nodes | `/readyz` | Ready requires weights loaded, full decode-worker health, and timeout streak/debt below threshold |
 | Fail-closed admission | generation `503` with `error=distributed_kv_transport_degraded` | optional protection when degraded transport should stop new generation work immediately |
