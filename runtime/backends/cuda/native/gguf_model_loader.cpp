@@ -1077,6 +1077,10 @@ void GGUFModelLoader::ClearDequantizedCache() {
   }
 }
 
+bool GGUFModelLoader::HasDequantizedCache() const {
+  return has_dequantized_entries_;
+}
+
 const ModelInfo &GGUFModelLoader::GetModelInfo() const { return model_info_; }
 
 std::string GGUFModelLoader::GetFormat() const { return "gguf"; }

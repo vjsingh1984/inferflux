@@ -192,6 +192,11 @@ public:
   virtual void ClearDequantizedCache() = 0;
 
   /**
+   * @brief Check if any tensors have cached dequantized GPU data
+   */
+  virtual bool HasDequantizedCache() const = 0;
+
+  /**
    * @brief Get weight accessor for a specific tensor
    * @param tensor_name Name of tensor
    * @return Shared pointer to weight accessor, or nullptr if not found

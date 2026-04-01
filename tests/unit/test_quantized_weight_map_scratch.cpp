@@ -70,6 +70,7 @@ public:
   }
 
   void ClearDequantizedCache() override {}
+  bool HasDequantizedCache() const override { return false; }
 
   std::shared_ptr<runtime::cuda::native::IWeightAccessor>
   GetWeightAccessor(const std::string &tensor_name) override {

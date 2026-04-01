@@ -32,6 +32,7 @@ public:
     return policy_;
   }
   void ClearDequantizedCache() override { ++clear_calls_; }
+  bool HasDequantizedCache() const override { return false; }
   std::shared_ptr<runtime::cuda::native::IWeightAccessor>
   GetWeightAccessor(const std::string &) override {
     return nullptr;

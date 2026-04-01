@@ -87,6 +87,16 @@ void GGUFModelLoader::ClearDequantizedCache() {
   }
 }
 
+bool GGUFModelLoader::HasDequantizedCache() const {
+  for (const auto &[name, tensor] : tensors_) {
+    (void)name;
+    if (tensor.dequantized_gpu) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::shared_ptr<IWeightAccessor>
 GGUFModelLoader::GetWeightAccessor(const std::string &) {
   return nullptr;

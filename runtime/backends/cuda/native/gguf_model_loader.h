@@ -81,6 +81,7 @@ public:
   void SetDequantizedCachePolicy(DequantizedCachePolicy policy) override;
   DequantizedCachePolicy GetDequantizedCachePolicy() const override;
   void ClearDequantizedCache() override;
+  bool HasDequantizedCache() const override;
 
   /**
    * @brief Get weight accessor for a specific tensor
