@@ -1423,23 +1423,22 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
     prefill_lane_forward_->SetExecutionPolicy(execution_policy_);
   }
 
-  // CUDA graph capture involves cudaStreamSynchronize + cudaStreamBeginCapture
-  // which corrupts the host heap when concurrent CUDA work is in-flight on
-  // other streams (decode_stream_, prefill_stream_). This manifests as
-  // intermittent "double free or corruption" at c>=4.
-  //
-  // Disable graphs on ALL forward instances when lane overlap is active.
-  // Graph benefits (~17% at c=1) are preserved when lane overlap is NOT
-  // triggered (pure single-sequence decode), since EnsureLaneOverlapResources
-  // is only called when mixed workloads are detected.
+  // CUDA graphs are unsafe with lane overlap workers: decode and prefill
+  // workers run on separate threads with varying batch sizes, causing graph
+  // destroy/capture races. Disable graphs on lane-specific forwards only.
+  // The primary forward keeps graphs enabled for non-overlapped execution
+  // (single-sequence decode or when lane overlap is not triggered).
+  // The lane_overlap_mutex_ in ExecuteLaneBatchForAsync and
+  // ReleaseBatchScopedDequantizedCache prevents concurrent access to shared
+  // resources during lane execution.
   {
     NativeExecutionPolicy lane_policy = execution_policy_;
     lane_policy.disable_cuda_graph = true;
     decode_lane_forward_->SetExecutionPolicy(lane_policy);
     prefill_lane_forward_->SetExecutionPolicy(lane_policy);
-    model_forward_->SetExecutionPolicy(lane_policy);
     log::Info("inferflux_cuda_executor",
-              "CUDA graphs disabled (lane overlap active)");
+              "CUDA graphs disabled on lane forwards (overlap active); "
+              "primary forward retains graph support");
   }
 
   decode_lane_sampler_ = std::make_unique<GpuSampler>();

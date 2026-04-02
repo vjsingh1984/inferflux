@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -17,6 +18,7 @@ private:
   int AddToken(const std::string &token);
   std::vector<std::string> Tokenize(const std::string &text) const;
 
+  mutable std::mutex mu_;
   std::unordered_map<std::string, int> vocab_;
   std::vector<std::string> reverse_;
 };
