@@ -180,11 +180,14 @@ private:
   // CUDA graph state for batched decode.
   // graph_warmup_remaining_ skips capture for the first N calls to let lazy
   // allocations and weight dequantizations settle before attempting capture.
+  // graph_retry_remaining_ allows transient capture failures to be retried
+  // instead of permanently disabling graphs on the first failure.
   cudaGraph_t decode_graph_{nullptr};
   cudaGraphExec_t decode_graph_exec_{nullptr};
   int graph_batch_size_{0};
   bool graph_enabled_{true};
   int graph_warmup_remaining_{4};
+  int graph_retry_remaining_{3};
   NativeExecutionPolicy execution_policy_{};
   std::size_t device_workspace_bytes_{0};
   std::size_t host_workspace_bytes_{0};

@@ -651,9 +651,9 @@ start_server() {
     local pid=$!
     echo "$pid" > "$OUTPUT_DIR/${backend}.pid"
 
-    # Wait for readiness (max 60s)
+    # Wait for readiness (max 120s — llama_cpp_cuda needs ~90s on WSL2)
     local waited=0
-    while [ $waited -lt 60 ]; do
+    while [ $waited -lt 120 ]; do
         if ! kill -0 $pid 2>/dev/null; then
             log_err "$backend server exited early. Last log lines:"
             tail -20 "$log_file"
@@ -674,7 +674,7 @@ start_server() {
         waited=$((waited + 1))
     done
 
-    log_err "$backend did not start in 60s. Last log lines:"
+    log_err "$backend did not start in 120s. Last log lines:"
     tail -20 "$log_file"
     kill $pid 2>/dev/null || true
     return 1

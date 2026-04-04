@@ -2004,8 +2004,17 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
     if (err == cudaSuccess) {
       capturing = true;
     } else {
-      log::Warn("llama_forward", "CUDA graph capture begin failed");
-      graph_enabled_ = false;
+      if (--graph_retry_remaining_ <= 0) {
+        log::Warn("llama_forward",
+                  "CUDA graph capture begin permanently failed");
+        graph_enabled_ = false;
+      } else {
+        graph_warmup_remaining_ = 2;
+        log::Warn("llama_forward",
+                  "CUDA graph capture begin failed, will retry (" +
+                      std::to_string(graph_retry_remaining_) +
+                      " attempts remaining)");
+      }
     }
   }
 
@@ -2753,15 +2762,23 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
     cudaGetLastError();
 
     if (capture_abort) {
-      // cuBLAS fallback was needed but skipped during capture.
-      // Discard the incomplete graph and re-execute with cuBLAS.
+      // Fused kernel fallback was needed but skipped during capture.
+      // Discard the incomplete graph and retry on next call.
       if (decode_graph_) {
         cudaGraphDestroy(decode_graph_);
         decode_graph_ = nullptr;
       }
-      log::Info("llama_forward",
-                "CUDA graph: cuBLAS fallback needed, running without graph");
-      graph_enabled_ = false;
+      if (--graph_retry_remaining_ <= 0) {
+        log::Warn("llama_forward",
+                  "CUDA graph permanently disabled after capture aborts");
+        graph_enabled_ = false;
+      } else {
+        graph_warmup_remaining_ = 2;
+        log::Info("llama_forward",
+                  "CUDA graph capture aborted, will retry (" +
+                      std::to_string(graph_retry_remaining_) +
+                      " attempts remaining)");
+      }
       return RunCompute();
     }
 
@@ -2784,10 +2801,18 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
       cudaGraphDestroy(decode_graph_);
       decode_graph_ = nullptr;
     }
-    // Graph capture failed — re-execute without graph
-    log::Warn("llama_forward",
-              "CUDA graph capture failed, using direct execution");
-    graph_enabled_ = false;
+    // Graph capture failed — retry on next call
+    if (--graph_retry_remaining_ <= 0) {
+      log::Warn("llama_forward",
+                "CUDA graph permanently disabled after capture failures");
+      graph_enabled_ = false;
+    } else {
+      graph_warmup_remaining_ = 2;
+      log::Warn("llama_forward",
+                "CUDA graph capture failed, will retry (" +
+                    std::to_string(graph_retry_remaining_) +
+                    " attempts remaining)");
+    }
     return RunCompute();
   }
 
