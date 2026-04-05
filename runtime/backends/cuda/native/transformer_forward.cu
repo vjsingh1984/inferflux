@@ -1004,6 +1004,30 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
                            &h_batch_n_past_, &h_batch_seq_ids_,
                            &h_batch_kv_lens_);
 
+  // FlashDecode KV-split workspace for parallel attention.
+  // Layout: partial_O [B * num_kv_heads * splits * gqa_ratio * head_dim] float
+  //       + partial_max [B * num_kv_heads * splits * gqa_ratio] float
+  //       + partial_sum [B * num_kv_heads * splits * gqa_ratio] float
+  {
+    constexpr int kSplits = 16; // must match kFlashDecodeSplits in flash_attention.cu
+    const int gqa_ratio = (num_kv_heads_ > 0 && num_heads_ > num_kv_heads_)
+                              ? (num_heads_ / num_kv_heads_)
+                              : 1;
+    const size_t split_entries =
+        bsz * static_cast<size_t>(num_kv_heads_) * kSplits * gqa_ratio;
+    const size_t partial_O_bytes = split_entries * head_dim_ * sizeof(float);
+    const size_t partial_scalar_bytes = split_entries * sizeof(float);
+    attn_split_workspace_bytes_ = partial_O_bytes + 2 * partial_scalar_bytes;
+    err = cudaMalloc(&d_attn_split_workspace_, attn_split_workspace_bytes_);
+    if (err != cudaSuccess) {
+      // Non-fatal: fall back to unsplit attention
+      d_attn_split_workspace_ = nullptr;
+      attn_split_workspace_bytes_ = 0;
+    } else {
+      device_workspace_bytes_ += attn_split_workspace_bytes_;
+    }
+  }
+
   return true;
 }
 
@@ -1041,6 +1065,11 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
   if (d_ffn_act_q8_1_) {
     cudaFree(d_ffn_act_q8_1_);
     d_ffn_act_q8_1_ = nullptr;
+  }
+  if (d_attn_split_workspace_) {
+    cudaFree(d_attn_split_workspace_);
+    d_attn_split_workspace_ = nullptr;
+    attn_split_workspace_bytes_ = 0;
   }
 
   if (d_token_ids_) {
@@ -2262,7 +2291,8 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
             d_q_, typed_cache->Buffer(), d_attn_out_, d_batch_seq_ids_,
             d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_, head_dim_,
             typed_cache->SlotStride(), typed_cache->LayerStride(),
-            typed_cache->KvStride(), attn_scale, stream_);
+            typed_cache->KvStride(), attn_scale, stream_,
+            d_attn_split_workspace_, attn_split_workspace_bytes_);
         if (err != cudaSuccess) {
           log::Error("llama_forward",
                      "FlashDecodeMultiSeqStrided launch failed: " +
