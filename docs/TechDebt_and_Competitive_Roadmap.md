@@ -33,8 +33,8 @@ flowchart TB
 | Area | Current reading |
 |---|---|
 | `llama_cpp_cuda` vs Ollama | Strong published repo advantage; keep this as the stable public benchmark claim |
-| `inferflux_cuda` vs `llama_cpp_cuda` | Native exceeds llama.cpp on single-sequence (~1.1x); c=4 at 148.3 tok/s, c=8 at 174.6 tok/s (March 31 baseline). Lane overlap race fixes (0ccbad3) improved concurrent stability but residual c=8 instability remains (~75% pass rate) |
-| Native hot path reality | MMQ accumulate kernels landed for M=9-64 (0ccbad3); CUDA graphs re-enabled on primary forward path; remaining gap is concurrent stability at c>=8 |
+| `inferflux_cuda` vs `llama_cpp_cuda` | c=1: 82 tok/s (0.82x vs llama.cpp 100); c=4: 165 tok/s (1.13x FASTER); c=8: 176 tok/s (0.82x vs 213). Zero crashes. Fixes: SimpleTokenizer race, FlashDecode KV-split, NVCC template dispatch, blocking sync on Linux. Memory: 284 MB idle overhead |
+| Native hot path reality | Kernel time at parity with llama.cpp (9.3 vs 9.1 ms/tok). Remaining c=1 gap is overhead (scheduling, sync). c=4 exceeds llama.cpp. FlashDecode split-K parallelism (16 blocks vs prior 2) eliminated the attention bottleneck |
 | Distributed runtime | KV channel and SHM transport are production-tested; ownership cleanup and worker-loss handling still need hardening |
 
 ## 3) Debt Register
@@ -42,9 +42,9 @@ flowchart TB
 | Priority | Debt item | Why it matters | Retirement gate | Status |
 |---|---|---|---|---|
 | P0 | Decode down-proj row-pair and row-quad throughput | MMQ accumulate kernels for M=9-64 landed in 0ccbad3, covering the primary decode down-proj bottleneck | Native decode down-proj kernels improve sustained concurrent serving without regressing `c=4` | COMPLETED (0ccbad3) |
-| P0 | Lane overlap race conditions | GetLaneResources + ReleaseBatchScopedDequantizedCache now protected by lane_overlap_mutex_ (0ccbad3); concurrent stability improved but residual c=8 instability remains (~75% pass rate) | Race-free lane overlap under sustained concurrency | Partially resolved (0ccbad3) |
+| P0 | Lane overlap race conditions | GetLaneResources + ReleaseBatchScopedDequantizedCache protected by lane_overlap_mutex_ (0ccbad3). Root cause of crashes was SimpleTokenizer data race (d8f2aeb), not lane overlap | Race-free lane overlap under sustained concurrency | **Resolved** |
 | P0 | CUDA graph stability | CUDA graphs were blanket-disabled due to heap corruption risk; now selectively re-enabled on primary forward path with cudaDeviceSynchronize before capture (0ccbad3) | CUDA graphs enabled without heap corruption | COMPLETED (0ccbad3) |
-| P0 | Residual c=8 concurrent instability | Clean runs pass 32/32 but overall pass rate is ~75% at c=8; root cause unknown | c=8 throughput gate passes reliably (>95%) | Open |
+| P0 | Residual c=8 concurrent instability | **RESOLVED**: Root cause was SimpleTokenizer::Encode() data race — concurrent HTTP threads mutating vocab_ without synchronization. Fixed with mutex in d8f2aeb. Zero crashes validated across 5+ benchmark runs | All gates passing 100% | **Resolved** (d8f2aeb) |
 | P0 | Required GPU/provider CI lane | Native CUDA regressions are still too easy to discover late | Release-blocking GPU/provider runtime lane exists and is enforced | Not started |
 | P1 | Native structured output independence | Compatibility fallback still owns some important generation behavior | Grammar-constrained generation runs natively on the CUDA path | Not started |
 | P1 | Distributed sequence ownership cleanup | Transport health exists, but cleanup and worker-loss semantics are still not operations-grade | Ownership transfer, cleanup, and failure handling are deterministic and tested | Not started |
@@ -61,7 +61,7 @@ flowchart TB
 
 | Order | Work item | Reason |
 |---|---|---|
-| 1 | Diagnose and fix residual c=8 instability | MMQ accumulate and lane overlap fixes landed but ~75% pass rate at c=8 remains; this is the top remaining runtime risk |
+| 1 | ~~Diagnose and fix residual c=8 instability~~ | **DONE**: SimpleTokenizer race fix (d8f2aeb). Zero crashes at all concurrency levels. Next priority: close c=1 throughput gap (0.82x) via FFN MMVQ block layout optimization |
 | 2 | Add a required GPU/provider behavior lane | Prevent performance and routing regressions from landing unnoticed |
 | 3 | Reduce compatibility dependence for structured output | Shrink the last major capability gap between native and compatibility paths |
 | 4 | Harden release hygiene | Keep release docs and artifact policy aligned with real repo state |
