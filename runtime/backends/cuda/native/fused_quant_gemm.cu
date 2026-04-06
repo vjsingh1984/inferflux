@@ -2122,13 +2122,10 @@ bool FusedQuantGemm::GemvQ8_1Pair(
       M,    std::max(projections[0].output_cols, projections[1].output_cols),
       K,    2,
       true, false};
-  if (selected_op == FusedQuantGemm::FfnProjOperator::kFallback && policy) {
-    // Keep non-runtime callers aligned with the same policy-driven grouped FFN
-    // operator selection used by transformer_forward.
-    selected_op = SelectFfnProjOperator(
-        quant_type, quant_type, geometry, /*allow_q81=*/true,
-        /*allow_packed=*/false, policy);
-  }
+  // Note: when selected_op == kFallback, use the generic MMVQ pair dispatch
+  // below (line entry.fn). Do NOT auto-select an FFN-specific operator here
+  // because GemvQ8_1Pair is also called for QKV projections where FFN-specific
+  // operators (MMQ3, hot-Q4K, row-quad) have geometry mismatches.
   if (selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3) {
     static bool mmq3_logged[kMaxTensorType] = {};
     if (idx < kMaxTensorType && !mmq3_logged[idx] && entry.name) {

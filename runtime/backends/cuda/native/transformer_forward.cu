@@ -468,22 +468,21 @@ bool TryPackedProjectionGroup(
 // Q8_1 pre-quantized projection group dispatch.
 // Quantizes activations once (fused with RmsNorm when norm_weight != nullptr),
 // then dispatches grouped or individual Q8_1 GEMV kernels.
+// Q8_1 grouped projection dispatch: quantize activations once, then run
+// grouped or individual MMVQ kernels.  Only the half (FP16) path has
+// MMVQ kernels; other types return false.
 template <size_t GroupSize, typename T>
 bool TryQ8_1ProjectionGroup(
-    const std::array<PackedProjectionPlan<T>, GroupSize> &, const T *,
-    const T *, void *, int, int, float, cudaStream_t,
-    const NativeExecutionPolicy * = nullptr,
-    FusedQuantGemm::FfnProjOperator =
+    const std::array<PackedProjectionPlan<T>, GroupSize> &plans,
+    const T *input, const T *norm_weight, void *act_q8_1, int M, int K,
+    float eps, cudaStream_t stream, const NativeExecutionPolicy *policy = nullptr,
+    FusedQuantGemm::FfnProjOperator selected_op =
         FusedQuantGemm::FfnProjOperator::kFallback) {
-  return false;
-}
-
-template <size_t GroupSize>
-bool TryQ8_1ProjectionGroup(
-    const std::array<PackedProjectionPlan<half>, GroupSize> &plans,
-    const half *input, const half *norm_weight, void *act_q8_1, int M, int K,
-    float eps, cudaStream_t stream, const NativeExecutionPolicy *policy,
-    FusedQuantGemm::FfnProjOperator selected_op) {
+  if constexpr (!std::is_same_v<T, half>) {
+    (void)input; (void)norm_weight; (void)act_q8_1; (void)M; (void)K;
+    (void)eps; (void)stream; (void)policy; (void)selected_op;
+    return false;
+  } else {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   if (Q81ActivationsDisabled(policy_ref) || !input || !act_q8_1 || M <= 0 ||
       K <= 0) {
@@ -586,6 +585,7 @@ bool TryQ8_1ProjectionGroup(
     }
   }
   return true;
+  } // if constexpr (std::is_same_v<T, half>)
 }
 
 // Standalone Q8_1 GEMV for single projections without norm fusion.
