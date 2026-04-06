@@ -1,0 +1,165 @@
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+
+#include <cuda_runtime.h>
+#include <thread>
+
+namespace inferflux::runtime::cuda::native {
+
+enum class SyncTraceSite : size_t {
+  kSamplerResultReady = 0,
+  kSamplerBatchResultReady,
+  kSamplerLogitsReady,
+  kLaneExecutionDrain,
+  kPrefillForwardDrain,
+  kTimingForwardReady,
+  kTimingSamplingReady,
+  kCount,
+};
+
+struct SyncTraceEntry {
+  const char *label;
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> api_ns{0};
+};
+
+inline std::array<SyncTraceEntry, static_cast<size_t>(SyncTraceSite::kCount)>
+    kSyncTraceEntries = {{
+        {"sampler.result_ready"},
+        {"sampler.batch_result_ready"},
+        {"sampler.logits_ready"},
+        {"executor.lane_execution_drain"},
+        {"executor.prefill_forward_drain"},
+        {"executor.timing_forward_ready"},
+        {"executor.timing_sampling_ready"},
+    }};
+
+inline bool SyncTraceEnabled() {
+  static const bool enabled = []() {
+    const char *raw = std::getenv("INFERFLUX_CUDA_SYNC_TRACE");
+    return raw && std::string(raw) != "0" && std::string(raw) != "false";
+  }();
+  return enabled;
+}
+
+inline void LogSyncTraceSummaryAtExit() {
+  if (!SyncTraceEnabled()) {
+    return;
+  }
+  std::fprintf(stderr, "[native_sync_trace] summary begin\n");
+  for (const auto &entry : kSyncTraceEntries) {
+    const uint64_t calls = entry.calls.load(std::memory_order_relaxed);
+    if (calls == 0) {
+      continue;
+    }
+    const uint64_t api_ns = entry.api_ns.load(std::memory_order_relaxed);
+    const double avg_us =
+        calls > 0 ? static_cast<double>(api_ns) / static_cast<double>(calls) /
+                        1000.0
+                  : 0.0;
+    std::fprintf(stderr,
+                 "[native_sync_trace] site=%s calls=%llu api_ns=%llu avg_us=%.3f\n",
+                 entry.label, static_cast<unsigned long long>(calls),
+                 static_cast<unsigned long long>(api_ns), avg_us);
+  }
+  std::fprintf(stderr, "[native_sync_trace] summary end\n");
+}
+
+inline void EnsureSyncTraceRegistered() {
+  static std::once_flag once;
+  if (!SyncTraceEnabled()) {
+    return;
+  }
+  std::call_once(once, []() { std::atexit(LogSyncTraceSummaryAtExit); });
+}
+
+/// Spin-wait on cudaEventQuery instead of cudaEventSynchronize.
+/// On Windows WDDM, cudaEventSynchronize enters a kernel-level sleep that
+/// adds ~5-10ms of driver overhead per call. Spinning on cudaEventQuery
+/// avoids this by polling in user-space, reducing sync latency from ~10ms
+/// to ~0.1ms at the cost of CPU utilization during the wait.
+///
+/// On Linux/WSL2, cudaEventSynchronize is efficient (no WDDM sleep), so
+/// spin-wait wastes CPU and adds ~4-5ms overhead from poll loop contention.
+/// Default: enabled on Windows (WDDM), disabled on Linux/WSL2.
+/// Override: INFERFLUX_CUDA_SPIN_WAIT=1 to force enable, =0 to force disable.
+inline bool SpinWaitEnabled() {
+  static const bool enabled = []() {
+    // Check explicit override first
+    const char *raw = std::getenv("INFERFLUX_CUDA_SPIN_WAIT");
+    if (raw) {
+      return std::string(raw) == "1" || std::string(raw) == "true";
+    }
+    // Legacy env var (inverted sense)
+    const char *disable = std::getenv("INFERFLUX_CUDA_DISABLE_SPIN_WAIT");
+    if (disable && std::string(disable) != "0" &&
+        std::string(disable) != "false") {
+      return false;
+    }
+#ifdef _WIN32
+    return true;  // WDDM needs spin-wait
+#else
+    return false;  // Linux/WSL2 uses efficient blocking sync
+#endif
+  }();
+  return enabled;
+}
+
+inline cudaError_t SpinWaitEvent(cudaEvent_t event) {
+  cudaError_t err;
+  while ((err = cudaEventQuery(event)) == cudaErrorNotReady) {
+    // Yield to other threads but stay in user-space.
+    // On WDDM this avoids the ~5ms kernel sleep of cudaEventSynchronize.
+    std::this_thread::yield();
+  }
+  return err;
+}
+
+inline cudaError_t TracedCudaEventSynchronize(SyncTraceSite site,
+                                              cudaEvent_t event) {
+  if (!SyncTraceEnabled()) {
+    return SpinWaitEnabled() ? SpinWaitEvent(event)
+                             : cudaEventSynchronize(event);
+  }
+  EnsureSyncTraceRegistered();
+  const auto start = std::chrono::steady_clock::now();
+  const cudaError_t err = SpinWaitEnabled() ? SpinWaitEvent(event)
+                                            : cudaEventSynchronize(event);
+  const auto end = std::chrono::steady_clock::now();
+  auto &entry = kSyncTraceEntries[static_cast<size_t>(site)];
+  entry.calls.fetch_add(1, std::memory_order_relaxed);
+  entry.api_ns.fetch_add(
+      static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
+              .count()),
+      std::memory_order_relaxed);
+  return err;
+}
+
+inline cudaError_t TracedCudaStreamSynchronize(SyncTraceSite site,
+                                               cudaStream_t stream) {
+  if (!SyncTraceEnabled()) {
+    return cudaStreamSynchronize(stream);
+  }
+  EnsureSyncTraceRegistered();
+  const auto start = std::chrono::steady_clock::now();
+  const cudaError_t err = cudaStreamSynchronize(stream);
+  const auto end = std::chrono::steady_clock::now();
+  auto &entry = kSyncTraceEntries[static_cast<size_t>(site)];
+  entry.calls.fetch_add(1, std::memory_order_relaxed);
+  entry.api_ns.fetch_add(
+      static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
+              .count()),
+      std::memory_order_relaxed);
+  return err;
+}
+
+} // namespace inferflux::runtime::cuda::native

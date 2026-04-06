@@ -1,8 +1,12 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #include "server/startup_advisor.h"
+#include "support/scoped_env.h"
 
 #include <cstdlib>
+
+using inferflux::test::portable_setenv;
+using inferflux::test::portable_unsetenv;
 
 // Helper to build a well-tuned CUDA context (zero recommendations expected).
 static inferflux::StartupAdvisorContext WellTunedCudaContext() {
@@ -23,7 +27,7 @@ static inferflux::StartupAdvisorContext WellTunedCudaContext() {
   ctx.config.max_batch_size = 16;
   ctx.config.max_batch_tokens = 4096;
   ctx.config.kv_cpu_pages = 128;
-  ctx.config.prefer_native = true;
+  ctx.config.prefer_inferflux = true;
   ctx.config.tp_degree = 1;
 
   inferflux::AdvisorModelInfo m;
@@ -32,7 +36,7 @@ static inferflux::StartupAdvisorContext WellTunedCudaContext() {
                                             // recommendation
   m.format = "gguf";
   m.backend = "cuda";
-  m.backend_provider = "native";
+  m.backend_provider = "inferflux";
   m.file_size_bytes = 4ULL * 1024 * 1024 * 1024;
   m.quantization =
       inferflux::DetectQuantization(m.path, m.format); // Detect from filename
@@ -105,7 +109,7 @@ TEST_CASE("Multi-GPU with TP=1 and large model triggers tensor_parallel",
   m.id = "llama-70b";
   m.format = "gguf";
   m.backend = "cuda";
-  m.backend_provider = "native";
+  m.backend_provider = "inferflux";
   // Model uses > 70% of single-GPU VRAM.
   m.file_size_bytes = 35ULL * 1024 * 1024 * 1024;
   ctx.models.push_back(m);
@@ -137,9 +141,9 @@ TEST_CASE("Suppression env var disables all recommendations",
   ctx.config.phase_overlap_enabled = false;
 
   // Set suppression env var.
-  setenv("INFERFLUX_DISABLE_STARTUP_ADVISOR", "true", 1);
+  portable_setenv("INFERFLUX_DISABLE_STARTUP_ADVISOR", "true");
   int count = inferflux::RunStartupAdvisor(ctx);
   REQUIRE(count == 0);
   // Clean up.
-  unsetenv("INFERFLUX_DISABLE_STARTUP_ADVISOR");
+  portable_unsetenv("INFERFLUX_DISABLE_STARTUP_ADVISOR");
 }

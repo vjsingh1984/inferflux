@@ -15,6 +15,7 @@ flowchart LR
 | Runtime tuning workflow | [MONITORING](MONITORING.md) |
 | Config knobs and ranges | [CONFIG_REFERENCE](CONFIG_REFERENCE.md) |
 | Startup recommendations | [STARTUP_ADVISOR](STARTUP_ADVISOR.md) |
+| Benchmark / native burst workflow | [benchmark_multi_backend_steps](benchmark_multi_backend_steps.md) |
 
 ## Archived Full Guide
 

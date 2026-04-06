@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -34,6 +35,9 @@ struct SamplingParams {
 };
 
 // InferenceResult surfaced by the scheduler and BatchExecutor to HTTP handlers.
+inline constexpr std::string_view kBackendEmptyResponseText =
+    "[backend returned empty response]";
+
 struct InferenceResult {
   std::string model_id;
   std::string completion;
@@ -50,7 +54,16 @@ struct InferenceResult {
   } speculative;
 };
 
-// Phase of an inference request in the continuous batching pipeline.
+inline bool IsBackendEmptyResponse(std::string_view text) {
+  return text == kBackendEmptyResponseText;
+}
+
+inline bool IsBackendEmptyResponse(const InferenceResult &result) {
+  return !result.no_backend && result.completion_tokens == 0 &&
+         IsBackendEmptyResponse(result.completion);
+}
+
+// Phase of an inference request in the scheduler-driven batching pipeline.
 enum class RequestPhase {
   kPending,  // Queued, not yet scheduled.
   kPrefill,  // In prefill (prompt processing).
@@ -61,8 +74,49 @@ enum class RequestPhase {
 
 // InferenceRequest holds per-request state for the scheduler.
 // It replaces the legacy GenerateRequest DTO with a richer structure that
-// supports continuous batching, priority scheduling, and per-request
+// supports scheduler-driven batching, priority scheduling, and per-request
 // accounting.
+// Sub-structs grouping related InferenceRequest fields.
+// Defined outside InferenceRequest so callers can name the types directly
+// (e.g. ResponseFormatState) without the owning struct prefix.
+
+/// Structured-output / response_format state.
+struct ResponseFormatState {
+  bool has_format{false};
+  std::string type;    // "json_object", "grammar", etc.
+  std::string schema;  // Raw JSON schema string (if provided).
+  std::string grammar; // Resolved GBNF string.
+  std::string root{"root"};
+  bool ready{false};     // True once grammar string compiled/resolved.
+  bool supported{true};  // Feature gate for capability checks.
+  std::string error;
+  StructuredConstraint constraint;
+};
+
+/// Step-wise batch execution state (pause/resume across token steps).
+struct ExecutionState {
+  bool initialized{false};
+  bool active{true};
+  int tokens_generated{0};
+  int decode_limit{0};
+  int current_token{-1};
+  bool slice_active{false};
+  bool in_prefill{false};
+  InferenceResult result{};
+};
+
+/// Per-request fairness accounting.
+struct FairnessState {
+  int priority_level{0};
+  int service_tokens{0};
+  int timeslice_tokens{0};
+  int remaining_decode_tokens{-1};
+  int reported_prompt_tokens{-1};
+  int total_completion_tokens{0};
+  int last_timeslice_tokens{0};
+  bool yielded{false};
+};
+
 struct InferenceRequest {
   uint64_t id{0};
   std::string model;          // Requested model ID (empty = default).
@@ -70,6 +124,7 @@ struct InferenceRequest {
   // Optional upper-layer session handle (feature-flagged server behavior).
   // Empty keeps default stateless OpenAI-compatible semantics.
   std::string session_id;
+  std::string client_request_id; // Stable caller-provided trace/debug tag.
   bool session_lease_acquired{false};
   std::string prompt;
   int max_tokens{256};
@@ -88,11 +143,13 @@ struct InferenceRequest {
       false}; // True when the last slice yielded for fairness.
   bool json_mode{false};
   // Phased prefill/decode state (§2.5 Option A).
-  // Set by Scheduler::ProcessBatch after calling LlamaCPUBackend::Prefill().
+  // Set by Scheduler::ProcessBatch after calling LlamaCppBackend::Prefill().
   // BatchExecutor::ExecuteRequest() calls Decode() when n_past >= 0 instead of
   // Generate().
   int n_past{-1}; // KV position after prefill; -1 = use legacy Generate() path.
   int sequence_id{-1}; // KV cache sequence slot; -1 = unassigned.
+  uint64_t sequence_generation{
+      0}; // Generation-stamped lease identity for sequence_id.
   // BPE token count from Prefill() (= pr.n_past at prefill time).  Stored
   // separately because n_past is updated by each Decode() step and by fairness
   // slice rewrites, so by donation time it no longer reflects the prompt
@@ -100,7 +157,7 @@ struct InferenceRequest {
   // CopySequencePrefix.
   int prompt_bpe_tokens{-1};
   int prefill_offset{0}; // Progress through chunked prefill (§P1d).
-  // BPE token IDs produced by LlamaCPUBackend::TokenizeForCache() during the
+  // BPE token IDs produced by LlamaCppBackend::TokenizeForCache() during the
   // prefill block.  Used by LookupKVPrefix / DonateKVPrefix instead of
   // prompt_tokens (SimpleTokenizer) to ensure prefix matching is done in the
   // same BPE-token space as the KV cache, avoiding the boundary mismatch that
@@ -130,9 +187,10 @@ struct InferenceRequest {
   std::string response_format_error;
   StructuredConstraint response_constraint;
 
-  // Persistent execution state for iteration-level continuous batching.
+  // Persistent execution state for step-wise batch execution.
   // These fields allow BatchExecutor to pause and resume a request at any token
   // step without losing progress.
+  bool exec_initialized{false};
   bool exec_active{true};
   int exec_tokens_generated{0};
   int exec_decode_limit{0};
@@ -166,6 +224,9 @@ struct InferenceRequest {
   // Shared cancellation flag toggled when the HTTP connection closes.
   std::shared_ptr<std::atomic<bool>> cancellation_flag;
   std::vector<int> block_table; // Logical-to-physical KV block mappings.
+  // Distributed prefill/decode handoff retry counter. Incremented when
+  // kv_transport->Enqueue rejects a packet; reset on successful enqueue.
+  int disagg_enqueue_retries{0};
 
   // Swapping state (§P1c).
   bool is_swapped{false};
@@ -187,6 +248,14 @@ struct InferenceRequest {
   // OpenAI `stop` parameter: up to 4 strings at which generation halts.
   // The matched stop sequence is NOT included in the completion text.
   std::vector<std::string> stop;
+
+  // --- Grouped sub-struct views (Phase C1) ---
+  // These aggregate related flat fields into logical groups.  Callers
+  // should migrate from flat fields to these sub-structs file-by-file.
+  // Eventually the flat fields above will be deprecated.
+  ResponseFormatState response_format{};
+  ExecutionState execution{};
+  FairnessState fairness{};
 };
 
 // RequestBatch groups requests that will execute together in a single

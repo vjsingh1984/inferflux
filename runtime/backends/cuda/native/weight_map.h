@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/backends/cuda/native_kernel_executor.h"
+#include "runtime/backends/cuda/inferflux_cuda_executor.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -18,6 +18,21 @@ struct QuantizedWeightInfo {
   const void *data{nullptr}; // Raw quantized GPU pointer
   int quant_type{-1};        // GGUF::TensorType enum value (-1 = unknown)
   int64_t num_elements{0};   // Logical element count (rows * cols)
+};
+
+/**
+ * Tile-major quantized layout for MMQ-style kernels.
+ *
+ * Unlike QuantizedWeightInfo, this points at a transformed layout optimized
+ * for multi-output tiled execution rather than the original GGUF row-major
+ * tensor blocks.
+ */
+struct MmqWeightInfo {
+  const void *data{nullptr};
+  int quant_type{-1};
+  int rows{0};      // Logical output rows / columns in the destination matrix
+  int cols{0};      // Logical K dimension
+  int tile_cols{0}; // Number of output rows packed per layout tile
 };
 
 /**
@@ -71,8 +86,12 @@ public:
   virtual QuantizedWeightInfo LayerDownProjRaw(int /*layer*/) const {
     return {};
   }
+  virtual MmqWeightInfo LayerDownProjMmq(int /*layer*/) const { return {}; }
   virtual QuantizedWeightInfo LmHeadRaw() const { return {}; }
   virtual bool HasQuantizedWeights() const { return false; }
+  // Strategy-driven policy switch used by native CUDA forward kernels to
+  // force compatibility GEMM path when fused dequant kernels are disallowed.
+  virtual bool AllowFusedQuantizedMatmul() const { return true; }
 
 private:
   struct LayerWeights {

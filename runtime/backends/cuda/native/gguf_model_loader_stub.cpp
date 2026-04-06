@@ -87,6 +87,16 @@ void GGUFModelLoader::ClearDequantizedCache() {
   }
 }
 
+bool GGUFModelLoader::HasDequantizedCache() const {
+  for (const auto &[name, tensor] : tensors_) {
+    (void)name;
+    if (tensor.dequantized_gpu) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::shared_ptr<IWeightAccessor>
 GGUFModelLoader::GetWeightAccessor(const std::string &) {
   return nullptr;
@@ -159,8 +169,9 @@ bool GGUFModelLoader::UploadDequantizedToGPU(cudaStream_t) { return true; }
 
 size_t GGUFModelLoader::CalcGPUBufferSize() const { return 0; }
 
-GGUFWeightAccessor::GGUFWeightAccessor(GGUFTensorData *tensor)
-    : tensor_(tensor) {}
+GGUFWeightAccessor::GGUFWeightAccessor(GGUFTensorData *tensor,
+                                       bool *dequant_dirty_flag)
+    : tensor_(tensor), dequant_dirty_flag_(dequant_dirty_flag) {}
 
 std::pair<size_t, size_t> GGUFWeightAccessor::GetDimensions() const {
   if (!tensor_ || tensor_->info.shape.size() < 2) {

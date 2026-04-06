@@ -3,9 +3,13 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import unittest
 import http.client
+
+sys.path.insert(0, os.path.dirname(__file__))
+from process_helper import start_server_process, stop_server_process
 
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 18081
@@ -20,13 +24,10 @@ class StubIntegrationTests(unittest.TestCase):
         env = os.environ.copy()
         env["INFERFLUX_HOST_OVERRIDE"] = SERVER_HOST
         env["INFERFLUX_PORT_OVERRIDE"] = str(SERVER_PORT)
+        env["INFERFLUX_MODEL_PATH"] = ""
         # We assume the binary is in the build directory and we are in the project root.
-        cls.server_proc = subprocess.Popen(
-            [SERVER_BIN, "--config", "config/server.yaml"],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid
+        cls.server_proc = start_server_process(
+            [SERVER_BIN, "--config", "config/server.yaml"], env=env
         )
         deadline = time.time() + 20.0
         ready = False
@@ -58,8 +59,7 @@ class StubIntegrationTests(unittest.TestCase):
     def tearDownClass(cls):
         if hasattr(cls, 'server_proc') and cls.server_proc:
             try:
-                os.killpg(os.getpgid(cls.server_proc.pid), signal.SIGTERM)
-                cls.server_proc.wait(timeout=5)
+                stop_server_process(cls.server_proc)
             except:
                 pass
 
@@ -535,9 +535,26 @@ class StubIntegrationTests(unittest.TestCase):
         self.assertEqual(payload.get("status"), "ok")
         self.assertIn("pool_health", payload)
         self.assertIn("scheduler", payload)
+        self.assertIn("distributed_kv", payload)
+        self.assertIn("ready", payload["pool_health"])
+        self.assertIn("role", payload["pool_health"])
+        self.assertIn("reason", payload["pool_health"])
+        self.assertIn("model_loaded", payload["pool_health"])
+        self.assertIn("decode_pool_warm", payload["pool_health"])
+        self.assertIn("disagg_transport_degraded", payload["pool_health"])
+        self.assertIn("disagg_timeout_debt", payload["pool_health"])
+        self.assertIn("disagg_timeout_debt_threshold", payload["pool_health"])
+        self.assertIn("disagg_timeout_streak", payload["pool_health"])
+        self.assertIn("disagg_timeout_streak_threshold", payload["pool_health"])
         self.assertIn("queue_depth", payload["scheduler"])
         self.assertIn("prefill_queue_depth", payload["scheduler"])
         self.assertIn("decode_queue_depth", payload["scheduler"])
+        self.assertIn("enqueue_rejections_total", payload["distributed_kv"])
+        self.assertIn("enqueue_exhausted_total", payload["distributed_kv"])
+        self.assertIn("tickets_enqueued_total", payload["distributed_kv"])
+        self.assertIn("tickets_acknowledged_total", payload["distributed_kv"])
+        self.assertIn("tickets_committed_total", payload["distributed_kv"])
+        self.assertIn("tickets_timed_out_total", payload["distributed_kv"])
 
     def test_inferctl_admin_routing_rejects_multiple_operations(self):
         result = self._run_inferctl(["admin", "routing", "--get", "--set"])
@@ -822,13 +839,13 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
         env = os.environ.copy()
         env["INFERFLUX_HOST_OVERRIDE"] = SERVER_HOST
         env["INFERFLUX_PORT_OVERRIDE"] = str(SERVER_FAIL_PORT)
-        env["INFERFLUX_POLICY_STORE"] = "/proc/inferflux_policy_unwritable.conf"
-        cls.server_proc = subprocess.Popen(
-            [SERVER_BIN, "--config", "config/server.yaml"],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid
+        env["INFERFLUX_MODEL_PATH"] = ""
+        if sys.platform == "win32":
+            env["INFERFLUX_POLICY_STORE"] = "Z:\\nonexistent_volume\\inferflux_policy_unwritable.conf"
+        else:
+            env["INFERFLUX_POLICY_STORE"] = "/proc/inferflux_policy_unwritable.conf"
+        cls.server_proc = start_server_process(
+            [SERVER_BIN, "--config", "config/server.yaml"], env=env
         )
         deadline = time.time() + 20.0
         ready = False
@@ -860,8 +877,7 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
     def tearDownClass(cls):
         if hasattr(cls, 'server_proc') and cls.server_proc:
             try:
-                os.killpg(os.getpgid(cls.server_proc.pid), signal.SIGTERM)
-                cls.server_proc.wait(timeout=5)
+                stop_server_process(cls.server_proc)
             except:
                 pass
 
@@ -978,13 +994,10 @@ class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
         env = os.environ.copy()
         env["INFERFLUX_HOST_OVERRIDE"] = SERVER_HOST
         env["INFERFLUX_PORT_OVERRIDE"] = str(SERVER_STRICT_PORT)
-        env["INFERFLUX_BACKEND_STRICT_NATIVE_REQUEST"] = "true"
-        cls.server_proc = subprocess.Popen(
-            [SERVER_BIN, "--config", "config/server.yaml"],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid
+        env["INFERFLUX_MODEL_PATH"] = ""
+        env["INFERFLUX_BACKEND_STRICT_INFERFLUX_REQUEST"] = "true"
+        cls.server_proc = start_server_process(
+            [SERVER_BIN, "--config", "config/server.yaml"], env=env
         )
         deadline = time.time() + 20.0
         ready = False
@@ -1016,8 +1029,7 @@ class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
     def tearDownClass(cls):
         if hasattr(cls, 'server_proc') and cls.server_proc:
             try:
-                os.killpg(os.getpgid(cls.server_proc.pid), signal.SIGTERM)
-                cls.server_proc.wait(timeout=5)
+                stop_server_process(cls.server_proc)
             except:
                 pass
 
@@ -1036,7 +1048,7 @@ class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
             {
                 "id": "strict-native-test",
                 "path": "/tmp/strict-native-test.gguf",
-                "backend": "cuda_native",
+                "backend": "inferflux_cuda",
                 "format": "gguf",
             },
         )
@@ -1044,7 +1056,7 @@ class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(payload.get("error"), "backend_policy_violation")
         reason = payload.get("reason", "")
-        self.assertIn("strict_native_request", reason)
+        self.assertIn("strict_inferflux_request", reason)
 
 if __name__ == "__main__":
     unittest.main()

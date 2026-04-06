@@ -7,6 +7,7 @@
 #include "server/auth/api_key_auth.h"
 #include "server/auth/oidc_validator.h"
 #include "server/auth/rate_limiter.h"
+#include "server/http/http_utils.h"
 #include "server/logging/audit_logger.h"
 #include "server/metrics/metrics.h"
 #include "server/policy/guardrail.h"
@@ -16,10 +17,14 @@
 #endif
 
 #include <atomic>
+#include <algorithm>
+#include <cctype>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
@@ -30,12 +35,57 @@
 
 namespace inferflux {
 
+// Backward-compatible alias — delegates to GetHeaderValue in http_utils.h.
+inline std::string LookupHeaderValueForTest(const std::string &headers,
+                                            const std::string &name) {
+  return GetHeaderValue(headers, name);
+}
+
 class HttpServer {
 public:
   struct TlsConfig {
     bool enabled{false};
     std::string cert_path;
     std::string key_path;
+  };
+
+  struct ReadyStatus {
+    bool ready{false};
+    bool model_loaded{false};
+    bool decode_pool_warm{false};
+    bool disagg_transport_degraded{false};
+    uint64_t disagg_timeout_debt{0};
+    uint64_t disagg_timeout_debt_threshold{0};
+    uint64_t disagg_timeout_streak{0};
+    uint64_t disagg_timeout_streak_threshold{0};
+    std::string role{"unified"};
+    std::string reason;
+  };
+
+  struct AdminPoolsStatus {
+    struct DistributedKVStatus {
+      std::optional<int64_t> enqueue_rejections_total;
+      std::optional<int64_t> enqueue_exhausted_total;
+      std::optional<int64_t> tickets_enqueued_total;
+      std::optional<int64_t> tickets_acknowledged_total;
+      std::optional<int64_t> tickets_committed_total;
+      std::optional<int64_t> tickets_timed_out_total;
+    };
+
+    ReadyStatus pool_health;
+    std::optional<int64_t> queue_depth;
+    std::optional<int64_t> prefill_queue_depth;
+    std::optional<int64_t> decode_queue_depth;
+    std::optional<int64_t> batch_limit_size;
+    std::optional<int64_t> batch_limit_tokens;
+    DistributedKVStatus distributed_kv;
+  };
+
+  struct AdmissionDecision {
+    bool allowed{true};
+    int http_status{200};
+    std::string error;
+    std::string reason;
   };
 
   // Disaggregated deployment role (§2.5 item 12).
@@ -61,11 +111,15 @@ public:
   void SetDecodePoolReady(bool ready) {
     decode_pool_ready_.store(ready, std::memory_order_relaxed);
   }
+  ReadyStatus EvaluateReadyStatus() const;
+  AdminPoolsStatus EvaluateAdminPoolsStatus() const;
+  AdmissionDecision EvaluateGenerationAdmissionDecision() const;
 
 private:
   struct ClientSession {
     int fd{-1};
     SSL *ssl{nullptr};
+    bool keep_alive{false}; // Set to true after successful non-streaming response
   };
 
   void Run();
@@ -104,6 +158,9 @@ private:
   std::atomic<bool> model_ready_{false};
   std::atomic<PoolRole> role_{PoolRole::kUnified};
   std::atomic<bool> decode_pool_ready_{false};
+  bool admission_fail_closed_on_disagg_degraded_{false};
+  int readyz_disagg_timeout_debt_threshold_{0};
+  int readyz_disagg_timeout_streak_threshold_{3};
 #if INFERFLUX_ENABLE_WEBUI
   std::unique_ptr<WebUiRenderer> webui_renderer_;
 #endif

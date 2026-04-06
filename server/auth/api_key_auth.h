@@ -19,8 +19,10 @@ public:
   void AddKeyHashed(const std::string &hash,
                     const std::vector<std::string> &scopes = {});
   bool IsAllowed(const std::string &key) const;
+  bool IsAllowedByHash(const std::string &hash) const;
   bool HasKeys() const;
   std::vector<std::string> Scopes(const std::string &key) const;
+  std::vector<std::string> ScopesByHash(const std::string &hash) const;
   void RemoveKey(const std::string &key);
 
   // Hash a plaintext key to its storage representation.

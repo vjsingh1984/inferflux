@@ -1,7 +1,7 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/model_loader.h"
-#include "runtime/backends/cuda/native_kernel_executor.h"
+#include "runtime/backends/cuda/inferflux_cuda_executor.h"
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <string>
@@ -76,6 +76,7 @@ public:
   void SetDequantizedCachePolicy(DequantizedCachePolicy policy) override;
   DequantizedCachePolicy GetDequantizedCachePolicy() const override;
   void ClearDequantizedCache() override;
+  bool HasDequantizedCache() const override;
 
   /**
    * @brief Get weight accessor for a specific tensor

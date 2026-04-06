@@ -1,4 +1,5 @@
 #include "runtime/backends/cuda/native/quantized_weight_map.h"
+#include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/quantization_handler.h"
 #include "server/logging/logger.h"
@@ -8,10 +9,11 @@ namespace inferflux {
 QuantizedWeightMap::~QuantizedWeightMap() {
   // Note: per-tensor GPU memory is managed by IModelLoader, we don't own it
 #ifdef INFERFLUX_HAS_CUDA
-  if (scratch_buffer_) {
-    cudaFree(scratch_buffer_);
-    scratch_buffer_ = nullptr;
+  for (auto &lw : layers_) {
+    FusedQuantGemm::DestroyDownProjMmqLayout(lw.down_proj_mmq);
+    lw.down_proj_mmq = {};
   }
+  ReleaseScratchBuffer();
 #endif
 }
 
@@ -27,6 +29,7 @@ bool QuantizedWeightMap::Build(IModelLoader *loader, const ModelInfo &config,
   num_layers_ = config.num_hidden_layers;
   is_quantized_ = loader->IsQuantized();
   quantization_type_ = loader->GetQuantizationType();
+  scratch_high_water_bytes_ = 0;
 
   log::Info("quantized_weight_map",
             "Building weight map: layers=" + std::to_string(num_layers_) +
@@ -83,7 +86,9 @@ bool QuantizedWeightMap::Build(IModelLoader *loader, const ModelInfo &config,
   }
 
 #ifdef INFERFLUX_HAS_CUDA
-  // Allocate scratch buffer sized for the largest quantized projection weight
+  // Compute scratch buffer size for cuBLAS fallback dequantization.
+  // Allocation is deferred to first use — decode-only workloads (fused GEMV)
+  // never need it, saving up to hundreds of MB for large-vocab models.
   if (is_quantized_) {
     size_t max_elements = 0;
     for (int layer = 0; layer < num_layers_; ++layer) {
@@ -98,27 +103,17 @@ bool QuantizedWeightMap::Build(IModelLoader *loader, const ModelInfo &config,
         }
       }
     }
-    // Also check LM head (may be quantized)
-    if (lm_head_accessor && lm_head_accessor->IsQuantized()) {
-      auto dims = lm_head_accessor->GetDimensions();
-      max_elements = std::max(max_elements, dims.first * dims.second);
-    }
+    // Intentionally exclude lm_head from scratch sizing.
+    // Large vocab projection can dominate scratch reservation while regular
+    // projection fallback only needs per-layer matrices. When lm_head falls
+    // back and exceeds scratch, we use accessor-level dequant cache instead.
+    scratch_buffer_elements_ = max_elements; // Size known, allocation deferred
     if (max_elements > 0) {
-      auto err = cudaMalloc(reinterpret_cast<void **>(&scratch_buffer_),
-                            max_elements * sizeof(half));
-      if (err != cudaSuccess) {
-        log::Error(
-            "quantized_weight_map",
-            "Failed to allocate scratch buffer (" +
-                std::to_string(max_elements * sizeof(half) / 1024 / 1024) +
-                " MiB)");
-        return false;
-      }
-      scratch_buffer_elements_ = max_elements;
-      log::Info("quantized_weight_map",
-                "Scratch buffer: " +
-                    std::to_string(max_elements * sizeof(half) / 1024 / 1024) +
-                    " MiB (replaces per-tensor dequantized cache)");
+      log::Info(
+          "quantized_weight_map",
+          "Scratch buffer: " +
+              std::to_string(max_elements * sizeof(half) / 1024 / 1024) +
+              " MiB (deferred allocation, used only for cuBLAS fallback)");
     }
   }
 #endif
@@ -155,12 +150,20 @@ const half *QuantizedWeightMap::GetDequantizedWeights(
     return nullptr;
   }
 
-  // Return cached if available
+  // Fast path: return cached if already populated (read is safe once written).
   if (cache_ptr) {
     return cache_ptr;
   }
 
-  // Lazy dequantization
+  // Slow path: lazy dequantization under lock to prevent concurrent races
+  // when multiple threads populate the same cache slot.
+  std::lock_guard<std::mutex> lock(dequant_cache_mu_);
+
+  // Double-check after acquiring lock.
+  if (cache_ptr) {
+    return cache_ptr;
+  }
+
   cache_ptr = accessor->GetDequantizedGpuWeights(stream_);
 
   if (!cache_ptr) {
@@ -172,6 +175,7 @@ const half *QuantizedWeightMap::GetDequantizedWeights(
 
 const half *QuantizedWeightMap::DequantizeToScratch(
     std::shared_ptr<IWeightAccessor> accessor) const {
+#ifdef INFERFLUX_HAS_CUDA
   if (!accessor) {
     return nullptr;
   }
@@ -181,18 +185,33 @@ const half *QuantizedWeightMap::DequantizeToScratch(
     return accessor->GetDequantizedGpuWeights(stream_);
   }
 
-  // Quantized: dequantize into shared scratch buffer
-  if (!scratch_buffer_) {
-    // Fallback to per-tensor caching if scratch not allocated
-    return accessor->GetDequantizedGpuWeights(stream_);
-  }
-
+  // Quantized: dequantize into shared scratch buffer (lazy allocation)
   auto dims = accessor->GetDimensions();
   size_t num_elements = dims.first * dims.second;
-  if (num_elements > scratch_buffer_elements_) {
+  if (num_elements > scratch_buffer_elements_ ||
+      scratch_buffer_elements_ == 0) {
     log::Warn("quantized_weight_map",
               "Tensor too large for scratch buffer, falling back to cache");
     return accessor->GetDequantizedGpuWeights(stream_);
+  }
+
+  // Lazy allocate on first use (decode-only workloads skip this entirely)
+  if (!scratch_buffer_) {
+    auto err = cudaMalloc(reinterpret_cast<void **>(&scratch_buffer_),
+                          scratch_buffer_elements_ * sizeof(half));
+    if (err != cudaSuccess) {
+      log::Warn("quantized_weight_map",
+                "Failed to allocate scratch buffer, falling back to cache");
+      scratch_buffer_elements_ = 0;
+      return accessor->GetDequantizedGpuWeights(stream_);
+    }
+    log::Info("quantized_weight_map",
+              "Scratch buffer allocated: " +
+                  std::to_string(scratch_buffer_elements_ * sizeof(half) /
+                                 1024 / 1024) +
+                  " MiB (cuBLAS fallback triggered)");
+    scratch_high_water_bytes_ =
+        std::max(scratch_high_water_bytes_, ScratchReservedBytes());
   }
 
   // Get the quantization handler and dequantize directly into scratch
@@ -213,6 +232,10 @@ const half *QuantizedWeightMap::DequantizeToScratch(
 
   handler->DequantizeGpuToGpu(raw_gpu, scratch_buffer_, num_elements, stream_);
   return scratch_buffer_;
+#else
+  (void)accessor;
+  return nullptr;
+#endif // INFERFLUX_HAS_CUDA
 }
 
 // --- Per-layer accessors ---
@@ -222,24 +245,36 @@ const half *QuantizedWeightMap::DequantizeToScratch(
 const half *QuantizedWeightMap::LayerQProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].q_proj_accessor,
+                                 layers_[layer].q_proj);
   return DequantizeToScratch(layers_[layer].q_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerKProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].k_proj_accessor,
+                                 layers_[layer].k_proj);
   return DequantizeToScratch(layers_[layer].k_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerVProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].v_proj_accessor,
+                                 layers_[layer].v_proj);
   return DequantizeToScratch(layers_[layer].v_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerOProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].o_proj_accessor,
+                                 layers_[layer].o_proj);
   return DequantizeToScratch(layers_[layer].o_proj_accessor);
 }
 
@@ -262,18 +297,27 @@ const half *QuantizedWeightMap::LayerPostAttnNorm(int layer) const {
 const half *QuantizedWeightMap::LayerGateProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].gate_proj_accessor,
+                                 layers_[layer].gate_proj);
   return DequantizeToScratch(layers_[layer].gate_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerUpProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].up_proj_accessor,
+                                 layers_[layer].up_proj);
   return DequantizeToScratch(layers_[layer].up_proj_accessor);
 }
 
 const half *QuantizedWeightMap::LayerDownProj(int layer) const {
   if (layer < 0 || layer >= num_layers_)
     return nullptr;
+  if (batch_dequant_cache_enabled_)
+    return GetDequantizedWeights(layers_[layer].down_proj_accessor,
+                                 layers_[layer].down_proj);
   return DequantizeToScratch(layers_[layer].down_proj_accessor);
 }
 
@@ -314,7 +358,18 @@ const half *QuantizedWeightMap::FinalNorm() const {
 }
 
 const half *QuantizedWeightMap::LmHead() const {
-  // LM head is accessed every forward pass — keep permanent cache
+  if (!lm_head_accessor) {
+    return nullptr;
+  }
+
+  // In memory-first modes, avoid persisting a large dequantized lm_head cache.
+  // Keep model-lifetime behavior unchanged for throughput-first deployments.
+  if (loader_ && lm_head_accessor->IsQuantized() &&
+      loader_->GetDequantizedCachePolicy() !=
+          runtime::cuda::native::DequantizedCachePolicy::kModelLifetime) {
+    return DequantizeToScratch(lm_head_accessor);
+  }
+
   return GetDequantizedWeights(lm_head_accessor, lm_head_);
 }
 
@@ -379,6 +434,50 @@ QuantizedWeightInfo QuantizedWeightMap::GetRawLayerDownProj(int layer) const {
   return MakeRawInfo(layers_[layer].down_proj_accessor, stream_);
 }
 
+MmqWeightInfo QuantizedWeightMap::GetMmqLayerDownProj(int layer) const {
+#ifndef INFERFLUX_HAS_CUDA
+  (void)layer;
+  return {};
+#else
+  if (layer < 0 || layer >= num_layers_) {
+    return {};
+  }
+
+  auto &lw = layers_[layer];
+  if (lw.down_proj_mmq.data) {
+    return lw.down_proj_mmq;
+  }
+  if (!lw.down_proj_accessor || !lw.down_proj_accessor->IsQuantized()) {
+    return {};
+  }
+
+  const auto dims = lw.down_proj_accessor->GetDimensions();
+  if (dims.first == 0 || dims.second == 0) {
+    return {};
+  }
+
+  QuantizedWeightInfo raw = MakeRawInfo(lw.down_proj_accessor, stream_);
+  if (!FusedQuantGemm::SupportsDownProjMmq(raw.quant_type)) {
+    return {};
+  }
+
+  std::lock_guard<std::mutex> lock(mmq_cache_mu_);
+  if (lw.down_proj_mmq.data) {
+    return lw.down_proj_mmq;
+  }
+
+  MmqWeightInfo layout{};
+  if (!FusedQuantGemm::BuildDownProjMmqLayout(
+          raw, static_cast<int>(dims.first), static_cast<int>(dims.second),
+          &layout, stream_)) {
+    return {};
+  }
+
+  lw.down_proj_mmq = layout;
+  return lw.down_proj_mmq;
+#endif
+}
+
 QuantizedWeightInfo QuantizedWeightMap::GetRawLmHead() const {
   return MakeRawInfo(lm_head_accessor, stream_);
 }
@@ -395,7 +494,7 @@ QuantizedWeightMap::GetWeightAccessor(const std::string &name) {
 }
 
 void QuantizedWeightMap::ClearCache() {
-  log::Info("quantized_weight_map", "Clearing dequantized weight cache");
+  log::Debug("quantized_weight_map", "Clearing dequantized weight cache");
 
   // Projection weights use scratch buffer — nothing to clear for them.
   // Only clear permanently-cached non-projection weights.
@@ -407,10 +506,47 @@ void QuantizedWeightMap::ClearCache() {
     lw.v_proj_bias = nullptr;
   }
 
-  // Clear global caches
-  embed_tokens_ = nullptr;
-  final_norm_ = nullptr;
-  lm_head_ = nullptr;
+  // Keep token embeddings and final norm resident. They are reused by every
+  // request and dequantizing quantized embeddings again is prohibitively
+  // expensive.
+
+  // lm_head may be explicitly memory-first, so drop the cached pointer unless
+  // the loader is in model-lifetime mode or lm_head is tied to embeddings.
+  if (!loader_ ||
+      loader_->GetDequantizedCachePolicy() !=
+          runtime::cuda::native::DequantizedCachePolicy::kModelLifetime) {
+    if (lm_head_accessor != embed_tokens_accessor) {
+      lm_head_ = nullptr;
+    }
+  }
+}
+
+std::size_t QuantizedWeightMap::ScratchReservedBytes() const {
+#ifdef INFERFLUX_HAS_CUDA
+  if (!scratch_buffer_ || scratch_buffer_elements_ == 0) {
+    return 0;
+  }
+  return scratch_buffer_elements_ * sizeof(half);
+#else
+  return 0;
+#endif
+}
+
+std::size_t QuantizedWeightMap::ScratchInUseBytes() const {
+  return ScratchReservedBytes();
+}
+
+void QuantizedWeightMap::ReleaseScratchBuffer() {
+#ifdef INFERFLUX_HAS_CUDA
+  if (!scratch_buffer_) {
+    return;
+  }
+  if (cudaFree(scratch_buffer_) != cudaSuccess) {
+    log::Warn("quantized_weight_map", "Failed to release scratch buffer");
+    return;
+  }
+  scratch_buffer_ = nullptr;
+#endif
 }
 
 } // namespace inferflux

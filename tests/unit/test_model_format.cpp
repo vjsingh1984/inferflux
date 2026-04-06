@@ -1,6 +1,7 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #include "model/model_format.h"
+#include "support/scoped_env.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -11,49 +12,9 @@
 namespace fs = std::filesystem;
 
 using namespace inferflux;
+using inferflux::test::ScopedEnvVar;
 
 namespace {
-
-class ScopedEnvVar {
-public:
-  ScopedEnvVar(std::string name, std::string value) : name_(std::move(name)) {
-    const char *existing = std::getenv(name_.c_str());
-    if (existing != nullptr) {
-      had_original_ = true;
-      original_value_ = existing;
-    }
-    Set(value);
-  }
-
-  ~ScopedEnvVar() {
-    if (had_original_) {
-      Set(original_value_);
-    } else {
-      Unset();
-    }
-  }
-
-private:
-  void Set(const std::string &value) {
-#ifdef _WIN32
-    _putenv_s(name_.c_str(), value.c_str());
-#else
-    setenv(name_.c_str(), value.c_str(), 1);
-#endif
-  }
-
-  void Unset() {
-#ifdef _WIN32
-    _putenv_s(name_.c_str(), "");
-#else
-    unsetenv(name_.c_str());
-#endif
-  }
-
-  std::string name_;
-  std::string original_value_;
-  bool had_original_{false};
-};
 
 fs::path MakeTempDir(const std::string &suffix) {
   const auto base =

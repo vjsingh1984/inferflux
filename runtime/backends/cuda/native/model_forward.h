@@ -2,8 +2,9 @@
 
 #include "runtime/backends/cuda/native/cublas_gemm.h"
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
+#include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/weight_map.h"
-#include "runtime/backends/cuda/native_kernel_executor.h"
+#include "runtime/backends/cuda/inferflux_cuda_executor.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -55,6 +56,32 @@ public:
    * @param batch_size   Number of sequences
    * @return true on success
    */
+  /**
+   * Replay the CUDA graph without uploading batch metadata from host.
+   *
+   * Used after DeviceTokenRelay has updated the graph's input buffers
+   * directly on device. Skips the H2D metadata copy, eliminating the
+   * per-token WDDM scheduling round-trip (~10ms on Windows).
+   *
+   * @param d_logits     Output: [batch_size * vocab_size] FP32 logits
+   * @param batch_size   Number of sequences (must match captured graph)
+   * @return true if graph replayed; false if graph not available
+   */
+  virtual bool BatchForwardReplay(float *d_logits, int batch_size) {
+    return false; // Default: not supported (requires captured graph)
+  }
+
+  /**
+   * Get the device-side batch metadata pointer for DeviceTokenRelay.
+   * Returns nullptr if device-side relay is not supported.
+   */
+  virtual int *GetBatchMetaDevice() { return nullptr; }
+
+  /**
+   * Get the maximum batch size for the pre-allocated metadata buffers.
+   */
+  virtual int GetMaxBatchSize() const { return 0; }
+
   virtual bool BatchForward(const std::vector<int> &token_ids,
                             const std::vector<int> &n_past,
                             const std::vector<int> &sequence_ids,
@@ -71,10 +98,20 @@ public:
   }
 
   /**
+   * Pre-warm lazily-initialized weight caches (F32→FP16 norm weights,
+   * attention biases, embeddings).  Must be called once after Initialize()
+   * so that subsequent CUDA graph capture does not encounter illegal
+   * cudaStreamSynchronize calls inside the capture region.
+   */
+  virtual void WarmWeightCaches() {}
+
+  /**
    * Set the CUDA stream for forward passes.
    * Subclasses should propagate to cuBLAS handle and sampler.
    */
   virtual void SetStream(cudaStream_t /*stream*/) {}
+
+  virtual void SetExecutionPolicy(const NativeExecutionPolicy & /*policy*/) {}
 
   /**
    * Return the vocab size for offset calculations in batched forward.
@@ -82,9 +119,43 @@ public:
   virtual int VocabSize() const = 0;
 
   /**
+   * Run a forward pass for embedding extraction (mean-pooled hidden states).
+   *
+   * Runs all transformer layers, applies final RmsNorm, then mean-pools
+   * across token positions. Returns FP32 embeddings on device.
+   *
+   * @param token_ids    Input token IDs
+   * @param sequence_id  KV cache sequence slot
+   * @param d_output     Output: [hidden_size] FP32 embeddings on device
+   * @return true on success
+   */
+  virtual bool EmbedForward(const std::vector<int> &token_ids, int sequence_id,
+                            float *d_output) {
+    (void)token_ids;
+    (void)sequence_id;
+    (void)d_output;
+    return false; // Default: not supported
+  }
+
+  /**
+   * Return the hidden size for embedding dimension calculations.
+   */
+  virtual int HiddenSize() const = 0;
+
+  /**
    * Free scratch buffers.
    */
   virtual void FreeScratchBuffers() = 0;
+
+  /**
+   * Startup-accounted device workspace owned by this forwarder.
+   */
+  virtual std::size_t DeviceWorkspaceBytes() const { return 0; }
+
+  /**
+   * Startup-accounted pinned host workspace owned by this forwarder.
+   */
+  virtual std::size_t HostWorkspaceBytes() const { return 0; }
 
   /**
    * Model type name for logging.

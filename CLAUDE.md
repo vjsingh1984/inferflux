@@ -34,7 +34,9 @@ find server runtime scheduler model cli net io policy \
 
 **Build outputs:** `build/inferfluxd` (server), `build/inferctl` (CLI), `build/inferflux_tests` (test binary)
 
-**Dependencies:** llama.cpp (git submodule at `external/llama.cpp` — treat as vendor code), yaml-cpp (auto-fetched via CMake FetchContent), OpenSSL, nlohmann/json v3.11.3 (single-header at `external/nlohmann/json.hpp`), Catch2 v3.7.1 (amalgamated at `external/catch2/`)
+**Dependencies:** llama.cpp (git submodule at `external/llama.cpp` — **READONLY, never modify**), yaml-cpp (auto-fetched via CMake FetchContent), OpenSSL, nlohmann/json v3.11.3 (single-header at `external/nlohmann/json.hpp`), Catch2 v3.7.1 (amalgamated at `external/catch2/`)
+
+**IMPORTANT:** `external/llama.cpp` is a readonly git submodule used for reference and build only. **Never edit, patch, or write files inside `external/llama.cpp/`**. If llama.cpp behavior needs to change, wrap or override it in InferFlux code instead. To update the submodule version, use `git submodule update` — do not commit changes inside the submodule directory.
 
 ## Testing
 
@@ -72,7 +74,9 @@ cmake --build build-cov --target coverage
 
 Test files are in `tests/unit/` (one per module). Framework: Catch2 v3.7.1. Available ctest labels: `paged_kv`, `unified_batch`, `parallel`, `ep`, `backend_factory`, `backend_capabilities`, `moe`, `flash_attn`, `shm_transport`, `chat_template`, `sampling`, `logger`, `structured`, `model_registry`, `model_format`, `model_paths`, `model_identity`, `embeddings_routing`, `stop_sequences`, `fairness`.
 
-Integration test suites (Python, require built `inferfluxd`): `StubIntegration`, `IntegrationCLIModelListContract`, `IntegrationEmbeddingsRoutingContract`, `IntegrationModelIdentityContract`, `SSECancel`, `ShmSmoke`, `IntegrationSSE` (needs model).
+Integration test suites (Python, require built `inferfluxd`): `StubIntegration`, `IntegrationCLIModelListContract`, `IntegrationEmbeddingsRoutingContract`, `IntegrationModelIdentityContract`, `SSECancel`, `ShmSmoke`, `SSEMetrics`, `BackendIdentityContract`, `BenchmarkHarnessDefaults`, `BenchmarkResponseClassifier`, `InferctlAdminPools`, `NativePhaseTiming`, `ThroughputGateContract`, `ThroughputGateFailureContract`, `IntegrationSSE` (needs model).
+
+**First-token parity probe** (`tests/tools/first_token_probe.cpp`): builds `inferflux_first_token_probe` binary that runs a single forward pass and emits top-N logit distributions as JSON. Used by `tests/integration/first_token_parity_probe_test.py` to validate numeric parity across backends. Set `INFERFLUX_FIRST_TOKEN_PROBE_BIN` to override the binary path (defaults to `build/inferflux_first_token_probe`).
 
 ## Architecture
 
@@ -87,10 +91,10 @@ The CMake target `inferflux_core` links all modules into a single library consum
 - `RequestBatch` (`scheduler/request_batch.h`) — per-request state and batch grouping for continuous batching. Interface only.
 
 **Key modules:**
-- `runtime/` — Device abstraction (`DeviceContext`), paged KV cache with LRU/Clock eviction, speculative decoding (draft + validator), NVMe offload via async file writer (io/)
+- `runtime/` — Device abstraction (`DeviceContext`), paged KV cache with LRU/Clock eviction and host-RAM secondary tier, radix prefix cache for KV reuse, speculative decoding (draft + validator, partially integrated), disk offload via async file writer (io/), crash diagnostics with signal handler and breadcrumbs
 - `runtime/backends/` — Backend factory with native/universal provider paths, CUDA phase overlap and flash attention tuning, backend exposure policy with capability-based routing
 - `model/` — GGUF loader (via llama.cpp submodule in external/), tokenizer, model format auto-detection (`model_format.cpp` supports gguf/safetensors/hf with HuggingFace URI resolution)
-- `scheduler/` — Scheduler with global mutex (to be replaced by continuous batching via `RequestBatch`), `ModelRouter` with multi-model serving and backend provider tracking
+- `scheduler/` — Scheduler with granular lock ordering (queue, model-selection, sequence-retirement, eviction), fairness-aware batch construction, decode-worker pools for disaggregated deployments, `ModelRouter` with multi-model serving and backend provider tracking
 - `server/` — Multi-threaded HTTP server (thread pool), auth (API-key, OIDC, rate limiter), metrics (Prometheus /metrics), audit logging, guardrails, health probes (/healthz, /readyz, /livez)
 - `policy/` — `PolicyBackend` interface, `PolicyStore` (encrypted INI with AES-GCM via OpenSSL), OPA client
 - `cli/` — `inferctl` client (chat, completion, admin commands) using shared `HttpClient` and nlohmann/json
@@ -98,6 +102,15 @@ The CMake target `inferflux_core` links all modules into a single library consum
 - `config/` — `server.yaml` (primary config), `policy_store.conf` (encrypted policy persistence)
 
 **Tech debt tracker:** `docs/TechDebt_and_Competitive_Roadmap.md` — consult at session start for priorities.
+
+**Canonical docs (keep in sync with code changes):**
+- `docs/GEMV_KERNEL_ARCHITECTURE.md` — kernel geometry, dispatch priority, TDD coverage
+- `docs/GGUF_NATIVE_KERNEL_IMPLEMENTATION.md` — native GGUF runtime guide, operator status
+- `docs/MONITORING.md` — observability signals, tuning levers, profiling workflow
+- `docs/design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE.md` — design rules and next gates
+- `docs/API_SURFACE.md` — all HTTP endpoints and CLI contracts (source-aligned)
+- `docs/CONFIG_REFERENCE.md` — full config map including all env vars and YAML knobs
+- `docs/BACKEND_DEVELOPMENT.md` — guide to adding or extending backends
 
 ## Coding Conventions
 
@@ -109,12 +122,12 @@ The CMake target `inferflux_core` links all modules into a single library consum
 
 ## Backend Selection & Model Format Routing
 
-**Backend types:** `cpu`, `cuda`, `cuda_native` (native CUDA implementation), `cuda_llama_cpp`/`cuda_llama` (llama.cpp-backed), `mps`, `rocm`
+**Backend types:** `cpu`, `cuda`, `inferflux_cuda` (InferFlux CUDA implementation), `llama_cpp_cuda` (llama.cpp-backed), `mps`, `rocm`
 
 **Model formats:** `auto` (default), `gguf`, `safetensors`, `hf` (HuggingFace URI-style `hf://org/repo`)
 
 **Backend resolution logic:**
-1. Explicit backend hints (`cuda_native`, `cuda_llama_cpp`) are honored when available
+1. Explicit backend hints (`inferflux_cuda`, `llama_cpp_cuda`) are honored when available
 2. Backend priority (`runtime.backend_priority`, `INFERFLUX_BACKEND_PRIORITY`) determines fallback order
 3. Capability routing (`runtime.capability_routing.*`) enables graceful degradation when requested capabilities aren't available
 4. Backend exposure policy controls which backends are exposed via `/v1/models`
@@ -134,22 +147,94 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 - `INFERFLUX_POLICY_PASSPHRASE` — enables AES-GCM encryption on the policy store
 - `INFERFLUX_MPS_LAYERS` — number of layers to offload to Metal
 - `INFERFLUX_PORT_OVERRIDE` / `INFERFLUX_HOST_OVERRIDE` — network overrides
-- `INFERFLUX_BACKEND_PREFER_NATIVE` — prefer native implementations over universal
+- `INFERFLUX_BACKEND_PREFER_INFERFLUX` — prefer InferFlux implementations over llama.cpp
 - `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` — allow fallback to llama.cpp backends
-- `INFERFLUX_NATIVE_CUDA_STRICT` — fail load if native CUDA runtime reports fallback
+- `INFERFLUX_CUDA_STRICT` — fail load if native CUDA runtime reports fallback
 - `INFERFLUX_MODEL_FORMAT` — override model format detection
+- `INFERFLUX_DISABLE_STARTUP_ADVISOR=true` — suppress startup configuration recommendations
 
 ## CUDA Development
 
-**Native CUDA backend:** `runtime/backends/cuda/native_cuda_backend.cpp` and `runtime/backends/cuda/native_cuda_runtime.cpp` provide the canonical native CUDA path used by `cuda_native`.
+**Two-backend architecture:** The CUDA path has two providers that both accept GGUF models:
+- `inferflux_cuda` (`runtime/backends/cuda/inferflux_cuda_backend.cpp`, `inferflux_cuda_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp), FlashAttention-2 with GQA and multi-sequence decode, CUDA graph capture/replay, MMQ accumulate kernels (M=9-64 residual fusion). Use for **single-request optimization** and native feature development. Verified throughput (RTX 4000 Ada, Qwen2.5-3B Q4_K_M): c=1 82 tok/s (0.82x vs llama.cpp 100), c=4 165 tok/s (1.13x FASTER than llama.cpp 146), c=8 176 tok/s (0.82x vs llama.cpp 213). Zero crashes at all concurrency levels. Memory: 284 MB idle overhead vs llama.cpp.
+- `llama_cpp_cuda` — delegates to llama.cpp for inference. **Use for concurrent workloads** (validated 3.7x faster than Ollama at 16 agents). Higher throughput today, lower ceiling for InferFlux-specific innovation.
 
-**Phase overlap:** Mixed-batch decode prioritization with configurable prefill/decode overlap. Enable via `runtime.cuda.phase_overlap.enabled` or `INFERFLUX_CUDA_PHASE_OVERLAP`. Monitor via Prometheus metrics: `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_completions_total`, `inferflux_cuda_lane_overlap_events_total`, `inferflux_cuda_lane_overlap_duration_ms_total`.
+Only structured output (grammar-constrained generation) still delegates to the llama.cpp parity backend. Logprobs and embeddings are native.
 
-**Attention kernels:** Multiple CUDA attention implementations with automatic selection. Configure via `runtime.cuda.attention.kernel` or `INFERFLUX_CUDA_ATTENTION_KERNEL` (`auto`, `fa2`, `standard`). Monitor fallbacks via `inferflux_cuda_attention_kernel_fallbacks_total`.
+**Key CUDA env vars:** (centralized in `NativeExecutionPolicy::FromEnv()`)
+- `INFERFLUX_DISABLE_BATCHED_DECODE=1` — opt out of batched decode (default-on)
+- `INFERFLUX_DISABLE_CUDA_GRAPH=1` — disable CUDA graph capture (default-on for primary forward; lane forwards have graphs disabled automatically during overlap; lane overlap mutex fixes in 0ccbad3 prevent heap corruption)
+- `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` — disable pre-quantized Q8_1 activation path
+- `INFERFLUX_ENABLE_FUSED_GATE_UP_SILU=0|1` — toggle fused gate+up+SiLU MMVQ kernel (default on)
+- `INFERFLUX_ENABLE_FUSED_RESIDUAL_NORM=0|1` — fuse ResidualAdd+RmsNorm into one kernel at layer boundaries (default on)
+- `INFERFLUX_ENABLE_FUSED_BIAS_ADD=0|1` — fuse Q/K/V bias adds into single kernel (default on, Qwen2 only)
+- `INFERFLUX_ENABLE_GEMV_ACCUMULATE=0|1` — MMVQ accumulate mode for O-proj/down-proj, eliminates separate ResidualAdd (default on)
+- `INFERFLUX_ENABLE_FUSED_ROPE_KV_APPEND=0|1` — fuse RoPE+KvAppend into single kernel (default on, P1 validated)
+- `INFERFLUX_ENABLE_FUSED_GEMV_NORM_QUANT_EPILOGUE=0|1` — fuse RmsNorm+Q8_1 quant after GEMV accum (default on, P2 validated)
+- `INFERFLUX_ENABLE_MMVQ_BIAS_EPILOGUE=0|1` — fuse bias into MMVQ writeback, eliminates BiasAddTriple (default off, P3)
+- `INFERFLUX_ENABLE_Q6K_VECTORIZED=0|1` — use vectorized Q6_K MMVQ kernel with __ldg (default off, P4)
+- `INFERFLUX_ENABLE_GATE_UP_SILU_Q81_EPILOGUE=0|1` — fuse Q8_1 quant into gate+up+SiLU MMVQ (default off, P5)
+- `INFERFLUX_BATCH_DEQUANT_CACHE=0|1` — permanently cache dequantized projection weights instead of using scratch buffer (trades GPU memory for prefill performance, default off)
+- `INFERFLUX_GEMV_V2=1` — enable v2 cooperative-warp GEMV kernels (experimental, slower on Ada)
+- `INFERFLUX_CUDA_TIMING_SAMPLE_RATE=N` — record CUDA event timing every Nth batch (0=off)
+- `INFERFLUX_CUDA_PHASE_OVERLAP` — enable prefill/decode lane overlap
+- `INFERFLUX_CUDA_ATTENTION_KERNEL` — force attention kernel (`auto`, `fa2`, `standard`)
+- `INFERFLUX_CUDA_KV_MAX_BATCH` / `INFERFLUX_CUDA_KV_MAX_SEQ` — KV cache sizing
 
-**Native CUDA metrics:** The native kernel executor (`runtime/backends/cuda/native_kernel_executor.cpp`) reports per-forward-pass timing and batching metrics via Prometheus: `inferflux_native_forward_passes_total{phase}`, `inferflux_native_forward_batch_tokens_total`, `inferflux_native_forward_duration_ms` (histogram), `inferflux_native_sampling_duration_ms` (histogram), `inferflux_native_kv_active_sequences`, `inferflux_native_kv_max_sequences`. NVTX annotations are added for Nsight Systems profiling (ranges: Forward, Embedding, Layer, QKV_Projection, RoPE, KV_Append, FlashAttention2, O_Projection, FFN, LM_Head, Sampling).
+**InferFlux CUDA kernel files:**
+- `runtime/backends/cuda/native/kernels/fused_dequant_gemv.cuh` — V1 GEMV kernels (column-major, 8 warps/block, used for pair/triple M>8 fallback)
+- `runtime/backends/cuda/native/kernels/mmvq.cuh` — MMVQ weight-read-first kernels (batch 1-8, primary dispatch path) + accumulate variants for residual-stream fusion
+- `runtime/backends/cuda/native/kernels/mmq.cuh` — MMQ tiled quantized GEMM kernels (batch 9-64)
+- `runtime/backends/cuda/native/kernels/quant_common.cuh` — shared quantization primitives (Dp4aS8, Vsubss4, LoadPacked*)
+- `runtime/backends/cuda/native/fused_quant_gemm.cu` — dispatch tables, MMVQ/MMQ selection, threshold logic
+- `runtime/backends/cuda/native/transformer_forward.cu` — forward pass wiring
+- `runtime/backends/cuda/native/cuda_kernels.cu` — batched RoPE/KvAppend, MeanPool, utility kernels
+- `runtime/backends/cuda/native/kernels/fused_rope_kv_append.cuh` — fused RoPE+KvAppend kernel (P1)
+- `runtime/backends/cuda/native/kernels/fused_gemv_accum_norm_quant.cuh` — fused RmsNorm+Q8_1 quant epilogue (P2)
+- `runtime/backends/cuda/kernels/flash_attention.cu` — FlashAttention-2 and FlashDecodeMultiSeq
+- `runtime/backends/cuda/kernels/flash_attention_mma.cuh` — MMA tensor-core prefill kernel (m16n8k16, Br=16, auto-selected for query_len≥16)
 
-**Throughput validation:** Use `scripts/run_throughput_gate.py` for performance regression testing. The script validates tok/s thresholds, CUDA lane submissions, overlap metrics, native forward pass counters (`--require-native-forward-passes`), and backend provider exposure.
+**InferFlux CUDA policy and execution files:**
+- `runtime/backends/cuda/native/native_execution_policy.h` — `NativeExecutionPolicy` struct, env var parsing
+- `runtime/backends/cuda/native/native_dispatch_policy.{h,cpp}` — operator selection, dispatch decisions
+- `runtime/backends/cuda/native/native_dispatch_registry.{h,cpp}` — per-phase/batch-bucket dispatch winner registry
+- `runtime/backends/cuda/native/native_bootstrap_config.{h,cpp}` — KV cache sizing, startup config
+- `runtime/backends/cuda/native/native_linear_executor.h` — projection stage execution with fallback chains
+- `runtime/backends/cuda/native/cuda_sync_trace.h` — CUDA sync latency tracing at named pipeline sites
+
+**InferFlux CUDA metrics:** Prometheus at `/metrics`: `inferflux_cuda_forward_passes_total{phase}`, `inferflux_cuda_forward_batch_tokens_total`, `inferflux_cuda_forward_duration_ms`, `inferflux_cuda_sampling_duration_ms`, `inferflux_cuda_kv_active_sequences`, `inferflux_cuda_kv_max_sequences`, FFN/down-proj operator counters. NVTX annotations for Nsight Systems profiling.
+
+**Throughput validation:**
+```bash
+# Performance regression gate (canonical entry point)
+bash scripts/benchmark.sh throughput-gate
+
+# Native vs llama.cpp comparison benchmark
+bash scripts/benchmark.sh gguf-compare
+
+# Multi-backend benchmark (inferflux_cuda, llama_cpp_cuda, ollama, vllm, sglang, lmstudio)
+bash scripts/benchmark.sh multi-backend
+# AUTOSTART_VLLM=true / AUTOSTART_SGLANG=true to launch external engines automatically
+# INFERFLUX_BENCH_SINGLE_BACKEND=<id> to run one backend through the full harness
+
+# Profiling entry points
+bash scripts/profile.sh backend           # nsys backend profile
+bash scripts/profile.sh backend-ncu       # ncu kernel profile
+bash scripts/profile.sh phase-timing      # per-phase timing breakdown
+
+# Smoke tests (no model required)
+bash scripts/smoke.sh gguf-native
+bash scripts/smoke.sh backend-identity
+```
+
+**Script archive policy:** One-off probes and superseded wrappers live in `scripts/archive/`. New scripts should extend the entry points above, not add new top-level files.
+
+## Disaggregated Runtime
+
+`runtime/disaggregated/` implements split prefill/decode with KV transfer:
+- `kv_channel.h` — ticket-based KV handoff with lifecycle tracking (create/transfer/consume/timeout)
+- `shm_kv_transport.h` — shared-memory transport for process-local KV transfer
+- Health signals: timeout streak/debt metrics influence `/readyz` and optional fail-closed admission
 
 ## Commits & PRs
 

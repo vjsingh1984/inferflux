@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstdlib>
+#include <limits>
 #include <string>
 
 namespace inferflux {
@@ -24,18 +26,45 @@ inline std::string Trim(const std::string &s) {
   return s.substr(start, end - start + 1);
 }
 
-/// Parse a boolean from string ("true"/"1"/"yes" → true, else false).
+/// Parse a boolean from string.
+/// Recognises "true"/"1"/"yes"/"on" (case-insensitive) as true,
+/// "false"/"0"/"no"/"off" as false.  Any other value returns false.
 inline bool ParseBool(const std::string &val) {
   std::string lower = ToLower(val);
-  return lower == "true" || lower == "1" || lower == "yes";
+  return lower == "true" || lower == "1" || lower == "yes" || lower == "on";
 }
 
 /// Parse a boolean from environment variable with fallback.
+/// Recognises "true"/"1"/"yes"/"on" as true, "false"/"0"/"no"/"off" as false.
+/// Unset or empty returns @p fallback.
 inline bool ParseBoolEnv(const char *env_name, bool fallback) {
   const char *val = std::getenv(env_name);
-  if (!val)
+  if (!val || *val == '\0')
     return fallback;
-  return ParseBool(val);
+  std::string lower = ToLower(val);
+  if (lower == "1" || lower == "true" || lower == "yes" || lower == "on")
+    return true;
+  if (lower == "0" || lower == "false" || lower == "no" || lower == "off")
+    return false;
+  return fallback;
+}
+
+/// Parse an integer from environment variable with fallback and bounds.
+/// Returns @p default_value if unset, empty, unparseable, or out of
+/// [min_value, max_value].
+inline int ParseIntEnv(const char *env_name, int default_value,
+                       int min_value = 0,
+                       int max_value = std::numeric_limits<int>::max()) {
+  const char *raw = std::getenv(env_name);
+  if (!raw || *raw == '\0')
+    return default_value;
+  char *end = nullptr;
+  const long parsed = std::strtol(raw, &end, 10);
+  if (end == raw || (end && *end != '\0'))
+    return default_value;
+  if (parsed < min_value || parsed > max_value)
+    return default_value;
+  return static_cast<int>(parsed);
 }
 
 // Common size constants

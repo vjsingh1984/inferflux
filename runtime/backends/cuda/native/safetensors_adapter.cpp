@@ -196,6 +196,8 @@ void SafetensorsLoaderAdapter::ClearDequantizedCache() {
   // dequant cache lifecycle contract.
 }
 
+bool SafetensorsLoaderAdapter::HasDequantizedCache() const { return false; }
+
 std::shared_ptr<IWeightAccessor>
 SafetensorsLoaderAdapter::GetWeightAccessor(const std::string &tensor_name) {
   // Check cache first

@@ -17,6 +17,9 @@ public:
   int CurrentLimit() const;
 
 private:
+  void EvictStaleLocked(
+      std::chrono::steady_clock::time_point now);
+
   struct Entry {
     double tokens{0.0};
     std::chrono::steady_clock::time_point last;
@@ -26,6 +29,7 @@ private:
   double refill_per_second_;
   std::unordered_map<std::string, Entry> entries_;
   mutable std::mutex mutex_;
+  std::chrono::steady_clock::time_point last_eviction_;
 };
 
 } // namespace inferflux

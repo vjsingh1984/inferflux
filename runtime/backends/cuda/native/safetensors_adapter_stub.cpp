@@ -97,6 +97,7 @@ SafetensorsLoaderAdapter::GetDequantizedCachePolicy() const {
 }
 
 void SafetensorsLoaderAdapter::ClearDequantizedCache() {}
+bool SafetensorsLoaderAdapter::HasDequantizedCache() const { return false; }
 
 std::shared_ptr<IWeightAccessor>
 SafetensorsLoaderAdapter::GetWeightAccessor(const std::string &) {

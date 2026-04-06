@@ -31,5 +31,32 @@ cudaError_t FlashDecodeMultiSeq(const T *Q, const T *const *d_k_ptrs,
                                 int num_heads, int num_kv_heads, int head_dim,
                                 float scale, cudaStream_t stream = 0);
 
+/**
+ * FlashDecodeMultiSeqStrided: Batched decode attention for B sequences with
+ * different KV lengths, deriving K/V bases on device from a regular KV cache
+ * layout.
+ *
+ * kv_buffer layout: [max_batch][num_layers][2][max_seq_len][kv_dim]
+ * d_seq_ids/d_kv_lens: [B] sequence IDs and KV lengths on device.
+ *
+ * split_workspace: optional device buffer for KV-split parallelism.
+ *   When non-null and kv_len >= split_threshold, the KV sequence is split
+ *   across multiple blocks (grid.z) and reduced in a second kernel.
+ *   Required size: batch_size * num_heads * num_splits * (head_dim + 2) * 4.
+ *   When null, falls back to single-block-per-head (original behavior).
+ * split_workspace_bytes: size of the workspace buffer in bytes.
+ */
+template <typename T>
+cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
+                                       const int *d_seq_ids,
+                                       const int *d_kv_lens, int layer,
+                                       int batch_size, int num_heads,
+                                       int num_kv_heads, int head_dim,
+                                       size_t slot_stride, size_t layer_stride,
+                                       size_t kv_stride, float scale,
+                                       cudaStream_t stream = 0,
+                                       void *split_workspace = nullptr,
+                                       size_t split_workspace_bytes = 0);
+
 } // namespace cuda_kernel
 } // namespace inferflux

@@ -56,9 +56,12 @@ flowchart TD
 ## 5) Pre-Tag Checklist
 
 - `README.md` reflects current binaries and endpoints.
+- `README.md` benchmark claims distinguish published `llama_cpp_cuda` results from in-progress `inferflux_cuda` work.
 - `docs/INDEX.md` links only valid canonical docs.
 - `docs/Quickstart.md` commands are runnable.
 - `docs/API_SURFACE.md` matches implemented endpoints.
+- Root OSS files exist and are current: `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`.
+- Local benchmark and profiling artifacts are ignored and excluded from the release cut.
 - [DOCS_STYLE_GUIDE](DOCS_STYLE_GUIDE.md) constraints are met.
 
 ## 6) References

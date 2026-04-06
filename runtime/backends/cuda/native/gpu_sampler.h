@@ -12,6 +12,11 @@ namespace inferflux {
  *
  * For greedy (temperature=0): argmax via parallel reduction.
  * For stochastic: softmax -> top-k -> top-p -> multinomial sample.
+ *
+ * Thread-safety contract: NOT thread-safe.  Each inference lane
+ * (prefill/decode) must own its own GpuSampler instance.  This is
+ * correct by construction — InferfluxCudaExecutor creates per-lane
+ * sampler instances (sampler_, decode_lane_sampler_, prefill_lane_sampler_).
  */
 class GpuSampler {
 public:
@@ -38,6 +43,21 @@ public:
    */
   int Sample(const float *d_logits, float temperature, int top_k, float top_p,
              uint32_t seed = UINT32_MAX);
+  void EnqueueSample(const float *d_logits, float temperature, int top_k,
+                     float top_p, uint32_t seed = UINT32_MAX);
+  int CollectSample();
+
+  /**
+   * Copy last-position logits from device to a host buffer.
+   * The caller must provide a buffer of at least vocab_size floats.
+   * This must be called after Sample() / SampleBatch() and before the next
+   * forward pass overwrites the logits buffer.
+   *
+   * @param d_logits  [vocab_size] FP32 logits on device (same pointer passed
+   *                  to Sample)
+   * @param host_buf  [vocab_size] FP32 host destination
+   */
+  void CopyLogitsToHost(const float *d_logits, float *host_buf);
 
   /**
    * Sample tokens from batched logits.
@@ -53,7 +73,26 @@ public:
                    const std::vector<float> &temperatures,
                    const std::vector<int> &top_ks,
                    const std::vector<float> &top_ps,
+                   const std::vector<uint32_t> &seeds,
                    std::vector<int> *out_tokens);
+  void EnqueueSampleBatch(const float *d_logits, int batch_size,
+                          const std::vector<float> &temperatures,
+                          const std::vector<int> &top_ks,
+                          const std::vector<float> &top_ps,
+                          const std::vector<uint32_t> &seeds);
+  void CollectSampleBatch(std::vector<int> *out_tokens);
+
+  std::size_t DeviceWorkspaceBytes() const;
+  std::size_t HostWorkspaceBytes() const;
+
+  /// Device-side batch result pointer for DeviceTokenRelay integration.
+  /// Valid after EnqueueSampleBatch; invalidated by next EnqueueSampleBatch.
+  const int *DeviceResultBatch() const { return d_result_batch_; }
+
+  /// Lightweight greedy argmax that stays entirely on device — no D2H memcpy,
+  /// no event record. Used by BurstDecodeGreedy for zero-sync-overhead decode.
+  /// Result written to d_result_batch_[0..batch_size-1].
+  void EnqueueGreedyArgmaxDeviceOnly(const float *d_logits, int batch_size);
 
 private:
   int GreedyArgmax(const float *d_logits);
@@ -75,7 +114,7 @@ private:
   int *d_indices_{nullptr}; // [vocab_size] sorted indices
   float *d_temp_{nullptr};  // [vocab_size] temp storage
   int *d_result_{nullptr};  // [1] sampled token ID (device)
-  int h_result_{0};         // sampled token ID (host)
+  int *h_result_pinned_{nullptr}; // [1] sampled token ID (host pinned)
 
   // For argmax
   float *d_max_val_{nullptr}; // [1] max value
@@ -83,13 +122,17 @@ private:
 
   // Batch buffers (allocated once, sized for max batch)
   static constexpr int kMaxBatchSize = 64;
-  int *d_result_batch_{nullptr};        // [kMaxBatchSize] on device
-  int h_result_batch_[kMaxBatchSize]{}; // host buffer
+  int *d_result_batch_{nullptr};             // [kMaxBatchSize] on device
+  int *h_result_batch_pinned_{nullptr};      // [kMaxBatchSize] host pinned
+  float *h_logits_pinned_{nullptr};          // [vocab_size] host pinned
 
   // cuRAND
   curandGenerator_t rng_{nullptr};
   float *d_uniform_{nullptr}; // [1] random uniform
   bool rng_initialized_{false};
+  cudaEvent_t completion_event_{nullptr};
+  bool completion_pending_{false};
+  int pending_batch_size_{0};
 };
 
 } // namespace inferflux

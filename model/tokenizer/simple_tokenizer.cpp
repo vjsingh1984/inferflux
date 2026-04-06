@@ -56,6 +56,7 @@ std::vector<int> SimpleTokenizer::Encode(const std::string &text) {
   }
   std::vector<int> tokens;
   tokens.push_back(1); // <bos>
+  std::lock_guard<std::mutex> lock(mu_);
   for (const auto &word : words) {
     tokens.push_back(AddToken(word));
   }

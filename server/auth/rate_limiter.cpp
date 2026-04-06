@@ -13,6 +13,7 @@ bool RateLimiter::Allow(const std::string &key) {
   }
   auto now = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(mutex_);
+  EvictStaleLocked(now);
   auto &entry = entries_[key];
   if (entry.last.time_since_epoch().count() == 0) {
     entry.tokens = tokens_per_minute_;
@@ -29,6 +30,24 @@ bool RateLimiter::Allow(const std::string &key) {
     return true;
   }
   return false;
+}
+
+void RateLimiter::EvictStaleLocked(
+    std::chrono::steady_clock::time_point now) {
+  constexpr auto kEvictInterval = std::chrono::seconds(60);
+  if (now - last_eviction_ < kEvictInterval) {
+    return;
+  }
+  last_eviction_ = now;
+  // Remove entries older than 2× the rate limit window (2 minutes).
+  const auto ttl = std::chrono::seconds(120);
+  for (auto it = entries_.begin(); it != entries_.end();) {
+    if (now - it->second.last > ttl) {
+      it = entries_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void RateLimiter::UpdateLimit(int tokens_per_minute) {

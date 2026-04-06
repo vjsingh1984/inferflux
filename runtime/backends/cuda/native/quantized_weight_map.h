@@ -8,6 +8,7 @@
 #endif
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,9 @@ using runtime::cuda::native::ModelInfo;
  * - Compatible with existing forward pass code
  */
 class QuantizedWeightMap {
+#ifdef INFERFLUX_TESTING
+  friend class WeightMapTestAccess;
+#endif
 public:
   QuantizedWeightMap() = default;
   ~QuantizedWeightMap();
@@ -117,6 +121,22 @@ public:
   int NumLayers() const { return num_layers_; }
   bool IsQuantized() const { return is_quantized_; }
   std::string GetQuantizationType() const { return quantization_type_; }
+  void SetAllowFusedQuantizedMatmul(bool allow) {
+    allow_fused_quantized_matmul_ = allow;
+  }
+  bool AllowFusedQuantizedMatmul() const {
+    return allow_fused_quantized_matmul_;
+  }
+
+  // When enabled, projection weights use permanent per-tensor caching
+  // instead of the shared scratch buffer.  Trades GPU memory for prefill
+  // performance by eliminating dequantization kernel launches per layer.
+  void SetBatchDequantCacheEnabled(bool enable) {
+    batch_dequant_cache_enabled_ = enable;
+  }
+  bool BatchDequantCacheEnabled() const {
+    return batch_dequant_cache_enabled_;
+  }
 
   // --- Raw quantized weight accessors (for fused dequant-GEMV) ---
 
@@ -127,6 +147,7 @@ public:
   QuantizedWeightInfo GetRawLayerGateProj(int layer) const;
   QuantizedWeightInfo GetRawLayerUpProj(int layer) const;
   QuantizedWeightInfo GetRawLayerDownProj(int layer) const;
+  MmqWeightInfo GetMmqLayerDownProj(int layer) const;
   QuantizedWeightInfo GetRawLmHead() const;
 
   /**
@@ -144,6 +165,12 @@ public:
    * Use to reclaim GPU memory
    */
   void ClearCache();
+
+  std::size_t ScratchReservedBytes() const;
+  std::size_t ScratchInUseBytes() const;
+  std::size_t ScratchHighWaterBytes() const { return scratch_high_water_bytes_; }
+  bool HasScratchBuffer() const { return scratch_buffer_ != nullptr; }
+  void ReleaseScratchBuffer();
 
 private:
   /**
@@ -174,6 +201,7 @@ private:
     mutable const half *gate_proj{nullptr};
     mutable const half *up_proj{nullptr};
     mutable const half *down_proj{nullptr};
+    mutable MmqWeightInfo down_proj_mmq{};
     // Biases
     mutable const half *q_proj_bias{nullptr};
     mutable const half *k_proj_bias{nullptr};
@@ -194,7 +222,9 @@ private:
     std::shared_ptr<IWeightAccessor> v_proj_bias_accessor;
   };
 
-  // Helper to get dequantized weights (lazy evaluation, permanent cache)
+  // Helper to get dequantized weights (lazy evaluation, permanent cache).
+  // Guarded by dequant_cache_mu_ to prevent races when multiple threads
+  // (e.g. prefill/decode overlap lanes) lazily populate cache pointers.
   const half *GetDequantizedWeights(std::shared_ptr<IWeightAccessor> accessor,
                                     const half *&cache_ptr) const;
 
@@ -215,7 +245,12 @@ private:
 
   // Scratch buffer for on-demand projection dequantization
   mutable half *scratch_buffer_{nullptr};
-  size_t scratch_buffer_elements_{0};
+  mutable size_t scratch_buffer_elements_{0};
+  mutable size_t scratch_high_water_bytes_{0};
+  mutable std::mutex dequant_cache_mu_;
+  mutable std::mutex mmq_cache_mu_;
+  bool allow_fused_quantized_matmul_{true};
+  bool batch_dequant_cache_enabled_{false};
 
   // Global weight accessors
   std::shared_ptr<IWeightAccessor> embed_tokens_accessor;

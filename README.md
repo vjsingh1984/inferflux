@@ -1,12 +1,12 @@
 # InferFlux
 
-> Open-source inference server with OpenAI-compatible HTTP APIs, multi-backend runtime, and operator-grade controls.
+> Open-source inference server with OpenAI-compatible HTTP APIs, multi-backend runtime, explicit backend identity, and operator-grade controls.
 
 ```mermaid
 graph LR
     A[Clients\nOpenAI SDKs / curl / inferctl] --> B[InferFlux Server]
     B --> C[Scheduler\nBatching + Fairness + Routing]
-    C --> D[Backends\nCPU / CUDA / ROCm / MPS / MLX*]
+    C --> D[Backends\nCPU / CUDA / ROCm / MPS / Vulkan / MLX]
     C --> E[Policy\nAuth + Guardrails + RBAC]
     C --> F[Ops\nMetrics + Audit + Admin APIs]
 
@@ -17,6 +17,43 @@ graph LR
     style F fill:#90be6d
 ```
 
+## Benchmark Snapshot
+
+| Track | Current reading |
+|---|---|
+| Published competitive win | `llama_cpp_cuda` remains materially faster than Ollama on the documented GGUF concurrency matrix |
+| Native CUDA status | `inferflux_cuda` is real and measurable, but still behind `llama_cpp_cuda` at sustained concurrency |
+| Current optimization focus | Decode down-proj row-pair and row-quad paths, especially in `c=8` style batches |
+
+### Proven Repo-Level Result: `llama_cpp_cuda` vs Ollama
+
+Published benchmark result on RTX 4000 Ada with Qwen2.5-3B-Instruct Q4_K_M:
+
+| Metric | InferFlux `llama_cpp_cuda` | Ollama | Advantage |
+|---|---|---|---|
+| 16 concurrent agents | 277 tok/s | 76 tok/s | 3.7x |
+| 8 concurrent agents | 206 tok/s | 80 tok/s | 2.6x |
+| 4 concurrent agents | 176 tok/s | 80 tok/s | 2.2x |
+| Single agent | 107 tok/s | 52 tok/s | 2.0x |
+| GPU memory usage | 9.7 GB | 13.3 GB | 27% less |
+
+### Current Native CUDA Snapshot: `inferflux_cuda` vs `llama_cpp_cuda`
+
+Representative WSL2 harness run from March 31, 2026 using `32` requests, `64` max tokens, and `batch_accumulation_ms=2` (post-MMQ accumulate and lane overlap fixes):
+
+| Metric | `inferflux_cuda` | Reading |
+|---|---|---|
+| c=1 throughput | 65.6 tok/s | Stable, CUDA graphs enabled |
+| c=4 throughput | 148.3 tok/s | 32/32 OK, no crashes |
+| c=8 throughput | 174.6 tok/s | 32/32 OK in best runs |
+
+Interpretation:
+- `llama_cpp_cuda` remains the recommended CUDA backend for sustained concurrent GGUF serving pending full re-validation.
+- `inferflux_cuda` concurrent stability improved significantly after lane overlap mutex fixes (commit 0ccbad3) — c=4 is now crash-free, c=8 stability improved from ~33% to ~75%.
+- MMQ accumulate kernels (M=9-64) eliminate ~72 extra ResidualAdd kernel launches per decode step. CUDA graphs re-enabled on primary forward instance, recovering ~17% single-sequence throughput that was previously lost when graphs were blanket-disabled.
+
+Details: [docs/benchmarks.md](docs/benchmarks.md)
+
 ## OSS Release Snapshot
 
 | Area | What ships in this repo |
@@ -24,18 +61,40 @@ graph LR
 | Server binary | `inferfluxd` |
 | CLI binary | `inferctl` |
 | API surface | `/v1/completions`, `/v1/chat/completions`, `/v1/models`, `/v1/models/{id}`, `/v1/embeddings`, `/v1/admin/*` |
-| Runtime options | CPU + optional CUDA/ROCm/MPS/Vulkan/MLX (build-time toggles) |
+| Runtime options | CPU + optional CUDA/ROCm/MPS/Vulkan/MLX |
 | Ops endpoints | `/livez`, `/readyz`, `/healthz`, `/metrics`, optional `/ui` |
+| OSS metadata | `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md` |
+
+## Current Reality
+
+| State | Reading |
+|---|---|
+| Strong today | API/admin/CLI contracts, backend/provider identity, policy-visible fallback, and operator observability |
+| Proven advantage | `llama_cpp_cuda` outperforms Ollama on the published concurrent GGUF benchmark |
+| Native CUDA today | `inferflux_cuda` is competitive around `c=4` in the current Windows harness, but still trails at `c=8` |
+| Foundation now | Memory-first GGUF policy, KV auto-tune, optional session leases, transport-health semantics, and operator-level metrics |
+| Still open | Decode down-proj throughput, graph maturity, distributed ownership cleanup, and required GPU/provider CI lanes |
+
+## Modern Runtime Stance
+
+| Principle | Current reading |
+|---|---|
+| Throughput | Sync-first batching is the performance path |
+| Async | Useful for admission and collection only if it preserves batch quality |
+| Quantized GGUF | Should stay quantized and memory-first, not silently devolve into persistent full dequant |
+| Distributed runtime | Readiness and admission can react to degraded transport, but ownership maturity is still open |
+| Backend selection | `llama_cpp_cuda` for concurrent GGUF workloads today; `inferflux_cuda` remains in active optimization |
 
 ## 3-Minute Bring-Up
 
 ```bash
 # 1) Build
 ./scripts/build.sh
+
 # Optional: target Ada RTX 4000 specifically
 # INFERFLUX_CUDA_ARCHS=89 ./scripts/build.sh
 
-# 2) Run server (default config + default dev keys)
+# 2) Run server
 INFERFLUX_MODEL_PATH=models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf \
   ./build/inferfluxd --config config/server.yaml
 
@@ -46,7 +105,7 @@ INFERFLUX_MODEL_PATH=models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf \
   --api-key dev-key-123
 ```
 
-## API Surface (Code-Aligned)
+## API Surface
 
 | Scope | Endpoint | Method |
 |---|---|---|
@@ -63,9 +122,9 @@ INFERFLUX_MODEL_PATH=models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf \
 | Admin | `/v1/admin/routing` | `GET`, `PUT` |
 | Admin | `/v1/admin/cache`, `/v1/admin/cache/warm` | `GET`, `POST` |
 
-Full API map: [API Surface](docs/API_SURFACE.md)
+Full API map: [docs/API_SURFACE.md](docs/API_SURFACE.md)
 
-## CLI Surface (Code-Aligned)
+## CLI Surface
 
 ```mermaid
 graph TD
@@ -77,36 +136,37 @@ graph TD
     style A fill:#f2c14e
 ```
 
-## Documentation (Infographic-First)
+## Documentation
 
-Start here: [Docs Index](docs/INDEX.md)
+Start here: [docs/INDEX.md](docs/INDEX.md)
 
-| Use case | Doc |
-|---|---|
-| Fast local setup | [Quickstart](docs/Quickstart.md) |
-| API and auth contracts | [API Surface](docs/API_SURFACE.md) |
-| Runtime and subsystem design | [Architecture](docs/Architecture.md) |
-| Production operations | [Admin Guide](docs/AdminGuide.md) |
-| Config knobs | [Config Reference](docs/CONFIG_REFERENCE.md) |
-| Contributor workflow | [Developer Guide](docs/DeveloperGuide.md) |
-| Historical deep dives | [Archive Index](docs/ARCHIVE_INDEX.md) |
-| Documentation standards | [Docs Style Guide](docs/DOCS_STYLE_GUIDE.md) |
+Performance and runtime:
+- [docs/benchmarks.md](docs/benchmarks.md)
+- [docs/MONITORING.md](docs/MONITORING.md)
+- [docs/TechDebt_and_Competitive_Roadmap.md](docs/TechDebt_and_Competitive_Roadmap.md)
+- [docs/Roadmap.md](docs/Roadmap.md)
 
-## Build Matrix
+Architecture:
+- [docs/GEMV_KERNEL_ARCHITECTURE.md](docs/GEMV_KERNEL_ARCHITECTURE.md)
+- [docs/GGUF_NATIVE_KERNEL_IMPLEMENTATION.md](docs/GGUF_NATIVE_KERNEL_IMPLEMENTATION.md)
+- [docs/Architecture.md](docs/Architecture.md)
 
-| CMake option | Default | Purpose |
-|---|---:|---|
-| `ENABLE_CUDA` | `ON` | CUDA runtime + native CUDA kernels when toolkit exists |
-| `ENABLE_ROCM` | `ON` | ROCm backend path |
-| `ENABLE_MPS` | `ON` | Metal/MPS backend path |
-| `ENABLE_VULKAN` | `ON` | Vulkan backend via llama.cpp |
-| `ENABLE_WEBUI` | `OFF` | Embedded `/ui` assets |
-| `ENABLE_MLX` | `OFF` | Experimental MLX backend |
-| `ENABLE_MTMD` | `OFF` | Multimodal vision support |
+## Project Status
 
-## Current Positioning
+- Done: production-ready HTTP server with OpenAI-compatible APIs
+- Done: multi-backend runtime across CPU and optional GPU providers
+- Done: operator-grade auth, RBAC, metrics, audit, and admin surfaces
+- Done: documented `llama_cpp_cuda` advantage over Ollama on the published concurrent GGUF benchmark
+- In progress: `inferflux_cuda` concurrency work, especially decode down-proj row-pair and row-quad kernels
+- In progress: distributed runtime ownership and failure maturity
 
-Competitive and roadmap status lives in:
-- [Tech Debt and Competitive Roadmap](docs/TechDebt_and_Competitive_Roadmap.md)
-- [Roadmap](docs/Roadmap.md)
-- [PRD](docs/PRD.md)
+## Quick Links
+
+- Benchmarks: [docs/benchmarks.md](docs/benchmarks.md)
+- Configuration: [config/server.yaml](config/server.yaml)
+- Build: [scripts/build.sh](scripts/build.sh)
+- Tests: `ctest --test-dir build`
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

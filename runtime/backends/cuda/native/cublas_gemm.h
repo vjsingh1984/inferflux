@@ -47,6 +47,14 @@ public:
   bool GemmTyped(int M, int N, int K, const T *A, const T *B, T *C);
 
   /**
+   * Typed GEMM with accumulation: C = A * B^T + C (beta = 1.0)
+   * Eliminates the need for a separate ResidualAdd kernel when the output
+   * buffer already contains the residual to accumulate into.
+   */
+  template <typename T>
+  bool GemmTypedAccum(int M, int N, int K, const T *A, const T *B, T *C);
+
+  /**
    * Strided batched GEMM for GQA attention.
    * Each batch: C_i = A_i * B_i^T
    */
@@ -62,8 +70,17 @@ public:
                         long long stride_A, long long stride_B,
                         long long stride_C, int batch_count);
 
+  /**
+   * Pre-allocate cuBLAS workspace to avoid dynamic allocation during
+   * CUDA graph capture. Must be called after Initialize() and before
+   * any graph capture begins.
+   */
+  bool PreallocateWorkspace(size_t workspace_bytes = 4 * 1024 * 1024);
+
 private:
   cublasHandle_t handle_{nullptr};
+  void *workspace_{nullptr};
+  size_t workspace_size_{0};
 };
 
 } // namespace inferflux

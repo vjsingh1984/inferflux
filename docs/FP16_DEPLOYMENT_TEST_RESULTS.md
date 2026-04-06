@@ -8,7 +8,7 @@
 
 ## Test Environment
 
-- **Repository**: github.com:vjsingh1984/inferflux.git
+- **Repository**: github.com/inferflux/inferflux.git
 - **Commit**: 707138b
 - **Branch**: main
 - **GPU**: NVIDIA RTX 4000 Ada Generation (19.99 GB VRAM)

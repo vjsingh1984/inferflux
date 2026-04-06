@@ -22,6 +22,9 @@ struct UnifiedBatchInput {
   std::vector<int> tokens;
   bool request_logits{true};
   SamplingParams sampling; // Per-request sampling parameters
+  int64_t request_id{-1};
+  std::string client_request_id;
+  uint64_t sequence_generation{0};
 };
 
 /// Output for one sequence in a unified batch execution.
