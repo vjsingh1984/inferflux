@@ -545,6 +545,8 @@ bool TryQ8_1ProjectionGroup(
         LogPackedGemmPath("q8_1_triple", "using Q8_1 grouped triple GEMV");
         return true;
       }
+      // Q8_1 triple requires all same quant type. For Q4_K_M models
+      // where V uses Q6_K, this falls through to pair (Q+K) + individual (V).
     }
   }
 
