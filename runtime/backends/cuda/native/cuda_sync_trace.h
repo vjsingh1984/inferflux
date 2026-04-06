@@ -85,11 +85,29 @@ inline void EnsureSyncTraceRegistered() {
 /// adds ~5-10ms of driver overhead per call. Spinning on cudaEventQuery
 /// avoids this by polling in user-space, reducing sync latency from ~10ms
 /// to ~0.1ms at the cost of CPU utilization during the wait.
-/// Disable with INFERFLUX_CUDA_DISABLE_SPIN_WAIT=1 to use blocking sync.
+///
+/// On Linux/WSL2, cudaEventSynchronize is efficient (no WDDM sleep), so
+/// spin-wait wastes CPU and adds ~4-5ms overhead from poll loop contention.
+/// Default: enabled on Windows (WDDM), disabled on Linux/WSL2.
+/// Override: INFERFLUX_CUDA_SPIN_WAIT=1 to force enable, =0 to force disable.
 inline bool SpinWaitEnabled() {
   static const bool enabled = []() {
-    const char *raw = std::getenv("INFERFLUX_CUDA_DISABLE_SPIN_WAIT");
-    return !(raw && std::string(raw) != "0" && std::string(raw) != "false");
+    // Check explicit override first
+    const char *raw = std::getenv("INFERFLUX_CUDA_SPIN_WAIT");
+    if (raw) {
+      return std::string(raw) == "1" || std::string(raw) == "true";
+    }
+    // Legacy env var (inverted sense)
+    const char *disable = std::getenv("INFERFLUX_CUDA_DISABLE_SPIN_WAIT");
+    if (disable && std::string(disable) != "0" &&
+        std::string(disable) != "false") {
+      return false;
+    }
+#ifdef _WIN32
+    return true;  // WDDM needs spin-wait
+#else
+    return false;  // Linux/WSL2 uses efficient blocking sync
+#endif
   }();
   return enabled;
 }
