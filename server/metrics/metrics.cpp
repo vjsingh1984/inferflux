@@ -22,9 +22,9 @@ namespace {
 MetricsRegistry g_metrics;
 
 std::string NormalizeNativePhase(std::string_view phase) {
-  return phase == "decode"   ? "decode"
+  return phase == "decode"    ? "decode"
          : phase == "prefill" ? "prefill"
-                               : "unknown";
+                              : "unknown";
 }
 
 std::string NormalizeBurstPhase(std::string_view phase) {
@@ -106,7 +106,8 @@ std::string InferfluxCudaPrefillBatchSizeBucket(int batch_size) {
   return "129_plus";
 }
 
-std::string InferfluxCudaBatchSizeBucket(std::string_view phase, int batch_size) {
+std::string InferfluxCudaBatchSizeBucket(std::string_view phase,
+                                         int batch_size) {
   const std::string phase_label = NormalizeNativePhase(phase);
   if (phase_label == "prefill") {
     return InferfluxCudaPrefillBatchSizeBucket(batch_size);
@@ -557,9 +558,8 @@ void MetricsRegistry::RecordDisaggKVTicketStage(std::string_view stage) {
     disagg_kv_tickets_committed_.fetch_add(1, std::memory_order_relaxed);
     disagg_kv_timeout_streak_.store(0, std::memory_order_relaxed);
     uint64_t debt = disagg_kv_timeout_debt_.load(std::memory_order_relaxed);
-    while (debt > 0 &&
-           !disagg_kv_timeout_debt_.compare_exchange_weak(
-               debt, debt - 1, std::memory_order_relaxed)) {
+    while (debt > 0 && !disagg_kv_timeout_debt_.compare_exchange_weak(
+                           debt, debt - 1, std::memory_order_relaxed)) {
     }
     return;
   }
@@ -792,7 +792,8 @@ void MetricsRegistry::RecordDecodeAssemblySnapshot(std::string_view mode,
   scheduler_decode_assembly_ready_[mode_key + "|" +
                                    SchedulerDecodeCountBucket(ready)] += 1;
   scheduler_decode_assembly_selected_[mode_key + "|" +
-                                      SchedulerDecodeCountBucket(selected)] += 1;
+                                      SchedulerDecodeCountBucket(selected)] +=
+      1;
   if (compatible > 0) {
     scheduler_decode_assembly_compatible_[mode_key + "|" +
                                           SchedulerDecodeCountBucket(
@@ -805,33 +806,40 @@ void MetricsRegistry::RecordDecodeAssemblySnapshot(std::string_view mode,
   }
 }
 
-void MetricsRegistry::RecordInferfluxCudaForwardShape(bool is_decode, int batch_size) {
+void MetricsRegistry::RecordInferfluxCudaForwardShape(bool is_decode,
+                                                      int batch_size) {
   if (is_decode) {
-    inferflux_cuda_forward_decode_total_.fetch_add(1, std::memory_order_relaxed);
+    inferflux_cuda_forward_decode_total_.fetch_add(1,
+                                                   std::memory_order_relaxed);
   } else {
-    inferflux_cuda_forward_prefill_total_.fetch_add(1, std::memory_order_relaxed);
+    inferflux_cuda_forward_prefill_total_.fetch_add(1,
+                                                    std::memory_order_relaxed);
   }
-  inferflux_cuda_forward_batch_tokens_total_.fetch_add(batch_size,
-                                               std::memory_order_relaxed);
-  RecordInferfluxCudaForwardBatchSize(is_decode ? "decode" : "prefill", batch_size);
+  inferflux_cuda_forward_batch_tokens_total_.fetch_add(
+      batch_size, std::memory_order_relaxed);
+  RecordInferfluxCudaForwardBatchSize(is_decode ? "decode" : "prefill",
+                                      batch_size);
 }
 
 void MetricsRegistry::RecordInferfluxCudaForwardLatency(double forward_ms) {
   inferflux_cuda_forward_latency_.Record(forward_ms);
 }
 
-void MetricsRegistry::RecordInferfluxCudaForwardPass(bool is_decode, int batch_size,
-                                              double forward_ms) {
+void MetricsRegistry::RecordInferfluxCudaForwardPass(bool is_decode,
+                                                     int batch_size,
+                                                     double forward_ms) {
   RecordInferfluxCudaForwardShape(is_decode, batch_size);
   RecordInferfluxCudaForwardLatency(forward_ms);
 }
 
-void MetricsRegistry::RecordInferfluxCudaSampling(int batch_size, double sampling_ms) {
+void MetricsRegistry::RecordInferfluxCudaSampling(int batch_size,
+                                                  double sampling_ms) {
   (void)batch_size;
   inferflux_cuda_sampling_latency_.Record(sampling_ms);
 }
 
-void MetricsRegistry::RecordInferfluxCudaBatchDecode(int batch_size, double total_ms) {
+void MetricsRegistry::RecordInferfluxCudaBatchDecode(int batch_size,
+                                                     double total_ms) {
   (void)batch_size;
   (void)total_ms;
   // Tracked via forward + sampling histograms; this is for future use.
@@ -872,132 +880,124 @@ void MetricsRegistry::RecordInferfluxCudaBurstDecodeFallback(
 
 void MetricsRegistry::RecordInferfluxCudaBurstDecodeIneligible(
     std::string_view phase, std::string_view reason) {
-  const std::string key = NormalizeBurstPhase(phase) + "|" +
-                          NormalizeBurstIneligibleReason(reason);
-  std::lock_guard<std::mutex> lock(inferflux_cuda_burst_decode_ineligible_mutex_);
+  const std::string key =
+      NormalizeBurstPhase(phase) + "|" + NormalizeBurstIneligibleReason(reason);
+  std::lock_guard<std::mutex> lock(
+      inferflux_cuda_burst_decode_ineligible_mutex_);
   inferflux_cuda_burst_decode_ineligible_counts_[key] += 1;
 }
 
-void MetricsRegistry::RecordInferfluxCudaForwardBatchSize(std::string_view phase,
-                                                   int batch_size) {
-  const std::string key =
-      NormalizeNativePhase(phase) + "|" +
-      InferfluxCudaBatchSizeBucket(phase, batch_size);
+void MetricsRegistry::RecordInferfluxCudaForwardBatchSize(
+    std::string_view phase, int batch_size) {
+  const std::string key = NormalizeNativePhase(phase) + "|" +
+                          InferfluxCudaBatchSizeBucket(phase, batch_size);
   std::lock_guard<std::mutex> lock(inferflux_cuda_forward_batch_size_mutex_);
   inferflux_cuda_forward_batch_size_counts_[key] += 1;
 }
 
 void MetricsRegistry::RecordInferfluxCudaFfnProjOperator(std::string_view phase,
-                                                  std::string_view op) {
+                                                         std::string_view op) {
   const std::string phase_label = NormalizeNativePhase(phase);
   const std::string op_label =
-      op == "q8_1_group_hot_q4k" ? "q8_1_group_hot_q4k"
+      op == "q8_1_group_hot_q4k"       ? "q8_1_group_hot_q4k"
       : op == "q8_1_group_row_pair_w4" ? "q8_1_group_row_pair_w4"
       : op == "q8_1_group_row_quad_m4" ? "q8_1_group_row_quad_m4"
-      : op == "q8_1_group_v2"    ? "q8_1_group_v2"
-      : op == "q8_1_group_generic" ? "q8_1_group_generic"
-      : op == "q8_1_group_row_pair" ? "q8_1_group_row_pair"
-      : op == "q8_1_group_row_quad" ? "q8_1_group_row_quad"
-      : op == "q8_1_group"       ? "q8_1_group_generic"
-      : op == "packed_group"     ? "packed_group"
-      : op == "fallback"         ? "fallback"
-                                  : "unknown";
+      : op == "q8_1_group_v2"          ? "q8_1_group_v2"
+      : op == "q8_1_group_generic"     ? "q8_1_group_generic"
+      : op == "q8_1_group_row_pair"    ? "q8_1_group_row_pair"
+      : op == "q8_1_group_row_quad"    ? "q8_1_group_row_quad"
+      : op == "q8_1_group"             ? "q8_1_group_generic"
+      : op == "packed_group"           ? "packed_group"
+      : op == "fallback"               ? "fallback"
+                                       : "unknown";
   const std::string key = phase_label + "|" + op_label;
-  std::lock_guard<std::mutex> lock(inferflux_cuda_ffn_proj_operator_mutex_);
+  std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
   inferflux_cuda_ffn_proj_operator_counts_[key] += 1;
 }
 
-void MetricsRegistry::RecordInferfluxCudaFfnProjGeometry(std::string_view phase,
-                                                  std::string_view op,
-                                                  std::string_view quant,
-                                                  int batch_size, int n, int k,
-                                                  int grouped_outputs) {
+void MetricsRegistry::RecordInferfluxCudaFfnProjGeometry(
+    std::string_view phase, std::string_view op, std::string_view quant,
+    int batch_size, int n, int k, int grouped_outputs) {
   const std::string key =
       NormalizeNativePhase(phase) + "|" + std::string(op) + "|" +
       NormalizeNativeQuant(quant) + "|" +
-      InferfluxCudaBatchSizeBucket(phase, batch_size) +
-      "|" + std::to_string(std::max(0, n)) + "|" +
-      NativeLinearDimBucket(n) + "|" + std::to_string(std::max(0, k)) + "|" +
-      NativeLinearDimBucket(k) + "|" +
+      InferfluxCudaBatchSizeBucket(phase, batch_size) + "|" +
+      std::to_string(std::max(0, n)) + "|" + NativeLinearDimBucket(n) + "|" +
+      std::to_string(std::max(0, k)) + "|" + NativeLinearDimBucket(k) + "|" +
       NativeGroupedOutputsBucket(grouped_outputs);
-  std::lock_guard<std::mutex> lock(inferflux_cuda_ffn_proj_geometry_mutex_);
+  std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
   inferflux_cuda_ffn_proj_geometry_counts_[key] += 1;
 }
 
-void MetricsRegistry::RecordInferfluxCudaDownProjOperator(std::string_view phase,
-                                                   std::string_view op) {
+void MetricsRegistry::RecordInferfluxCudaDownProjOperator(
+    std::string_view phase, std::string_view op) {
   const std::string phase_label = NormalizeNativePhase(phase);
   const std::string op_label =
-      op == "mmq"                  ? "mmq"
-      : op == "q8_1_gemv_v2"       ? "q8_1_gemv_v2"
-      : op == "q8_1_gemv"          ? "q8_1_gemv"
-      : op == "q8_1_gemv_hot_fixed" ? "q8_1_gemv_hot_fixed"
+      op == "mmq"                            ? "mmq"
+      : op == "q8_1_gemv_v2"                 ? "q8_1_gemv_v2"
+      : op == "q8_1_gemv"                    ? "q8_1_gemv"
+      : op == "q8_1_gemv_hot_fixed"          ? "q8_1_gemv_hot_fixed"
       : op == "q8_1_gemv_row_pair_hot_fixed" ? "q8_1_gemv_row_pair_hot_fixed"
-      : op == "q8_1_gemv_row_pair_v2" ? "q8_1_gemv_row_pair_v2"
-      : op == "q8_1_gemv_row_pair" ? "q8_1_gemv_row_pair"
-      : op == "q8_1_gemv_row_quad" ? "q8_1_gemv_row_quad"
-      : op == "packed_gemv"        ? "packed_gemv"
-      : op == "fallback"           ? "fallback"
-                                    : "unknown";
+      : op == "q8_1_gemv_row_pair_v2"        ? "q8_1_gemv_row_pair_v2"
+      : op == "q8_1_gemv_row_pair"           ? "q8_1_gemv_row_pair"
+      : op == "q8_1_gemv_row_quad"           ? "q8_1_gemv_row_quad"
+      : op == "packed_gemv"                  ? "packed_gemv"
+      : op == "fallback"                     ? "fallback"
+                                             : "unknown";
   const std::string key = phase_label + "|" + op_label;
-  std::lock_guard<std::mutex> lock(inferflux_cuda_down_proj_operator_mutex_);
+  std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
   inferflux_cuda_down_proj_operator_counts_[key] += 1;
 }
 
-void MetricsRegistry::RecordInferfluxCudaDownProjGeometry(std::string_view phase,
-                                                   std::string_view op,
-                                                   std::string_view quant,
-                                                   int batch_size, int n,
-                                                   int k) {
+void MetricsRegistry::RecordInferfluxCudaDownProjGeometry(
+    std::string_view phase, std::string_view op, std::string_view quant,
+    int batch_size, int n, int k) {
   const std::string key =
       NormalizeNativePhase(phase) + "|" + std::string(op) + "|" +
       NormalizeNativeQuant(quant) + "|" +
-      InferfluxCudaBatchSizeBucket(phase, batch_size) +
-      "|" + std::to_string(std::max(0, n)) + "|" +
-      NativeLinearDimBucket(n) + "|" + std::to_string(std::max(0, k)) + "|" +
-      NativeLinearDimBucket(k);
-  std::lock_guard<std::mutex> lock(inferflux_cuda_down_proj_geometry_mutex_);
+      InferfluxCudaBatchSizeBucket(phase, batch_size) + "|" +
+      std::to_string(std::max(0, n)) + "|" + NativeLinearDimBucket(n) + "|" +
+      std::to_string(std::max(0, k)) + "|" + NativeLinearDimBucket(k);
+  std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
   inferflux_cuda_down_proj_geometry_counts_[key] += 1;
 }
 
-void MetricsRegistry::RecordInferfluxCudaRowPairSelection(std::string_view phase,
-                                                  std::string_view op,
-                                                  int batch_rows) {
+void MetricsRegistry::RecordInferfluxCudaRowPairSelection(
+    std::string_view phase, std::string_view op, int batch_rows) {
   if (batch_rows < 2) {
     return;
   }
-  const std::string key =
-      NormalizeNativePhase(phase) + "|" + std::string(op) + "|" +
-      InferfluxCudaBatchSizeBucket(phase, batch_rows);
-  std::lock_guard<std::mutex> lock(inferflux_cuda_rowpair_selection_mutex_);
+  const std::string key = NormalizeNativePhase(phase) + "|" + std::string(op) +
+                          "|" + InferfluxCudaBatchSizeBucket(phase, batch_rows);
+  std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
   inferflux_cuda_rowpair_selection_counts_[key] += 1;
 }
 
-void MetricsRegistry::RecordInferfluxCudaKvAutoTunePlan(int requested_max_seq,
-                                                 int planned_max_seq,
-                                                 std::size_t requested_bytes,
-                                                 std::size_t planned_bytes,
-                                                 std::size_t budget_bytes) {
+void MetricsRegistry::RecordInferfluxCudaKvAutoTunePlan(
+    int requested_max_seq, int planned_max_seq, std::size_t requested_bytes,
+    std::size_t planned_bytes, std::size_t budget_bytes) {
   inferflux_cuda_kv_requested_max_seq_.store(std::max(0, requested_max_seq),
-                                     std::memory_order_relaxed);
+                                             std::memory_order_relaxed);
   inferflux_cuda_kv_planned_max_seq_.store(std::max(0, planned_max_seq),
-                                   std::memory_order_relaxed);
-  inferflux_cuda_kv_requested_bytes_.store(static_cast<uint64_t>(requested_bytes),
-                                   std::memory_order_relaxed);
+                                           std::memory_order_relaxed);
+  inferflux_cuda_kv_requested_bytes_.store(
+      static_cast<uint64_t>(requested_bytes), std::memory_order_relaxed);
   inferflux_cuda_kv_planned_bytes_.store(static_cast<uint64_t>(planned_bytes),
-                                 std::memory_order_relaxed);
+                                         std::memory_order_relaxed);
   inferflux_cuda_kv_budget_bytes_.store(static_cast<uint64_t>(budget_bytes),
-                                std::memory_order_relaxed);
+                                        std::memory_order_relaxed);
   if (planned_max_seq > 0 && requested_max_seq > planned_max_seq) {
-    inferflux_cuda_kv_autotune_events_total_.fetch_add(1, std::memory_order_relaxed);
+    inferflux_cuda_kv_autotune_events_total_.fetch_add(
+        1, std::memory_order_relaxed);
   }
 }
 
 void MetricsRegistry::SetInferfluxCudaKvCacheOccupancy(int active_sequences,
-                                                int max_sequences) {
+                                                       int max_sequences) {
   inferflux_cuda_kv_active_sequences_.store(active_sequences,
-                                    std::memory_order_relaxed);
-  inferflux_cuda_kv_max_sequences_.store(max_sequences, std::memory_order_relaxed);
+                                            std::memory_order_relaxed);
+  inferflux_cuda_kv_max_sequences_.store(max_sequences,
+                                         std::memory_order_relaxed);
 }
 
 void MetricsRegistry::SetSchedulerDeferredSequenceRetirements(int depth) {
@@ -1075,19 +1075,22 @@ void MetricsRegistry::SetInferfluxCudaKvMemoryBytes(
     uint64_t total_bytes, uint64_t active_bytes, uint64_t prefix_retained_bytes,
     uint64_t free_bytes, int active_sequences, int prefix_retained_sequences,
     int free_sequences, int max_sequences) {
-  inferflux_cuda_kv_memory_total_bytes_.store(total_bytes, std::memory_order_relaxed);
-  inferflux_cuda_kv_memory_active_bytes_.store(active_bytes, std::memory_order_relaxed);
-  inferflux_cuda_kv_memory_prefix_retained_bytes_.store(prefix_retained_bytes,
-                                                std::memory_order_relaxed);
-  inferflux_cuda_kv_memory_free_bytes_.store(free_bytes, std::memory_order_relaxed);
-  inferflux_cuda_kv_memory_active_sequences_.store(std::max(0, active_sequences),
-                                           std::memory_order_relaxed);
+  inferflux_cuda_kv_memory_total_bytes_.store(total_bytes,
+                                              std::memory_order_relaxed);
+  inferflux_cuda_kv_memory_active_bytes_.store(active_bytes,
+                                               std::memory_order_relaxed);
+  inferflux_cuda_kv_memory_prefix_retained_bytes_.store(
+      prefix_retained_bytes, std::memory_order_relaxed);
+  inferflux_cuda_kv_memory_free_bytes_.store(free_bytes,
+                                             std::memory_order_relaxed);
+  inferflux_cuda_kv_memory_active_sequences_.store(
+      std::max(0, active_sequences), std::memory_order_relaxed);
   inferflux_cuda_kv_memory_prefix_retained_sequences_.store(
       std::max(0, prefix_retained_sequences), std::memory_order_relaxed);
   inferflux_cuda_kv_memory_free_sequences_.store(std::max(0, free_sequences),
-                                         std::memory_order_relaxed);
+                                                 std::memory_order_relaxed);
   inferflux_cuda_kv_max_sequences_.store(std::max(0, max_sequences),
-                                 std::memory_order_relaxed);
+                                         std::memory_order_relaxed);
 }
 
 MetricsRegistry::InferfluxCudaKvMemorySnapshot
@@ -1098,11 +1101,12 @@ MetricsRegistry::GetInferfluxCudaKvMemorySnapshot() const {
   snapshot.active_bytes =
       inferflux_cuda_kv_memory_active_bytes_.load(std::memory_order_relaxed);
   snapshot.prefix_retained_bytes =
-      inferflux_cuda_kv_memory_prefix_retained_bytes_.load(std::memory_order_relaxed);
+      inferflux_cuda_kv_memory_prefix_retained_bytes_.load(
+          std::memory_order_relaxed);
   snapshot.free_bytes =
       inferflux_cuda_kv_memory_free_bytes_.load(std::memory_order_relaxed);
-  snapshot.active_sequences =
-      inferflux_cuda_kv_memory_active_sequences_.load(std::memory_order_relaxed);
+  snapshot.active_sequences = inferflux_cuda_kv_memory_active_sequences_.load(
+      std::memory_order_relaxed);
   snapshot.prefix_retained_sequences =
       inferflux_cuda_kv_memory_prefix_retained_sequences_.load(
           std::memory_order_relaxed);
@@ -1300,8 +1304,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
          "number of sequence slots waiting on backend release fences\n";
   out << "# TYPE inferflux_scheduler_deferred_sequence_retirements gauge\n";
   out << "inferflux_scheduler_deferred_sequence_retirements{backend=\""
-      << backend << "\"} "
-      << scheduler_deferred_sequence_retirements_.load() << "\n";
+      << backend << "\"} " << scheduler_deferred_sequence_retirements_.load()
+      << "\n";
 
   out << "# HELP "
          "inferflux_scheduler_deferred_sequence_retirements_completed_total "
@@ -1356,17 +1360,17 @@ std::string MetricsRegistry::RenderPrometheus() const {
          "lifecycle transitions by stage\n";
   out << "# TYPE inferflux_disagg_kv_tickets_total counter\n";
   out << "inferflux_disagg_kv_tickets_total{backend=\"" << backend
-      << "\",stage=\"enqueued\"} "
-      << disagg_kv_tickets_enqueued_.load() << "\n";
+      << "\",stage=\"enqueued\"} " << disagg_kv_tickets_enqueued_.load()
+      << "\n";
   out << "inferflux_disagg_kv_tickets_total{backend=\"" << backend
-      << "\",stage=\"acknowledged\"} "
-      << disagg_kv_tickets_acknowledged_.load() << "\n";
+      << "\",stage=\"acknowledged\"} " << disagg_kv_tickets_acknowledged_.load()
+      << "\n";
   out << "inferflux_disagg_kv_tickets_total{backend=\"" << backend
-      << "\",stage=\"committed\"} "
-      << disagg_kv_tickets_committed_.load() << "\n";
+      << "\",stage=\"committed\"} " << disagg_kv_tickets_committed_.load()
+      << "\n";
   out << "inferflux_disagg_kv_tickets_total{backend=\"" << backend
-      << "\",stage=\"timed_out\"} "
-      << disagg_kv_tickets_timed_out_.load() << "\n";
+      << "\",stage=\"timed_out\"} " << disagg_kv_tickets_timed_out_.load()
+      << "\n";
   out << "# HELP inferflux_disagg_kv_timeout_streak Consecutive distributed KV "
          "ticket timeouts since the last committed handoff\n";
   out << "# TYPE inferflux_disagg_kv_timeout_streak gauge\n";
@@ -1871,22 +1875,24 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_scheduler_batch_limit_tokens "
       << scheduler_batch_limit_tokens_.load() << "\n";
 
-  out << "# HELP inferflux_scheduler_decode_worker_batch_size_total Decode worker "
+  out << "# HELP inferflux_scheduler_decode_worker_batch_size_total Decode "
+         "worker "
          "batch-size distribution\n";
   out << "# TYPE inferflux_scheduler_decode_worker_batch_size_total counter\n";
   {
     std::vector<std::string> buckets;
     {
-      std::lock_guard<std::mutex> lock(scheduler_decode_worker_batch_size_mutex_);
+      std::lock_guard<std::mutex> lock(
+          scheduler_decode_worker_batch_size_mutex_);
       buckets.reserve(scheduler_decode_worker_batch_size_counts_.size());
       for (const auto &entry : scheduler_decode_worker_batch_size_counts_) {
         buckets.push_back(entry.first);
       }
     }
-    std::sort(buckets.begin(), buckets.end(), [](const std::string &a,
-                                               const std::string &b) {
-      return std::stoll(a) < std::stoll(b);
-    });
+    std::sort(buckets.begin(), buckets.end(),
+              [](const std::string &a, const std::string &b) {
+                return std::stoll(a) < std::stoll(b);
+              });
     for (const auto &bucket : buckets) {
       uint64_t count = 0;
       {
@@ -1909,7 +1915,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
   {
     std::vector<std::string> paths;
     {
-      std::lock_guard<std::mutex> lock(scheduler_decode_worker_batch_size_mutex_);
+      std::lock_guard<std::mutex> lock(
+          scheduler_decode_worker_batch_size_mutex_);
       paths.reserve(scheduler_decode_worker_execution_path_counts_.size());
       for (const auto &entry : scheduler_decode_worker_execution_path_counts_) {
         paths.push_back(entry.first);
@@ -1940,7 +1947,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
   {
     std::vector<std::string> merge_sizes;
     {
-      std::lock_guard<std::mutex> lock(scheduler_decode_worker_batch_size_mutex_);
+      std::lock_guard<std::mutex> lock(
+          scheduler_decode_worker_batch_size_mutex_);
       merge_sizes.reserve(scheduler_decode_worker_sticky_merge_counts_.size());
       for (const auto &entry : scheduler_decode_worker_sticky_merge_counts_) {
         merge_sizes.push_back(entry.first);
@@ -1990,8 +1998,9 @@ std::string MetricsRegistry::RenderPrometheus() const {
             entries.push_back(entry);
           }
         }
-        std::sort(entries.begin(), entries.end(),
-                  [](const auto &a, const auto &b) { return a.first < b.first; });
+        std::sort(
+            entries.begin(), entries.end(),
+            [](const auto &a, const auto &b) { return a.first < b.first; });
         for (const auto &[key, count] : entries) {
           const auto sep = key.find('|');
           const std::string mode =
@@ -2009,7 +2018,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
       scheduler_decode_assembly_ready_);
   render_decode_assembly_counter(
       "inferflux_scheduler_decode_assembly_selected_total",
-      "Decode requests selected into the active cohort while assembling decode work",
+      "Decode requests selected into the active cohort while assembling decode "
+      "work",
       scheduler_decode_assembly_selected_);
   render_decode_assembly_counter(
       "inferflux_scheduler_decode_assembly_compatible_total",
@@ -2035,38 +2045,44 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_cuda_forward_batch_tokens_total "
       << inferflux_cuda_forward_batch_tokens_total_.load() << "\n";
 
-  out << "# HELP inferflux_cuda_forward_batch_size_total InferFlux CUDA forward "
+  out << "# HELP inferflux_cuda_forward_batch_size_total InferFlux CUDA "
+         "forward "
          "batch-size distribution by phase\n";
   out << "# TYPE inferflux_cuda_forward_batch_size_total counter\n";
   {
     static constexpr const char *kPrefillBuckets[] = {
-        "1", "2", "3_4", "5_8", "9_16", "17_32", "33_64", "65_128",
-        "129_plus"};
-    static constexpr const char *kDecodeBuckets[] = {"1", "2", "3_4", "5_8",
-                                                      "9_16", "17_plus"};
+        "1", "2", "3_4", "5_8", "9_16", "17_32", "33_64", "65_128", "129_plus"};
+    static constexpr const char *kDecodeBuckets[] = {"1",   "2",    "3_4",
+                                                     "5_8", "9_16", "17_plus"};
     std::lock_guard<std::mutex> lock(inferflux_cuda_forward_batch_size_mutex_);
     for (const char *bucket : kPrefillBuckets) {
       const std::string key = std::string("prefill|") + bucket;
       const auto it = inferflux_cuda_forward_batch_size_counts_.find(key);
       const uint64_t count =
-          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0 : it->second;
-      out << "inferflux_cuda_forward_batch_size_total{phase=\"prefill\",bucket=\""
+          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0
+                                                                : it->second;
+      out << "inferflux_cuda_forward_batch_size_total{phase=\"prefill\",bucket="
+             "\""
           << bucket << "\"} " << count << "\n";
     }
     for (const char *bucket : kDecodeBuckets) {
       const std::string key = std::string("decode|") + bucket;
       const auto it = inferflux_cuda_forward_batch_size_counts_.find(key);
       const uint64_t count =
-          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0 : it->second;
-      out << "inferflux_cuda_forward_batch_size_total{phase=\"decode\",bucket=\""
+          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0
+                                                                : it->second;
+      out << "inferflux_cuda_forward_batch_size_total{phase=\"decode\",bucket="
+             "\""
           << bucket << "\"} " << count << "\n";
     }
     for (const char *bucket : kDecodeBuckets) {
       const std::string key = std::string("unknown|") + bucket;
       const auto it = inferflux_cuda_forward_batch_size_counts_.find(key);
       const uint64_t count =
-          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0 : it->second;
-      out << "inferflux_cuda_forward_batch_size_total{phase=\"unknown\",bucket=\""
+          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0
+                                                                : it->second;
+      out << "inferflux_cuda_forward_batch_size_total{phase=\"unknown\",bucket="
+             "\""
           << bucket << "\"} " << count << "\n";
     }
   }
@@ -2085,7 +2101,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_cuda_burst_decode_requested_tokens_total{phase=\"decode\"} "
       << inferflux_cuda_burst_decode_requested_tokens_decode_total_.load()
       << "\n";
-  out << "inferflux_cuda_burst_decode_requested_tokens_total{phase=\"generate\"} "
+  out << "inferflux_cuda_burst_decode_requested_tokens_total{phase="
+         "\"generate\"} "
       << inferflux_cuda_burst_decode_requested_tokens_generate_total_.load()
       << "\n";
 
@@ -2095,8 +2112,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_cuda_burst_decode_produced_tokens_total{phase=\"decode\"} "
       << inferflux_cuda_burst_decode_produced_tokens_decode_total_.load()
       << "\n";
-  out
-      << "inferflux_cuda_burst_decode_produced_tokens_total{phase=\"generate\"} "
+  out << "inferflux_cuda_burst_decode_produced_tokens_total{phase=\"generate\"}"
+         " "
       << inferflux_cuda_burst_decode_produced_tokens_generate_total_.load()
       << "\n";
 
@@ -2132,7 +2149,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
       {
         std::lock_guard<std::mutex> lock(
             inferflux_cuda_burst_decode_ineligible_mutex_);
-        const auto it = inferflux_cuda_burst_decode_ineligible_counts_.find(key);
+        const auto it =
+            inferflux_cuda_burst_decode_ineligible_counts_.find(key);
         if (it != inferflux_cuda_burst_decode_ineligible_counts_.end()) {
           count = it->second;
         }
@@ -2148,68 +2166,84 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_cuda_ffn_proj_operator_total counter\n";
   {
     static constexpr const char *kPhases[] = {"prefill", "decode"};
-    static constexpr const char *kOps[] = {
-        "q8_1_group_mmvq",      "q8_1_group_mmq",
-        "q8_1_group_hot_q4k",   "q8_1_group_row_pair_w4",
-        "q8_1_group_row_quad_m4", "q8_1_group_mmq3",
-        "packed_group",         "fallback"};
-    std::lock_guard<std::mutex> lock(inferflux_cuda_ffn_proj_operator_mutex_);
+    static constexpr const char *kOps[] = {"q8_1_group_hot_q4k",
+                                           "q8_1_group_row_pair_w4",
+                                           "q8_1_group_row_quad_m4",
+                                           "q8_1_group_v2",
+                                           "q8_1_group_generic",
+                                           "q8_1_group_row_pair",
+                                           "q8_1_group_row_quad",
+                                           "packed_group",
+                                           "fallback"};
+    std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
     for (const char *phase : kPhases) {
       for (const char *op : kOps) {
         const std::string key = std::string(phase) + "|" + op;
         const auto it = inferflux_cuda_ffn_proj_operator_counts_.find(key);
         const uint64_t count =
-            it == inferflux_cuda_ffn_proj_operator_counts_.end() ? 0 : it->second;
+            it == inferflux_cuda_ffn_proj_operator_counts_.end() ? 0
+                                                                 : it->second;
         out << "inferflux_cuda_ffn_proj_operator_total{phase=\"" << phase
             << "\",operator=\"" << op << "\"} " << count << "\n";
       }
     }
   }
 
-  out << "# HELP inferflux_cuda_down_proj_operator_total InferFlux CUDA down-proj "
+  out << "# HELP inferflux_cuda_down_proj_operator_total InferFlux CUDA "
+         "down-proj "
          "operator selections by phase and operator\n";
   out << "# TYPE inferflux_cuda_down_proj_operator_total counter\n";
   {
     static constexpr const char *kPhases[] = {"prefill", "decode"};
-    static constexpr const char *kOps[] = {
-        "q8_1_gemv_v2", "q8_1_gemv", "q8_1_gemv_hot_fixed",
-        "q8_1_gemv_row_pair_hot_fixed",
-        "q8_1_gemv_row_pair_v2", "q8_1_gemv_row_pair",
-        "q8_1_gemv_row_quad", "packed_gemv", "mmq", "fallback"};
-    std::lock_guard<std::mutex> lock(inferflux_cuda_down_proj_operator_mutex_);
+    static constexpr const char *kOps[] = {"q8_1_gemv_v2",
+                                           "q8_1_gemv",
+                                           "q8_1_gemv_hot_fixed",
+                                           "q8_1_gemv_row_pair_hot_fixed",
+                                           "q8_1_gemv_row_pair_v2",
+                                           "q8_1_gemv_row_pair",
+                                           "q8_1_gemv_row_quad",
+                                           "packed_gemv",
+                                           "mmq",
+                                           "fallback"};
+    std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
     for (const char *phase : kPhases) {
       for (const char *op : kOps) {
         const std::string key = std::string(phase) + "|" + op;
         const auto it = inferflux_cuda_down_proj_operator_counts_.find(key);
         const uint64_t count =
-            it == inferflux_cuda_down_proj_operator_counts_.end() ? 0 : it->second;
+            it == inferflux_cuda_down_proj_operator_counts_.end() ? 0
+                                                                  : it->second;
         out << "inferflux_cuda_down_proj_operator_total{phase=\"" << phase
             << "\",operator=\"" << op << "\"} " << count << "\n";
       }
     }
   }
 
-  out << "# HELP inferflux_cuda_ffn_proj_geometry_total InferFlux CUDA FFN gate+up "
+  out << "# HELP inferflux_cuda_ffn_proj_geometry_total InferFlux CUDA FFN "
+         "gate+up "
          "projection geometry selections by phase, operator, quant, and M/N/K "
          "shape buckets\n";
   out << "# TYPE inferflux_cuda_ffn_proj_geometry_total counter\n";
   {
     std::vector<std::pair<std::string, uint64_t>> entries;
     {
-      std::lock_guard<std::mutex> lock(inferflux_cuda_ffn_proj_geometry_mutex_);
+      std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
       entries.assign(inferflux_cuda_ffn_proj_geometry_counts_.begin(),
                      inferflux_cuda_ffn_proj_geometry_counts_.end());
     }
-    std::sort(entries.begin(), entries.end(),
-              [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+    std::sort(
+        entries.begin(), entries.end(),
+        [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
     for (const auto &entry : entries) {
       std::istringstream key(entry.first);
       std::string phase, op, quant, m_bucket, n_exact, n_bucket, k_exact,
           k_bucket, grouped_bucket;
       if (!std::getline(key, phase, '|') || !std::getline(key, op, '|') ||
           !std::getline(key, quant, '|') || !std::getline(key, m_bucket, '|') ||
-          !std::getline(key, n_exact, '|') || !std::getline(key, n_bucket, '|') ||
-          !std::getline(key, k_exact, '|') || !std::getline(key, k_bucket, '|') ||
+          !std::getline(key, n_exact, '|') ||
+          !std::getline(key, n_bucket, '|') ||
+          !std::getline(key, k_exact, '|') ||
+          !std::getline(key, k_bucket, '|') ||
           !std::getline(key, grouped_bucket, '|')) {
         continue;
       }
@@ -2222,35 +2256,38 @@ std::string MetricsRegistry::RenderPrometheus() const {
     }
   }
 
-  out << "# HELP inferflux_cuda_down_proj_geometry_total InferFlux CUDA down-proj "
+  out << "# HELP inferflux_cuda_down_proj_geometry_total InferFlux CUDA "
+         "down-proj "
          "geometry selections by phase, operator, quant, and M/N/K shape "
          "buckets\n";
   out << "# TYPE inferflux_cuda_down_proj_geometry_total counter\n";
   {
     std::vector<std::pair<std::string, uint64_t>> entries;
     {
-      std::lock_guard<std::mutex> lock(inferflux_cuda_down_proj_geometry_mutex_);
+      std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
       entries.assign(inferflux_cuda_down_proj_geometry_counts_.begin(),
                      inferflux_cuda_down_proj_geometry_counts_.end());
     }
-    std::sort(entries.begin(), entries.end(),
-              [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+    std::sort(
+        entries.begin(), entries.end(),
+        [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
     for (const auto &entry : entries) {
       std::istringstream key(entry.first);
       std::string phase, op, quant, m_bucket, n_exact, n_bucket, k_exact,
           k_bucket;
       if (!std::getline(key, phase, '|') || !std::getline(key, op, '|') ||
           !std::getline(key, quant, '|') || !std::getline(key, m_bucket, '|') ||
-          !std::getline(key, n_exact, '|') || !std::getline(key, n_bucket, '|') ||
-          !std::getline(key, k_exact, '|') || !std::getline(key, k_bucket, '|')) {
+          !std::getline(key, n_exact, '|') ||
+          !std::getline(key, n_bucket, '|') ||
+          !std::getline(key, k_exact, '|') ||
+          !std::getline(key, k_bucket, '|')) {
         continue;
       }
       out << "inferflux_cuda_down_proj_geometry_total{phase=\"" << phase
           << "\",operator=\"" << op << "\",quant=\"" << quant
           << "\",m_bucket=\"" << m_bucket << "\",n=\"" << n_exact
           << "\",n_bucket=\"" << n_bucket << "\",k=\"" << k_exact
-          << "\",k_bucket=\"" << k_bucket << "\"} " << entry.second
-          << "\n";
+          << "\",k_bucket=\"" << k_bucket << "\"} " << entry.second << "\n";
     }
   }
 
@@ -2259,35 +2296,37 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_cuda_rowpair_selection_total counter\n";
   static constexpr const char *kRowPairPhases[] = {"prefill", "decode"};
   static constexpr const char *kRowPairOps[] = {
-      "q8_1_group_row_pair_w4",
-      "q8_1_group_row_pair",
-      "q8_1_gemv_row_pair",
-      "q8_1_gemv_row_pair_v2",
+      "q8_1_group_row_pair_w4",       "q8_1_group_row_pair",
+      "q8_1_gemv_row_pair",           "q8_1_gemv_row_pair_v2",
       "q8_1_gemv_row_pair_hot_fixed",
   };
-  std::lock_guard<std::mutex> rowpair_lock(inferflux_cuda_rowpair_selection_mutex_);
-  for (const char *phase : kRowPairPhases) {
-    const std::vector<const char *> buckets =
-        std::string_view(phase) == "prefill"
-            ? std::vector<const char *>{"1", "2", "3_4", "5_8", "9_16",
-                                        "17_32", "33_64", "65_128",
-                                        "129_plus"}
-            : std::vector<const char *>{"1", "2", "3_4", "5_8", "9_16",
-                                        "17_plus"};
-    for (const char *op : kRowPairOps) {
-      for (const char *bucket : buckets) {
-        const std::string key = std::string(phase) + "|" + op + "|" + bucket;
-        const auto it = inferflux_cuda_rowpair_selection_counts_.find(key);
-        const uint64_t count =
-            it == inferflux_cuda_rowpair_selection_counts_.end() ? 0 : it->second;
-        out << "inferflux_cuda_rowpair_selection_total{phase=\"" << phase
-            << "\",operator=\"" << op << "\",bucket=\"" << bucket
-            << "\"} " << count << "\n";
+  {
+    std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
+    for (const char *phase : kRowPairPhases) {
+      const std::vector<const char *> buckets =
+          std::string_view(phase) == "prefill"
+              ? std::vector<const char *>{"1",     "2",      "3_4",
+                                          "5_8",   "9_16",   "17_32",
+                                          "33_64", "65_128", "129_plus"}
+              : std::vector<const char *>{"1",   "2",    "3_4",
+                                          "5_8", "9_16", "17_plus"};
+      for (const char *op : kRowPairOps) {
+        for (const char *bucket : buckets) {
+          const std::string key = std::string(phase) + "|" + op + "|" + bucket;
+          const auto it = inferflux_cuda_rowpair_selection_counts_.find(key);
+          const uint64_t count =
+              it == inferflux_cuda_rowpair_selection_counts_.end() ? 0
+                                                                   : it->second;
+          out << "inferflux_cuda_rowpair_selection_total{phase=\"" << phase
+              << "\",operator=\"" << op << "\",bucket=\"" << bucket << "\"} "
+              << count << "\n";
+        }
       }
     }
   }
 
-  out << "# HELP inferflux_cuda_forward_duration_ms InferFlux CUDA forward pass "
+  out << "# HELP inferflux_cuda_forward_duration_ms InferFlux CUDA forward "
+         "pass "
          "latency in milliseconds\n";
   out << "# TYPE inferflux_cuda_forward_duration_ms histogram\n";
   for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
@@ -2296,7 +2335,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
         << inferflux_cuda_forward_latency_.counts[i].load() << "\n";
   }
   out << "inferflux_cuda_forward_duration_ms_bucket{le=\"+Inf\"} "
-      << inferflux_cuda_forward_latency_.counts[LatencyHistogram::kBuckets.size()]
+      << inferflux_cuda_forward_latency_
+             .counts[LatencyHistogram::kBuckets.size()]
              .load()
       << "\n";
   out << "inferflux_cuda_forward_duration_ms_sum "
@@ -2304,7 +2344,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_cuda_forward_duration_ms_count "
       << inferflux_cuda_forward_latency_.total.load() << "\n";
 
-  out << "# HELP inferflux_cuda_sampling_duration_ms InferFlux CUDA sampling latency "
+  out << "# HELP inferflux_cuda_sampling_duration_ms InferFlux CUDA sampling "
+         "latency "
          "in milliseconds\n";
   out << "# TYPE inferflux_cuda_sampling_duration_ms histogram\n";
   for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
@@ -2313,7 +2354,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
         << inferflux_cuda_sampling_latency_.counts[i].load() << "\n";
   }
   out << "inferflux_cuda_sampling_duration_ms_bucket{le=\"+Inf\"} "
-      << inferflux_cuda_sampling_latency_.counts[LatencyHistogram::kBuckets.size()]
+      << inferflux_cuda_sampling_latency_
+             .counts[LatencyHistogram::kBuckets.size()]
              .load()
       << "\n";
   out << "inferflux_cuda_sampling_duration_ms_sum "
@@ -2330,16 +2372,18 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# HELP inferflux_cuda_kv_max_sequences Maximum KV cache sequences "
          "in the InferFlux CUDA backend\n";
   out << "# TYPE inferflux_cuda_kv_max_sequences gauge\n";
-  out << "inferflux_cuda_kv_max_sequences " << inferflux_cuda_kv_max_sequences_.load()
-      << "\n";
+  out << "inferflux_cuda_kv_max_sequences "
+      << inferflux_cuda_kv_max_sequences_.load() << "\n";
 
   out << "# HELP inferflux_cuda_kv_autotune_events_total Number of times "
-         "InferFlux CUDA KV auto-tuning reduced max_seq during pipeline planning\n";
+         "InferFlux CUDA KV auto-tuning reduced max_seq during pipeline "
+         "planning\n";
   out << "# TYPE inferflux_cuda_kv_autotune_events_total counter\n";
   out << "inferflux_cuda_kv_autotune_events_total "
       << inferflux_cuda_kv_autotune_events_total_.load() << "\n";
 
-  out << "# HELP inferflux_cuda_kv_requested_max_seq Requested InferFlux CUDA KV "
+  out << "# HELP inferflux_cuda_kv_requested_max_seq Requested InferFlux CUDA "
+         "KV "
          "max_seq before auto-tune\n";
   out << "# TYPE inferflux_cuda_kv_requested_max_seq gauge\n";
   out << "inferflux_cuda_kv_requested_max_seq "
@@ -2360,29 +2404,33 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# HELP inferflux_cuda_kv_planned_bytes Planned InferFlux CUDA KV "
          "reservation bytes after auto-tune\n";
   out << "# TYPE inferflux_cuda_kv_planned_bytes gauge\n";
-  out << "inferflux_cuda_kv_planned_bytes " << inferflux_cuda_kv_planned_bytes_.load()
-      << "\n";
+  out << "inferflux_cuda_kv_planned_bytes "
+      << inferflux_cuda_kv_planned_bytes_.load() << "\n";
 
-  out << "# HELP inferflux_cuda_kv_budget_bytes InferFlux CUDA KV budget bytes used "
+  out << "# HELP inferflux_cuda_kv_budget_bytes InferFlux CUDA KV budget bytes "
+         "used "
          "for auto-tune planning\n";
   out << "# TYPE inferflux_cuda_kv_budget_bytes gauge\n";
-  out << "inferflux_cuda_kv_budget_bytes " << inferflux_cuda_kv_budget_bytes_.load()
-      << "\n";
+  out << "inferflux_cuda_kv_budget_bytes "
+      << inferflux_cuda_kv_budget_bytes_.load() << "\n";
 
   out << "# HELP inferflux_cuda_kv_memory_total_bytes InferFlux CUDA KV bytes "
          "partitioned by slot state accounting\n";
   out << "# TYPE inferflux_cuda_kv_memory_total_bytes gauge\n";
   out << "inferflux_cuda_kv_memory_total_bytes "
-      << inferflux_cuda_kv_memory_total_bytes_.load(std::memory_order_relaxed) << "\n";
+      << inferflux_cuda_kv_memory_total_bytes_.load(std::memory_order_relaxed)
+      << "\n";
 
-  out << "# HELP inferflux_cuda_kv_memory_active_bytes InferFlux CUDA KV bytes held "
+  out << "# HELP inferflux_cuda_kv_memory_active_bytes InferFlux CUDA KV bytes "
+         "held "
          "by active slots\n";
   out << "# TYPE inferflux_cuda_kv_memory_active_bytes gauge\n";
   out << "inferflux_cuda_kv_memory_active_bytes "
       << inferflux_cuda_kv_memory_active_bytes_.load(std::memory_order_relaxed)
       << "\n";
 
-  out << "# HELP inferflux_cuda_kv_memory_prefix_retained_bytes InferFlux CUDA KV "
+  out << "# HELP inferflux_cuda_kv_memory_prefix_retained_bytes InferFlux CUDA "
+         "KV "
          "bytes retained for session/prefix reuse\n";
   out << "# TYPE inferflux_cuda_kv_memory_prefix_retained_bytes gauge\n";
   out << "inferflux_cuda_kv_memory_prefix_retained_bytes "
@@ -2394,20 +2442,23 @@ std::string MetricsRegistry::RenderPrometheus() const {
          "available for new slots\n";
   out << "# TYPE inferflux_cuda_kv_memory_free_bytes gauge\n";
   out << "inferflux_cuda_kv_memory_free_bytes "
-      << inferflux_cuda_kv_memory_free_bytes_.load(std::memory_order_relaxed) << "\n";
+      << inferflux_cuda_kv_memory_free_bytes_.load(std::memory_order_relaxed)
+      << "\n";
 
   out << "# HELP inferflux_cuda_kv_memory_sequences Native KV slot counts by "
          "state partition\n";
   out << "# TYPE inferflux_cuda_kv_memory_sequences gauge\n";
   out << "inferflux_cuda_kv_memory_sequences{state=\"active\"} "
-      << inferflux_cuda_kv_memory_active_sequences_.load(std::memory_order_relaxed)
+      << inferflux_cuda_kv_memory_active_sequences_.load(
+             std::memory_order_relaxed)
       << "\n";
   out << "inferflux_cuda_kv_memory_sequences{state=\"prefix_retained\"} "
       << inferflux_cuda_kv_memory_prefix_retained_sequences_.load(
              std::memory_order_relaxed)
       << "\n";
   out << "inferflux_cuda_kv_memory_sequences{state=\"free\"} "
-      << inferflux_cuda_kv_memory_free_sequences_.load(std::memory_order_relaxed)
+      << inferflux_cuda_kv_memory_free_sequences_.load(
+             std::memory_order_relaxed)
       << "\n";
 
   {
@@ -2420,9 +2471,10 @@ std::string MetricsRegistry::RenderPrometheus() const {
         << snapshot.model_label << "\"} " << snapshot.total.reserved_bytes
         << "\n";
     for (const auto &entry : snapshot.domains) {
-      out << "inferflux_cuda_model_memory_reserved_bytes{scope=\"domain\",model=\""
-          << snapshot.model_label << "\",domain=\"" << entry.first
-          << "\"} " << entry.second.reserved_bytes << "\n";
+      out << "inferflux_cuda_model_memory_reserved_bytes{scope=\"domain\","
+             "model=\""
+          << snapshot.model_label << "\",domain=\"" << entry.first << "\"} "
+          << entry.second.reserved_bytes << "\n";
     }
 
     out << "# HELP inferflux_cuda_model_memory_in_use_bytes Native model "
@@ -2432,33 +2484,38 @@ std::string MetricsRegistry::RenderPrometheus() const {
         << snapshot.model_label << "\"} " << snapshot.total.in_use_bytes
         << "\n";
     for (const auto &entry : snapshot.domains) {
-      out << "inferflux_cuda_model_memory_in_use_bytes{scope=\"domain\",model=\""
-          << snapshot.model_label << "\",domain=\"" << entry.first
-          << "\"} " << entry.second.in_use_bytes << "\n";
+      out << "inferflux_cuda_model_memory_in_use_bytes{scope=\"domain\",model="
+             "\""
+          << snapshot.model_label << "\",domain=\"" << entry.first << "\"} "
+          << entry.second.in_use_bytes << "\n";
     }
 
     out << "# HELP inferflux_cuda_model_memory_high_water_bytes Native model "
            "memory high-water bytes by scope\n";
     out << "# TYPE inferflux_cuda_model_memory_high_water_bytes gauge\n";
-    out << "inferflux_cuda_model_memory_high_water_bytes{scope=\"total\",model=\""
+    out << "inferflux_cuda_model_memory_high_water_bytes{scope=\"total\",model="
+           "\""
         << snapshot.model_label << "\"} " << snapshot.total.high_water_bytes
         << "\n";
     for (const auto &entry : snapshot.domains) {
-      out << "inferflux_cuda_model_memory_high_water_bytes{scope=\"domain\",model=\""
-          << snapshot.model_label << "\",domain=\"" << entry.first
-          << "\"} " << entry.second.high_water_bytes << "\n";
+      out << "inferflux_cuda_model_memory_high_water_bytes{scope=\"domain\","
+             "model=\""
+          << snapshot.model_label << "\",domain=\"" << entry.first << "\"} "
+          << entry.second.high_water_bytes << "\n";
     }
 
     out << "# HELP inferflux_cuda_model_memory_evictable_bytes Native model "
            "memory evictable bytes by scope\n";
     out << "# TYPE inferflux_cuda_model_memory_evictable_bytes gauge\n";
-    out << "inferflux_cuda_model_memory_evictable_bytes{scope=\"total\",model=\""
+    out << "inferflux_cuda_model_memory_evictable_bytes{scope=\"total\",model="
+           "\""
         << snapshot.model_label << "\"} " << snapshot.total.evictable_bytes
         << "\n";
     for (const auto &entry : snapshot.domains) {
-      out << "inferflux_cuda_model_memory_evictable_bytes{scope=\"domain\",model=\""
-          << snapshot.model_label << "\",domain=\"" << entry.first
-          << "\"} " << entry.second.evictable_bytes << "\n";
+      out << "inferflux_cuda_model_memory_evictable_bytes{scope=\"domain\","
+             "model=\""
+          << snapshot.model_label << "\",domain=\"" << entry.first << "\"} "
+          << entry.second.evictable_bytes << "\n";
     }
   }
 

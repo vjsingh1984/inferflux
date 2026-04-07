@@ -179,9 +179,9 @@ void UnifiedBatchLaneDispatcher::WorkerLoop(bool decode_lane) {
       result.success = false;
       result.error = e.what();
       result.outputs.clear();
-    } catch (...) {
+    } catch (const std::exception &e) {
       result.success = false;
-      result.error = "unknown lane worker error";
+      result.error = std::string("lane worker error: ") + e.what();
       result.outputs.clear();
     }
 

@@ -1,7 +1,7 @@
 #include "runtime/backends/cuda/native/strategy_registry.h"
 
-#include <algorithm>
-#include <cctype>
+#include "runtime/string_utils.h"
+
 #include <utility>
 
 namespace inferflux {
@@ -9,13 +9,6 @@ namespace runtime {
 namespace cuda {
 namespace native {
 namespace {
-
-std::string ToLower(std::string value) {
-  std::transform(
-      value.begin(), value.end(), value.begin(),
-      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-  return value;
-}
 
 class StaticWeightLayoutStrategy final : public IWeightLayoutStrategy {
 public:

@@ -14,11 +14,12 @@ bool RateLimiter::Allow(const std::string &key) {
   auto now = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(mutex_);
   EvictStaleLocked(now);
-  auto &entry = entries_[key];
-  if (entry.last.time_since_epoch().count() == 0) {
-    entry.tokens = tokens_per_minute_;
-    entry.last = now;
+  auto it = entries_.find(key);
+  if (it == entries_.end()) {
+    entries_[key] = {static_cast<double>(tokens_per_minute_), now};
+    it = entries_.find(key);
   }
+  auto &entry = it->second;
   auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
                      now - entry.last)
                      .count();
@@ -32,8 +33,7 @@ bool RateLimiter::Allow(const std::string &key) {
   return false;
 }
 
-void RateLimiter::EvictStaleLocked(
-    std::chrono::steady_clock::time_point now) {
+void RateLimiter::EvictStaleLocked(std::chrono::steady_clock::time_point now) {
   constexpr auto kEvictInterval = std::chrono::seconds(60);
   if (now - last_eviction_ < kEvictInterval) {
     return;

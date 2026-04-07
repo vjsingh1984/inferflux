@@ -6,10 +6,31 @@
 
 namespace inferflux {
 
+// DeviceBuffer is a non-owning view of device/host memory.
+// Ownership is managed by the DeviceContext that allocated it.
+// Callers must return buffers via DeviceContext::Free() before
+// the context is destroyed.
 class DeviceBuffer {
 public:
   DeviceBuffer() = default;
   DeviceBuffer(void *ptr, std::size_t bytes) : ptr_(ptr), bytes_(bytes) {}
+
+  // Non-copyable, movable.
+  DeviceBuffer(const DeviceBuffer &) = delete;
+  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
+  DeviceBuffer(DeviceBuffer &&other) noexcept
+      : ptr_(other.ptr_), bytes_(other.bytes_) {
+    other.ptr_ = nullptr;
+    other.bytes_ = 0;
+  }
+  DeviceBuffer &operator=(DeviceBuffer &&other) noexcept {
+    ptr_ = other.ptr_;
+    bytes_ = other.bytes_;
+    other.ptr_ = nullptr;
+    other.bytes_ = 0;
+    return *this;
+  }
+
   void *data() const { return ptr_; }
   std::size_t size() const { return bytes_; }
 

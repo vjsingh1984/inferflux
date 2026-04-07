@@ -1,20 +1,11 @@
 #include "runtime/backends/backend_factory.h"
 
 #include "runtime/backends/backend_registry.h"
-#include "runtime/backends/cuda/cuda_backend.h"
-#include "runtime/backends/cuda/inferflux_cuda_backend.h"
 #include "runtime/backends/gpu/native_cuda_device_strategy.h"
-#include "runtime/backends/mps/mps_backend.h"
-#include "runtime/backends/rocm/rocm_backend.h"
-#include "runtime/backends/vulkan/vulkan_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
+#include "runtime/string_utils.h"
 #include "server/logging/logger.h"
 
-#if INFERFLUX_HAS_MLX
-#include "runtime/backends/mlx/mlx_backend.h"
-#endif
-
-#include <algorithm>
-#include <cctype>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -25,13 +16,6 @@ namespace {
 
 BackendExposurePolicy g_policy{};
 std::mutex g_policy_mutex;
-
-std::string ToLower(std::string value) {
-  std::transform(
-      value.begin(), value.end(), value.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return value;
-}
 
 BackendExposurePolicy LoadPolicy() {
   std::lock_guard<std::mutex> lock(g_policy_mutex);
@@ -93,64 +77,52 @@ BackendFactoryResult LlamaCppForTarget(LlamaBackendTarget target,
   out.backend_label = BackendFactory::CanonicalBackendId(out.provider, target);
   out.config = TuneLlamaBackendConfig(target, {});
 
-  if (hint == "cuda") {
-#ifdef INFERFLUX_HAS_CUDA
-    out.backend = std::make_shared<CudaBackend>();
-#else
-    return CpuFallback(
-        "CUDA backend requested but binary was built without CUDA support. "
-        "Falling back to CPU backend.");
-#endif
-    return out;
-  }
+  // Map hint string to target enum for registry lookup.
+  struct HintMapping {
+    const char *hint;
+    LlamaBackendTarget target;
+    const char *not_compiled_msg;
+  };
+  static constexpr HintMapping kHintMappings[] = {
+      {"cuda", LlamaBackendTarget::kCuda,
+       "CUDA backend requested but binary was built without CUDA support."},
+      {"rocm", LlamaBackendTarget::kRocm,
+       "ROCm backend requested but binary was built without ROCm support."},
+      {"mps", LlamaBackendTarget::kMps,
+       "MPS backend requested but binary was built without MPS support."},
+      {"vulkan", LlamaBackendTarget::kVulkan,
+       "Vulkan backend requested but binary was built without Vulkan support."},
+  };
 
+  // MLX is special — uses its own target label.
   if (hint == "mlx") {
-#if INFERFLUX_HAS_MLX
-    out.target = LlamaBackendTarget::kMps;
-    out.traits = DescribeLlamaBackendTarget(out.target);
-    out.capabilities = out.traits.capabilities;
-    out.backend = std::make_shared<MlxBackend>();
-    out.backend_label = "mlx";
-    out.config = TuneLlamaBackendConfig(out.target, {});
-    return out;
-#else
+    auto &reg = BackendRegistry::Instance();
+    if (reg.Has(LlamaBackendTarget::kMps, BackendProvider::kLlamaCpp)) {
+      out.target = LlamaBackendTarget::kMps;
+      out.traits = DescribeLlamaBackendTarget(out.target);
+      out.capabilities = out.traits.capabilities;
+      out.backend =
+          reg.Create(LlamaBackendTarget::kMps, BackendProvider::kLlamaCpp);
+      out.backend_label = "mlx";
+      out.config = TuneLlamaBackendConfig(out.target, {});
+      return out;
+    }
     return CpuFallback(
         "MLX backend requested but binary was built without ENABLE_MLX. "
         "Falling back to CPU backend.");
-#endif
   }
 
-  if (hint == "rocm") {
-#ifdef INFERFLUX_HAS_ROCM
-    out.backend = std::make_shared<RocmBackend>();
-#else
-    return CpuFallback(
-        "ROCm backend requested but binary was built without ROCm support. "
-        "Falling back to CPU backend.");
-#endif
-    return out;
-  }
-
-  if (hint == "mps") {
-    auto &reg = BackendRegistry::Instance();
-    if (reg.Has(LlamaBackendTarget::kMps, BackendProvider::kLlamaCpp)) {
-      out.backend =
-          reg.Create(LlamaBackendTarget::kMps, BackendProvider::kLlamaCpp);
-    } else {
-      out.backend = std::make_shared<MpsBackend>();
+  // Lookup via self-registered backends in the registry.
+  for (const auto &mapping : kHintMappings) {
+    if (hint == mapping.hint) {
+      auto &reg = BackendRegistry::Instance();
+      if (reg.Has(mapping.target, BackendProvider::kLlamaCpp)) {
+        out.backend = reg.Create(mapping.target, BackendProvider::kLlamaCpp);
+        return out;
+      }
+      return CpuFallback(std::string(mapping.not_compiled_msg) +
+                         " Falling back to CPU backend.");
     }
-    return out;
-  }
-
-  if (hint == "vulkan") {
-    auto &reg = BackendRegistry::Instance();
-    if (reg.Has(LlamaBackendTarget::kVulkan, BackendProvider::kLlamaCpp)) {
-      out.backend =
-          reg.Create(LlamaBackendTarget::kVulkan, BackendProvider::kLlamaCpp);
-    } else {
-      out.backend = std::make_shared<VulkanBackend>();
-    }
-    return out;
   }
 
   if (hint == "cpu") {

@@ -1,5 +1,7 @@
 #include <catch2/catch_amalgamated.hpp>
 
+#ifdef INFERFLUX_HAS_CUDA
+
 #include "runtime/backends/cuda/native/native_bootstrap_config.h"
 #include "support/scoped_env.h"
 
@@ -56,3 +58,5 @@ TEST_CASE("NativeBootstrapConfig: records valid overrides and invalid raw values
 }
 
 } // namespace inferflux
+
+#endif // INFERFLUX_HAS_CUDA

@@ -205,8 +205,8 @@ HttpClient::SendRaw(const std::string &method, const std::string &url,
     }
   } else {
     while (send_remaining > 0) {
-      ssize_t sent = ::send(conn.sock, send_ptr,
-                            static_cast<int>(send_remaining), 0);
+      ssize_t sent =
+          ::send(conn.sock, send_ptr, static_cast<int>(send_remaining), 0);
       if (sent <= 0) {
         close_connection("failed to send request");
       }
@@ -234,8 +234,7 @@ ssize_t HttpClient::RecvRaw(RawConnection &conn, char *buffer,
     }
   }
   while (true) {
-    ssize_t received =
-        ::recv(conn.sock, buffer, static_cast<int>(length), 0);
+    ssize_t received = ::recv(conn.sock, buffer, static_cast<int>(length), 0);
 #ifdef _WIN32
     if (received < 0 && WSAGetLastError() == WSAEINTR) {
       continue;
@@ -366,7 +365,7 @@ HttpClient::Send(const std::string &method, const std::string &url,
   if (status_pos != std::string::npos) {
     try {
       http_response.status = std::stoi(header.substr(status_pos + 1));
-    } catch (...) {
+    } catch (const std::exception &) {
       http_response.status = 0;
     }
   }

@@ -56,7 +56,7 @@ std::size_t ShmKVTransport::ExtractShmSize(const std::string &metadata) {
   pos += 6; // skip "|size="
   try {
     return static_cast<std::size_t>(std::stoull(metadata.substr(pos)));
-  } catch (...) {
+  } catch (const std::exception &) {
     return 0;
   }
 }
@@ -145,11 +145,14 @@ std::optional<KVPacket> ShmKVTransport::TryDequeue() {
       } else {
         log::Error("shm_transport",
                    std::string("mmap(read) failed: ") + std::strerror(errno));
+        ::shm_unlink(shm_name.c_str());
+        return std::nullopt; // KV data irrecoverable
       }
       ::shm_unlink(shm_name.c_str());
     } else {
       log::Error("shm_transport", "shm_open(read) failed for " + shm_name +
                                       ": " + std::strerror(errno));
+      return std::nullopt; // KV data irrecoverable
     }
   }
 

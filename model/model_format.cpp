@@ -1,7 +1,7 @@
 #include "model/model_format.h"
 
-#include <algorithm>
-#include <cctype>
+#include "runtime/string_utils.h"
+
 #include <cstdlib>
 #include <filesystem>
 #include <system_error>
@@ -9,13 +9,6 @@
 namespace inferflux {
 
 namespace {
-
-std::string ToLower(std::string value) {
-  std::transform(
-      value.begin(), value.end(), value.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return value;
-}
 
 std::string InferfluxHomePath() {
   if (const char *env_home = std::getenv("INFERFLUX_HOME")) {

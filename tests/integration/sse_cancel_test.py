@@ -95,8 +95,14 @@ class SSECancelTest(unittest.TestCase):
             # server may return 404/422; the test goal is verifying the server
             # survives the subsequent client disconnect, not completion success.
             self.assertIn(b"HTTP/1.1 ", data)
-            # Consume a chunk then close early to trigger cancellation path.
-            sock.recv(512)
+            # Try to consume another chunk then close early to trigger
+            # cancellation path.  In stub mode the full response may already
+            # have been received above, so a timeout here is acceptable.
+            sock.settimeout(1.0)
+            try:
+                sock.recv(512)
+            except (TimeoutError, OSError):
+                pass
             sock.close()
         time.sleep(0.5)
         # verify server still serves health endpoint

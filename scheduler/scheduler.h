@@ -9,6 +9,7 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "runtime/scheduler/sequence_slot_manager.h"
 #include "runtime/speculative/speculative_decoder.h"
+#include "scheduler/batch_selection_policy.h"
 #include "scheduler/fairness_controller.h"
 #include "scheduler/model_router.h"
 #include "scheduler/model_selection.h"
@@ -166,7 +167,6 @@ private:
   };
 
 private:
-
   void WorkerLoop();
   void ProcessBatch(BatchSelection selection);
   void DecodeWorkerLoop();
@@ -236,6 +236,7 @@ private:
   FairnessConfig fairness_config_;
   DisaggregatedConfig disagg_config_;
   Config config_;
+  std::unique_ptr<IBatchSelectionPolicy> batch_policy_;
   MetricsRegistry *metrics_; // Non-owning; defaults to &GlobalMetrics().
   mutable std::mutex model_selection_options_mutex_;
   ModelSelectionOptions model_selection_options_;

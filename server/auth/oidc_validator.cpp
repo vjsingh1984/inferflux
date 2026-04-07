@@ -90,8 +90,6 @@ bool OIDCValidator::VerifyRS256(const std::string &header_payload,
     return false;
   }
 
-  RSA *rsa = nullptr;
-  EVP_PKEY *pkey = nullptr;
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -99,24 +97,25 @@ bool OIDCValidator::VerifyRS256(const std::string &header_payload,
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
-  rsa = RSA_new();
+  // RAII wrapper for RSA — note: EVP_PKEY_assign_RSA transfers ownership,
+  // so we release the RSA unique_ptr after successful assignment.
+  std::unique_ptr<RSA, decltype(&RSA_free)> rsa(RSA_new(), &RSA_free);
   if (!rsa) {
     return false;
   }
-  if (RSA_set0_key(rsa, bn_n.release(), bn_e.release(), nullptr) != 1) {
-    RSA_free(rsa);
+  if (RSA_set0_key(rsa.get(), bn_n.release(), bn_e.release(), nullptr) != 1) {
     return false;
   }
-  pkey = EVP_PKEY_new();
+  std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(EVP_PKEY_new(),
+                                                           &EVP_PKEY_free);
   if (!pkey) {
-    RSA_free(rsa);
     return false;
   }
-  if (EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
-    EVP_PKEY_free(pkey);
-    RSA_free(rsa);
+  // EVP_PKEY_assign_RSA takes ownership of rsa on success.
+  if (EVP_PKEY_assign_RSA(pkey.get(), rsa.get()) != 1) {
     return false;
   }
+  rsa.release(); // pkey now owns the RSA object
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #elif defined(__GNUC__)
@@ -124,27 +123,28 @@ bool OIDCValidator::VerifyRS256(const std::string &header_payload,
 #endif
 
   bool ok = false;
-  EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+  std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> md_ctx(
+      EVP_MD_CTX_new(), &EVP_MD_CTX_free);
   if (md_ctx) {
     EVP_PKEY_CTX *pctx = nullptr;
-    if (EVP_DigestVerifyInit(md_ctx, &pctx, EVP_sha256(), nullptr, pkey) == 1) {
+    if (EVP_DigestVerifyInit(md_ctx.get(), &pctx, EVP_sha256(), nullptr,
+                             pkey.get()) == 1) {
 #if defined(RSA_PKCS1_PADDING)
       if (pctx) {
         EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING);
         EVP_PKEY_CTX_set_signature_md(pctx, EVP_sha256());
       }
 #endif
-      if (EVP_DigestVerifyUpdate(md_ctx, header_payload.data(),
+      if (EVP_DigestVerifyUpdate(md_ctx.get(), header_payload.data(),
                                  header_payload.size()) == 1 &&
           EVP_DigestVerifyFinal(
-              md_ctx, reinterpret_cast<const unsigned char *>(sig_bytes.data()),
+              md_ctx.get(),
+              reinterpret_cast<const unsigned char *>(sig_bytes.data()),
               sig_bytes.size()) == 1) {
         ok = true;
       }
     }
-    EVP_MD_CTX_free(md_ctx);
   }
-  EVP_PKEY_free(pkey); // also frees rsa
   return ok;
 }
 

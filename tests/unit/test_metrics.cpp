@@ -445,13 +445,16 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
                       "\"prefill\",operator=\"q8_1_group_row_quad_m4\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_cuda_ffn_proj_operator_total{phase="
-                      "\"prefill\",operator=\"q8_1_group_mmvq\"} 1") !=
+                      "\"prefill\",operator=\"q8_1_group_v2\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_cuda_ffn_proj_operator_total{phase="
-                      "\"prefill\",operator=\"q8_1_group_mmq\"} 1") !=
+                      "\"prefill\",operator=\"q8_1_group_generic\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_cuda_ffn_proj_operator_total{phase="
-                      "\"decode\",operator=\"q8_1_group_mmq3\"} 1") !=
+                      "\"decode\",operator=\"q8_1_group_row_pair\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_ffn_proj_operator_total{phase="
+                      "\"decode\",operator=\"q8_1_group_row_quad\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_cuda_ffn_proj_operator_total{phase="
                       "\"decode\",operator=\"packed_group\"} 1") !=

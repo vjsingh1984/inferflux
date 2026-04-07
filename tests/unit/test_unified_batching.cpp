@@ -135,6 +135,8 @@ public:
   bool burst_enabled{true};
   std::vector<BurstDecodeOutput> burst_outputs;
 
+  std::string Name() const override { return "inferflux_cuda"; }
+
   bool TryGreedyBurstDecodeTokens(int sequence_id, int n_past_start,
                                   int first_token_id,
                                   const SamplingParams &sampling, int max_tokens,

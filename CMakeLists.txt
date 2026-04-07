@@ -37,6 +37,12 @@ add_compile_definitions(INFERFLUX_USE_COMMON_BACKEND_TYPES)
 
 add_library(inferflux_core STATIC
   runtime/device_context.h
+  runtime/core/gguf/igguf_parser.h
+  runtime/core/gguf/cpu_gguf_parser.cpp
+  runtime/core/gguf/cpu_gguf_parser.h
+  runtime/core/gguf/igguf_executor.h
+  runtime/core/gguf/cpu_executor.cpp
+  runtime/core/gguf/cpu_executor.h
   runtime/kv_cache/paged_kv_cache.cpp
   runtime/kv_cache/paged_kv_cache.h
   runtime/tensors/tensor.h
@@ -112,6 +118,7 @@ add_library(inferflux_core STATIC
   model/model_format.h
   runtime/scheduler/sequence_slot_manager.cpp
   runtime/scheduler/sequence_slot_manager.h
+  scheduler/batch_selection_policy.cpp
   scheduler/scheduler.cpp
   scheduler/session_handle_manager.cpp
   scheduler/session_handle_manager.h
@@ -143,6 +150,9 @@ add_library(inferflux_core STATIC
   server/logging/audit_logger.h
   server/logging/logger.cpp
   server/logging/logger.h
+  server/quantization_detection.h
+  server/cpu_quantization_detector.cpp
+  server/cpu_quantization_detector.h
   server/policy/guardrail.cpp
   server/policy/guardrail.h
   server/startup_advisor.cpp
@@ -607,6 +617,7 @@ add_executable(inferflux_tests
   tests/unit/test_metrics.cpp
   tests/unit/test_http_server.cpp
   tests/unit/test_scheduler.cpp
+  tests/unit/test_batch_selection_policy.cpp
   tests/unit/test_session_handle_manager.cpp
   tests/unit/test_sequence_slot_manager.cpp
   tests/unit/test_policy_store.cpp
@@ -735,8 +746,10 @@ add_test(NAME BackendFactoryTests COMMAND inferflux_tests "[backend_factory]")
 set_tests_properties(BackendFactoryTests PROPERTIES LABELS backend_factory)
 add_test(NAME BackendCapabilitiesTests COMMAND inferflux_tests "[backend_capabilities]")
 set_tests_properties(BackendCapabilitiesTests PROPERTIES LABELS backend_capabilities)
-add_test(NAME GGUFMemoryContractTests COMMAND inferflux_tests "[memory_contract]")
-set_tests_properties(GGUFMemoryContractTests PROPERTIES LABELS "memory_contract;integration")
+if(ENABLE_CUDA AND CUDAToolkit_FOUND)
+  add_test(NAME GGUFMemoryContractTests COMMAND inferflux_tests "[memory_contract]")
+  set_tests_properties(GGUFMemoryContractTests PROPERTIES LABELS "memory_contract;integration")
+endif()
 add_test(NAME MoETests COMMAND inferflux_tests "[moe]")
 set_tests_properties(MoETests PROPERTIES LABELS moe)
 add_test(NAME FlashAttnTests COMMAND inferflux_tests "[flash_attn]")
@@ -769,18 +782,20 @@ add_test(NAME EmbeddingsRoutingTests COMMAND inferflux_tests "[embeddings_routin
 set_tests_properties(EmbeddingsRoutingTests PROPERTIES LABELS embeddings_routing)
 add_test(NAME StopSequenceTests COMMAND inferflux_tests "[stop_sequences]")
 set_tests_properties(StopSequenceTests PROPERTIES LABELS stop_sequences)
-add_test(NAME NativeForwardTests COMMAND inferflux_tests "[native_forward]")
-set_tests_properties(NativeForwardTests PROPERTIES LABELS native_forward)
+if(ENABLE_CUDA AND CUDAToolkit_FOUND)
+  add_test(NAME NativeForwardTests COMMAND inferflux_tests "[native_forward]")
+  set_tests_properties(NativeForwardTests PROPERTIES LABELS native_forward)
+  add_test(NAME DtypeTraitsTests COMMAND inferflux_tests "[dtype_traits]")
+  set_tests_properties(DtypeTraitsTests PROPERTIES LABELS dtype_traits)
+  add_test(NAME GpuKvCacheTests COMMAND inferflux_tests "[gpu_kv_cache]")
+  set_tests_properties(GpuKvCacheTests PROPERTIES LABELS gpu_kv_cache)
+  add_test(NAME GpuSamplerTests COMMAND inferflux_tests "[gpu_sampler]")
+  set_tests_properties(GpuSamplerTests PROPERTIES LABELS gpu_sampler)
+  add_test(NAME NativeBatchTests COMMAND inferflux_tests "[native_batch]")
+  set_tests_properties(NativeBatchTests PROPERTIES LABELS native_batch)
+endif()
 add_test(NAME TokenizerFactoryTests COMMAND inferflux_tests "[tokenizer_factory]")
 set_tests_properties(TokenizerFactoryTests PROPERTIES LABELS tokenizer_factory)
-add_test(NAME DtypeTraitsTests COMMAND inferflux_tests "[dtype_traits]")
-set_tests_properties(DtypeTraitsTests PROPERTIES LABELS dtype_traits)
-add_test(NAME GpuKvCacheTests COMMAND inferflux_tests "[gpu_kv_cache]")
-set_tests_properties(GpuKvCacheTests PROPERTIES LABELS gpu_kv_cache)
-add_test(NAME GpuSamplerTests COMMAND inferflux_tests "[gpu_sampler]")
-set_tests_properties(GpuSamplerTests PROPERTIES LABELS gpu_sampler)
-add_test(NAME NativeBatchTests COMMAND inferflux_tests "[native_batch]")
-set_tests_properties(NativeBatchTests PROPERTIES LABELS native_batch)
 add_test(NAME StartupAdvisorTests COMMAND inferflux_tests "[startup_advisor]")
 set_tests_properties(StartupAdvisorTests PROPERTIES LABELS startup_advisor)
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
@@ -791,6 +806,8 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
 endif()
 add_test(NAME SequenceSlotManagerTests COMMAND inferflux_tests "[slot_manager]")
 set_tests_properties(SequenceSlotManagerTests PROPERTIES LABELS slot_manager)
+add_test(NAME BatchSelectionPolicyTests COMMAND inferflux_tests "[batch_selection_policy]")
+set_tests_properties(BatchSelectionPolicyTests PROPERTIES LABELS batch_selection_policy)
 if(ENABLE_MLX)
   add_test(NAME MlxLoaderTests COMMAND inferflux_tests "[mlx_loader]")
   set_tests_properties(MlxLoaderTests PROPERTIES LABELS mlx_loader)

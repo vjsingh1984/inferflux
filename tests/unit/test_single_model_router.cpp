@@ -1,11 +1,14 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #include "runtime/backends/llama/llama_cpp_backend.h"
+#ifdef INFERFLUX_HAS_CUDA
 #include "runtime/backends/cuda/inferflux_cuda_backend.h"
+#endif
 #include "scheduler/single_model_router.h"
 
 namespace inferflux {
 
+#ifdef INFERFLUX_HAS_CUDA
 namespace {
 
 class NativeContractBackendStub final : public InferfluxCudaBackend {
@@ -39,6 +42,7 @@ private:
 };
 
 } // namespace
+#endif // INFERFLUX_HAS_CUDA
 
 TEST_CASE("SingleModelRouter applies native capability contract",
           "[single_model_router]") {
@@ -64,6 +68,7 @@ TEST_CASE("SingleModelRouter applies native capability contract",
   REQUIRE(caps.supports_kv_prefix_transfer);
 }
 
+#ifdef INFERFLUX_HAS_CUDA
 TEST_CASE("SingleModelRouter maps endpoint contracts from native backend",
           "[single_model_router]") {
   auto router = std::make_shared<SingleModelRouter>();
@@ -113,6 +118,7 @@ TEST_CASE("SingleModelRouter preserves enabled native endpoint contracts",
   REQUIRE(caps.supports_speculative_decoding);
   REQUIRE(caps.supports_kv_prefix_transfer);
 }
+#endif // INFERFLUX_HAS_CUDA
 
 TEST_CASE("SingleModelRouter keeps llama.cpp capability defaults",
           "[single_model_router]") {

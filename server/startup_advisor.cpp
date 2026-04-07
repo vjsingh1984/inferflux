@@ -2,6 +2,7 @@
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
 #include "server/logging/logger.h"
+#include "server/quantization_detection.h"
 
 #include <algorithm>
 #include <array>
@@ -138,137 +139,12 @@ std::filesystem::path ResolveGgufPath(const std::filesystem::path &path) {
   return first_gguf;
 }
 
-#ifdef INFERFLUX_HAS_CUDA
 QuantizationType
 DetectQuantizationFromGgufMetadata(const std::filesystem::path &path) {
-  const std::filesystem::path gguf_path = ResolveGgufPath(path);
-  if (gguf_path.empty()) {
-    return QuantizationType::kUnknown;
-  }
-
-  FILE *file = fopen(gguf_path.string().c_str(), "rb");
-  if (!file) {
-    return QuantizationType::kUnknown;
-  }
-
-  ::inferflux::runtime::cuda::native::GGUF::Header header{};
-  if (!ReadU32(file, &header.magic) || !ReadU32(file, &header.version) ||
-      !::inferflux::runtime::cuda::native::GGUFReader::ReadInt64(
-          file, &header.tensor_count) ||
-      !::inferflux::runtime::cuda::native::GGUFReader::ReadInt64(
-          file, &header.kv_count)) {
-    fclose(file);
-    return QuantizationType::kUnknown;
-  }
-
-  if (!::inferflux::runtime::cuda::native::ValidateGGUFHeader(header) ||
-      header.tensor_count < 0 || header.kv_count < 0) {
-    fclose(file);
-    return QuantizationType::kUnknown;
-  }
-
-  for (int64_t i = 0; i < header.kv_count; ++i) {
-    std::string key;
-    if (!::inferflux::runtime::cuda::native::GGUFReader::ReadString(file,
-                                                                    &key)) {
-      fclose(file);
-      return QuantizationType::kUnknown;
-    }
-    uint32_t type_raw = 0;
-    if (!ReadU32(file, &type_raw)) {
-      fclose(file);
-      return QuantizationType::kUnknown;
-    }
-    const auto value_type =
-        static_cast<::inferflux::runtime::cuda::native::GGUF::ValueType>(
-            type_raw);
-    if (!::inferflux::runtime::cuda::native::GGUFReader::SkipValue(
-            file, value_type)) {
-      fclose(file);
-      return QuantizationType::kUnknown;
-    }
-  }
-
-  constexpr std::size_t kTensorTypeCount =
-      static_cast<std::size_t>(GgufTensorType::Q8_K) + 1U;
-  std::array<std::size_t, kTensorTypeCount> type_counts{};
-
-  for (int64_t i = 0; i < header.tensor_count; ++i) {
-    std::string tensor_name;
-    if (!::inferflux::runtime::cuda::native::GGUFReader::ReadString(
-            file, &tensor_name)) {
-      fclose(file);
-      return QuantizationType::kUnknown;
-    }
-    uint32_t n_dims = 0;
-    if (!ReadU32(file, &n_dims)) {
-      fclose(file);
-      return QuantizationType::kUnknown;
-    }
-    for (uint32_t dim_idx = 0; dim_idx < n_dims; ++dim_idx) {
-      int64_t dim = 0;
-      if (!::inferflux::runtime::cuda::native::GGUFReader::ReadInt64(file,
-                                                                     &dim)) {
-        fclose(file);
-        return QuantizationType::kUnknown;
-      }
-    }
-
-    uint32_t type_raw = 0;
-    if (!ReadU32(file, &type_raw)) {
-      fclose(file);
-      return QuantizationType::kUnknown;
-    }
-    uint64_t offset = 0;
-    if (!::inferflux::runtime::cuda::native::GGUFReader::ReadUint64(file,
-                                                                    &offset)) {
-      fclose(file);
-      return QuantizationType::kUnknown;
-    }
-    (void)offset;
-
-    if (type_raw >= kTensorTypeCount) {
-      continue;
-    }
-    ++type_counts[type_raw];
-  }
-
-  fclose(file);
-
-  std::size_t best_quantized_count = 0;
-  GgufTensorType best_quantized_type = GgufTensorType::F16;
-  for (std::size_t idx = 0; idx < kTensorTypeCount; ++idx) {
-    const auto type = static_cast<GgufTensorType>(idx);
-    if (!::inferflux::runtime::cuda::native::IsQuantizedType(type)) {
-      continue;
-    }
-    if (type_counts[idx] > best_quantized_count) {
-      best_quantized_count = type_counts[idx];
-      best_quantized_type = type;
-    }
-  }
-
-  if (best_quantized_count > 0) {
-    return QuantizationTypeFromGgufTensorType(best_quantized_type);
-  }
-
-  const std::size_t f16_count =
-      type_counts[static_cast<std::size_t>(GgufTensorType::F16)];
-  const std::size_t f32_count =
-      type_counts[static_cast<std::size_t>(GgufTensorType::F32)];
-  if (f16_count == 0 && f32_count == 0) {
-    return QuantizationType::kUnknown;
-  }
-  return f16_count >= f32_count ? QuantizationType::kFp16
-                                : QuantizationType::kFp32;
+  // Use interface-based quantization detection (works on both CPU and CUDA)
+  auto detector = inferflux::server::CreateQuantizationDetector();
+  return detector->DetectFromGgufMetadata(path);
 }
-#else
-QuantizationType
-DetectQuantizationFromGgufMetadata(const std::filesystem::path &) {
-  // GGUF metadata parsing requires CUDA
-  return QuantizationType::kUnknown;
-}
-#endif
 
 std::uint64_t ScaleByPercent(std::uint64_t value, std::uint32_t percent) {
 #if defined(__SIZEOF_INT128__)
@@ -992,11 +868,9 @@ int CheckGpuUnused(const StartupAdvisorContext &ctx) {
   if (ctx.models.empty())
     return 0;
 
-  bool all_cpu =
-      std::all_of(ctx.models.begin(), ctx.models.end(),
-                  [](const AdvisorModelInfo &m) {
-                    return UsesCpuBackend(m.backend);
-                  });
+  bool all_cpu = std::all_of(
+      ctx.models.begin(), ctx.models.end(),
+      [](const AdvisorModelInfo &m) { return UsesCpuBackend(m.backend); });
   if (!all_cpu)
     return 0;
 

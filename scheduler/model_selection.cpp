@@ -1,9 +1,8 @@
 #include "scheduler/model_selection.h"
 
 #include "runtime/backends/llama/llama_cpp_backend.h"
+#include "runtime/string_utils.h"
 
-#include <algorithm>
-#include <cctype>
 #include <optional>
 #include <tuple>
 #include <vector>
@@ -11,13 +10,6 @@
 namespace inferflux {
 
 namespace {
-
-std::string ToLower(std::string value) {
-  std::transform(
-      value.begin(), value.end(), value.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return value;
-}
 
 bool IsDefaultModelAlias(const std::string &value) {
   return ToLower(value) == "default";

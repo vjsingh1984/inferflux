@@ -1,8 +1,7 @@
 #include "runtime/backends/mlx/mlx_tokenizer.h"
+#include "runtime/string_utils.h"
 #include "server/logging/logger.h"
 
-#include <algorithm>
-#include <cctype>
 #include <climits>
 #include <fstream>
 #include <sstream>
@@ -69,13 +68,6 @@ const ByteUnicodeTable &GetBUT() {
 
 // U+2581 ▁  (LOWER ONE EIGHTH BLOCK — used as space marker in Metaspace).
 constexpr const char *kMetaMark = "\xe2\x96\x81";
-
-std::string ToLower(std::string value) {
-  std::transform(
-      value.begin(), value.end(), value.begin(),
-      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-  return value;
-}
 
 } // namespace
 
@@ -256,8 +248,7 @@ MlxTokenizer::DetectPreTokenizerType(const std::string &pre_tokenizer_hint,
   if (hint == "bytelevel" || hint == "gpt2" || hint == "qwen" ||
       hint == "qwen2" || hint == "qwen3" || hint == "phi3" ||
       hint == "starcoder" || hint == "starcoder2" || hint == "deepseek" ||
-      hint == "deepseek-coder" || hint == "command-r" ||
-      hint == "byte_level") {
+      hint == "deepseek-coder" || hint == "command-r" || hint == "byte_level") {
     if (add_prefix_space) {
       *add_prefix_space = false;
     }
@@ -278,9 +269,9 @@ MlxTokenizer::DetectPreTokenizerType(const std::string &pre_tokenizer_hint,
 
 bool MlxTokenizer::InitializeFromBpeData(
     const std::vector<std::string> &id_to_token,
-    const std::vector<std::string> &merges, const std::string &pre_tokenizer_hint,
-    int32_t bos_id, int32_t eos_id, const std::string &chat_template,
-    bool add_bos_token,
+    const std::vector<std::string> &merges,
+    const std::string &pre_tokenizer_hint, int32_t bos_id, int32_t eos_id,
+    const std::string &chat_template, bool add_bos_token,
     const std::unordered_set<int32_t> &special_ids) {
   Reset();
   if (id_to_token.empty()) {
@@ -409,7 +400,7 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
     json cfg;
     try {
       cfg_f >> cfg;
-    } catch (...) {
+    } catch (const std::exception &) {
     }
 
     auto resolve_tok = [&](const char *key) -> std::string {

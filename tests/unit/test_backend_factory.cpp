@@ -2,7 +2,9 @@
 
 #include "runtime/backends/backend_factory.h"
 #include "runtime/backends/cuda/cuda_backend.h"
+#ifdef INFERFLUX_HAS_CUDA
 #include "runtime/backends/cuda/inferflux_cuda_backend.h"
+#endif
 #include "runtime/backends/llama/llama_backend_traits.h"
 
 using namespace inferflux;
@@ -144,6 +146,7 @@ TEST_CASE("BackendFactory explicit inferflux_cuda hint uses native or "
 #endif
 }
 
+#ifdef INFERFLUX_HAS_CUDA
 TEST_CASE(
     "BackendFactory strict inferflux policy rejects explicit inferflux_cuda when"
     " native kernels are not ready",
@@ -165,6 +168,7 @@ TEST_CASE(
 
   BackendFactory::SetExposurePolicy({true, true, false});
 }
+#endif // INFERFLUX_HAS_CUDA
 
 TEST_CASE("BackendFactory auto hint follows compiled accelerators",
           "[backend_factory]") {
@@ -320,6 +324,7 @@ TEST_CASE("TuneLlamaBackendConfig normalizes unknown CUDA attention kernel",
   REQUIRE(tuned.cuda_attention_kernel == "auto");
 }
 
+#ifdef INFERFLUX_HAS_CUDA
 TEST_CASE("BackendFactory can disable llama.cpp fallback for native policy",
           "[backend_factory]") {
   BackendFactory::SetExposurePolicy({true, false});
@@ -340,6 +345,7 @@ TEST_CASE("BackendFactory can disable llama.cpp fallback for native policy",
 
   BackendFactory::SetExposurePolicy({true, true});
 }
+#endif // INFERFLUX_HAS_CUDA
 
 TEST_CASE("BackendFactory NormalizeHintList deduplicates and falls back",
           "[backend_factory]") {

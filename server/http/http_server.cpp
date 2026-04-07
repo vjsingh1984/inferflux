@@ -64,7 +64,7 @@ int ParseNonNegativeEnvInt(const char *name, int default_value) {
   }
   try {
     return std::max(0, std::stoi(raw));
-  } catch (...) {
+  } catch (const std::exception &) {
     inferflux::log::Warn("http", std::string("Invalid value for ") + name +
                                      ": " + raw + "; using default " +
                                      std::to_string(default_value));
@@ -91,7 +91,7 @@ json OptionalIntToJson(const std::optional<int64_t> &value) {
   return value.has_value() ? json(*value) : json(nullptr);
 }
 
-} // namespace (close anonymous for BuildResponse/BuildErrorBody to be visible)
+} // namespace
 
 std::string BuildResponse(const std::string &body, int status,
                           std::string_view status_text,
@@ -1164,9 +1164,8 @@ void HttpServer::Run() {
   if (fd < 0) {
     std::perror("socket");
 #ifdef _WIN32
-    inferflux::log::Error(
-        "http", "socket() failed, WSAGetLastError=" +
-                    std::to_string(WSAGetLastError()));
+    inferflux::log::Error("http", "socket() failed, WSAGetLastError=" +
+                                      std::to_string(WSAGetLastError()));
 #endif
     return;
   }

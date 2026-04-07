@@ -3,6 +3,7 @@
 #include "runtime/backends/backend_utils.h"
 #include "runtime/execution/batch_executor.h"
 #include "runtime/execution/parallel_context.h"
+#include "runtime/string_utils.h"
 #include "runtime/structured_output/structured_output_adapter.h"
 #include "scheduler/model_selection.h"
 #include "scheduler/request_requeue.h"
@@ -13,7 +14,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -23,13 +23,6 @@
 namespace inferflux {
 
 namespace {
-
-std::string ToLower(std::string value) {
-  std::transform(
-      value.begin(), value.end(), value.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return value;
-}
 
 bool SequenceSlotDebugEnabled() {
   static const bool enabled = []() {
@@ -74,11 +67,12 @@ void LogSequenceSlotEvent(std::string_view stage, int64_t request_id,
     return;
   }
   std::string message =
-      "sequence_slot[" + std::string(stage) + "]: request_id=" +
-      std::to_string(request_id) + ", sequence_id=" +
-      std::to_string(sequence_id) + ", sequence_generation=" +
-      std::to_string(sequence_generation) + ", phase=" +
-      RequestPhaseDebugString(phase) + ", n_past=" + std::to_string(n_past) +
+      "sequence_slot[" + std::string(stage) +
+      "]: request_id=" + std::to_string(request_id) +
+      ", sequence_id=" + std::to_string(sequence_id) +
+      ", sequence_generation=" + std::to_string(sequence_generation) +
+      ", phase=" + RequestPhaseDebugString(phase) +
+      ", n_past=" + std::to_string(n_past) +
       ", remaining_decode_tokens=" + std::to_string(remaining_decode_tokens);
   if (!detail.empty()) {
     message += ", detail=" + std::string(detail);
@@ -132,8 +126,6 @@ ParseSchedulerBatchPolicy(const std::string &value,
 }
 
 namespace {
-constexpr double kFairnessAgingDivisorMs =
-    2000.0; // every 2s of wait adds +1 to effective priority
 // Number of distinct KV sequence slots available for phased prefill/decode.
 // Must exceed typical in-flight batch width.  Previous value of 16 caused
 // "No free slots available" crashes at concurrency >= 2 with batch_size > 8.
@@ -209,8 +201,8 @@ void ResetSequenceLease(InferenceRequest *inference) {
 int ResidentSequenceTokenCount(const InferenceRequest &inference) {
   int token_count = std::max(0, inference.n_past);
   token_count = std::max(token_count, inference.prompt_bpe_tokens);
-  token_count =
-      std::max(token_count, static_cast<int>(inference.bpe_prompt_tokens.size()));
+  token_count = std::max(token_count,
+                         static_cast<int>(inference.bpe_prompt_tokens.size()));
   return token_count;
 }
 
@@ -287,8 +279,8 @@ bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
 
     std::vector<UnifiedBatchOutput> outputs;
     if (backend->SupportsAsyncUnifiedBatch()) {
-      const auto handle = backend->SubmitUnifiedBatchAsync(
-          inputs, UnifiedBatchLane::kPrefill);
+      const auto handle =
+          backend->SubmitUnifiedBatchAsync(inputs, UnifiedBatchLane::kPrefill);
       if (handle == 0 || !WaitForUnifiedBatchAsync(backend, handle, &outputs) ||
           outputs.size() != 1) {
         return false;
@@ -388,15 +380,16 @@ void PrimeUnifiedDecodeStepState(InferenceRequest *req) {
       req->exec_tokens_generated++;
       req->exec_result.completion += piece;
       std::string emit_piece;
-      stop_hit = ApplyStop(piece, req->exec_result.completion, req->stop,
-                           &emit_piece);
+      stop_hit =
+          ApplyStop(piece, req->exec_result.completion, req->stop, &emit_piece);
       if (req->on_token && !emit_piece.empty()) {
         GlobalMetrics().RecordStreamTokens(1);
         req->on_token(emit_piece, nullptr);
       }
     }
 
-    if (stop_hit || (req->cancellation_flag && req->cancellation_flag->load()) ||
+    if (stop_hit ||
+        (req->cancellation_flag && req->cancellation_flag->load()) ||
         req->exec_tokens_generated >= req->exec_decode_limit) {
       req->exec_active = false;
     }
@@ -453,10 +446,9 @@ void FinalizeUnifiedDecodeStepResult(InferenceRequest *req,
   result->model_id = ResolveResultModelId(*req);
   result->completion = req->accumulated_output;
   result->completion_tokens = req->total_completion_tokens;
-  result->prompt_tokens =
-      req->reported_prompt_tokens >= 0
-          ? req->reported_prompt_tokens
-          : static_cast<int>(req->prompt_tokens.size());
+  result->prompt_tokens = req->reported_prompt_tokens >= 0
+                              ? req->reported_prompt_tokens
+                              : static_cast<int>(req->prompt_tokens.size());
   if (result->completion.empty() && !result->no_backend) {
     result->completion = std::string(kBackendEmptyResponseText);
     GlobalMetrics().RecordEmptyGeneration();
@@ -484,8 +476,7 @@ Scheduler::Config NormalizeSchedulerConfig(const Scheduler::Config &raw) {
   if (normalized.max_batch_tokens > 131072) {
     normalized.max_batch_tokens = 131072;
   }
-  normalized.decode_burst_tokens =
-      std::max(0, normalized.decode_burst_tokens);
+  normalized.decode_burst_tokens = std::max(0, normalized.decode_burst_tokens);
   normalized.chunked_prefill_tokens =
       std::max(1, normalized.chunked_prefill_tokens);
   if (!std::isfinite(normalized.mixed_prefill_budget_ratio)) {
@@ -519,6 +510,8 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
       disagg_config_(disagg_config), config_(NormalizeSchedulerConfig(config)),
       metrics_(config_.metrics ? config_.metrics : &GlobalMetrics()),
       model_selection_options_(model_selection_options) {
+  batch_policy_ = CreateBatchSelectionPolicy(config_.batch_policy);
+
   BatchExecutor::UnifiedBatchTuning tuning;
   tuning.decode_burst_tokens = config_.decode_burst_tokens;
   tuning.chunked_prefill_tokens = config_.chunked_prefill_tokens;
@@ -564,7 +557,7 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
   eviction_thread_ = std::thread(&Scheduler::EvictionWorkerLoop, this);
 
   metrics_->SetSchedulerBatchLimits(config_.max_batch_size,
-                                          config_.max_batch_tokens);
+                                    config_.max_batch_tokens);
   RefreshNativeKvMemoryMetrics();
 }
 
@@ -636,13 +629,13 @@ void Scheduler::SyncSequenceSlotProgress(
 void Scheduler::RefreshNativeKvMemoryMetrics() const {
   if (!slot_manager_) {
     metrics_->SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/0,
-                                                  /*active_bytes=*/0,
-                                                  /*prefix_retained_bytes=*/0,
-                                                  /*free_bytes=*/0,
-                                                  /*active_sequences=*/0,
-                                                  /*prefix_retained_sequences=*/0,
-                                                  /*free_sequences=*/0,
-                                                  /*max_sequences=*/0);
+                                            /*active_bytes=*/0,
+                                            /*prefix_retained_bytes=*/0,
+                                            /*free_bytes=*/0,
+                                            /*active_sequences=*/0,
+                                            /*prefix_retained_sequences=*/0,
+                                            /*free_sequences=*/0,
+                                            /*max_sequences=*/0);
     return;
   }
 
@@ -650,13 +643,13 @@ void Scheduler::RefreshNativeKvMemoryMetrics() const {
   const int max_sequences = metrics_->GetInferfluxCudaKvMaxSequences();
   if (total_bytes == 0 || max_sequences <= 0) {
     metrics_->SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/0,
-                                                  /*active_bytes=*/0,
-                                                  /*prefix_retained_bytes=*/0,
-                                                  /*free_bytes=*/0,
-                                                  /*active_sequences=*/0,
-                                                  /*prefix_retained_sequences=*/0,
-                                                  /*free_sequences=*/0,
-                                                  /*max_sequences=*/0);
+                                            /*active_bytes=*/0,
+                                            /*prefix_retained_bytes=*/0,
+                                            /*free_bytes=*/0,
+                                            /*active_sequences=*/0,
+                                            /*prefix_retained_sequences=*/0,
+                                            /*free_sequences=*/0,
+                                            /*max_sequences=*/0);
     return;
   }
 
@@ -878,16 +871,17 @@ void Scheduler::DecodeWorkerLoop() {
         pending_decode_.erase(pending_decode_.begin(),
                               pending_decode_.begin() +
                                   static_cast<std::ptrdiff_t>(n));
-        metrics_->RecordDecodeAssemblySnapshot(
-            "worker_initial", ready_before, batch.size(), 0, 0);
+        metrics_->RecordDecodeAssemblySnapshot("worker_initial", ready_before,
+                                               batch.size(), 0, 0);
       } else if (batch.size() < max_batch_size && sticky_step_backend) {
         const std::size_t ready_before = pending_decode_.size();
         const std::size_t compatible_before =
             CountCompatiblePendingDecodeLocked(sticky_step_backend);
         std::size_t merged = AppendCompatiblePendingDecodeLocked(
             &batch, sticky_step_backend, max_batch_size);
-        if (sticky_accumulation_wait_enabled && config_.batch_accumulation_ms > 0 &&
-            merged == 0 && batch.size() < max_batch_size &&
+        if (sticky_accumulation_wait_enabled &&
+            config_.batch_accumulation_ms > 0 && merged == 0 &&
+            batch.size() < max_batch_size &&
             batch.size() < accumulation_target) {
           auto compatible_pending_decode = [&]() {
             return std::any_of(
@@ -916,9 +910,9 @@ void Scheduler::DecodeWorkerLoop() {
         const std::size_t incompatible_before =
             ready_before >= compatible_before ? ready_before - compatible_before
                                               : 0;
-        metrics_->RecordDecodeAssemblySnapshot(
-            "worker_sticky", ready_before, batch.size(), compatible_before,
-            incompatible_before);
+        metrics_->RecordDecodeAssemblySnapshot("worker_sticky", ready_before,
+                                               batch.size(), compatible_before,
+                                               incompatible_before);
       }
       UpdateQueueDepthLocked();
     }
@@ -1053,8 +1047,7 @@ void Scheduler::DecodeWorkerLoop() {
             inference.collect_logprobs || inference.has_response_format) {
           return nullptr;
         }
-        if (sticky_step_backend &&
-            backend.get() != sticky_step_backend.get()) {
+        if (sticky_step_backend && backend.get() != sticky_step_backend.get()) {
           return nullptr;
         }
         if (!direct_backend) {
@@ -1195,8 +1188,7 @@ void Scheduler::DecodeWorkerLoop() {
               cache_->ReleaseBlocksRef(inference->block_table);
             }
             inference->block_table.clear();
-            FreeSeqSlot(inference->sequence_id,
-                        inference->sequence_generation,
+            FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
                         pending->resolved_backend);
             ResetSequenceLease(inference);
           }
@@ -1216,8 +1208,7 @@ void Scheduler::DecodeWorkerLoop() {
     if (exec_pending.empty())
       continue;
 
-    metrics_->RecordDecodeWorkerExecutionPath(
-        "general");
+    metrics_->RecordDecodeWorkerExecutionPath("general");
 
     bool use_stepwise_decode = config_.decode_burst_tokens == 0;
     std::shared_ptr<LlamaCppBackend> step_backend;
@@ -1309,8 +1300,7 @@ void Scheduler::DecodeWorkerLoop() {
         auto now = std::chrono::steady_clock::now();
         pending->enqueue_time = now;
         PrepareFairnessDecodeRequeue(inference, now);
-        LogSequenceSlotEvent("fairness_requeue", *inference,
-                             "decode_worker");
+        LogSequenceSlotEvent("fairness_requeue", *inference, "decode_worker");
         queue_requeue.push_back(pending);
         continue;
       }
@@ -1539,9 +1529,10 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
     auto *pending_ptr = pending_prefill_[i].get();
     if (!seen_pending.insert(pending_ptr).second) {
       duplicate_remove_prefill.push_back(i);
-      log::Warn("scheduler",
-                "Deduplicating pending request from prefill queue: request_id=" +
-                    std::to_string(pending_prefill_[i]->inference.id));
+      log::Warn(
+          "scheduler",
+          "Deduplicating pending request from prefill queue: request_id=" +
+              std::to_string(pending_prefill_[i]->inference.id));
       continue;
     }
     queue_items.push_back(QueueItem{pending_prefill_[i], false, i});
@@ -1551,9 +1542,10 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
       auto *pending_ptr = pending_decode_[i].get();
       if (!seen_pending.insert(pending_ptr).second) {
         duplicate_remove_decode.push_back(i);
-        log::Warn("scheduler",
-                  "Deduplicating pending request from decode queue: request_id=" +
-                      std::to_string(pending_decode_[i]->inference.id));
+        log::Warn(
+            "scheduler",
+            "Deduplicating pending request from decode queue: request_id=" +
+                std::to_string(pending_decode_[i]->inference.id));
         continue;
       }
       queue_items.push_back(QueueItem{pending_decode_[i], true, i});
@@ -1561,8 +1553,7 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
   }
 
   const bool prefix_affinity_enabled =
-      config_.batch_policy != SchedulerBatchPolicy::kPriorityAge &&
-      prefix_cache_ != nullptr;
+      batch_policy_->UsesPrefixAffinity() && prefix_cache_ != nullptr;
   if (prefix_affinity_enabled) {
     for (auto &item : queue_items) {
       if (item.from_decode || !item.pending) {
@@ -1609,27 +1600,21 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
   }
 
   auto now = std::chrono::steady_clock::now();
+  const auto &policy = *batch_policy_;
   std::stable_sort(queue_items.begin(), queue_items.end(),
                    [&](const QueueItem &a, const QueueItem &b) {
-                     double age_a = std::chrono::duration<double, std::milli>(
+                     ScoringItem sa{std::chrono::duration<double, std::milli>(
                                         now - a.pending->enqueue_time)
-                                        .count();
-                     double age_b = std::chrono::duration<double, std::milli>(
+                                        .count(),
+                                    a.pending->priority, a.pending->sequence,
+                                    a.prefix_affinity_tokens};
+                     ScoringItem sb{std::chrono::duration<double, std::milli>(
                                         now - b.pending->enqueue_time)
-                                        .count();
-                     double eff_a = static_cast<double>(a.pending->priority) +
-                                    age_a / kFairnessAgingDivisorMs;
-                     double eff_b = static_cast<double>(b.pending->priority) +
-                                    age_b / kFairnessAgingDivisorMs;
-                     if (config_.batch_policy ==
-                         SchedulerBatchPolicy::kLpmPriority) {
-                       eff_a += a.prefix_affinity_tokens / 32.0;
-                       eff_b += b.prefix_affinity_tokens / 32.0;
-                     } else if (config_.batch_policy ==
-                                SchedulerBatchPolicy::kThroughputBalanced) {
-                       eff_a += a.prefix_affinity_tokens / 64.0;
-                       eff_b += b.prefix_affinity_tokens / 64.0;
-                     }
+                                        .count(),
+                                    b.pending->priority, b.pending->sequence,
+                                    b.prefix_affinity_tokens};
+                     double eff_a = policy.Score(sa);
+                     double eff_b = policy.Score(sb);
                      if (eff_a != eff_b) {
                        return eff_a > eff_b;
                      }
@@ -1684,21 +1669,21 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
     std::sort(indices.begin(), indices.end());
     indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
     for (std::size_t idx = indices.size(); idx-- > 0;) {
-      queue->erase(queue->begin() +
-                   static_cast<std::ptrdiff_t>(indices[idx]));
+      queue->erase(queue->begin() + static_cast<std::ptrdiff_t>(indices[idx]));
     }
   };
 
   to_remove_prefill.insert(to_remove_prefill.end(),
                            duplicate_remove_prefill.begin(),
                            duplicate_remove_prefill.end());
-  to_remove_decode.insert(to_remove_decode.end(), duplicate_remove_decode.begin(),
+  to_remove_decode.insert(to_remove_decode.end(),
+                          duplicate_remove_decode.begin(),
                           duplicate_remove_decode.end());
   erase_indices(&pending_prefill_, std::move(to_remove_prefill));
   erase_indices(&pending_decode_, std::move(to_remove_decode));
   if (!decode_workers_own_decode && decode_available_before > 0) {
     metrics_->RecordDecodeAssemblySnapshot("unified", decode_available_before,
-                                                 decode_selected, 0, 0);
+                                           decode_selected, 0, 0);
   }
   UpdateQueueDepthLocked();
   return selection;
@@ -1719,8 +1704,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     }
   }
 
-  metrics_->SetDecodeQueueDepth(
-      static_cast<int>(selection.pending.size()));
+  metrics_->SetDecodeQueueDepth(static_cast<int>(selection.pending.size()));
   ApplyFairness(&selection);
   ResolveBackends(selection.pending);
   auto batch_start = std::chrono::steady_clock::now();
@@ -1742,8 +1726,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         log::Warn("scheduler",
                   "Prefill queue contained decode-ready request; routing "
                   "directly to decode request_id=" +
-                      std::to_string(inf.id) + ", sequence_id=" +
-                      std::to_string(inf.sequence_id));
+                      std::to_string(inf.id) +
+                      ", sequence_id=" + std::to_string(inf.sequence_id));
         if (BackendUsesSplitDecodeWorkers(pending->resolved_backend)) {
           staged_decode_worker.push_back(pending);
         } else {
@@ -1864,13 +1848,14 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               if (new_blocks_needed > 0) {
                 new_blocks = cache_->ReserveBlocks(new_blocks_needed);
               }
-            } catch (...) {
+            } catch (const std::exception &) {
               new_blocks.clear();
             }
           }
         }
 
-        uint64_t seq_generation = reused_session_state ? cached_seq_generation : 0;
+        uint64_t seq_generation =
+            reused_session_state ? cached_seq_generation : 0;
         int seq_id = reused_session_state
                          ? cached_seq_id
                          : AllocSeqSlot(static_cast<int64_t>(pending->sequence),
@@ -1884,15 +1869,16 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         if (can_admit) {
           if (reused_session_state && slot_manager_ && seq_generation != 0) {
             const bool restored = slot_manager_->RestoreLease(
-                {seq_id, seq_generation, static_cast<int64_t>(pending->sequence)},
+                {seq_id, seq_generation,
+                 static_cast<int64_t>(pending->sequence)},
                 static_cast<int64_t>(pending->sequence), seq_id,
                 std::max(matched_tokens,
                          static_cast<int>(inf.bpe_prompt_tokens.size())));
             if (!restored) {
               log::Warn("scheduler",
                         "Failed to restore retained sequence lease for slot " +
-                            std::to_string(seq_id) + " gen=" +
-                            std::to_string(seq_generation));
+                            std::to_string(seq_id) +
+                            " gen=" + std::to_string(seq_generation));
               can_admit = false;
             } else {
               RefreshNativeKvMemoryMetrics();
@@ -1985,10 +1971,9 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               copied_prefix = true;
             }
 
-            bool prefill_ok =
-                ExecutePhasedPrefillStep(pending->resolved_backend.get(), inf,
-                                         {seq_id, prefill_start, seq_generation},
-                                         &pr);
+            bool prefill_ok = ExecutePhasedPrefillStep(
+                pending->resolved_backend.get(), inf,
+                {seq_id, prefill_start, seq_generation}, &pr);
             if (!prefill_ok) {
               if (copied_prefix) {
                 pr = pending->resolved_backend->PrefillPartial(
@@ -2157,15 +2142,14 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     // accounting.
     metrics_decode_requests = decode_ready.size();
   }
-  metrics_->RecordSchedulerIteration(
-      prefill_requests, metrics_decode_requests, selection.total_tokens);
+  metrics_->RecordSchedulerIteration(prefill_requests, metrics_decode_requests,
+                                     selection.total_tokens);
   metrics_->RecordSchedulerPolicyIteration(
       SchedulerBatchPolicyToString(config_.batch_policy), prefill_requests,
       metrics_decode_requests);
 
   if (use_decode_workers_) {
-    metrics_->SetDecodeQueueDepth(
-        static_cast<int>(pending_decode_.size()));
+    metrics_->SetDecodeQueueDepth(static_cast<int>(pending_decode_.size()));
   }
   if (use_decode_workers_ && decode_ready.empty()) {
     return;
@@ -2191,7 +2175,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     }
   }
   metrics_->RecordBatch(selection.batch.requests.size(),
-                              selection.total_tokens);
+                        selection.total_tokens);
 
   RequestBatch exec_batch;
   exec_batch.batch_id = selection.batch.batch_id;
@@ -2504,8 +2488,8 @@ void Scheduler::PollDeferredSequenceRetirements() {
     if (slot_manager_ && !slot_manager_->CompleteRetiredLease(it->lease)) {
       log::Warn("scheduler",
                 "Failed to complete retired sequence lease for slot " +
-                    std::to_string(it->lease.slot_id) + " gen=" +
-                    std::to_string(it->lease.generation));
+                    std::to_string(it->lease.slot_id) +
+                    " gen=" + std::to_string(it->lease.generation));
     }
     LogSequenceSlotEvent("retire_complete", it->lease.request_id,
                          it->lease.slot_id, it->lease.generation,
@@ -2551,17 +2535,17 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
     auto fence = backend->BeginFreeSequence(slot);
     if (fence.pending) {
       const scheduler::SequenceLease lease{slot, generation, -1};
-      const bool retired =
-          slot_manager_->RetireLease(lease, scheduler::SequenceRetireFence::Pending());
+      const bool retired = slot_manager_->RetireLease(
+          lease, scheduler::SequenceRetireFence::Pending());
       if (!retired) {
         log::Warn("scheduler",
                   "Rejected stale sequence lease retirement for slot " +
-                      std::to_string(slot) + " gen=" +
-                      std::to_string(generation));
+                      std::to_string(slot) +
+                      " gen=" + std::to_string(generation));
         return;
       }
-      LogSequenceSlotEvent("retire_pending", /*request_id=*/-1, slot, generation,
-                           RequestPhase::kFinished, /*n_past=*/-1,
+      LogSequenceSlotEvent("retire_pending", /*request_id=*/-1, slot,
+                           generation, RequestPhase::kFinished, /*n_past=*/-1,
                            /*remaining_decode_tokens=*/-1);
       {
         std::lock_guard<std::mutex> lock(deferred_sequence_retirements_mutex_);
@@ -2577,10 +2561,9 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
   } else if (!backend && generation != 0) {
     const bool released = slot_manager_->ReleaseLease({slot, generation, -1});
     if (!released) {
-      log::Warn("scheduler",
-                "Rejected stale sequence lease release for slot " +
-                    std::to_string(slot) + " gen=" +
-                    std::to_string(generation));
+      log::Warn("scheduler", "Rejected stale sequence lease release for slot " +
+                                 std::to_string(slot) +
+                                 " gen=" + std::to_string(generation));
     } else {
       LogSequenceSlotEvent("release", /*request_id=*/-1, slot, generation,
                            RequestPhase::kFinished, /*n_past=*/-1,
@@ -2593,10 +2576,9 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
   if (generation != 0) {
     const bool released = slot_manager_->ReleaseLease({slot, generation, -1});
     if (!released) {
-      log::Warn("scheduler",
-                "Rejected stale sequence lease release for slot " +
-                    std::to_string(slot) + " gen=" +
-                    std::to_string(generation));
+      log::Warn("scheduler", "Rejected stale sequence lease release for slot " +
+                                 std::to_string(slot) +
+                                 " gen=" + std::to_string(generation));
     } else {
       LogSequenceSlotEvent("release", /*request_id=*/-1, slot, generation,
                            RequestPhase::kFinished, /*n_past=*/-1,
@@ -2651,9 +2633,9 @@ void Scheduler::FinalizeSessionLease(PendingRequest *pending,
         log::Warn("scheduler",
                   "Failed to mark retained native sequence slot completed for "
                   "session " +
-                      inference.session_id + " slot=" +
-                      std::to_string(inference.sequence_id) + " gen=" +
-                      std::to_string(inference.sequence_generation));
+                      inference.session_id +
+                      " slot=" + std::to_string(inference.sequence_id) +
+                      " gen=" + std::to_string(inference.sequence_generation));
       }
     }
     scheduler::SessionHandleState state;
@@ -2733,7 +2715,8 @@ void Scheduler::ResolveBackends(
     const std::vector<std::shared_ptr<PendingRequest>> &batch) {
   if (!router_) {
     for (auto &pending : batch) {
-      if (HasBoundDecodeBackend(pending->inference, pending->resolved_backend)) {
+      if (HasBoundDecodeBackend(pending->inference,
+                                pending->resolved_backend)) {
         continue;
       }
       pending->resolved_backend.reset();
@@ -2775,14 +2758,14 @@ void Scheduler::ResolveBackends(
           selection.reason.empty()
               ? "Selected model does not support requested features"
               : selection.reason;
-      metrics_->RecordModelRoute(selection.info.id,
-                                       selection.info.backend, false);
+      metrics_->RecordModelRoute(selection.info.id, selection.info.backend,
+                                 false);
       continue;
     }
     if (selection.status == ModelSelectionStatus::kBackendUnavailable) {
       pending->inference.resolved_model = selection.info.id;
-      metrics_->RecordModelRoute(selection.info.id,
-                                       selection.info.backend, false);
+      metrics_->RecordModelRoute(selection.info.id, selection.info.backend,
+                                 false);
       continue;
     }
 
@@ -2797,15 +2780,15 @@ void Scheduler::ResolveBackends(
       pending->resolved_backend =
           std::static_pointer_cast<LlamaCppBackend>(selection.backend);
       pending->inference.resolved_model = selection.info.id;
-      metrics_->RecordModelRoute(selection.info.id,
-                                       selection.info.backend, true);
+      metrics_->RecordModelRoute(selection.info.id, selection.info.backend,
+                                 true);
       if (selection.info.is_moe) {
         metrics_->RecordMoERequest();
       }
     } else {
       pending->inference.resolved_model = selection.info.id;
-      metrics_->RecordModelRoute(selection.info.id,
-                                       selection.info.backend, false);
+      metrics_->RecordModelRoute(selection.info.id, selection.info.backend,
+                                 false);
     }
   }
 }
@@ -2825,7 +2808,7 @@ bool Scheduler::TrySwapIn(InferenceRequest &inf) {
     inf.swapped_host_handles.clear();
     inf.is_swapped = false;
     return true;
-  } catch (...) {
+  } catch (const std::exception &) {
     return false;
   }
 }
@@ -2841,7 +2824,7 @@ bool Scheduler::TrySwapOut(InferenceRequest &inf) {
     metrics_->RecordFairnessPreemption(
         inf.priority_level); // Reuse preemption metric for swap
     return true;
-  } catch (...) {
+  } catch (const std::exception &) {
     return false;
   }
 }

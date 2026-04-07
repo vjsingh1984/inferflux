@@ -201,7 +201,7 @@ public:
   void RecordInferfluxCudaForwardShape(bool is_decode, int batch_size);
   void RecordInferfluxCudaForwardLatency(double forward_ms);
   void RecordInferfluxCudaForwardPass(bool is_decode, int batch_size,
-                               double forward_ms);
+                                      double forward_ms);
   void RecordInferfluxCudaSampling(int batch_size, double sampling_ms);
   void RecordInferfluxCudaBatchDecode(int batch_size, double total_ms);
   void RecordInferfluxCudaBurstDecodeChunk(std::string_view phase,
@@ -210,27 +210,33 @@ public:
   void RecordInferfluxCudaBurstDecodeFallback(std::string_view phase);
   void RecordInferfluxCudaBurstDecodeIneligible(std::string_view phase,
                                                 std::string_view reason);
-  void RecordInferfluxCudaForwardBatchSize(std::string_view phase, int batch_size);
+  void RecordInferfluxCudaForwardBatchSize(std::string_view phase,
+                                           int batch_size);
   void RecordInferfluxCudaFfnProjOperator(std::string_view phase,
-                                   std::string_view op);
+                                          std::string_view op);
   void RecordInferfluxCudaFfnProjGeometry(std::string_view phase,
-                                   std::string_view op,
-                                   std::string_view quant, int batch_size, int n,
-                                   int k, int grouped_outputs);
+                                          std::string_view op,
+                                          std::string_view quant,
+                                          int batch_size, int n, int k,
+                                          int grouped_outputs);
   void RecordInferfluxCudaDownProjOperator(std::string_view phase,
-                                    std::string_view op);
+                                           std::string_view op);
   void RecordInferfluxCudaDownProjGeometry(std::string_view phase,
-                                    std::string_view op,
-                                    std::string_view quant, int batch_size,
-                                    int n, int k);
+                                           std::string_view op,
+                                           std::string_view quant,
+                                           int batch_size, int n, int k);
   void RecordInferfluxCudaRowPairSelection(std::string_view phase,
-                                    std::string_view op, int batch_rows);
-  void RecordInferfluxCudaKvAutoTunePlan(int requested_max_seq, int planned_max_seq,
-                                  std::size_t requested_bytes,
-                                  std::size_t planned_bytes,
-                                  std::size_t budget_bytes);
-  void SetInferfluxCudaKvCacheOccupancy(int active_sequences, int max_sequences);
-  int GetQueueDepth() const { return queue_depth_.load(std::memory_order_relaxed); }
+                                           std::string_view op, int batch_rows);
+  void RecordInferfluxCudaKvAutoTunePlan(int requested_max_seq,
+                                         int planned_max_seq,
+                                         std::size_t requested_bytes,
+                                         std::size_t planned_bytes,
+                                         std::size_t budget_bytes);
+  void SetInferfluxCudaKvCacheOccupancy(int active_sequences,
+                                        int max_sequences);
+  int GetQueueDepth() const {
+    return queue_depth_.load(std::memory_order_relaxed);
+  }
   int GetPrefillQueueDepth() const {
     return prefill_queue_depth_.load(std::memory_order_relaxed);
   }
@@ -288,11 +294,12 @@ public:
       std::unordered_map<std::string, MemoryUsageMetrics> domains);
   InferfluxCudaModelMemorySnapshot GetInferfluxCudaModelMemorySnapshot() const;
 
-  void SetInferfluxCudaKvMemoryBytes(uint64_t total_bytes, uint64_t active_bytes,
-                              uint64_t prefix_retained_bytes,
-                              uint64_t free_bytes, int active_sequences,
-                              int prefix_retained_sequences,
-                              int free_sequences, int max_sequences);
+  void SetInferfluxCudaKvMemoryBytes(uint64_t total_bytes,
+                                     uint64_t active_bytes,
+                                     uint64_t prefix_retained_bytes,
+                                     uint64_t free_bytes, int active_sequences,
+                                     int prefix_retained_sequences,
+                                     int free_sequences, int max_sequences);
   InferfluxCudaKvMemorySnapshot GetInferfluxCudaKvMemorySnapshot() const;
   int GetInferfluxCudaKvMaxSequences() const {
     return inferflux_cuda_kv_max_sequences_.load(std::memory_order_relaxed);
@@ -450,12 +457,12 @@ private:
   std::atomic<uint64_t> inferflux_cuda_forward_batch_tokens_total_{0};
   std::atomic<uint64_t> inferflux_cuda_burst_decode_chunks_decode_total_{0};
   std::atomic<uint64_t> inferflux_cuda_burst_decode_chunks_generate_total_{0};
-  std::atomic<uint64_t> inferflux_cuda_burst_decode_requested_tokens_decode_total_{
-      0};
+  std::atomic<uint64_t>
+      inferflux_cuda_burst_decode_requested_tokens_decode_total_{0};
   std::atomic<uint64_t>
       inferflux_cuda_burst_decode_requested_tokens_generate_total_{0};
-  std::atomic<uint64_t> inferflux_cuda_burst_decode_produced_tokens_decode_total_{
-      0};
+  std::atomic<uint64_t>
+      inferflux_cuda_burst_decode_produced_tokens_decode_total_{0};
   std::atomic<uint64_t>
       inferflux_cuda_burst_decode_produced_tokens_generate_total_{0};
   std::atomic<uint64_t> inferflux_cuda_burst_decode_fallbacks_decode_total_{0};
@@ -467,16 +474,20 @@ private:
   std::unordered_map<std::string, uint64_t>
       inferflux_cuda_burst_decode_ineligible_counts_;
   mutable std::mutex inferflux_cuda_forward_batch_size_mutex_;
-  std::unordered_map<std::string, uint64_t> inferflux_cuda_forward_batch_size_counts_;
-  mutable std::mutex inferflux_cuda_ffn_proj_operator_mutex_;
-  std::unordered_map<std::string, uint64_t> inferflux_cuda_ffn_proj_operator_counts_;
-  mutable std::mutex inferflux_cuda_ffn_proj_geometry_mutex_;
-  std::unordered_map<std::string, uint64_t> inferflux_cuda_ffn_proj_geometry_counts_;
-  mutable std::mutex inferflux_cuda_down_proj_operator_mutex_;
-  std::unordered_map<std::string, uint64_t> inferflux_cuda_down_proj_operator_counts_;
-  mutable std::mutex inferflux_cuda_down_proj_geometry_mutex_;
-  std::unordered_map<std::string, uint64_t> inferflux_cuda_down_proj_geometry_counts_;
-  mutable std::mutex inferflux_cuda_rowpair_selection_mutex_;
+  std::unordered_map<std::string, uint64_t>
+      inferflux_cuda_forward_batch_size_counts_;
+  // CUDA operator metrics: FFN/down-proj operator selections, geometry,
+  // and row-pair selection are all protected by a single mutex to reduce
+  // lock overhead and eliminate cross-mutex ordering risks.
+  mutable std::mutex inferflux_cuda_operator_metrics_mutex_;
+  std::unordered_map<std::string, uint64_t>
+      inferflux_cuda_ffn_proj_operator_counts_;
+  std::unordered_map<std::string, uint64_t>
+      inferflux_cuda_ffn_proj_geometry_counts_;
+  std::unordered_map<std::string, uint64_t>
+      inferflux_cuda_down_proj_operator_counts_;
+  std::unordered_map<std::string, uint64_t>
+      inferflux_cuda_down_proj_geometry_counts_;
   std::unordered_map<std::string, uint64_t>
       inferflux_cuda_rowpair_selection_counts_;
   std::atomic<int> inferflux_cuda_kv_active_sequences_{0};

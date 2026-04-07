@@ -128,7 +128,7 @@ bool ParsePrometheusMetricValue(const std::string &metrics_body,
     try {
       *value_out = std::stod(value_str);
       return true;
-    } catch (...) {
+    } catch (const std::exception &) {
       continue;
     }
   }
@@ -180,7 +180,7 @@ bool ParsePrometheusLabeledMetricValue(
     try {
       *value_out = std::stod(value_str);
       return true;
-    } catch (...) {
+    } catch (const std::exception &) {
       continue;
     }
   }
@@ -884,7 +884,7 @@ DownloadHeaders ParseDownloadHeaders(const std::string &header_block) {
       if (sp != std::string::npos) {
         try {
           h.status = std::stoi(line.substr(sp + 1));
-        } catch (...) {
+        } catch (const std::exception &) {
         }
       }
       continue;
@@ -900,7 +900,7 @@ DownloadHeaders ParseDownloadHeaders(const std::string &header_block) {
     else if (key_lower == "content-length") {
       try {
         h.content_length = std::stoll(val);
-      } catch (...) {
+      } catch (const std::exception &) {
       }
     }
   }
@@ -1236,7 +1236,7 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
           ready = true;
           break;
         }
-      } catch (...) {
+      } catch (const std::exception &) {
         // Server not ready yet
       }
     }
@@ -1332,7 +1332,7 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
           ready = true;
           break;
         }
-      } catch (...) {
+      } catch (const std::exception &) {
         // Server not ready yet
       }
     }
@@ -1847,7 +1847,7 @@ int main(int argc, char **argv) {
             if (consumed != set_value_raw.size()) {
               throw std::invalid_argument("trailing characters");
             }
-          } catch (...) {
+          } catch (const std::exception &) {
             std::cerr << "inferctl admin rate-limit: --set must be an integer"
                       << std::endl;
             return 1;
@@ -2364,7 +2364,7 @@ int main(int argc, char **argv) {
             }
             try {
               warm_completion_tokens = std::stoi(completion_tokens_value);
-            } catch (...) {
+            } catch (const std::exception &) {
               std::cerr
                   << "inferctl admin cache: --completion-tokens must be an "
                      "integer"
@@ -2417,7 +2417,7 @@ int main(int argc, char **argv) {
           while (std::getline(tok_ss, tok, ',')) {
             try {
               tokens_arr.push_back(std::stoi(Trim(tok)));
-            } catch (...) {
+            } catch (const std::exception &) {
               std::cerr << "Invalid token id: " << tok << "\n";
               return 1;
             }

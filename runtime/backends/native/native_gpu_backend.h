@@ -3,6 +3,7 @@
 #include "runtime/backends/gpu/gpu_accelerated_backend.h"
 #include "runtime/backends/native/native_inference_runtime.h"
 
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -35,11 +36,12 @@ public:
   std::vector<UnifiedBatchOutput>
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override;
   bool SupportsAsyncUnifiedBatch() const override;
-  bool TryGreedyBurstDecodeTokens(
-      int sequence_id, int n_past_start, int first_token_id,
-      const SamplingParams &sampling, int max_tokens,
-      std::vector<BurstDecodeOutput> *outputs,
-      std::string *reason = nullptr) override;
+  bool TryGreedyBurstDecodeTokens(int sequence_id, int n_past_start,
+                                  int first_token_id,
+                                  const SamplingParams &sampling,
+                                  int max_tokens,
+                                  std::vector<BurstDecodeOutput> *outputs,
+                                  std::string *reason = nullptr) override;
   bool SupportsSplitPrefillDecodeHandoff() const override;
   bool SupportsProcessLocalSequenceTransfer() const override;
   UnifiedBatchHandle SubmitUnifiedBatchAsync(
@@ -134,8 +136,7 @@ private:
   int NativeBurstChunkTokens() const;
   const char *NativeBurstDecodeIneligibleReason(
       const SamplingParams &sampling, bool collect_logprobs,
-      bool has_chunk_callback,
-      const std::vector<std::string> &stop_seqs,
+      bool has_chunk_callback, const std::vector<std::string> &stop_seqs,
       const ITokenizer *tokenizer) const;
 
   std::unique_ptr<NativeInferenceRuntime> runtime_;
@@ -143,12 +144,17 @@ private:
   LlamaBackendConfig loaded_config_{};
   std::filesystem::path parity_load_path_;
   bool parity_delegate_enabled_{true};
-  mutable bool parity_delegate_available_{false};
-  mutable bool parity_delegate_init_attempted_{false};
+  mutable std::atomic<bool> parity_delegate_available_{false};
+  mutable std::atomic<bool> parity_delegate_init_attempted_{false};
   mutable std::shared_ptr<LlamaCppBackend> parity_backend_;
   std::string runtime_kind_{"native"};
   bool fallback_mode_{true};
   std::string fallback_reason_;
+  // Lock ordering (acquire in this order to prevent deadlock):
+  //   1. runtime_mutex_         — protects runtime_, forward pass, model state
+  //   2. parity_backend_mutex_  — protects parity_backend_ lazy init
+  //   3. sampling_mutex_        — protects active_sampling_, sampler state
+  // Never hold a lower-numbered lock while acquiring a higher-numbered one.
   mutable std::recursive_mutex runtime_mutex_;
   mutable std::mutex parity_backend_mutex_;
   mutable std::mutex sampling_mutex_;

@@ -5,8 +5,8 @@
 #include "runtime/backends/backend_utils.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
 #include "runtime/string_utils.h"
-#include "server/metrics/metrics.h"
 #include "server/logging/logger.h"
+#include "server/metrics/metrics.h"
 
 #include <algorithm>
 #include <cctype>
@@ -159,8 +159,8 @@ bool NativeGpuBackend::TryGreedyBurstDecodeTokens(
     if (reason) {
       *reason = "missing_runtime";
     }
-    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
-        "decode", "missing_runtime");
+    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible("decode",
+                                                             "missing_runtime");
     return false;
   }
 
@@ -179,8 +179,8 @@ bool NativeGpuBackend::TryGreedyBurstDecodeTokens(
     if (reason) {
       *reason = "disabled";
     }
-    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
-        "decode", "disabled");
+    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible("decode",
+                                                             "disabled");
     return false;
   }
 
@@ -188,8 +188,8 @@ bool NativeGpuBackend::TryGreedyBurstDecodeTokens(
     if (reason) {
       *reason = "temperature";
     }
-    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
-        "decode", "temperature");
+    GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible("decode",
+                                                             "temperature");
     return false;
   }
 
@@ -261,8 +261,8 @@ int NativeGpuBackend::UnifiedBatchTokenCapacity() const {
   return backend->UnifiedBatchTokenCapacity();
 }
 
-PrefillResult
-NativeGpuBackend::Prefill(const std::string &prompt, int sequence_id) {
+PrefillResult NativeGpuBackend::Prefill(const std::string &prompt,
+                                        int sequence_id) {
   auto backend = DelegateBackend();
   if (!backend) {
     return {};
@@ -270,9 +270,9 @@ NativeGpuBackend::Prefill(const std::string &prompt, int sequence_id) {
   return backend->Prefill(prompt, sequence_id);
 }
 
-PrefillResult
-NativeGpuBackend::PrefillPartial(const std::string &prompt, int sequence_id,
-                                 int n_past_start) {
+PrefillResult NativeGpuBackend::PrefillPartial(const std::string &prompt,
+                                               int sequence_id,
+                                               int n_past_start) {
   auto backend = DelegateBackend();
   if (!backend) {
     return {};
@@ -295,8 +295,7 @@ void NativeGpuBackend::FreeSequence(int sequence_id) {
   }
 }
 
-SequenceReleaseFence
-NativeGpuBackend::BeginFreeSequence(int sequence_id) {
+SequenceReleaseFence NativeGpuBackend::BeginFreeSequence(int sequence_id) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     return runtime_->NativeBeginFreeSequence(sequence_id);
@@ -408,11 +407,11 @@ std::string NativeGpuBackend::Decode(
   const char *burst_ineligible_reason =
       burst_chunk_tokens > 0
           ? NativeBurstDecodeIneligibleReason(sampling, collect_lp,
-                                             static_cast<bool>(on_chunk),
-                                             stop_seqs, tokenizer)
+                                              static_cast<bool>(on_chunk),
+                                              stop_seqs, tokenizer)
           : "disabled";
-  const bool can_burst = burst_chunk_tokens > 0 &&
-                         burst_ineligible_reason == nullptr;
+  const bool can_burst =
+      burst_chunk_tokens > 0 && burst_ineligible_reason == nullptr;
   if (burst_ineligible_reason != nullptr) {
     GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
         "decode", burst_ineligible_reason);
@@ -431,8 +430,8 @@ std::string NativeGpuBackend::Decode(
       const int generated = runtime_->BurstDecodeGreedy(
           sequence_id, n_past, current_token, burst_n, eos_id, &burst_tokens);
       if (generated > 0) {
-        GlobalMetrics().RecordInferfluxCudaBurstDecodeChunk(
-            "decode", burst_n, generated);
+        GlobalMetrics().RecordInferfluxCudaBurstDecodeChunk("decode", burst_n,
+                                                            generated);
         bool stop = false;
         for (int token_id : burst_tokens) {
           ++n_past;
@@ -626,11 +625,11 @@ std::string NativeGpuBackend::Generate(
   const char *burst_ineligible_reason =
       burst_chunk_tokens > 0
           ? NativeBurstDecodeIneligibleReason(sampling, collect_lp,
-                                             static_cast<bool>(on_chunk),
-                                             stop_seqs, tokenizer)
+                                              static_cast<bool>(on_chunk),
+                                              stop_seqs, tokenizer)
           : "disabled";
-  const bool can_burst = burst_chunk_tokens > 0 &&
-                         burst_ineligible_reason == nullptr;
+  const bool can_burst =
+      burst_chunk_tokens > 0 && burst_ineligible_reason == nullptr;
   if (burst_ineligible_reason != nullptr) {
     GlobalMetrics().RecordInferfluxCudaBurstDecodeIneligible(
         "generate", burst_ineligible_reason);
@@ -1014,7 +1013,7 @@ int NativeGpuBackend::NativeBurstChunkTokens() const {
   }
   try {
     return ClampBurstChunkTokens(std::stoi(raw));
-  } catch (...) {
+  } catch (const std::exception &) {
     return 0;
   }
 }
