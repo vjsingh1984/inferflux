@@ -9,10 +9,27 @@
 #include "scheduler/request_batch.h"
 #include "scheduler/scheduler.h"
 
+#include <chrono>
 #include <memory>
 #include <string>
 
 namespace inferflux {
+
+class MetricsRegistry;
+
+// RAII timer that records elapsed milliseconds on destruction or query.
+class ExecutionTimer {
+public:
+  ExecutionTimer() : start_(std::chrono::steady_clock::now()) {}
+  double ElapsedMs() const {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - start_)
+        .count();
+  }
+
+private:
+  std::chrono::steady_clock::time_point start_;
+};
 
 class BatchExecutor {
 public:
@@ -30,13 +47,14 @@ public:
                 std::shared_ptr<CPUDeviceContext> device,
                 std::shared_ptr<PagedKVCache> cache,
                 std::shared_ptr<ModelRouter> router,
-                std::shared_ptr<SpeculativeDecoder> speculative_decoder);
+                std::shared_ptr<SpeculativeDecoder> speculative_decoder,
+                MetricsRegistry *metrics = nullptr);
   BatchExecutor(SimpleTokenizer *tokenizer,
                 std::shared_ptr<CPUDeviceContext> device,
                 std::shared_ptr<PagedKVCache> cache,
                 std::shared_ptr<ModelRouter> router,
                 std::shared_ptr<SpeculativeDecoder> speculative_decoder,
-                UnifiedBatchTuning tuning);
+                UnifiedBatchTuning tuning, MetricsRegistry *metrics = nullptr);
 
   std::vector<InferenceResult> ExecuteBatch(
       const RequestBatch &batch,
@@ -86,6 +104,7 @@ private:
   std::shared_ptr<ModelRouter> router_;
   std::shared_ptr<SpeculativeDecoder> speculative_decoder_;
   UnifiedBatchTuning tuning_;
+  MetricsRegistry &metrics_;
 };
 
 } // namespace inferflux

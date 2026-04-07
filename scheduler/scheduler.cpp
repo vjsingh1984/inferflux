@@ -516,8 +516,9 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
   tuning.decode_burst_tokens = config_.decode_burst_tokens;
   tuning.chunked_prefill_tokens = config_.chunked_prefill_tokens;
   tuning.mixed_prefill_budget_ratio = config_.mixed_prefill_budget_ratio;
-  executor_ = std::make_unique<BatchExecutor>(
-      &tokenizer_, device_, cache_, router_, speculative_decoder_, tuning);
+  executor_ =
+      std::make_unique<BatchExecutor>(&tokenizer_, device_, cache_, router_,
+                                      speculative_decoder_, tuning, metrics_);
 
   // Initialize sequence slot manager for universal KV cache tracking.
   slot_manager_ =
