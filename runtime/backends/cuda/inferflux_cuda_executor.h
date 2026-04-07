@@ -1,11 +1,11 @@
 #pragma once
 
+#include "runtime/backends/cuda/inferflux_cuda_runtime.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/model_memory_ledger.h"
 #include "runtime/backends/cuda/native/native_bootstrap_config.h"
 #include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/strategy_registry.h"
-#include "runtime/backends/cuda/inferflux_cuda_runtime.h"
 #include "runtime/execution/unified_batch_lane_dispatcher.h"
 
 #ifdef INFERFLUX_HAS_CUDA
@@ -178,7 +178,9 @@ public:
   // InferfluxCudaRuntime interface
   std::string Name() const override { return "inferflux_cuda"; }
   bool IsFallback() const override { return fallback_mode_; }
-  const std::string &FallbackReason() const override { return fallback_reason_; }
+  const std::string &FallbackReason() const override {
+    return fallback_reason_;
+  }
 
   /**
    * Load model from safetensors
@@ -398,9 +400,9 @@ private:
    * Returns actual tokens generated (may be < n_tokens if EOS hit).
    * Tokens written to out_tokens[0..return_value-1].
    */
-  int BurstDecodeGreedy(int sequence_id, int n_past_start,
-                        int first_token_id, int n_tokens,
-                        int eos_token_id, std::vector<int> *out_tokens);
+  int BurstDecodeGreedy(int sequence_id, int n_past_start, int first_token_id,
+                        int n_tokens, int eos_token_id,
+                        std::vector<int> *out_tokens);
 
   // Phase overlap configuration
   bool overlap_enabled_{true};

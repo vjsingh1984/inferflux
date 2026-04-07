@@ -12,10 +12,9 @@ namespace inferflux {
 inline std::string GetHeaderValue(const std::string &headers,
                                   const std::string &name) {
   auto lower_name = name;
-  std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
-                 [](unsigned char c) {
-                   return static_cast<char>(std::tolower(c));
-                 });
+  std::transform(
+      lower_name.begin(), lower_name.end(), lower_name.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
   std::size_t line_start = 0;
   while (line_start < headers.size()) {
@@ -25,10 +24,9 @@ inline std::string GetHeaderValue(const std::string &headers,
     const std::size_t colon = headers.find(':', line_start);
     if (colon != std::string::npos && colon < current_end) {
       std::string header_name = headers.substr(line_start, colon - line_start);
-      std::transform(header_name.begin(), header_name.end(),
-                     header_name.begin(), [](unsigned char c) {
-                       return static_cast<char>(std::tolower(c));
-                     });
+      std::transform(
+          header_name.begin(), header_name.end(), header_name.begin(),
+          [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
       if (header_name == lower_name) {
         std::string value =
             headers.substr(colon + 1, current_end - (colon + 1));

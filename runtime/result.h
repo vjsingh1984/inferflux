@@ -35,14 +35,15 @@ struct Error {
 ///   Result<int> r = Err("something broke");
 ///   if (r) use(r.value());
 ///   else   log(r.error().message);
-template <typename T>
-class Result {
+template <typename T> class Result {
 public:
   // Implicit construction from T (success).
-  Result(T val) : data_(std::move(val)) {} // NOLINT(google-explicit-constructor)
+  Result(T val)
+      : data_(std::move(val)) {} // NOLINT(google-explicit-constructor)
 
   // Implicit construction from Error (failure).
-  Result(Error err) : data_(std::move(err)) {} // NOLINT(google-explicit-constructor)
+  Result(Error err)
+      : data_(std::move(err)) {} // NOLINT(google-explicit-constructor)
 
   bool ok() const { return std::holds_alternative<T>(data_); }
   explicit operator bool() const { return ok(); }
@@ -58,12 +59,12 @@ private:
 };
 
 /// Result<void> specialisation for operations that produce no value.
-template <>
-class Result<void> {
+template <> class Result<void> {
 public:
   Result() : error_(std::nullopt) {}
 
-  Result(Error err) : error_(std::move(err)) {} // NOLINT(google-explicit-constructor)
+  Result(Error err)
+      : error_(std::move(err)) {} // NOLINT(google-explicit-constructor)
 
   bool ok() const { return !error_.has_value(); }
   explicit operator bool() const { return ok(); }
@@ -79,8 +80,7 @@ private:
 // --- Free-function factories ---
 
 /// Construct a successful Result<T>.
-template <typename T>
-Result<std::decay_t<T>> Ok(T &&val) {
+template <typename T> Result<std::decay_t<T>> Ok(T &&val) {
   return Result<std::decay_t<T>>(std::forward<T>(val));
 }
 

@@ -45,10 +45,9 @@ bool CublasGemm::PreallocateWorkspace(size_t workspace_bytes) {
   }
   cudaError_t err = cudaMalloc(&workspace_, workspace_bytes);
   if (err != cudaSuccess) {
-    log::Warn("cublas_gemm",
-              "Workspace pre-allocation failed (" +
-                  std::to_string(workspace_bytes / 1024) +
-                  " KB), CUDA graph capture may not work");
+    log::Warn("cublas_gemm", "Workspace pre-allocation failed (" +
+                                 std::to_string(workspace_bytes / 1024) +
+                                 " KB), CUDA graph capture may not work");
     return false;
   }
   workspace_size_ = workspace_bytes;
@@ -61,9 +60,9 @@ bool CublasGemm::PreallocateWorkspace(size_t workspace_bytes) {
     workspace_size_ = 0;
     return false;
   }
-  log::Info("cublas_gemm",
-            "Pre-allocated " + std::to_string(workspace_bytes / 1024) +
-                " KB workspace for CUDA graph capture");
+  log::Info("cublas_gemm", "Pre-allocated " +
+                               std::to_string(workspace_bytes / 1024) +
+                               " KB workspace for CUDA graph capture");
   return true;
 }
 
@@ -162,9 +161,10 @@ template bool CublasGemm::GemmTyped<__nv_bfloat16>(int, int, int,
 
 template bool CublasGemm::GemmTypedAccum<half>(int, int, int, const half *,
                                                const half *, half *);
-template bool CublasGemm::GemmTypedAccum<__nv_bfloat16>(
-    int, int, int, const __nv_bfloat16 *, const __nv_bfloat16 *,
-    __nv_bfloat16 *);
+template bool CublasGemm::GemmTypedAccum<__nv_bfloat16>(int, int, int,
+                                                        const __nv_bfloat16 *,
+                                                        const __nv_bfloat16 *,
+                                                        __nv_bfloat16 *);
 
 template bool CublasGemm::GemmBatchedTyped<half>(int, int, int, const half *,
                                                  const half *, half *,

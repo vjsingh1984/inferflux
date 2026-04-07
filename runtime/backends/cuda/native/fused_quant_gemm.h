@@ -179,9 +179,9 @@ public:
    * @return true if accumulate kernel was launched, false if unsupported
    */
   static bool GemvQ8_1Accum(const QuantizedWeightInfo &weight,
-                             const void *act_q8_1, half *output, int M, int N,
-                             int K, cudaStream_t stream,
-                             const NativeExecutionPolicy *policy = nullptr);
+                            const void *act_q8_1, half *output, int M, int N,
+                            int K, cudaStream_t stream,
+                            const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * MMQ-style tiled down-projection path for transformed GGUF weights.
@@ -271,10 +271,9 @@ public:
    * Output is FP16; caller must quantize to Q8_1 before down_proj GEMV.
    */
   static bool FusedGateUpSiluGemvQ8_1(const QuantizedWeightInfo &gate_raw,
-                                       const QuantizedWeightInfo &up_raw,
-                                       const void *act_q8_1, half *output,
-                                       int M, int N, int K,
-                                       cudaStream_t stream);
+                                      const QuantizedWeightInfo &up_raw,
+                                      const void *act_q8_1, half *output, int M,
+                                      int N, int K, cudaStream_t stream);
 
   /**
    * Fused gate+up+SiLU MMVQ with Q8_1 quantization epilogue.
@@ -302,10 +301,10 @@ public:
    * Currently supports Q4_K only.
    */
   static bool GemvQ8_1WithBias(const QuantizedWeightInfo &weight,
-                                const void *act_q8_1, half *output,
-                                const half *bias, int M, int N, int K,
-                                cudaStream_t stream,
-                                const NativeExecutionPolicy *policy = nullptr);
+                               const void *act_q8_1, half *output,
+                               const half *bias, int M, int N, int K,
+                               cudaStream_t stream,
+                               const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Returns true when a quant type supports Q8_1 activation GEMV.

@@ -45,12 +45,13 @@ struct NativeExecutionPolicy {
   bool enable_gemv_accumulate{true};
   bool enable_batch_dequant_cache{false};
 
-  // Fused kernel redesign flags (P1+P2 validated: parity-exact, zero regression)
-  bool enable_fused_rope_kv_append{true};              // P1: validated
-  bool enable_fused_gemv_norm_quant_epilogue{true};     // P2: validated
-  bool enable_mmvq_bias_epilogue{false};                // P3
-  bool enable_q6k_vectorized{false};                    // P4
-  bool enable_gate_up_silu_q81_epilogue{false};         // P5
+  // Fused kernel redesign flags (P1+P2 validated: parity-exact, zero
+  // regression)
+  bool enable_fused_rope_kv_append{true};           // P1: validated
+  bool enable_fused_gemv_norm_quant_epilogue{true}; // P2: validated
+  bool enable_mmvq_bias_epilogue{false};            // P3
+  bool enable_q6k_vectorized{false};                // P4
+  bool enable_gate_up_silu_q81_epilogue{false};     // P5
 
   static NativeExecutionPolicy FromEnv() {
     NativeExecutionPolicy policy;
@@ -76,9 +77,8 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_CUDA_DEBUG_DECODE_MAPPING_LIMIT", 32, 1,
                     std::numeric_limits<int>::max());
     policy.debug_logits = ParseBoolEnv("INFERFLUX_DEBUG_LOGITS", false);
-    policy.debug_logits_limit =
-        ParseIntEnv("INFERFLUX_DEBUG_LOGITS_LIMIT", 64, 1,
-                    std::numeric_limits<int>::max());
+    policy.debug_logits_limit = ParseIntEnv("INFERFLUX_DEBUG_LOGITS_LIMIT", 64,
+                                            1, std::numeric_limits<int>::max());
     policy.debug_operator_selection =
         ParseBoolEnv("INFERFLUX_CUDA_DEBUG_OPERATOR_SELECTION", false);
     policy.debug_operator_selection_limit =
@@ -101,16 +101,15 @@ struct NativeExecutionPolicy {
     policy.enable_experimental_q81_downproj_hot_fixed = ParseBoolEnv(
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", false);
     policy.enable_experimental_q81_downproj_rowpair_hot_fixed = ParseBoolEnv(
-        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
-        false);
+        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED", false);
     policy.enable_experimental_q81_grouped_hot_q4k = ParseBoolEnv(
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", true);
     policy.enable_experimental_q81_grouped_rowpair_w4 = ParseBoolEnv(
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4", true);
     policy.enable_experimental_q81_grouped_rowquad_m4 = ParseBoolEnv(
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWQUAD_M4", false);
-    policy.enable_experimental_q81_grouped_mmq3 = ParseBoolEnv(
-        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_MMQ3", true);
+    policy.enable_experimental_q81_grouped_mmq3 =
+        ParseBoolEnv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_MMQ3", true);
     policy.enable_downproj_mmq =
         ParseBoolEnv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", false);
     policy.downproj_mmq_min_batch_override =
@@ -145,7 +144,6 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_GATE_UP_SILU_Q81_EPILOGUE", false);
     return policy;
   }
-
 };
 
 } // namespace inferflux

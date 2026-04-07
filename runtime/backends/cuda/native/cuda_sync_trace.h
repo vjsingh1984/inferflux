@@ -60,14 +60,14 @@ inline void LogSyncTraceSummaryAtExit() {
       continue;
     }
     const uint64_t api_ns = entry.api_ns.load(std::memory_order_relaxed);
-    const double avg_us =
-        calls > 0 ? static_cast<double>(api_ns) / static_cast<double>(calls) /
-                        1000.0
-                  : 0.0;
-    std::fprintf(stderr,
-                 "[native_sync_trace] site=%s calls=%llu api_ns=%llu avg_us=%.3f\n",
-                 entry.label, static_cast<unsigned long long>(calls),
-                 static_cast<unsigned long long>(api_ns), avg_us);
+    const double avg_us = calls > 0 ? static_cast<double>(api_ns) /
+                                          static_cast<double>(calls) / 1000.0
+                                    : 0.0;
+    std::fprintf(
+        stderr,
+        "[native_sync_trace] site=%s calls=%llu api_ns=%llu avg_us=%.3f\n",
+        entry.label, static_cast<unsigned long long>(calls),
+        static_cast<unsigned long long>(api_ns), avg_us);
   }
   std::fprintf(stderr, "[native_sync_trace] summary end\n");
 }
@@ -104,9 +104,9 @@ inline bool SpinWaitEnabled() {
       return false;
     }
 #ifdef _WIN32
-    return true;  // WDDM needs spin-wait
+    return true; // WDDM needs spin-wait
 #else
-    return false;  // Linux/WSL2 uses efficient blocking sync
+    return false; // Linux/WSL2 uses efficient blocking sync
 #endif
   }();
   return enabled;
@@ -130,8 +130,8 @@ inline cudaError_t TracedCudaEventSynchronize(SyncTraceSite site,
   }
   EnsureSyncTraceRegistered();
   const auto start = std::chrono::steady_clock::now();
-  const cudaError_t err = SpinWaitEnabled() ? SpinWaitEvent(event)
-                                            : cudaEventSynchronize(event);
+  const cudaError_t err =
+      SpinWaitEnabled() ? SpinWaitEvent(event) : cudaEventSynchronize(event);
   const auto end = std::chrono::steady_clock::now();
   auto &entry = kSyncTraceEntries[static_cast<size_t>(site)];
   entry.calls.fetch_add(1, std::memory_order_relaxed);

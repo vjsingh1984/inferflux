@@ -35,8 +35,8 @@
 #include <set>
 #include <thread>
 #ifdef _WIN32
-#include <windows.h>
 #include <io.h>
+#include <windows.h>
 #ifndef F_OK
 #define F_OK 0
 #endif
@@ -131,8 +131,7 @@ std::string ToLowerAscii(const std::string &value) {
   return inferflux::ToLower(value);
 }
 
-bool DecodeMappingDebugEnabled(
-    const inferflux::NativeExecutionPolicy &policy) {
+bool DecodeMappingDebugEnabled(const inferflux::NativeExecutionPolicy &policy) {
   return policy.debug_decode_mapping;
 }
 
@@ -155,8 +154,7 @@ bool NativeLogitsDebugEnabled(const inferflux::NativeExecutionPolicy &policy) {
   return policy.debug_logits;
 }
 
-bool ConsumeNativeLogitsBudget(
-    const inferflux::NativeExecutionPolicy &policy) {
+bool ConsumeNativeLogitsBudget(const inferflux::NativeExecutionPolicy &policy) {
   static thread_local int last_limit = -1;
   static thread_local int remaining = 0;
   if (policy.debug_logits_limit != last_limit) {
@@ -188,24 +186,24 @@ void LogNativeTopLogits(std::string_view stage, const float *d_logits_row,
   }
 
   constexpr std::size_t kTopK = 5;
-  std::vector<std::pair<float, int>> scored(static_cast<std::size_t>(vocab_size));
+  std::vector<std::pair<float, int>> scored(
+      static_cast<std::size_t>(vocab_size));
   for (int i = 0; i < vocab_size; ++i) {
-    scored[static_cast<std::size_t>(i)] = {h_logits[static_cast<std::size_t>(i)], i};
+    scored[static_cast<std::size_t>(i)] = {
+        h_logits[static_cast<std::size_t>(i)], i};
   }
-  const std::size_t top_n =
-      std::min<std::size_t>(kTopK, scored.size());
-  std::partial_sort(scored.begin(), scored.begin() + top_n, scored.end(),
-                    [](const auto &a, const auto &b) {
-                      return a.first > b.first;
-                    });
+  const std::size_t top_n = std::min<std::size_t>(kTopK, scored.size());
+  std::partial_sort(
+      scored.begin(), scored.begin() + top_n, scored.end(),
+      [](const auto &a, const auto &b) { return a.first > b.first; });
 
   std::string payload;
   for (std::size_t i = 0; i < top_n; ++i) {
     if (!payload.empty()) {
       payload += " ";
     }
-    payload += "[" + std::to_string(scored[i].second) + "]=" +
-               std::to_string(scored[i].first);
+    payload += "[" + std::to_string(scored[i].second) +
+               "]=" + std::to_string(scored[i].first);
   }
 
   const std::string client_prefix =
@@ -215,27 +213,25 @@ void LogNativeTopLogits(std::string_view stage, const float *d_logits_row,
   inferflux::log::Info(
       "inferflux_cuda_executor",
       "debug_logits[" + std::string(stage) + "]: " + client_prefix +
-          "request_id=" +
-          std::to_string(request_id) + ", sequence_id=" +
-          std::to_string(sequence_id) + ", sequence_generation=" +
-          std::to_string(sequence_generation) + ", n_past=" +
-          std::to_string(n_past) + " top-5: " + payload);
+          "request_id=" + std::to_string(request_id) +
+          ", sequence_id=" + std::to_string(sequence_id) +
+          ", sequence_generation=" + std::to_string(sequence_generation) +
+          ", n_past=" + std::to_string(n_past) + " top-5: " + payload);
 }
 #endif
 
 void LogSampleMapping(std::string_view stage, int input_idx, int64_t request_id,
                       std::string_view client_request_id, int sequence_id,
                       uint64_t sequence_generation, int n_past, int token_count,
-                      int token_id,
-                      const inferflux::ITokenizer *tokenizer,
+                      int token_id, const inferflux::ITokenizer *tokenizer,
                       const inferflux::NativeExecutionPolicy &policy) {
   if (!DecodeMappingDebugEnabled(policy) ||
       !ConsumeDecodeMappingBudget(policy)) {
     return;
   }
-  const std::string piece =
-      (tokenizer && token_id >= 0) ? tokenizer->TokenToString(token_id)
-                                   : std::string();
+  const std::string piece = (tokenizer && token_id >= 0)
+                                ? tokenizer->TokenToString(token_id)
+                                : std::string();
   inferflux::log::Info(
       "inferflux_cuda_executor",
       std::string(stage) + ": input_idx=" + std::to_string(input_idx) + ", " +
@@ -979,18 +975,19 @@ void InferfluxCudaExecutor::RefreshMemoryLedger() {
     memory_ledger_.SetModelLabel(loaded_model_path_.filename().string());
   }
 
-  const std::size_t weights_bytes =
-      model_loader_ ? model_loader_->GetGPUSize()
-                    : (loader_ ? loader_->GetGPUSize() : 0);
+  const std::size_t weights_bytes = model_loader_
+                                        ? model_loader_->GetGPUSize()
+                                        : (loader_ ? loader_->GetGPUSize() : 0);
   if (weights_bytes > 0) {
-    memory_ledger_.UpsertItem(
-        model_loader_ ? "weights.loader" : "weights.safetensors",
-        runtime::cuda::native::MemoryDomain::kWeights,
-        runtime::cuda::native::MemoryLifetime::kModel, weights_bytes,
-        weights_bytes);
+    memory_ledger_.UpsertItem(model_loader_ ? "weights.loader"
+                                            : "weights.safetensors",
+                              runtime::cuda::native::MemoryDomain::kWeights,
+                              runtime::cuda::native::MemoryLifetime::kModel,
+                              weights_bytes, weights_bytes);
   }
 
-  auto record_qwm_scratch = [&](const char *label, const QuantizedWeightMap *map) {
+  auto record_qwm_scratch = [&](const char *label,
+                                const QuantizedWeightMap *map) {
     if (!map) {
       return;
     }
@@ -1010,10 +1007,9 @@ void InferfluxCudaExecutor::RefreshMemoryLedger() {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (kv_cache_) {
     const std::size_t kv_bytes = kv_cache_->GetMemoryUsage();
-    memory_ledger_.UpsertItem("kv_cache.primary",
-                              runtime::cuda::native::MemoryDomain::kKvCache,
-                              runtime::cuda::native::MemoryLifetime::kPool,
-                              kv_bytes, kv_bytes);
+    memory_ledger_.UpsertItem(
+        "kv_cache.primary", runtime::cuda::native::MemoryDomain::kKvCache,
+        runtime::cuda::native::MemoryLifetime::kPool, kv_bytes, kv_bytes);
   }
 
   auto record_forward = [&](const char *device_label, const char *host_label,
@@ -1031,8 +1027,7 @@ void InferfluxCudaExecutor::RefreshMemoryLedger() {
     const std::size_t host_bytes = forward->HostWorkspaceBytes();
     if (host_bytes > 0) {
       memory_ledger_.UpsertItem(
-          host_label,
-          runtime::cuda::native::MemoryDomain::kWorkspaceHostPinned,
+          host_label, runtime::cuda::native::MemoryDomain::kWorkspaceHostPinned,
           runtime::cuda::native::MemoryLifetime::kModel, host_bytes,
           host_bytes);
     }
@@ -1114,8 +1109,8 @@ void InferfluxCudaExecutor::RefreshMemoryLedger() {
     usage.evictable_bytes = summary.usage.evictable_bytes;
     domains.emplace(runtime::cuda::native::ToString(summary.domain), usage);
   }
-  GlobalMetrics().SetInferfluxCudaModelMemorySnapshot(memory_ledger_.ModelLabel(),
-                                               total, std::move(domains));
+  GlobalMetrics().SetInferfluxCudaModelMemorySnapshot(
+      memory_ledger_.ModelLabel(), total, std::move(domains));
 }
 
 bool InferfluxCudaExecutor::ConfigureDequantizedCachePolicy(
@@ -1129,7 +1124,8 @@ bool InferfluxCudaExecutor::ConfigureDequantizedCachePolicy(
       runtime::cuda::native::DequantizedCachePolicy::kNone;
   if (!runtime::cuda::native::ParseDequantizedCachePolicy(policy, &parsed)) {
     log::Warn("inferflux_cuda_executor", "Invalid dequantized cache policy '" +
-                                            policy + "'; falling back to none");
+                                             policy +
+                                             "'; falling back to none");
     parsed = runtime::cuda::native::DequantizedCachePolicy::kNone;
     policy = "none";
   }
@@ -1161,8 +1157,8 @@ void InferfluxCudaExecutor::ReleaseBatchScopedDequantizedCache() {
   // allocated for cuBLAS fallback (M>64 prefill) which is rare during decode.
   // The 3 stream syncs (~2-4ms) per batch were the root cause of c=1
   // throughput regression (81.7 → 50 tok/s).
-  const bool has_scratch = quantized_weight_map_ &&
-                           quantized_weight_map_->ScratchInUseBytes() > 0;
+  const bool has_scratch =
+      quantized_weight_map_ && quantized_weight_map_->ScratchInUseBytes() > 0;
 #else
   const bool has_scratch = true;
 #endif
@@ -1242,13 +1238,15 @@ void InferfluxCudaExecutor::DestroyLaneOverlapResourcesUnlocked() {
   prefill_lane_quantized_weight_map_.reset();
   if (d_decode_logits_) {
     if (cudaFree(d_decode_logits_) != cudaSuccess) {
-      log::Error("inferflux_cuda_executor", "cudaFree(d_decode_logits_) failed");
+      log::Error("inferflux_cuda_executor",
+                 "cudaFree(d_decode_logits_) failed");
     }
     d_decode_logits_ = nullptr;
   }
   if (d_prefill_logits_) {
     if (cudaFree(d_prefill_logits_) != cudaSuccess) {
-      log::Error("inferflux_cuda_executor", "cudaFree(d_prefill_logits_) failed");
+      log::Error("inferflux_cuda_executor",
+                 "cudaFree(d_prefill_logits_) failed");
     }
     d_prefill_logits_ = nullptr;
   }
@@ -1531,7 +1529,8 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
   }
   inference_dtype_ = want_bf16 ? InferenceDtype::kBF16 : InferenceDtype::kFP16;
 
-  const std::string &kv_precision_choice = bootstrap_config_.kv_precision_choice;
+  const std::string &kv_precision_choice =
+      bootstrap_config_.kv_precision_choice;
 
   if (kv_precision_choice == "auto") {
     kv_precision_ = want_bf16 ? runtime::cuda::native::KvPrecision::kBf16
@@ -1539,8 +1538,8 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
   } else if (!runtime::cuda::native::ParseKvPrecision(kv_precision_choice,
                                                       &kv_precision_)) {
     log::Warn("inferflux_cuda_executor", "Invalid KV precision '" +
-                                            kv_precision_choice +
-                                            "', falling back to auto");
+                                             kv_precision_choice +
+                                             "', falling back to auto");
     kv_precision_ = want_bf16 ? runtime::cuda::native::KvPrecision::kBf16
                               : runtime::cuda::native::KvPrecision::kFp16;
   }
@@ -1595,9 +1594,9 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
   constexpr int kMinKvBatch = 4;
   if (max_batch < kMinKvBatch) {
     log::Warn("inferflux_cuda_executor",
-              "KV max_batch=" + std::to_string(max_batch) +
-                  " < minimum (" + std::to_string(kMinKvBatch) +
-                  "), clamping to " + std::to_string(kMinKvBatch));
+              "KV max_batch=" + std::to_string(max_batch) + " < minimum (" +
+                  std::to_string(kMinKvBatch) + "), clamping to " +
+                  std::to_string(kMinKvBatch));
     max_batch = kMinKvBatch;
   }
   if (!bootstrap_config_.invalid_kv_max_seq.empty()) {
@@ -1716,7 +1715,7 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
     kv_cache_ = std::move(cache);
   }
   GlobalMetrics().SetInferfluxCudaKvCacheOccupancy(/*active_sequences=*/0,
-                                            /*max_sequences=*/max_batch);
+                                                   /*max_sequences=*/max_batch);
 
   // 2.5. Strategy selection (foundation layer for native quantized runtime).
   runtime::cuda::native::QuantizedRuntimeStrategyRegistry &registry =
@@ -1846,7 +1845,8 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
     }
     if (!model_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
                                     gemm_.get(), compute_stream_)) {
-      log::Error("inferflux_cuda_executor", "Failed to initialize forward pass");
+      log::Error("inferflux_cuda_executor",
+                 "Failed to initialize forward pass");
       return false;
     }
     model_forward_->SetExecutionPolicy(execution_policy_);
@@ -1972,7 +1972,7 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
 #endif
 
 bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
-                                     const LlamaBackendConfig &config) {
+                                      const LlamaBackendConfig &config) {
   log::Info("inferflux_cuda_executor",
             "Loading InferFlux CUDA model from: " + model_path.string());
   loaded_model_path_ = model_path;
@@ -2020,8 +2020,8 @@ bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
           std::string(overlap_enabled_ ? "enabled" : "disabled") +
           ", min_prefill_tokens=" + std::to_string(min_prefill_tokens_) +
           ", kv_dtype_hint=" + bootstrap_config_.kv_precision_choice +
-          ", dequant_cache_policy=" +
-          dequantized_cache_policy_hint_ + ", require_fused_quantized_matmul=" +
+          ", dequant_cache_policy=" + dequantized_cache_policy_hint_ +
+          ", require_fused_quantized_matmul=" +
           std::string(require_fused_quantized_matmul_ ? "true" : "false"));
 
   // Initialize CUDA
@@ -2086,7 +2086,7 @@ bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
     model_info_ = model_loader_->GetModelInfo();
     model_config_ = ConvertModelInfo(model_info_);
     log::Info("inferflux_cuda_executor", "Uploading model weights to GPU via " +
-                                            detected_format + " loader...");
+                                             detected_format + " loader...");
     if (!model_loader_->UploadToGPU(compute_stream_)) {
       log::Error("inferflux_cuda_executor",
                  "Failed to upload model weights via " + detected_format +
@@ -2211,17 +2211,11 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto &input = inputs[i];
     if (input.tokens.size() == 1 && input.request_logits) {
-      decode_group.push_back({static_cast<int>(i),
-                              input.request_id,
-                              input.client_request_id,
-                              input.tokens[0],
-                              input.n_past,
-                              input.sequence_id,
-                              input.sequence_generation,
-                              input.sampling.temperature,
-                              input.sampling.top_k,
-                              input.sampling.top_p,
-                              input.sampling.seed});
+      decode_group.push_back(
+          {static_cast<int>(i), input.request_id, input.client_request_id,
+           input.tokens[0], input.n_past, input.sequence_id,
+           input.sequence_generation, input.sampling.temperature,
+           input.sampling.top_k, input.sampling.top_p, input.sampling.seed});
     } else {
       prefill_indices.push_back(static_cast<int>(i));
     }
@@ -2296,25 +2290,23 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
           }
           const auto &entry = decode_group[offset + static_cast<size_t>(b)];
           const int token_id = sampled_tokens[b];
-          const std::string piece =
-              (tokenizer_ && token_id >= 0)
-                  ? tokenizer_->TokenToString(token_id)
-                  : std::string();
+          const std::string piece = (tokenizer_ && token_id >= 0)
+                                        ? tokenizer_->TokenToString(token_id)
+                                        : std::string();
           log::Info("inferflux_cuda_executor",
                     "decode_mapping[lane]: input_idx=" +
                         std::to_string(entry.input_idx) + ", " +
                         (entry.client_request_id.empty()
                              ? std::string()
-                             : "client_request_id=" +
-                                   entry.client_request_id + ", ") +
+                             : "client_request_id=" + entry.client_request_id +
+                                   ", ") +
                         "request_id=" + std::to_string(entry.request_id) +
-                        ", sequence_id=" +
-                        std::to_string(entry.sequence_id) +
+                        ", sequence_id=" + std::to_string(entry.sequence_id) +
                         ", sequence_generation=" +
                         std::to_string(entry.sequence_generation) +
-                        ", n_past=" +
-                        std::to_string(entry.n_past) + ", sampled_token=" +
-                        std::to_string(token_id) + ", piece=" + piece);
+                        ", n_past=" + std::to_string(entry.n_past) +
+                        ", sampled_token=" + std::to_string(token_id) +
+                        ", piece=" + piece);
         }
       }
 
@@ -2329,7 +2321,8 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
           output.token = token_id;
           output.piece = VisibleTokenPiece(tokenizer_.get(), token_id);
           if (!output.piece.empty()) {
-            perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+            perf_accum_.generated_tokens.fetch_add(1,
+                                                   std::memory_order_relaxed);
           }
         }
         output.ok = true;
@@ -2365,11 +2358,9 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
 
     if (input.request_logits) {
       const auto sample_start = std::chrono::steady_clock::now();
-      resources.sampler->EnqueueSample(resources.logits,
-                                       input.sampling.temperature,
-                                       input.sampling.top_k,
-                                       input.sampling.top_p,
-                                       input.sampling.seed);
+      resources.sampler->EnqueueSample(
+          resources.logits, input.sampling.temperature, input.sampling.top_k,
+          input.sampling.top_p, input.sampling.seed);
       const int token_id = resources.sampler->CollectSample();
       const auto sample_end = std::chrono::steady_clock::now();
       sample_ms_total +=
@@ -2378,9 +2369,8 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
       ++sampled_prefill_total;
       LogSampleMapping("sample_mapping[lane_prefill]", idx, input.request_id,
                        input.client_request_id, input.sequence_id,
-                       input.sequence_generation,
-                       input.n_past, token_count, token_id, tokenizer_.get(),
-                       execution_policy_);
+                       input.sequence_generation, input.n_past, token_count,
+                       token_id, tokenizer_.get(), execution_policy_);
 
       if (tokenizer_ && tokenizer_->IsTerminalGeneratedToken(token_id)) {
         output.token = -1;
@@ -2720,7 +2710,8 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!model_forward_) {
-    log::Warn("inferflux_cuda_executor", "InferFlux CUDA pipeline not initialized");
+    log::Warn("inferflux_cuda_executor",
+              "InferFlux CUDA pipeline not initialized");
     return {};
   }
 
@@ -2773,17 +2764,11 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto &input = inputs[i];
     if (input.tokens.size() == 1 && input.request_logits) {
-      decode_group.push_back({static_cast<int>(i),
-                              input.request_id,
-                              input.client_request_id,
-                              input.tokens[0],
-                              input.n_past,
-                              input.sequence_id,
-                              input.sequence_generation,
-                              input.sampling.temperature,
-                              input.sampling.top_k,
-                              input.sampling.top_p,
-                              input.sampling.seed});
+      decode_group.push_back(
+          {static_cast<int>(i), input.request_id, input.client_request_id,
+           input.tokens[0], input.n_past, input.sequence_id,
+           input.sequence_generation, input.sampling.temperature,
+           input.sampling.top_k, input.sampling.top_p, input.sampling.seed});
     } else {
       prefill_indices.push_back(static_cast<int>(i));
     }
@@ -2881,9 +2866,8 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
       if (model_forward_->GetBatchMetaDevice() &&
           model_forward_->GetMaxBatchSize() > 0) {
         cuda_kernel::DeviceTokenRelay(
-            sampler_->DeviceResultBatch(),
-            model_forward_->GetBatchMetaDevice(), B,
-            model_forward_->GetMaxBatchSize(), compute_stream_);
+            sampler_->DeviceResultBatch(), model_forward_->GetBatchMetaDevice(),
+            B, model_forward_->GetMaxBatchSize(), compute_stream_);
         decode_relay_active_ = true;
         decode_relay_batch_size_ = B;
       }
@@ -2892,12 +2876,11 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
       if (NativeLogitsDebugEnabled(execution_policy_)) {
         for (int b = 0; b < B; ++b) {
           const auto &entry = decode_group[offset + static_cast<size_t>(b)];
-          LogNativeTopLogits("primary",
-                             d_logits_ + b * model_config_.vocab_size,
-                             model_config_.vocab_size,
-                             entry.request_id, entry.client_request_id,
-                             entry.sequence_id, entry.sequence_generation,
-                             entry.n_past, execution_policy_);
+          LogNativeTopLogits(
+              "primary", d_logits_ + b * model_config_.vocab_size,
+              model_config_.vocab_size, entry.request_id,
+              entry.client_request_id, entry.sequence_id,
+              entry.sequence_generation, entry.n_past, execution_policy_);
         }
       }
 #endif
@@ -2912,25 +2895,23 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
           }
           const auto &entry = decode_group[offset + static_cast<size_t>(b)];
           const int token_id = sampled_tokens[b];
-          const std::string piece =
-              (tokenizer_ && token_id >= 0)
-                  ? tokenizer_->TokenToString(token_id)
-                  : std::string();
+          const std::string piece = (tokenizer_ && token_id >= 0)
+                                        ? tokenizer_->TokenToString(token_id)
+                                        : std::string();
           log::Info("inferflux_cuda_executor",
                     "decode_mapping[primary]: input_idx=" +
                         std::to_string(entry.input_idx) + ", " +
                         (entry.client_request_id.empty()
                              ? std::string()
-                             : "client_request_id=" +
-                                   entry.client_request_id + ", ") +
+                             : "client_request_id=" + entry.client_request_id +
+                                   ", ") +
                         "request_id=" + std::to_string(entry.request_id) +
-                        ", sequence_id=" +
-                        std::to_string(entry.sequence_id) +
+                        ", sequence_id=" + std::to_string(entry.sequence_id) +
                         ", sequence_generation=" +
                         std::to_string(entry.sequence_generation) +
-                        ", n_past=" +
-                        std::to_string(entry.n_past) + ", sampled_token=" +
-                        std::to_string(token_id) + ", piece=" + piece);
+                        ", n_past=" + std::to_string(entry.n_past) +
+                        ", sampled_token=" + std::to_string(token_id) +
+                        ", piece=" + piece);
         }
       }
 
@@ -2958,7 +2939,8 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
           outputs[entry.input_idx].piece =
               VisibleTokenPiece(tokenizer_.get(), token_id);
           if (!outputs[entry.input_idx].piece.empty()) {
-            perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+            perf_accum_.generated_tokens.fetch_add(1,
+                                                   std::memory_order_relaxed);
           }
         }
         outputs[entry.input_idx].ok = true;
@@ -2993,7 +2975,8 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         runtime::cuda::native::TracedCudaEventSynchronize(
             runtime::cuda::native::SyncTraceSite::kTimingForwardReady,
             forward_stop_);
-        GlobalMetrics().RecordInferfluxCudaForwardShape(is_decode, batch_tokens);
+        GlobalMetrics().RecordInferfluxCudaForwardShape(is_decode,
+                                                        batch_tokens);
         float fwd_ms = 0.0f;
         if (CheckCudaStatus(
                 cudaEventElapsedTime(&fwd_ms, forward_start_, forward_stop_),
@@ -3008,7 +2991,8 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         runtime::cuda::native::TracedCudaStreamSynchronize(
             runtime::cuda::native::SyncTraceSite::kPrefillForwardDrain,
             compute_stream_);
-        GlobalMetrics().RecordInferfluxCudaForwardShape(is_decode, batch_tokens);
+        GlobalMetrics().RecordInferfluxCudaForwardShape(is_decode,
+                                                        batch_tokens);
       }
       perf_accum_.prompt_tokens.fetch_add(batch_tokens,
                                           std::memory_order_relaxed);
@@ -3043,11 +3027,10 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
                               input.sampling.seed);
       int token_id = sampler_->CollectSample();
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-      LogNativeTopLogits("primary_prefill", d_logits_,
-                         model_config_.vocab_size, input.request_id,
-                         input.client_request_id, input.sequence_id,
-                         input.sequence_generation, input.n_past,
-                         execution_policy_);
+      LogNativeTopLogits("primary_prefill", d_logits_, model_config_.vocab_size,
+                         input.request_id, input.client_request_id,
+                         input.sequence_id, input.sequence_generation,
+                         input.n_past, execution_policy_);
 #endif
       if (record_prefill_timing) {
         cudaEventRecord(sampling_stop_, compute_stream_);
@@ -3074,11 +3057,11 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
           }
         }
         float samp_ms = 0.0f;
-        if (CheckCudaStatus(runtime::cuda::native::TracedCudaEventSynchronize(
-                                runtime::cuda::native::SyncTraceSite::
-                                    kTimingSamplingReady,
-                                sampling_stop_),
-                            "cudaEventSynchronize(sampling_stop_)") &&
+        if (CheckCudaStatus(
+                runtime::cuda::native::TracedCudaEventSynchronize(
+                    runtime::cuda::native::SyncTraceSite::kTimingSamplingReady,
+                    sampling_stop_),
+                "cudaEventSynchronize(sampling_stop_)") &&
             CheckCudaStatus(
                 cudaEventElapsedTime(&samp_ms, sampling_start_, sampling_stop_),
                 "cudaEventElapsedTime(sampling,prefill_logits)")) {
@@ -3098,9 +3081,8 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
       }
       LogSampleMapping("sample_mapping[primary_prefill]", idx, input.request_id,
                        input.client_request_id, input.sequence_id,
-                       input.sequence_generation,
-                       input.n_past, batch_tokens, token_id, tokenizer_.get(),
-                       execution_policy_);
+                       input.sequence_generation, input.n_past, batch_tokens,
+                       token_id, tokenizer_.get(), execution_policy_);
       output.ok = true;
     }
   }
@@ -3209,7 +3191,7 @@ bool InferfluxCudaExecutor::RunNativeInference(
 
 // CPU-only stubs for InferfluxCudaExecutor CUDA-dependent methods.
 bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &,
-                                     const LlamaBackendConfig &) {
+                                      const LlamaBackendConfig &) {
   log::Error("inferflux_cuda_executor", "CUDA not available");
   return false;
 }
@@ -3299,7 +3281,7 @@ bool InferfluxCudaExecutor::ShouldRecordTimingSample(
 }
 
 bool InferfluxCudaExecutor::ShouldRecordTimingSample(int sample_rate,
-                                                    int *counter) {
+                                                     int *counter) {
   if (sample_rate <= 0 || !counter) {
     return false;
   }
@@ -3371,10 +3353,9 @@ InferfluxCudaExecutor::NativeBeginFreeSequence(int sequence_id) {
     if (!stream) {
       return true;
     }
-    if (!CheckCudaStatus(cudaEventCreateWithFlags(event_out,
-                                                  cudaEventDisableTiming),
-                         std::string("cudaEventCreateWithFlags(") + label +
-                             ")")) {
+    if (!CheckCudaStatus(
+            cudaEventCreateWithFlags(event_out, cudaEventDisableTiming),
+            std::string("cudaEventCreateWithFlags(") + label + ")")) {
       return false;
     }
     if (!CheckCudaStatus(cudaEventRecord(*event_out, stream),
@@ -3444,8 +3425,8 @@ bool InferfluxCudaExecutor::NativePollFreeSequence(
     }
     log::Warn("inferflux_cuda_executor",
               "cudaEventQuery failed during sequence release poll: " +
-                  std::string(label) + " err=" +
-                  std::string(cudaGetErrorString(err)));
+                  std::string(label) +
+                  " err=" + std::string(cudaGetErrorString(err)));
     cudaGetLastError();
     return true;
   };
@@ -3506,7 +3487,7 @@ bool InferfluxCudaExecutor::NativePollFreeSequence(
 }
 
 void InferfluxCudaExecutor::NativeCopySequencePrefix(int src_seq, int dst_seq,
-                                                    int n_tokens) {
+                                                     int n_tokens) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!kv_cache_ || n_tokens <= 0 || src_seq < 0 || dst_seq < 0) {
     return;
@@ -3645,11 +3626,10 @@ int InferfluxCudaExecutor::CopyLastLogitsToHost(float *host_buf, int buf_size) {
 #endif
 }
 
-int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id,
-                                              int n_past_start,
-                                              int first_token_id, int n_tokens,
-                                              int eos_token_id,
-                                              std::vector<int> *out_tokens) {
+int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id, int n_past_start,
+                                             int first_token_id, int n_tokens,
+                                             int eos_token_id,
+                                             std::vector<int> *out_tokens) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!model_forward_ || !sampler_ || n_tokens <= 0) {
     return 0;
@@ -3688,7 +3668,7 @@ int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id,
 
   // First token: normal BatchForward (uploads metadata, captures/replays graph)
   bool fwd_ok = model_forward_->BatchForward(batch_tokens, batch_n_past,
-                                              batch_seq_ids, d_logits_, B);
+                                             batch_seq_ids, d_logits_, B);
   if (!fwd_ok) {
     cudaFree(d_token_buf);
     return 0;
@@ -3699,11 +3679,11 @@ int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id,
 
   // Accumulate + relay + EOS check — all on device
   cuda_kernel::AppendTokenToBuffer(sampler_->DeviceResultBatch(), d_token_buf,
-                                    0, compute_stream_);
-  cuda_kernel::DeviceTokenRelay(sampler_->DeviceResultBatch(), d_meta, B,
-                                 max_B, compute_stream_);
+                                   0, compute_stream_);
+  cuda_kernel::DeviceTokenRelay(sampler_->DeviceResultBatch(), d_meta, B, max_B,
+                                compute_stream_);
   cuda_kernel::DeviceCheckEos(sampler_->DeviceResultBatch(), B, eos_token_id,
-                               d_eos_flag_, compute_stream_);
+                              d_eos_flag_, compute_stream_);
 
   int tokens_generated = 1;
 
@@ -3714,12 +3694,12 @@ int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id,
       break;
     }
     sampler_->EnqueueGreedyArgmaxDeviceOnly(d_logits_, B);
-    cuda_kernel::AppendTokenToBuffer(sampler_->DeviceResultBatch(),
-                                      d_token_buf, t, compute_stream_);
+    cuda_kernel::AppendTokenToBuffer(sampler_->DeviceResultBatch(), d_token_buf,
+                                     t, compute_stream_);
     cuda_kernel::DeviceTokenRelay(sampler_->DeviceResultBatch(), d_meta, B,
-                                   max_B, compute_stream_);
+                                  max_B, compute_stream_);
     cuda_kernel::DeviceCheckEos(sampler_->DeviceResultBatch(), B, eos_token_id,
-                                 d_eos_flag_, compute_stream_);
+                                d_eos_flag_, compute_stream_);
     ++tokens_generated;
   }
 

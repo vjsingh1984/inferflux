@@ -87,8 +87,8 @@ struct ResponseFormatState {
   std::string schema;  // Raw JSON schema string (if provided).
   std::string grammar; // Resolved GBNF string.
   std::string root{"root"};
-  bool ready{false};     // True once grammar string compiled/resolved.
-  bool supported{true};  // Feature gate for capability checks.
+  bool ready{false};    // True once grammar string compiled/resolved.
+  bool supported{true}; // Feature gate for capability checks.
   std::string error;
   StructuredConstraint constraint;
 };

@@ -134,9 +134,7 @@ public:
   void SetBatchDequantCacheEnabled(bool enable) {
     batch_dequant_cache_enabled_ = enable;
   }
-  bool BatchDequantCacheEnabled() const {
-    return batch_dequant_cache_enabled_;
-  }
+  bool BatchDequantCacheEnabled() const { return batch_dequant_cache_enabled_; }
 
   // --- Raw quantized weight accessors (for fused dequant-GEMV) ---
 
@@ -168,7 +166,9 @@ public:
 
   std::size_t ScratchReservedBytes() const;
   std::size_t ScratchInUseBytes() const;
-  std::size_t ScratchHighWaterBytes() const { return scratch_high_water_bytes_; }
+  std::size_t ScratchHighWaterBytes() const {
+    return scratch_high_water_bytes_;
+  }
   bool HasScratchBuffer() const { return scratch_buffer_ != nullptr; }
   void ReleaseScratchBuffer();
 

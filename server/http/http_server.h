@@ -16,8 +16,8 @@
 #include "webui/ui_renderer.h"
 #endif
 
-#include <atomic>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <cstdint>
@@ -119,7 +119,8 @@ private:
   struct ClientSession {
     int fd{-1};
     SSL *ssl{nullptr};
-    bool keep_alive{false}; // Set to true after successful non-streaming response
+    bool keep_alive{
+        false}; // Set to true after successful non-streaming response
   };
 
   void Run();

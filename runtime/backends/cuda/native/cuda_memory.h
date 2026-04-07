@@ -13,8 +13,7 @@ namespace inferflux {
 
 /// RAII wrapper for cudaMalloc / cudaFree (device memory).
 /// Move-only.  Releases the allocation on destruction.
-template <typename T>
-class CudaDevicePtr {
+template <typename T> class CudaDevicePtr {
 public:
   CudaDevicePtr() = default;
   ~CudaDevicePtr() { reset(); }
@@ -88,8 +87,7 @@ private:
 };
 
 /// RAII wrapper for cudaMallocHost / cudaFreeHost (pinned host memory).
-template <typename T>
-class CudaPinnedPtr {
+template <typename T> class CudaPinnedPtr {
 public:
   CudaPinnedPtr() = default;
   ~CudaPinnedPtr() { reset(); }
@@ -117,7 +115,8 @@ public:
   static Result<CudaPinnedPtr> Alloc(std::size_t count) {
 #ifdef INFERFLUX_HAS_CUDA
     T *raw = nullptr;
-    auto err = cudaMallocHost(reinterpret_cast<void **>(&raw), count * sizeof(T));
+    auto err =
+        cudaMallocHost(reinterpret_cast<void **>(&raw), count * sizeof(T));
     if (err != cudaSuccess) {
       return Err(std::string("cudaMallocHost failed: ") +
                  cudaGetErrorString(err));

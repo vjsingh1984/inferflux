@@ -17,8 +17,7 @@ public:
   int CurrentLimit() const;
 
 private:
-  void EvictStaleLocked(
-      std::chrono::steady_clock::time_point now);
+  void EvictStaleLocked(std::chrono::steady_clock::time_point now);
 
   struct Entry {
     double tokens{0.0};

@@ -29,9 +29,9 @@ std::unique_ptr<DeviceBuffer> CudaDeviceContext::Allocate(std::size_t bytes) {
     void *ptr = nullptr;
     auto err = cudaMalloc(&ptr, bytes);
     if (err != cudaSuccess) {
-      log::Error("cuda_backend",
-                 std::string("cudaMalloc failed: ") +
-                     cudaGetErrorString(err) + "; falling back to host");
+      log::Error("cuda_backend", std::string("cudaMalloc failed: ") +
+                                     cudaGetErrorString(err) +
+                                     "; falling back to host");
     } else {
       return std::make_unique<DeviceBuffer>(ptr, bytes);
     }
