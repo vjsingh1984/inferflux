@@ -138,6 +138,7 @@ std::filesystem::path ResolveGgufPath(const std::filesystem::path &path) {
   return first_gguf;
 }
 
+#ifdef INFERFLUX_HAS_CUDA
 QuantizationType
 DetectQuantizationFromGgufMetadata(const std::filesystem::path &path) {
   const std::filesystem::path gguf_path = ResolveGgufPath(path);
@@ -261,6 +262,13 @@ DetectQuantizationFromGgufMetadata(const std::filesystem::path &path) {
   return f16_count >= f32_count ? QuantizationType::kFp16
                                 : QuantizationType::kFp32;
 }
+#else
+QuantizationType
+DetectQuantizationFromGgufMetadata(const std::filesystem::path &) {
+  // GGUF metadata parsing requires CUDA
+  return QuantizationType::kUnknown;
+}
+#endif
 
 std::uint64_t ScaleByPercent(std::uint64_t value, std::uint32_t percent) {
 #if defined(__SIZEOF_INT128__)

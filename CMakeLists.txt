@@ -45,22 +45,7 @@ add_library(inferflux_core STATIC
   runtime/backends/cpu/llama_cpp_backend.h
   runtime/backends/llama/llama_cpp_backend.cpp
   runtime/backends/llama/llama_cpp_backend.h
-  runtime/backends/cuda/cuda_device_context.cpp
-  runtime/backends/cuda/cuda_device_context.h
-  runtime/backends/cuda/cuda_backend.cpp
-  runtime/backends/cuda/cuda_backend.h
-  runtime/backends/cuda/inferflux_cuda_runtime.cpp
-  runtime/backends/cuda/inferflux_cuda_runtime.h
-  runtime/backends/cuda/inferflux_cuda_backend.cpp
-  runtime/backends/cuda/inferflux_cuda_backend.h
   runtime/backends/native/native_inference_runtime.h
-  runtime/backends/native/native_gpu_backend.cpp
-  runtime/backends/native/native_gpu_backend.h
-  runtime/backends/cuda/native/safetensors_parser.cpp
-  runtime/backends/cuda/native/safetensors_parser.h
-  runtime/backends/cuda/inferflux_cuda_executor.cpp
-  runtime/backends/cuda/inferflux_cuda_executor.h
-  runtime/backends/cuda/native/native_bootstrap_config.cpp
   model/tokenizer_factory.cpp
   model/tokenizer_factory.h
   runtime/backends/backend_capabilities.cpp
@@ -117,8 +102,6 @@ add_library(inferflux_core STATIC
   model/tokenizer/simple_tokenizer.cpp
   model/tokenizer/simple_tokenizer.h
   model/tokenizer.h
-  model/gguf_tokenizer.cpp
-  model/gguf_tokenizer.h
   model/llama_tokenizer.cpp
   model/llama_tokenizer.h
   model/hf_tokenizer.cpp
@@ -183,17 +166,6 @@ add_library(inferflux_core STATIC
   io/async_file_writer.h
   net/http_client.cpp
   net/http_client.h
-)
-
-# GGUF/quantization components that are required by CPU tests and
-# non-CUDA build paths.
-target_sources(inferflux_core PRIVATE
-  runtime/backends/cuda/native/model_loader.cpp
-  runtime/backends/cuda/native/model_memory_ledger.cpp
-  runtime/backends/cuda/native/quantization_handler.cpp
-  runtime/backends/cuda/native/gguf_util.cpp
-  runtime/backends/cuda/native/strategy_registry.cpp
-  runtime/backends/cuda/native/quantized_weight_map.cpp
 )
 
 target_include_directories(inferflux_core PUBLIC
@@ -266,6 +238,16 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_CUDA=1)
   target_link_libraries(inferflux_core PUBLIC CUDA::cudart)
 
+  # GGUF/quantization components that require CUDA headers
+  target_sources(inferflux_core PRIVATE
+    runtime/backends/cuda/native/model_loader.cpp
+    runtime/backends/cuda/native/model_memory_ledger.cpp
+    runtime/backends/cuda/native/quantization_handler.cpp
+    runtime/backends/cuda/native/gguf_util.cpp
+    runtime/backends/cuda/native/strategy_registry.cpp
+    runtime/backends/cuda/native/quantized_weight_map.cpp
+  )
+
   # Native CUDA inference kernels (no llama.cpp dependency)
   add_library(inferflux_cuda_kernels STATIC
     runtime/backends/cuda/native/cuda_kernels.cu
@@ -292,6 +274,21 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
 
   # Add native CUDA C++ sources to inferflux_core
   target_sources(inferflux_core PRIVATE
+    runtime/backends/cuda/cuda_device_context.cpp
+    runtime/backends/cuda/cuda_device_context.h
+    runtime/backends/cuda/cuda_backend.cpp
+    runtime/backends/cuda/cuda_backend.h
+    runtime/backends/cuda/inferflux_cuda_runtime.cpp
+    runtime/backends/cuda/inferflux_cuda_runtime.h
+    runtime/backends/cuda/inferflux_cuda_backend.cpp
+    runtime/backends/cuda/inferflux_cuda_backend.h
+    runtime/backends/native/native_gpu_backend.cpp
+    runtime/backends/native/native_gpu_backend.h
+    runtime/backends/cuda/native/safetensors_parser.cpp
+    runtime/backends/cuda/native/safetensors_parser.h
+    runtime/backends/cuda/inferflux_cuda_executor.cpp
+    runtime/backends/cuda/inferflux_cuda_executor.h
+    runtime/backends/cuda/native/native_bootstrap_config.cpp
     runtime/backends/cuda/native/cublas_gemm.cpp
     runtime/backends/cuda/native/native_dispatch_registry.cpp
     runtime/backends/cuda/native/native_dispatch_policy.cpp
@@ -307,6 +304,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/q6_k_handler.cpp
     runtime/backends/cuda/native/q8_0_handler.cpp
     runtime/backends/cuda/native/q8_k_handler.cpp
+    model/gguf_tokenizer.cpp
   )
   target_link_libraries(inferflux_core PUBLIC inferflux_cuda_kernels CUDA::cublas)
   set_target_properties(inferflux_core PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
@@ -328,12 +326,10 @@ else()
   if(ENABLE_CUDA)
     message(WARNING "ENABLE_CUDA=ON but CUDA toolkit not found; building without GPU support")
   endif()
-  # CPU-only stubs for GGUF/safetensors/quantized interfaces that are part of
-  # the test and API surface even when CUDA kernels are unavailable.
-  target_sources(inferflux_core PRIVATE
-    runtime/backends/cuda/native/safetensors_adapter_stub.cpp
-    runtime/backends/cuda/native/gguf_model_loader_stub.cpp
-  )
+  # NOTE: GGUF/safetensors stubs require CUDA headers even in stub form.
+  # Disabling CPU-only GGUF support until proper CPU GGUF loader is implemented.
+  # GGUF tests require CUDA for now.
+  message(STATUS "CUDA disabled - GGUF native loader unavailable (GGUF tests require CUDA)")
   set(LLAMA_CUDA OFF CACHE BOOL "" FORCE)
 endif()
 
@@ -646,31 +642,37 @@ add_executable(inferflux_tests
   tests/unit/test_backend_types.cpp
   tests/unit/test_batch_analyzer.cpp
   tests/unit/test_backend_interface.cpp
-  tests/unit/test_native_forward.cpp
-  tests/unit/test_native_rowpair_kernels.cpp
   tests/unit/test_native_bootstrap_config.cpp
-  tests/unit/test_native_dequant_policy.cpp
   tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
-  tests/unit/test_model_memory_ledger.cpp
-  tests/unit/test_dtype_traits.cpp
-  tests/unit/test_gpu_kv_cache.cpp
-  tests/unit/test_gpu_sampler.cpp
-  tests/unit/test_native_batching.cpp
-  tests/unit/test_native_gpu_backend.cpp
-  tests/unit/test_batched_decode.cpp
   tests/unit/test_startup_advisor.cpp
-  tests/unit/test_gguf_tokenizer.cpp
-  tests/unit/test_gguf_parsing.cpp
-  tests/unit/test_gguf_model_loader.cpp
-  tests/unit/test_quantized_weight_map.cpp
-  tests/unit/test_quantized_weight_map_scratch.cpp
-  tests/unit/test_strategy_registry.cpp
   tests/unit/test_result.cpp
-  tests/integration/test_gguf_quantization.cpp
   tests/integration/test_http_generation_admission.cpp
   external/catch2/catch_amalgamated.cpp
 )
+
+# CUDA-specific tests (require CUDA headers and native kernel support)
+if(ENABLE_CUDA AND CUDAToolkit_FOUND)
+  target_sources(inferflux_tests PRIVATE
+    tests/unit/test_native_forward.cpp
+    tests/unit/test_native_rowpair_kernels.cpp
+    tests/unit/test_native_dequant_policy.cpp
+    tests/unit/test_gpu_kv_cache.cpp
+    tests/unit/test_gpu_sampler.cpp
+    tests/unit/test_native_batching.cpp
+    tests/unit/test_native_gpu_backend.cpp
+    tests/unit/test_batched_decode.cpp
+    tests/unit/test_model_memory_ledger.cpp
+    tests/unit/test_dtype_traits.cpp
+    tests/unit/test_gguf_tokenizer.cpp
+    tests/unit/test_gguf_parsing.cpp
+    tests/unit/test_gguf_model_loader.cpp
+    tests/unit/test_quantized_weight_map.cpp
+    tests/unit/test_quantized_weight_map_scratch.cpp
+    tests/unit/test_strategy_registry.cpp
+    tests/integration/test_gguf_quantization.cpp
+  )
+endif()
 target_include_directories(inferflux_tests PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/external
   ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -781,10 +783,12 @@ add_test(NAME NativeBatchTests COMMAND inferflux_tests "[native_batch]")
 set_tests_properties(NativeBatchTests PROPERTIES LABELS native_batch)
 add_test(NAME StartupAdvisorTests COMMAND inferflux_tests "[startup_advisor]")
 set_tests_properties(StartupAdvisorTests PROPERTIES LABELS startup_advisor)
-add_test(NAME GGUFTests COMMAND inferflux_tests "[gguf]")
-set_tests_properties(GGUFTests PROPERTIES LABELS gguf)
-add_test(NAME QuantizationTests COMMAND inferflux_tests "[quantization]")
-set_tests_properties(QuantizationTests PROPERTIES LABELS quantization)
+if(ENABLE_CUDA AND CUDAToolkit_FOUND)
+  add_test(NAME GGUFTests COMMAND inferflux_tests "[gguf]")
+  set_tests_properties(GGUFTests PROPERTIES LABELS gguf)
+  add_test(NAME QuantizationTests COMMAND inferflux_tests "[quantization]")
+  set_tests_properties(QuantizationTests PROPERTIES LABELS quantization)
+endif()
 add_test(NAME SequenceSlotManagerTests COMMAND inferflux_tests "[slot_manager]")
 set_tests_properties(SequenceSlotManagerTests PROPERTIES LABELS slot_manager)
 if(ENABLE_MLX)

@@ -3,8 +3,17 @@
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/quantization_handler.h"
+
+#ifdef INFERFLUX_HAS_CUDA
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
+#else
+// Stub types for CPU-only builds
+struct half {
+  unsigned short x;
+};
+#endif
+
 #include <filesystem>
 #include <memory>
 #include <mutex>

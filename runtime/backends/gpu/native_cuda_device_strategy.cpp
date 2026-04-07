@@ -89,12 +89,16 @@ bool NativeCudaDeviceStrategy::NativeKernelsReady() {
 
 std::unique_ptr<NativeInferenceRuntime>
 NativeCudaDeviceStrategy::CreateRuntime() {
+#ifdef INFERFLUX_HAS_CUDA
   if (!native_ready_) {
     log::Error("native_cuda_strategy",
                "Cannot create runtime before Initialize()");
     return nullptr;
   }
   return CreateInferfluxCudaRuntime();
+#else
+  return nullptr;
+#endif
 }
 
 } // namespace inferflux
