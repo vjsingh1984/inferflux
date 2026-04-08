@@ -85,21 +85,43 @@ The CMake target `inferflux_core` links all modules into a single library consum
 **Request flow:** Client → `HttpServer` (multi-threaded, server/http/) → auth middleware (API-key SHA-256/OIDC RS256/rate-limiting in server/auth/) → guardrail enforcement (server/policy/) → `Scheduler` (scheduler/) → `BackendManager` (runtime/backends/) → llama.cpp backend. Responses stream back as SSE when `stream: true`.
 
 **Plugin interfaces** (pure-virtual C++ classes at key boundaries):
-- `PolicyBackend` (`policy/policy_backend.h`) — policy storage/enforcement. Implemented by `PolicyStore` (encrypted INI). HttpServer depends on the interface, not the concrete store.
-- `ModelRouter` (`scheduler/model_router.h`) — multi-model serving (list, load, unload, resolve). Implemented by `SingleModelRouter` with backend provider tracking (native vs universal), format routing (gguf/safetensors/hf), and capability-based fallback.
-- `DeviceContext` (`runtime/device_context.h`) — hardware abstraction. Implemented by `CPUDeviceContext`.
-- `RequestBatch` (`scheduler/request_batch.h`) — per-request state and batch grouping for continuous batching. Interface only.
+```
+Interface                  Location                              Implementations
+─────────────────────────  ────────────────────────────────────  ─────────────────────────
+PolicyBackend              policy/policy_backend.h               PolicyStore (encrypted INI)
+ModelRouter                scheduler/model_router.h              SingleModelRouter
+DeviceContext              runtime/device_context.h              CPUDeviceContext, CudaDeviceContext
+IAuthenticator             server/auth/authenticator.h           ApiKeyAuth, OIDCValidator
+IBatchSelectionPolicy      scheduler/batch_selection_policy.h    PriorityAge, LpmPriority, ThroughputBalanced
+IGGUFParser                runtime/core/gguf/igguf_parser.h      CpuGgufParser
+IQuantizationDetector      server/quantization_detection.h       CpuQuantizationDetector
+```
 
 **Key modules:**
 - `runtime/` — Device abstraction (`DeviceContext`), paged KV cache with LRU/Clock eviction and host-RAM secondary tier, radix prefix cache for KV reuse, speculative decoding (draft + validator, partially integrated), disk offload via async file writer (io/), crash diagnostics with signal handler and breadcrumbs
-- `runtime/backends/` — Backend factory with native/universal provider paths, CUDA phase overlap and flash attention tuning, backend exposure policy with capability-based routing
+- `runtime/backends/` — Backend factory (registry-based, no concrete backend includes), native/universal provider paths, CUDA phase overlap and flash attention tuning, backend exposure policy with capability-based routing
+- `runtime/core/gguf/` — CPU-only GGUF parser (`IGGUFParser` / `CpuGgufParser`) and executor interfaces, decoupled from CUDA
 - `model/` — GGUF loader (via llama.cpp submodule in external/), tokenizer, model format auto-detection (`model_format.cpp` supports gguf/safetensors/hf with HuggingFace URI resolution)
-- `scheduler/` — Scheduler with granular lock ordering (queue, model-selection, sequence-retirement, eviction), fairness-aware batch construction, decode-worker pools for disaggregated deployments, `ModelRouter` with multi-model serving and backend provider tracking
+- `scheduler/` — Scheduler with granular lock ordering (queue, model-selection, sequence-retirement, eviction), pluggable batch selection policy (`IBatchSelectionPolicy`), fairness-aware batch construction, decode-worker pools for disaggregated deployments, `ModelRouter` with multi-model serving and backend provider tracking
 - `server/` — Multi-threaded HTTP server (thread pool), auth (API-key, OIDC, rate limiter), metrics (Prometheus /metrics), audit logging, guardrails, health probes (/healthz, /readyz, /livez)
 - `policy/` — `PolicyBackend` interface, `PolicyStore` (encrypted INI with AES-GCM via OpenSSL), OPA client
 - `cli/` — `inferctl` client (chat, completion, admin commands) using shared `HttpClient` and nlohmann/json
 - `net/` — Shared `HttpClient` (Get/Post/Put/Delete/SendRaw)
 - `config/` — `server.yaml` (primary config), `policy_store.conf` (encrypted policy persistence)
+
+**InferenceRequest structure** (`scheduler/request_batch.h`):
+```
+InferenceRequest
+├── id, model, prompt, max_tokens, priority, ...   (core request fields)
+├── response_format: ResponseFormatState            (structured output / grammar)
+│   └── has_format, type, schema, grammar, root, ready, supported, error, constraint
+├── execution: ExecutionState                       (step-wise batch pause/resume)
+│   └── initialized, active, tokens_generated, decode_limit, current_token, ...
+├── fairness: FairnessState                         (timeslice / preemption accounting)
+│   └── priority_level, service_tokens, timeslice_tokens, remaining_decode_tokens, ...
+├── sampling: SamplingParams                        (temperature, top_p, penalties, ...)
+└── (phase, tokens, timing, cancellation, KV state, logprobs, stop sequences)
+```
 
 **Tech debt tracker:** `docs/TechDebt_and_Competitive_Roadmap.md` — consult at session start for priorities.
 

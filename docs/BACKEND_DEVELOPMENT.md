@@ -166,20 +166,34 @@ BackendCapabilities TensorRtBackend::ReportCapabilities() const {
 } // namespace inferflux
 ```
 
-### Step 3: Register via BackendRegistry
+### Step 3: Self-Register via BackendRegistry
+
+Backends self-register using a static initializer in their `.cpp` file.
+`BackendFactory` discovers them via the registry — no need to add includes
+or creation logic to `backend_factory.cpp`.
 
 ```cpp
-// In backend_factory.cpp or a dedicated registration file:
+// runtime/backends/tensorrt/tensorrt_backend.cpp
 #include "runtime/backends/backend_registry.h"
 #include "runtime/backends/tensorrt/tensorrt_backend.h"
 
-// Register as a native provider for CUDA targets:
-BackendRegistry::Instance().Register(
-    LlamaBackendTarget::kCuda, BackendProvider::kNative,
-    []() -> std::shared_ptr<BackendInterface> {
-      return std::make_shared<TensorRtBackend>();
-    });
+namespace inferflux {
+
+// Self-registration: runs at static-init time, before main().
+// BackendFactory::Create("cuda") finds this via BackendRegistry::Has().
+#ifdef INFERFLUX_HAS_TENSORRT
+static const bool kRegistered =
+    (BackendRegistry::Instance().Register(
+         LlamaBackendTarget::kCuda, BackendProvider::kNative,
+         [] { return std::make_shared<TensorRtBackend>(); }),
+     true);
+#endif
+
+} // namespace inferflux
 ```
+
+> **Note:** `BackendFactory` contains zero concrete backend `#include` directives.
+> All backend creation flows through `BackendRegistry`. This is enforced by design.
 
 ### Step 4: Add to CMakeLists.txt
 
