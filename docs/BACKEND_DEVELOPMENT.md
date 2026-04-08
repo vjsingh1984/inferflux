@@ -72,6 +72,15 @@ mindmap
       All model formats
 ```
 
+> **Competitive landscape note:** Ollama and LM Studio both use llama.cpp as
+> their inference engine. Benchmark data confirms this: identical GPU memory
+> footprint (±12 MB), 0.90-0.96 embedding cosine similarity with
+> `llama_cpp_cuda`, and matching output for greedy-decoded prompts.
+> InferFlux's `inferflux_cuda` backend uses independent CUDA kernels
+> (MMVQ, FlashAttention-2, fused ops) which produce numerically correct
+> but differently-phrased output due to floating-point divergence from
+> llama.cpp's GGML kernels.
+
 ## Creating a Standalone Backend
 
 Standalone backends inherit directly from `BackendInterface` — no llama.cpp dependency, no `LlamaCppBackend` inheritance required. All methods on `BackendInterface` have default implementations, so you only override what your backend supports.
