@@ -29,7 +29,7 @@ TEST_CASE("NativeBootstrapConfig: uses hinted KV precision and default sizing",
   REQUIRE_FALSE(config.kv_max_seq_overridden);
   REQUIRE(config.kv_auto_tune);
   REQUIRE(config.kv_budget_bytes == 0);
-  REQUIRE(config.kv_budget_ratio == Catch::Approx(0.30));
+  REQUIRE(config.kv_budget_ratio == Catch::Approx(0.20));
 }
 
 TEST_CASE(
@@ -54,7 +54,7 @@ TEST_CASE(
   REQUIRE_FALSE(config.kv_auto_tune);
   REQUIRE(config.kv_budget_bytes ==
           static_cast<std::size_t>(256) * 1024U * 1024U);
-  REQUIRE(config.kv_budget_ratio == Catch::Approx(0.30));
+  REQUIRE(config.kv_budget_ratio == Catch::Approx(0.20));
   REQUIRE(config.invalid_kv_free_mem_ratio == "bad");
 }
 

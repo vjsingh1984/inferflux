@@ -13,7 +13,7 @@ struct NativeBootstrapConfig {
   bool kv_max_seq_overridden{false};
   bool kv_auto_tune{true};
   std::size_t kv_budget_bytes{0};
-  double kv_budget_ratio{0.30};
+  double kv_budget_ratio{0.20};
   std::string invalid_kv_max_batch;
   std::string invalid_kv_max_seq;
   std::string invalid_kv_budget_mb;

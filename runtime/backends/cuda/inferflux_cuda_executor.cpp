@@ -2949,6 +2949,15 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
   }
 
   // === Prefill group (sequential, variable lengths) ===
+  // Clear KV cache slots for new prefill requests (n_past==0) to prevent
+  // stale data from a prior sequence occupant from corrupting attention.
+  for (int idx : prefill_indices) {
+    const auto &pi = inputs[idx];
+    if (pi.n_past == 0 && pi.sequence_id >= 0 && kv_cache_) {
+      kv_cache_->ClearSequenceAsync(pi.sequence_id, compute_stream_);
+    }
+  }
+
   for (int idx : prefill_indices) {
     const auto &input = inputs[idx];
     UnifiedBatchOutput &output = outputs[idx];

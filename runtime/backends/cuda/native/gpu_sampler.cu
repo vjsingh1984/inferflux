@@ -16,6 +16,37 @@ namespace inferflux {
 // Kernels
 // ============================================================================
 
+// Repetition penalty: for each token in recent_ids, apply multiplicative
+// repetition penalty and additive frequency/presence penalties to its logit.
+// Matches llama.cpp llama_sampler_penalties behavior.
+__global__ void RepetitionPenaltyKernel(float *__restrict__ logits,
+                                        const int *__restrict__ recent_ids,
+                                        const int *__restrict__ freq_counts,
+                                        int num_recent, int vocab_size,
+                                        float rep_penalty, float freq_penalty,
+                                        float pres_penalty) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_recent)
+    return;
+  int token_id = recent_ids[idx];
+  if (token_id < 0 || token_id >= vocab_size)
+    return;
+  float logit = logits[token_id];
+  // Multiplicative repetition penalty
+  if (logit > 0.0f) {
+    logit /= rep_penalty;
+  } else {
+    logit *= rep_penalty;
+  }
+  // Additive frequency and presence penalties
+  int count = freq_counts[idx];
+  logit -= freq_penalty * static_cast<float>(count);
+  if (count > 0) {
+    logit -= pres_penalty;
+  }
+  logits[token_id] = logit;
+}
+
 // Temperature scaling: logits /= temperature
 __global__ void TemperatureScaleKernel(float *__restrict__ logits,
                                        int vocab_size, float temperature) {
@@ -755,6 +786,41 @@ void GpuSampler::EnqueueGreedyArgmaxDeviceOnly(const float *d_logits,
   BatchedArgmaxKernel<<<B, threads, smem, stream_>>>(d_logits, d_result_batch_,
                                                       vocab_size_, B);
   // No D2H memcpy, no event record — result stays on device only.
+}
+
+void GpuSampler::ApplyPenalties(float *d_logits,
+                                const std::vector<int> &recent_ids,
+                                const std::vector<int> &freq_counts,
+                                float repetition_penalty,
+                                float frequency_penalty,
+                                float presence_penalty) {
+  if (recent_ids.empty() ||
+      (repetition_penalty == 1.0f && frequency_penalty == 0.0f &&
+       presence_penalty == 0.0f)) {
+    return; // No penalties to apply
+  }
+  const int n = static_cast<int>(recent_ids.size());
+
+  // Upload recent token IDs and frequency counts to device
+  int *d_recent = nullptr;
+  int *d_freq = nullptr;
+  cudaMalloc(&d_recent, n * sizeof(int));
+  cudaMalloc(&d_freq, n * sizeof(int));
+  cudaMemcpyAsync(d_recent, recent_ids.data(), n * sizeof(int),
+                  cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(d_freq, freq_counts.data(), n * sizeof(int),
+                  cudaMemcpyHostToDevice, stream_);
+
+  int threads = 256;
+  int blocks = (n + threads - 1) / threads;
+  RepetitionPenaltyKernel<<<blocks, threads, 0, stream_>>>(
+      d_logits, d_recent, d_freq, n, vocab_size_, repetition_penalty,
+      frequency_penalty, presence_penalty);
+
+  // Synchronize before freeing temp buffers
+  cudaStreamSynchronize(stream_);
+  cudaFree(d_recent);
+  cudaFree(d_freq);
 }
 
 void GpuSampler::CopyLogitsToHost(const float *d_logits, float *host_buf) {

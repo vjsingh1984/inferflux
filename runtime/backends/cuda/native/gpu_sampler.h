@@ -47,6 +47,14 @@ public:
                      float top_p, uint32_t seed = UINT32_MAX);
   int CollectSample();
 
+  /// Apply repetition/frequency/presence penalties to logits in-place on
+  /// device. Must be called BEFORE EnqueueSample/Sample. The recent_ids and
+  /// freq_counts arrays are host vectors; they are copied to device internally.
+  void ApplyPenalties(float *d_logits, const std::vector<int> &recent_ids,
+                      const std::vector<int> &freq_counts,
+                      float repetition_penalty, float frequency_penalty,
+                      float presence_penalty);
+
   /**
    * Copy last-position logits from device to a host buffer.
    * The caller must provide a buffer of at least vocab_size floats.
