@@ -1384,6 +1384,7 @@ results_dir = sys.argv[1]
 concurrency_levels = [int(x) for x in sys.argv[2].split(',')]
 backends = ["llama_cpp_cuda", "inferflux_cuda"]
 
+# ── Word-level metrics ──────────────────────────────────────────────────────
 def tokenize(text):
     return re.findall(r'\w+', text.lower())
 
@@ -1397,10 +1398,46 @@ def overlap(a, b):
     total = len(sa) + len(sb)
     return 2.0 * len(sa & sb) / total if total else 1.0
 
+# ── Embedding-based semantic similarity ─────────────────────────────────────
+# Uses sentence-transformers (local, no API calls) for cosine similarity
+# between completion pairs.  Falls back gracefully if unavailable.
+embed_model = None
+try:
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    _model_name = os.environ.get(
+        "BENCH_EMBED_MODEL", "all-MiniLM-L6-v2")
+    embed_model = SentenceTransformer(_model_name)
+    print(f"[similarity] Loaded embedding model: {_model_name}")
+except Exception as e:
+    print(f"[similarity] sentence-transformers unavailable ({e}); "
+          "skipping semantic similarity")
+
+def cosine_sim(a_vec, b_vec):
+    dot = float(np.dot(a_vec, b_vec))
+    norm = float(np.linalg.norm(a_vec) * np.linalg.norm(b_vec))
+    return dot / norm if norm > 0 else 0.0
+
+def batch_semantic_similarity(texts_a, texts_b):
+    """Compute pairwise cosine similarity using sentence embeddings."""
+    if embed_model is None or not texts_a:
+        return []
+    emb_a = embed_model.encode(texts_a, show_progress_bar=False,
+                                normalize_embeddings=True)
+    emb_b = embed_model.encode(texts_b, show_progress_bar=False,
+                                normalize_embeddings=True)
+    return [cosine_sim(emb_a[i], emb_b[i]) for i in range(len(texts_a))]
+
+# ── Per-backend quality check against ALL other backends ────────────────────
+# Collects all responses so we can do NxN pairwise comparison, not just 2.
+all_backends = ["inferflux_cuda", "llama_cpp_cuda", "ollama", "lmstudio",
+                "vllm", "sglang"]
+
 for concurrency in concurrency_levels:
     responses = {}
-    for backend in backends:
-        resp_dir = os.path.join(results_dir, f"responses_{backend}", f"c{concurrency}")
+    for backend in all_backends:
+        resp_dir = os.path.join(results_dir, f"responses_{backend}",
+                                f"c{concurrency}")
         if not os.path.isdir(resp_dir):
             continue
         responses[backend] = {}
@@ -1409,17 +1446,19 @@ for concurrency in concurrency_levels:
                 continue
             try:
                 idx = int(name.split("_")[1].split(".")[0])
-                with open(os.path.join(resp_dir, name), "r", encoding="utf-8") as f:
+                with open(os.path.join(resp_dir, name), "r",
+                          encoding="utf-8") as f:
                     data = json.load(f)
                 responses[backend][idx] = data.get("text", "")
             except Exception:
                 continue
 
-    if len(responses) < 2:
+    # Primary comparison: inferflux_cuda vs llama_cpp_cuda
+    lhs_name, rhs_name = backends[0], backends[1]
+    if lhs_name not in responses or rhs_name not in responses:
         continue
-
-    lhs = responses[backends[0]]
-    rhs = responses[backends[1]]
+    lhs = responses[lhs_name]
+    rhs = responses[rhs_name]
     common = sorted(set(lhs.keys()) & set(rhs.keys()))
     if not common:
         continue
@@ -1427,6 +1466,8 @@ for concurrency in concurrency_levels:
     exact = 0
     jaccards = []
     overlaps = []
+    texts_a = []
+    texts_b = []
     for idx in common:
         ta, tb = lhs[idx], rhs[idx]
         if ta == tb:
@@ -1435,6 +1476,12 @@ for concurrency in concurrency_levels:
         toks_b = tokenize(tb)
         jaccards.append(jaccard(toks_a, toks_b))
         overlaps.append(overlap(toks_a, toks_b))
+        texts_a.append(ta)
+        texts_b.append(tb)
+
+    # Semantic similarity via sentence embeddings
+    sem_sims = batch_semantic_similarity(texts_a, texts_b)
+    mean_semantic = (sum(sem_sims) / len(sem_sims)) if sem_sims else None
 
     comp = {
         "concurrency": concurrency,
@@ -1444,13 +1491,42 @@ for concurrency in concurrency_levels:
         "mean_jaccard": sum(jaccards) / len(jaccards),
         "mean_overlap": sum(overlaps) / len(overlaps),
     }
+    if mean_semantic is not None:
+        comp["mean_semantic_similarity"] = round(mean_semantic, 4)
+        comp["per_request_semantic"] = [round(s, 4) for s in sem_sims]
+
+    # Pairwise semantic similarity across all available backends
+    available = [b for b in all_backends if b in responses]
+    pairwise = {}
+    if embed_model and len(available) >= 2:
+        for i, ba in enumerate(available):
+            for bb in available[i+1:]:
+                pair_common = sorted(
+                    set(responses[ba].keys()) & set(responses[bb].keys()))
+                if not pair_common:
+                    continue
+                pa = [responses[ba][idx] for idx in pair_common]
+                pb = [responses[bb][idx] for idx in pair_common]
+                sims = batch_semantic_similarity(pa, pb)
+                if sims:
+                    key = f"{ba}_vs_{bb}"
+                    pairwise[key] = {
+                        "mean": round(sum(sims) / len(sims), 4),
+                        "min": round(min(sims), 4),
+                        "max": round(max(sims), 4),
+                        "n": len(sims),
+                    }
+        comp["pairwise_semantic"] = pairwise
 
     sim_path = os.path.join(results_dir, f"similarity_c{concurrency}.json")
     with open(sim_path, "w", encoding="utf-8") as f:
         json.dump(comp, f, indent=2)
 
-    for backend, peer in ((backends[0], backends[1]), (backends[1], backends[0])):
-        stats_path = os.path.join(results_dir, f"stats_{backend}_c{concurrency}.json")
+    # Patch per-backend stats files
+    for backend, peer in ((backends[0], backends[1]),
+                          (backends[1], backends[0])):
+        stats_path = os.path.join(results_dir,
+                                  f"stats_{backend}_c{concurrency}.json")
         if not os.path.exists(stats_path):
             continue
         with open(stats_path, "r", encoding="utf-8") as f:
@@ -1460,6 +1536,9 @@ for concurrency in concurrency_levels:
         stats["exact_match_rate"] = comp["exact_match_rate"]
         stats["mean_jaccard"] = comp["mean_jaccard"]
         stats["mean_overlap"] = comp["mean_overlap"]
+        if mean_semantic is not None:
+            stats["mean_semantic_similarity"] = comp[
+                "mean_semantic_similarity"]
         with open(stats_path, "w", encoding="utf-8") as f:
             json.dump(stats, f, indent=2)
 PYEOF
@@ -1888,18 +1967,85 @@ for backend in backends:
         print()
 
 print()
-print("Similarity (inferflux_cuda vs llama_cpp_cuda):")
-print("-" * 60)
+print("Semantic Similarity (embedding cosine, all backend pairs):")
+print("-" * 80)
 for c in sorted([int(x) for x in concurrency_levels]):
     sim_file = os.path.join(output_dir, f"similarity_c{c}.json")
     if not os.path.exists(sim_file):
         continue
     with open(sim_file) as f:
         sim = json.load(f)
-    print(f"c={c:<2} exact={sim.get('exact_match_rate', 0.0):.3f}  "
-          f"jaccard={sim.get('mean_jaccard', 0.0):.3f}  "
-          f"overlap={sim.get('mean_overlap', 0.0):.3f}  "
-          f"compared={sim.get('num_compared', 0)}")
+    pairwise = sim.get("pairwise_semantic", {})
+    if pairwise:
+        print(f"c={c}:")
+        for pair, vals in sorted(pairwise.items()):
+            label = pair.replace("_vs_", " vs ")
+            mean = vals["mean"]
+            grade = "HIGH" if mean >= 0.75 else "MED" if mean >= 0.50 else "LOW"
+            bar = "#" * int(mean * 20)
+            print(f"  {label:<40s} {mean:.3f} [{bar:<20s}] {grade}")
+    else:
+        # Fallback to word-level metrics
+        print(f"c={c:<2} jaccard={sim.get('mean_jaccard', 0.0):.3f}  "
+              f"overlap={sim.get('mean_overlap', 0.0):.3f}  "
+              f"compared={sim.get('num_compared', 0)}")
+
+# ── 3-Dimension Evaluation Summary ─────────────────────────────────────────
+print()
+print("3-Dimension Evaluation Summary")
+print("=" * 90)
+print(f"{'Backend':<20} {'Throughput':>10} {'Scaling':>10} {'Semantic':>10} "
+      f"{'GPU Peak':>10} {'Mem Eff':>10} {'Score':>10}")
+print(f"{'':20} {'(tok/s c=8)':>10} {'(c8/c1)':>10} {'(vs ref)':>10} "
+      f"{'(MB)':>10} {'(tok/MB)':>10} {'(0-100)':>10}")
+print("-" * 90)
+
+# Collect c=8 (or max concurrency) stats and semantic scores
+max_c = max([int(x) for x in concurrency_levels])
+ref_backend = "llama_cpp_cuda"
+sim_file = os.path.join(output_dir, f"similarity_c{max_c}.json")
+pairwise = {}
+if os.path.exists(sim_file):
+    with open(sim_file) as f:
+        pairwise = json.load(f).get("pairwise_semantic", {})
+
+for backend in backends:
+    if max_c not in results[backend]:
+        continue
+    r_max = results[backend][max_c]
+    r_1 = results[backend].get(1, {})
+    tps_max = r_max.get("tok_per_sec", 0)
+    tps_1 = r_1.get("tok_per_sec", 1)
+    scaling = tps_max / tps_1 if tps_1 > 0 else 0
+    mem = r_max.get("gpu_mem_peak_mb", 1)
+    mem_eff = tps_max / (mem / 1000.0) if mem > 0 else 0
+
+    # Find semantic similarity vs reference backend
+    sem = 1.0  # ref vs itself
+    if backend != ref_backend:
+        pair_key = f"{min(backend, ref_backend)}_vs_{max(backend, ref_backend)}"
+        alt_key = f"{max(backend, ref_backend)}_vs_{min(backend, ref_backend)}"
+        sem_data = pairwise.get(pair_key, pairwise.get(alt_key, {}))
+        sem = sem_data.get("mean", 0.0)
+
+    # Composite score: 40% throughput + 30% quality + 30% memory efficiency
+    # Normalize each dimension to 0-1 range (will be relative)
+    score_parts = {"tps": tps_max, "sem": sem, "mem_eff": mem_eff,
+                   "scaling": scaling}
+    results[backend]["_score_parts"] = score_parts
+    print(f"{backend:<20} {tps_max:>10.1f} {scaling:>10.2f}x "
+          f"{sem:>10.3f} {mem:>10.0f} {mem_eff:>10.1f} ", end="")
+
+    # Weighted composite (normalized later)
+    raw_score = 0.4 * min(tps_max / 200.0, 1.0) + \
+                0.3 * sem + \
+                0.3 * min(mem_eff / 40.0, 1.0)
+    print(f"{raw_score * 100:>10.1f}")
+
+print()
+print("Score weights: 40% throughput (tok/s@max_c, cap 200), "
+      "30% semantic quality (cosine vs llama_cpp), "
+      "30% memory efficiency (tok/s per GB, cap 40)")
 
 PYEOF
 }
