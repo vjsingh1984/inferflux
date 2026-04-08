@@ -8,13 +8,13 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
-#include "runtime/backends/cuda/native/kernels/quant_common.cuh"
 #include "runtime/backends/cuda/native/kernels/fused_dequant_gemv.cuh"
+#include "runtime/backends/cuda/native/kernels/quant_common.cuh"
 
 #include <algorithm>
 #include <chrono>
-#include <vector>
 #include <random>
+#include <vector>
 
 namespace inferflux {
 namespace runtime {
@@ -26,9 +26,9 @@ namespace test {
 // Test Configuration
 // =============================================================================
 
-constexpr int K = 2048;           // Input dimension (hidden size)
-constexpr int N = 4096;           // Output dimension (intermediate size)
-constexpr int QK_K = 256;         // Q4_K block size
+constexpr int K = 2048;   // Input dimension (hidden size)
+constexpr int N = 4096;   // Output dimension (intermediate size)
+constexpr int QK_K = 256; // Q4_K block size
 
 // =============================================================================
 // Utility Functions
@@ -45,8 +45,8 @@ void PrintTestInfo(const std::string &test_name, int M, int N, int K) {
 
 void CheckCudaError(cudaError_t err, const char *file, int line) {
   if (err != cudaSuccess) {
-    std::cerr << "CUDA error at " << file << ":" << line
-              << ": " << cudaGetErrorString(err) << "\n";
+    std::cerr << "CUDA error at " << file << ":" << line << ": "
+              << cudaGetErrorString(err) << "\n";
     throw std::runtime_error(cudaGetErrorString(err));
   }
 }
@@ -74,10 +74,11 @@ std::vector<half> RunBaselineKernel(int M, int N, int K,
   CHECK_CUDA(cudaMalloc(&d_output, output.size() * sizeof(half)));
 
   // Copy data to device
-  CHECK_CUDA(cudaMemcpy(d_weight, weight.data(), weight.size() * sizeof(block_q4_k),
-                       cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_weight, weight.data(),
+                        weight.size() * sizeof(block_q4_k),
+                        cudaMemcpyHostToDevice));
   CHECK_CUDA(cudaMemcpy(d_x, x.data(), x.size() * sizeof(half),
-                       cudaMemcpyHostToDevice));
+                        cudaMemcpyHostToDevice));
 
   // Configure kernel launch
   const int nwarps = kGemvWarpsPerBlock;
@@ -90,13 +91,14 @@ std::vector<half> RunBaselineKernel(int M, int N, int K,
   size_t smem_size = K * sizeof(float);
 
   // Launch kernel
-  fused_dequant_gemv_q4k<<<grid, block, smem_size>>>(d_weight, d_x, d_output, N, K);
+  fused_dequant_gemv_q4k<<<grid, block, smem_size>>>(d_weight, d_x, d_output, N,
+                                                     K);
   CHECK_CUDA(cudaGetLastError());
   CHECK_CUDA(cudaDeviceSynchronize());
 
   // Copy result back
   CHECK_CUDA(cudaMemcpy(output.data(), d_output, output.size() * sizeof(half),
-                       cudaMemcpyDeviceToHost));
+                        cudaMemcpyDeviceToHost));
 
   // Cleanup
   CHECK_CUDA(cudaFree(d_weight));
@@ -115,8 +117,8 @@ std::vector<half> RunBaselineKernel(int M, int N, int K,
  */
 template <int BatchSize>
 std::vector<half> RunBatchKernel(int M, int N, int K,
-                                  const std::vector<block_q4_k> &weight,
-                                  const std::vector<half> &x) {
+                                 const std::vector<block_q4_k> &weight,
+                                 const std::vector<half> &x) {
   std::vector<half> output(M * N);
 
   // Allocate device memory
@@ -127,10 +129,11 @@ std::vector<half> RunBatchKernel(int M, int N, int K,
   CHECK_CUDA(cudaMalloc(&d_output, output.size() * sizeof(half)));
 
   // Copy data to device
-  CHECK_CUDA(cudaMemcpy(d_weight, weight.data(), weight.size() * sizeof(block_q4_k),
-                       cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_weight, weight.data(),
+                        weight.size() * sizeof(block_q4_k),
+                        cudaMemcpyHostToDevice));
   CHECK_CUDA(cudaMemcpy(d_x, x.data(), x.size() * sizeof(half),
-                       cudaMemcpyHostToDevice));
+                        cudaMemcpyHostToDevice));
 
   // Configure kernel launch
   const int nwarps = kGemvWarpsPerBlock;
@@ -143,14 +146,14 @@ std::vector<half> RunBatchKernel(int M, int N, int K,
   size_t smem_size = K * sizeof(float);
 
   // Launch batch kernel
-  fused_dequant_gemv_q4k_batched<BatchSize><<<grid, block, smem_size>>>(
-      d_weight, d_x, d_output, N, K);
+  fused_dequant_gemv_q4k_batched<BatchSize>
+      <<<grid, block, smem_size>>>(d_weight, d_x, d_output, N, K);
   CHECK_CUDA(cudaGetLastError());
   CHECK_CUDA(cudaDeviceSynchronize());
 
   // Copy result back
   CHECK_CUDA(cudaMemcpy(output.data(), d_output, output.size() * sizeof(half),
-                       cudaMemcpyDeviceToHost));
+                        cudaMemcpyDeviceToHost));
 
   // Cleanup
   CHECK_CUDA(cudaFree(d_weight));
@@ -172,9 +175,9 @@ std::vector<block_q4_k> GenerateRandomQ4KWeights(int N, int K) {
 
   std::random_device rd;
   std::mt19937 gen(rd());
-  std::uniform_int_distribution<> d_dist(0, 255);  // 8-bit delta scale
-  std::uniform_int_distribution<> m_dist(0, 255);  // 8-bit delta min
-  std::uniform_int_distribution<> q_dist(0, 15);   // 4-bit quantized
+  std::uniform_int_distribution<> d_dist(0, 255); // 8-bit delta scale
+  std::uniform_int_distribution<> m_dist(0, 255); // 8-bit delta min
+  std::uniform_int_distribution<> q_dist(0, 15);  // 4-bit quantized
 
   for (auto &block : weight) {
     // Delta-scale and delta-min as half2 (but we use half for simplicity)
@@ -224,15 +227,15 @@ std::vector<half> GenerateRandomActivations(int M, int K) {
  * Compare two output vectors with tolerance
  */
 bool CompareOutputs(const std::vector<half> &output1,
-                    const std::vector<half> &output2,
-                    float tolerance = 1e-3f) {
+                    const std::vector<half> &output2, float tolerance = 1e-3f) {
   if (output1.size() != output2.size()) {
-    std::cerr << "Size mismatch: " << output1.size() << " vs " << output2.size() << "\n";
+    std::cerr << "Size mismatch: " << output1.size() << " vs " << output2.size()
+              << "\n";
     return false;
   }
 
   int mismatches = 0;
-  const int max_mismatches = 10;  // Only report first 10
+  const int max_mismatches = 10; // Only report first 10
 
   for (size_t i = 0; i < output1.size(); ++i) {
     float v1 = __half2float(output1[i]);
@@ -241,8 +244,7 @@ bool CompareOutputs(const std::vector<half> &output1,
 
     if (diff > tolerance) {
       if (mismatches < max_mismatches) {
-        std::cerr << "Mismatch at index " << i
-                  << ": " << v1 << " vs " << v2
+        std::cerr << "Mismatch at index " << i << ": " << v1 << " vs " << v2
                   << " (diff=" << diff << ")\n";
       }
       mismatches++;
@@ -254,7 +256,8 @@ bool CompareOutputs(const std::vector<half> &output1,
   }
 
   if (mismatches > 0) {
-    std::cerr << "Total mismatches: " << mismatches << " / " << output1.size() << "\n";
+    std::cerr << "Total mismatches: " << mismatches << " / " << output1.size()
+              << "\n";
     return false;
   }
 
@@ -359,7 +362,7 @@ float MeasureKernelTime(KernelFunc kernel_func, int iterations = 10) {
   auto end = std::chrono::high_resolution_clock::now();
 
   std::chrono::duration<float, std::milli> diff = end - start;
-  return diff.count() / iterations;  // Average time in ms
+  return diff.count() / iterations; // Average time in ms
 }
 
 TEST(BatchGEMVKernelTest, Performance_BaselineVsBatch) {
@@ -387,10 +390,11 @@ TEST(BatchGEMVKernelTest, Performance_BaselineVsBatch) {
     CHECK_CUDA(cudaMalloc(&d_output_batch, M * N * sizeof(half)));
 
     // Copy data once
-    CHECK_CUDA(cudaMemcpy(d_weight, weight.data(), weight.size() * sizeof(block_q4_k),
-                         cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_weight, weight.data(),
+                          weight.size() * sizeof(block_q4_k),
+                          cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_x, x.data(), x.size() * sizeof(half),
-                         cudaMemcpyHostToDevice));
+                          cudaMemcpyHostToDevice));
 
     // Configure kernel
     const int nwarps = kGemvWarpsPerBlock;
@@ -413,24 +417,24 @@ TEST(BatchGEMVKernelTest, Performance_BaselineVsBatch) {
     // Measure batch kernel
     auto batch_kernel = [&]() {
       switch (M) {
-        case 1:
-          fused_dequant_gemv_q4k_batched<1><<<grid, block, smem_size>>>(
-              d_weight, d_x, d_output_batch, N, K);
-          break;
-        case 2:
-          fused_dequant_gemv_q4k_batched<2><<<grid, block, smem_size>>>(
-              d_weight, d_x, d_output_batch, N, K);
-          break;
-        case 4:
-          fused_dequant_gemv_q4k_batched<4><<<grid, block, smem_size>>>(
-              d_weight, d_x, d_output_batch, N, K);
-          break;
-        case 8:
-          fused_dequant_gemv_q4k_batched<8><<<grid, block, smem_size>>>(
-              d_weight, d_x, d_output_batch, N, K);
-          break;
-        default:
-          GTEST_FAIL() << "Unsupported batch size";
+      case 1:
+        fused_dequant_gemv_q4k_batched<1>
+            <<<grid, block, smem_size>>>(d_weight, d_x, d_output_batch, N, K);
+        break;
+      case 2:
+        fused_dequant_gemv_q4k_batched<2>
+            <<<grid, block, smem_size>>>(d_weight, d_x, d_output_batch, N, K);
+        break;
+      case 4:
+        fused_dequant_gemv_q4k_batched<4>
+            <<<grid, block, smem_size>>>(d_weight, d_x, d_output_batch, N, K);
+        break;
+      case 8:
+        fused_dequant_gemv_q4k_batched<8>
+            <<<grid, block, smem_size>>>(d_weight, d_x, d_output_batch, N, K);
+        break;
+      default:
+        GTEST_FAIL() << "Unsupported batch size";
       }
       CHECK_CUDA(cudaGetLastError());
       CHECK_CUDA(cudaDeviceSynchronize());
@@ -446,7 +450,8 @@ TEST(BatchGEMVKernelTest, Performance_BaselineVsBatch) {
     std::cout << "  Baseline: " << baseline_time << " ms\n";
     std::cout << "  Batched:  " << batch_time << " ms\n";
     std::cout << "  Speedup:  " << speedup << "x\n";
-    std::cout << "  Change:   " << (improvement >= 0 ? "+" : "") << improvement << "%\n";
+    std::cout << "  Change:   " << (improvement >= 0 ? "+" : "") << improvement
+              << "%\n";
     std::cout << "\n";
 
     // Cleanup

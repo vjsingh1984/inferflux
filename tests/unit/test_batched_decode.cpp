@@ -29,8 +29,7 @@ template <typename T> T *AllocDevice(size_t count) {
   return d;
 }
 
-template <typename T>
-std::vector<T> FromDevice(const T *d, size_t count) {
+template <typename T> std::vector<T> FromDevice(const T *d, size_t count) {
   std::vector<T> host(count);
   REQUIRE(cudaMemcpy(host.data(), d, count * sizeof(T),
                      cudaMemcpyDeviceToHost) == cudaSuccess);
@@ -121,10 +120,9 @@ TEST_CASE("BatchedRoPE matches sequential RoPE per-sequence",
   half *d_k_batch = ToDevice(h_k);
   int *d_n_past = ToDevice(h_n_past);
 
-  REQUIRE(cuda_kernel::BatchedRoPE<half>(d_q_batch, d_k_batch, B, num_heads,
-                                          num_kv_heads, head_dim, d_n_past,
-                                          freq_base, nullptr,
-                                          rope_type) == cudaSuccess);
+  REQUIRE(cuda_kernel::BatchedRoPE<half>(
+              d_q_batch, d_k_batch, B, num_heads, num_kv_heads, head_dim,
+              d_n_past, freq_base, nullptr, rope_type) == cudaSuccess);
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
   auto batch_q = FromDevice(d_q_batch, B * q_per_seq);
@@ -132,17 +130,14 @@ TEST_CASE("BatchedRoPE matches sequential RoPE per-sequence",
 
   // --- Sequential path (per-sequence RoPE) ---
   for (int b = 0; b < B; ++b) {
-    half *d_q_seq = ToDevice(
-        std::vector<half>(h_q.begin() + b * q_per_seq,
-                          h_q.begin() + (b + 1) * q_per_seq));
-    half *d_k_seq = ToDevice(
-        std::vector<half>(h_k.begin() + b * k_per_seq,
-                          h_k.begin() + (b + 1) * k_per_seq));
+    half *d_q_seq = ToDevice(std::vector<half>(
+        h_q.begin() + b * q_per_seq, h_q.begin() + (b + 1) * q_per_seq));
+    half *d_k_seq = ToDevice(std::vector<half>(
+        h_k.begin() + b * k_per_seq, h_k.begin() + (b + 1) * k_per_seq));
 
-    REQUIRE(cuda_kernel::RoPE<half>(d_q_seq, d_k_seq, 1, num_heads,
-                                     num_kv_heads, head_dim, h_n_past[b],
-                                     freq_base, nullptr,
-                                     rope_type) == cudaSuccess);
+    REQUIRE(cuda_kernel::RoPE<half>(
+                d_q_seq, d_k_seq, 1, num_heads, num_kv_heads, head_dim,
+                h_n_past[b], freq_base, nullptr, rope_type) == cudaSuccess);
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
     auto seq_q = FromDevice(d_q_seq, q_per_seq);
@@ -202,9 +197,8 @@ TEST_CASE("BatchedKvAppend scatters to correct destinations",
   REQUIRE(cudaMemcpy(d_v_dst, h_v_dst_ptrs.data(), B * sizeof(half *),
                      cudaMemcpyHostToDevice) == cudaSuccess);
 
-  cudaError_t err = cuda_kernel::BatchedKvAppend<half>(d_k, d_v, d_k_dst,
-                                                        d_v_dst, B, kv_dim,
-                                                        nullptr);
+  cudaError_t err = cuda_kernel::BatchedKvAppend<half>(
+      d_k, d_v, d_k_dst, d_v_dst, B, kv_dim, nullptr);
   REQUIRE(err == cudaSuccess);
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
@@ -377,7 +371,7 @@ TEST_CASE("KvCache batch pointer computation is consistent with Append",
 
   KvCacheGpuTyped<half> cache;
   REQUIRE(cache.Allocate(num_layers, num_kv_heads, head_dim, max_seq_len,
-                          max_batch));
+                         max_batch));
 
   // Write known data at specific positions using Append
   auto k_data = MakeRandom(kv_dim, 1.0f);
@@ -398,7 +392,7 @@ TEST_CASE("KvCache batch pointer computation is consistent with Append",
   std::vector<int> n_past = {pos};
   half *h_k_ptr = nullptr, *h_v_ptr = nullptr;
   cache.GetBatchAppendPtrs(layer, seq_ids.data(), n_past.data(), 1, &h_k_ptr,
-                            &h_v_ptr);
+                           &h_v_ptr);
 
   // The append pointer should point exactly where we wrote data
   auto readback = FromDevice(h_k_ptr, kv_dim);
@@ -449,7 +443,7 @@ TEST_CASE("Batched decode pipeline runs without CUDA errors",
   for (int b = 0; b < B; ++b) {
     for (int pos = 0; pos < h_n_past[b]; ++pos) {
       REQUIRE(cache.Append(0, h_seq_ids[b], pos, 1, d_kv_fill, d_kv_fill,
-                            nullptr) == cudaSuccess);
+                           nullptr) == cudaSuccess);
     }
   }
   cudaFree(d_kv_fill);
@@ -487,8 +481,8 @@ TEST_CASE("Batched decode pipeline runs without CUDA errors",
   // Step 1: BatchedRoPE
   {
     cudaError_t err = cuda_kernel::BatchedRoPE<half>(
-        d_q, d_k_new, B, num_heads, num_kv_heads, head_dim, d_n_past,
-        freq_base, nullptr, 0);
+        d_q, d_k_new, B, num_heads, num_kv_heads, head_dim, d_n_past, freq_base,
+        nullptr, 0);
     INFO("BatchedRoPE launch: " << cudaGetErrorString(err));
     REQUIRE(err == cudaSuccess);
     err = cudaDeviceSynchronize();
@@ -512,9 +506,9 @@ TEST_CASE("Batched decode pipeline runs without CUDA errors",
   // Step 3: FlashDecodeMultiSeqStrided
   {
     cudaError_t err = cuda_kernel::FlashDecodeMultiSeqStrided<half>(
-        d_q, cache.Buffer(), d_attn_out, d_seq_ids, d_kv_lens, 0, B,
-        num_heads, num_kv_heads, head_dim, cache.SlotStride(),
-        cache.LayerStride(), cache.KvStride(), scale, nullptr);
+        d_q, cache.Buffer(), d_attn_out, d_seq_ids, d_kv_lens, 0, B, num_heads,
+        num_kv_heads, head_dim, cache.SlotStride(), cache.LayerStride(),
+        cache.KvStride(), scale, nullptr);
     INFO("FlashDecodeMultiSeqStrided launch: " << cudaGetErrorString(err));
     REQUIRE(err == cudaSuccess);
     err = cudaDeviceSynchronize();
@@ -531,7 +525,6 @@ TEST_CASE("Batched decode pipeline runs without CUDA errors",
         ++nonzero;
     }
     CHECK(nonzero > 0);
-
   }
 
   cudaFree(d_q);

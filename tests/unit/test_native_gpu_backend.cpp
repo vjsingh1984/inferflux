@@ -78,7 +78,9 @@ public:
   GpuDeviceInfo GetDeviceInfo() const override {
     return {"fake-gpu", "sm_fake", 1024, 0, true, "fa2"};
   }
-  LlamaBackendTarget Target() const override { return LlamaBackendTarget::kCuda; }
+  LlamaBackendTarget Target() const override {
+    return LlamaBackendTarget::kCuda;
+  }
   void RecordMetrics(const LlamaBackendConfig &config) override {
     (void)config;
   }
@@ -86,11 +88,14 @@ public:
 
 class FakeNativeRuntime final : public NativeInferenceRuntime {
 public:
-  explicit FakeNativeRuntime(FakeTokenizer *tokenizer) : tokenizer_(tokenizer) {}
+  explicit FakeNativeRuntime(FakeTokenizer *tokenizer)
+      : tokenizer_(tokenizer) {}
 
   std::string Name() const override { return "inferflux_cuda"; }
   bool IsFallback() const override { return false; }
-  const std::string &FallbackReason() const override { return fallback_reason_; }
+  const std::string &FallbackReason() const override {
+    return fallback_reason_;
+  }
 
   bool LoadModel(const std::filesystem::path &model_path,
                  const LlamaBackendConfig &config) override {
@@ -107,8 +112,8 @@ public:
     for (std::size_t i = 0; i < inputs.size(); ++i) {
       outputs[i].ok = true;
       if (standard_index_ < static_cast<int>(standard_tokens_.size())) {
-        outputs[i].token = standard_tokens_[static_cast<std::size_t>(
-            standard_index_++)];
+        outputs[i].token =
+            standard_tokens_[static_cast<std::size_t>(standard_index_++)];
         outputs[i].piece =
             tokenizer_ ? tokenizer_->TokenToString(outputs[i].token) : "";
       } else {
@@ -156,8 +161,7 @@ public:
     if (!burst_enabled_) {
       return 0;
     }
-    const int remaining =
-        static_cast<int>(burst_tokens_.size()) - burst_index_;
+    const int remaining = static_cast<int>(burst_tokens_.size()) - burst_index_;
     const int take = std::max(0, std::min(n_tokens, remaining));
     for (int i = 0; i < take; ++i) {
       out_tokens->push_back(
@@ -230,8 +234,8 @@ TEST_CASE("NativeGpuBackend Decode uses burst path for eligible greedy decode",
   backend.SetupSampler("", "root", greedy);
 
   const std::string output =
-      backend.Decode(/*n_past=*/1, /*sequence_id=*/7, /*max_tokens=*/3, {},
-                     {}, /*logprob_top_n=*/0, nullptr,
+      backend.Decode(/*n_past=*/1, /*sequence_id=*/7, /*max_tokens=*/3, {}, {},
+                     /*logprob_top_n=*/0, nullptr,
                      /*first_token=*/10, {});
 
   REQUIRE(output == "ABC");

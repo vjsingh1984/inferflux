@@ -1,5 +1,5 @@
-#include <catch2/catch_amalgamated.hpp>
 #include "server/diagnostics/crash_handler.h"
+#include <catch2/catch_amalgamated.hpp>
 
 using namespace inferflux::diagnostics;
 

@@ -6,7 +6,8 @@
 //                      --model <path> --prompt <text>
 //                      [--max-tokens N] [--ctx-size N] [--gpu-layers N]
 //
-// Output: JSON with kernel_launches count and per-phase timing (when available).
+// Output: JSON with kernel_launches count and per-phase timing (when
+// available).
 
 #include "runtime/backends/cuda/cuda_backend.h"
 #include "runtime/backends/cuda/inferflux_cuda_backend.h"
@@ -65,27 +66,33 @@ bool ParseArgs(int argc, char **argv, Options *out) {
     };
     if (arg == "--backend") {
       const char *v = require_value("--backend");
-      if (!v) return false;
+      if (!v)
+        return false;
       out->backend = v;
     } else if (arg == "--model") {
       const char *v = require_value("--model");
-      if (!v) return false;
+      if (!v)
+        return false;
       out->model_path = v;
     } else if (arg == "--prompt") {
       const char *v = require_value("--prompt");
-      if (!v) return false;
+      if (!v)
+        return false;
       out->prompt = std::string(v);
     } else if (arg == "--max-tokens") {
       const char *v = require_value("--max-tokens");
-      if (!v) return false;
+      if (!v)
+        return false;
       out->max_tokens = std::stoi(v);
     } else if (arg == "--ctx-size") {
       const char *v = require_value("--ctx-size");
-      if (!v) return false;
+      if (!v)
+        return false;
       out->ctx_size = std::stoi(v);
     } else if (arg == "--gpu-layers") {
       const char *v = require_value("--gpu-layers");
-      if (!v) return false;
+      if (!v)
+        return false;
       out->gpu_layers = std::stoi(v);
     } else if (arg == "--help" || arg == "-h") {
       PrintUsage(argv[0]);
@@ -109,9 +116,9 @@ struct KernelCounter {
   CUpti_SubscriberHandle subscriber{nullptr};
 
   static void CUPTIAPI Callback(void *userdata, CUpti_CallbackDomain domain,
-                                CUpti_CallbackId cbid,
-                                const void *cbdata) {
-    if (domain != CUPTI_CB_DOMAIN_RUNTIME_API) return;
+                                CUpti_CallbackId cbid, const void *cbdata) {
+    if (domain != CUPTI_CB_DOMAIN_RUNTIME_API)
+      return;
     auto *data = static_cast<const CUpti_CallbackData *>(cbdata);
     // Count on entry to cudaLaunchKernel
     if (cbid == CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000 &&
@@ -237,8 +244,7 @@ int Run(const Options &options) {
       {"cupti_available", cupti_ok},
   };
 
-  if (auto *native =
-          dynamic_cast<InferfluxCudaBackend *>(backend.get())) {
+  if (auto *native = dynamic_cast<InferfluxCudaBackend *>(backend.get())) {
     payload["executor_kind"] = native->ExecutorKind();
     payload["is_fallback"] = native->IsFallbackExecutor();
   }
@@ -263,9 +269,9 @@ int main(int argc, char **argv) {
               << std::endl;
     return 1;
   } catch (...) {
-    std::cout << nlohmann::json{{"ok", false}, {"error", "unknown exception"}}
-                     .dump(2)
-              << std::endl;
+    std::cout
+        << nlohmann::json{{"ok", false}, {"error", "unknown exception"}}.dump(2)
+        << std::endl;
     return 1;
   }
 }

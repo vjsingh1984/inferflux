@@ -13,12 +13,11 @@ TEST_CASE("ModelMemoryLedger aggregates startup allocations by domain",
   ledger.SetModelLabel("qwen2.5-3b");
   ledger.UpsertItem("weights.loader", MemoryDomain::kWeights,
                     MemoryLifetime::kModel, 1024, 1024);
-  ledger.UpsertItem("workspace.forward.primary",
-                    MemoryDomain::kWorkspaceDevice, MemoryLifetime::kModel,
-                    512, 512);
+  ledger.UpsertItem("workspace.forward.primary", MemoryDomain::kWorkspaceDevice,
+                    MemoryLifetime::kModel, 512, 512);
   ledger.UpsertItem("workspace.forward.primary.host",
-                    MemoryDomain::kWorkspaceHostPinned,
-                    MemoryLifetime::kModel, 128, 128);
+                    MemoryDomain::kWorkspaceHostPinned, MemoryLifetime::kModel,
+                    128, 128);
   ledger.UpsertItem("kv_cache.primary", MemoryDomain::kKvCache,
                     MemoryLifetime::kPool, 2048, 1536, 2048);
 
@@ -47,12 +46,10 @@ TEST_CASE("ModelMemoryLedger aggregates startup allocations by domain",
 TEST_CASE("ModelMemoryLedger upsert replaces item state",
           "[model_memory_ledger]") {
   ModelMemoryLedger ledger;
-  ledger.UpsertItem("workspace.logits.primary",
-                    MemoryDomain::kWorkspaceDevice, MemoryLifetime::kModel, 64,
-                    64);
-  ledger.UpsertItem("workspace.logits.primary",
-                    MemoryDomain::kWorkspaceDevice, MemoryLifetime::kModel, 96,
-                    80, 112);
+  ledger.UpsertItem("workspace.logits.primary", MemoryDomain::kWorkspaceDevice,
+                    MemoryLifetime::kModel, 64, 64);
+  ledger.UpsertItem("workspace.logits.primary", MemoryDomain::kWorkspaceDevice,
+                    MemoryLifetime::kModel, 96, 80, 112);
 
   REQUIRE(ledger.TotalReservedBytes() == 96);
   REQUIRE(ledger.TotalInUseBytes() == 80);

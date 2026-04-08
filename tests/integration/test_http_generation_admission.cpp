@@ -132,8 +132,7 @@ std::unique_ptr<Scheduler> MakeScheduler(SimpleTokenizer &tokenizer) {
       16, 1024, PagedKVCache::EvictionPolicy::kLRU);
   DisaggregatedConfig disagg_config;
   disagg_config.decode_pool_size = 1;
-  disagg_config.kv_transport =
-      std::make_shared<disaggregated::KVChannel>(8);
+  disagg_config.kv_transport = std::make_shared<disaggregated::KVChannel>(8);
   return std::make_unique<Scheduler>(tokenizer, device, cache, nullptr, nullptr,
                                      nullptr, FairnessConfig{}, disagg_config);
 }
@@ -143,8 +142,8 @@ std::unique_ptr<Scheduler> MakeScheduler(SimpleTokenizer &tokenizer) {
 TEST_CASE("HTTP generation admission fails closed on degraded distributed KV "
           "transport",
           "[http_server][integration][admission]") {
-  ScopedEnvVar fail_closed(
-      "INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED", "true");
+  ScopedEnvVar fail_closed("INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED",
+                           "true");
 
   SimpleTokenizer tokenizer;
   auto scheduler = MakeScheduler(tokenizer);
@@ -157,13 +156,14 @@ TEST_CASE("HTTP generation admission fails closed on degraded distributed KV "
   server.SetModelReady(true);
   server.Start();
 
-  REQUIRE(WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
+  REQUIRE(
+      WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
 
   inferflux::HttpClient client;
   REQUIRE(WaitForCondition([&]() {
     try {
-      auto resp = client.Get("http://127.0.0.1:" + std::to_string(port) +
-                             "/livez");
+      auto resp =
+          client.Get("http://127.0.0.1:" + std::to_string(port) + "/livez");
       return resp.status == 200;
     } catch (...) {
       return false;

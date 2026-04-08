@@ -1,5 +1,5 @@
-#include "runtime/prefix_cache/radix_prefix_cache.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
+#include "runtime/prefix_cache/radix_prefix_cache.h"
 
 #include <catch2/catch_amalgamated.hpp>
 
@@ -121,9 +121,8 @@ TEST_CASE("RadixPrefixCache: memory snapshot reports unique retained blocks",
   RadixPrefixCache cache(paged_kv, [](int) {}, RadixPrefixCacheLimits{64, 12});
 
   cache.Insert({1, 2, 3}, {10}, 1001, nullptr);
-  cache.Insert(
-      {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17},
-      {10, 20}, 1002, nullptr);
+  cache.Insert({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17},
+               {10, 20}, 1002, nullptr);
 
   const auto snapshot = cache.MemorySnapshot();
   REQUIRE(snapshot.unique_retained_blocks == 2);

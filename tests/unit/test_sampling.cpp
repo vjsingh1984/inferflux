@@ -300,8 +300,8 @@ TEST_CASE("ComputeLogprob produces valid log-softmax for sampled token",
   // log-softmax of the max logit should be negative and close to 0.
   REQUIRE(tlp.token == "tok2");
   REQUIRE(tlp.logprob < 0.0f);
-  REQUIRE(tlp.logprob > -1.0f); // 5.0 is strongly dominant
-  REQUIRE(tlp.bytes.size() == 4); // "tok2" = 4 bytes
+  REQUIRE(tlp.logprob > -1.0f);      // 5.0 is strongly dominant
+  REQUIRE(tlp.bytes.size() == 4);    // "tok2" = 4 bytes
   REQUIRE(tlp.top_logprobs.empty()); // top_n=0 means no alternatives
 }
 

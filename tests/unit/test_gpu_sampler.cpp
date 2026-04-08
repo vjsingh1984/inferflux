@@ -201,8 +201,9 @@ TEST_CASE("GpuSampler: Stochastic sample returns valid token",
   cudaStreamDestroy(stream);
 }
 
-TEST_CASE("GpuSampler: Batched stochastic sampling preserves per-sequence seeds",
-          "[gpu_sampler][cuda]") {
+TEST_CASE(
+    "GpuSampler: Batched stochastic sampling preserves per-sequence seeds",
+    "[gpu_sampler][cuda]") {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
   if (device_count == 0) {
@@ -243,9 +244,8 @@ TEST_CASE("GpuSampler: Batched stochastic sampling preserves per-sequence seeds"
 
   REQUIRE(batch_tokens.size() == batch_size);
   for (int i = 0; i < batch_size; ++i) {
-    const int single =
-        single_sampler.Sample(d_logits + i * vocab_size, temps[i], top_ks[i],
-                              top_ps[i], seeds[i]);
+    const int single = single_sampler.Sample(
+        d_logits + i * vocab_size, temps[i], top_ks[i], top_ps[i], seeds[i]);
     REQUIRE(batch_tokens[i] == single);
   }
 

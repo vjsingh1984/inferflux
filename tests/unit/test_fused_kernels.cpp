@@ -39,8 +39,8 @@
   do {                                                                         \
     cudaError_t err__ = (call);                                                \
     if (err__ != cudaSuccess) {                                                \
-      FAIL("CUDA error at " << __FILE__ << ":" << __LINE__ << ": "            \
-                             << cudaGetErrorString(err__));                     \
+      FAIL("CUDA error at " << __FILE__ << ":" << __LINE__ << ": "             \
+                            << cudaGetErrorString(err__));                     \
     }                                                                          \
   } while (0)
 
@@ -90,8 +90,8 @@ void FillRandomHalfRange(std::vector<half> &buf, std::mt19937 &rng, float lo,
     v = __float2half(dist(rng));
 }
 
-void FillRandomQ4KBlocks(
-    std::vector<runtime::cuda::native::block_q4_k> &buf, std::mt19937 &rng) {
+void FillRandomQ4KBlocks(std::vector<runtime::cuda::native::block_q4_k> &buf,
+                         std::mt19937 &rng) {
   std::uniform_real_distribution<float> scale_dist(0.002f, 0.05f);
   std::uniform_int_distribution<int> byte_dist(0, 255);
   std::uniform_int_distribution<int> scale_byte_dist(0, 63);
@@ -107,8 +107,8 @@ void FillRandomQ4KBlocks(
   }
 }
 
-void FillRandomQ81Blocks(
-    std::vector<runtime::cuda::native::block_q8_1> &buf, std::mt19937 &rng) {
+void FillRandomQ81Blocks(std::vector<runtime::cuda::native::block_q8_1> &buf,
+                         std::mt19937 &rng) {
   std::uniform_real_distribution<float> scale_dist(0.002f, 0.05f);
   std::uniform_int_distribution<int> q_dist(-127, 127);
   for (auto &block : buf) {
@@ -216,10 +216,10 @@ TEST_CASE("FusedResidualAddRmsNorm matches unfused ResidualAdd + RmsNorm",
   d_w.Upload(h_w);
 
   CUDA_CHECK(cuda_kernel::ResidualAdd<half>(d_ru.ptr, d_in.ptr, kN, s));
-  CUDA_CHECK(cuda_kernel::RmsNorm<half>(d_ru.ptr, d_w.ptr, d_ou.ptr, kR, kH,
-                                         kEps, s));
+  CUDA_CHECK(
+      cuda_kernel::RmsNorm<half>(d_ru.ptr, d_w.ptr, d_ou.ptr, kR, kH, kEps, s));
   CUDA_CHECK(cuda_kernel::ResidualAddRmsNorm<half>(d_rf.ptr, d_in.ptr, d_w.ptr,
-                                                    d_of.ptr, kR, kH, kEps, s));
+                                                   d_of.ptr, kR, kH, kEps, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
 
   REQUIRE(MaxAbsDiffHalf(d_ru.ptr, d_rf.ptr, kN) < kTol);
@@ -252,10 +252,10 @@ TEST_CASE("FusedResidualAddRmsNorm parity with single-row input",
   d_w.Upload(h_w);
 
   CUDA_CHECK(cuda_kernel::ResidualAdd<half>(d_ru.ptr, d_in.ptr, kN, s));
-  CUDA_CHECK(cuda_kernel::RmsNorm<half>(d_ru.ptr, d_w.ptr, d_ou.ptr, kR, kH,
-                                         kEps, s));
+  CUDA_CHECK(
+      cuda_kernel::RmsNorm<half>(d_ru.ptr, d_w.ptr, d_ou.ptr, kR, kH, kEps, s));
   CUDA_CHECK(cuda_kernel::ResidualAddRmsNorm<half>(d_rf.ptr, d_in.ptr, d_w.ptr,
-                                                    d_of.ptr, kR, kH, kEps, s));
+                                                   d_of.ptr, kR, kH, kEps, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
 
   REQUIRE(MaxAbsDiffHalf(d_ru.ptr, d_rf.ptr, kN) < kTol);
@@ -292,16 +292,21 @@ TEST_CASE("FusedBiasAddTriple matches three separate BiasAdd calls",
   DeviceBuf<half> dqu(kR * kQ), dku(kR * kK), dvu(kR * kV);
   DeviceBuf<half> dqf(kR * kQ), dkf(kR * kK), dvf(kR * kV);
   DeviceBuf<half> dqb(kQ), dkb(kK), dvb(kV);
-  dqu.Upload(hq);  dku.Upload(hk);  dvu.Upload(hv);
-  dqf.Upload(hq);  dkf.Upload(hk);  dvf.Upload(hv);
-  dqb.Upload(hqb); dkb.Upload(hkb); dvb.Upload(hvb);
+  dqu.Upload(hq);
+  dku.Upload(hk);
+  dvu.Upload(hv);
+  dqf.Upload(hq);
+  dkf.Upload(hk);
+  dvf.Upload(hv);
+  dqb.Upload(hqb);
+  dkb.Upload(hkb);
+  dvb.Upload(hvb);
 
   CUDA_CHECK(cuda_kernel::BiasAdd<half>(dqu.ptr, dqb.ptr, kR, kQ, s));
   CUDA_CHECK(cuda_kernel::BiasAdd<half>(dku.ptr, dkb.ptr, kR, kK, s));
   CUDA_CHECK(cuda_kernel::BiasAdd<half>(dvu.ptr, dvb.ptr, kR, kV, s));
-  CUDA_CHECK(cuda_kernel::BiasAddTriple<half>(dqf.ptr, dkf.ptr, dvf.ptr,
-                                               dqb.ptr, dkb.ptr, dvb.ptr, kR,
-                                               kQ, kK, kV, s));
+  CUDA_CHECK(cuda_kernel::BiasAddTriple<half>(
+      dqf.ptr, dkf.ptr, dvf.ptr, dqb.ptr, dkb.ptr, dvb.ptr, kR, kQ, kK, kV, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
 
   REQUIRE(MaxAbsDiffHalf(dqu.ptr, dqf.ptr, kR * kQ) < kTol);
@@ -325,7 +330,9 @@ TEST_CASE("FusedBiasAddTriple with uniform dimensions",
 
   std::vector<half> hq(kR * kD), hk(kR * kD), hv(kR * kD);
   std::vector<half> hqb(kD), hkb(kD), hvb(kD);
-  FillRandomHalf(hq, rng);  FillRandomHalf(hk, rng);  FillRandomHalf(hv, rng);
+  FillRandomHalf(hq, rng);
+  FillRandomHalf(hk, rng);
+  FillRandomHalf(hv, rng);
   FillRandomHalfRange(hqb, rng, -0.5f, 0.5f);
   FillRandomHalfRange(hkb, rng, -0.5f, 0.5f);
   FillRandomHalfRange(hvb, rng, -0.5f, 0.5f);
@@ -333,16 +340,21 @@ TEST_CASE("FusedBiasAddTriple with uniform dimensions",
   DeviceBuf<half> dqu(kR * kD), dku(kR * kD), dvu(kR * kD);
   DeviceBuf<half> dqf(kR * kD), dkf(kR * kD), dvf(kR * kD);
   DeviceBuf<half> dqb(kD), dkb(kD), dvb(kD);
-  dqu.Upload(hq);  dku.Upload(hk);  dvu.Upload(hv);
-  dqf.Upload(hq);  dkf.Upload(hk);  dvf.Upload(hv);
-  dqb.Upload(hqb); dkb.Upload(hkb); dvb.Upload(hvb);
+  dqu.Upload(hq);
+  dku.Upload(hk);
+  dvu.Upload(hv);
+  dqf.Upload(hq);
+  dkf.Upload(hk);
+  dvf.Upload(hv);
+  dqb.Upload(hqb);
+  dkb.Upload(hkb);
+  dvb.Upload(hvb);
 
   CUDA_CHECK(cuda_kernel::BiasAdd<half>(dqu.ptr, dqb.ptr, kR, kD, s));
   CUDA_CHECK(cuda_kernel::BiasAdd<half>(dku.ptr, dkb.ptr, kR, kD, s));
   CUDA_CHECK(cuda_kernel::BiasAdd<half>(dvu.ptr, dvb.ptr, kR, kD, s));
-  CUDA_CHECK(cuda_kernel::BiasAddTriple<half>(dqf.ptr, dkf.ptr, dvf.ptr,
-                                               dqb.ptr, dkb.ptr, dvb.ptr, kR,
-                                               kD, kD, kD, s));
+  CUDA_CHECK(cuda_kernel::BiasAddTriple<half>(
+      dqf.ptr, dkf.ptr, dvf.ptr, dqb.ptr, dkb.ptr, dvb.ptr, kR, kD, kD, kD, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
 
   REQUIRE(MaxAbsDiffHalf(dqu.ptr, dqf.ptr, kR * kD) < kTol);
@@ -395,8 +407,7 @@ TEST_CASE("FusedSoftmax matches 4-kernel softmax pipeline",
   CUDA_CHECK(cudaStreamDestroy(s));
 }
 
-TEST_CASE("FusedSoftmax parity with temperature=1.0",
-          "[cuda][fused_kernels]") {
+TEST_CASE("FusedSoftmax parity with temperature=1.0", "[cuda][fused_kernels]") {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
   if (device_count == 0)
@@ -562,14 +573,15 @@ TEST_CASE("FusedGateUpSiluGemvQ8_1WithEpilogue returns false for null inputs",
       empty, empty, nullptr, nullptr, nullptr, 0, 0, 0, nullptr));
 }
 
-TEST_CASE("FusedGateUpSiluGemvQ8_1WithEpilogue matches fused gate/up output and "
-          "quantized epilogue",
-          "[cuda][fused_kernels][gate_up_q81]") {
-  using runtime::cuda::native::GGUF::TensorType;
-  using runtime::cuda::native::QK8_1;
-  using runtime::cuda::native::QK_K;
+TEST_CASE(
+    "FusedGateUpSiluGemvQ8_1WithEpilogue matches fused gate/up output and "
+    "quantized epilogue",
+    "[cuda][fused_kernels][gate_up_q81]") {
   using runtime::cuda::native::block_q4_k;
   using runtime::cuda::native::block_q8_1;
+  using runtime::cuda::native::QK8_1;
+  using runtime::cuda::native::QK_K;
+  using runtime::cuda::native::GGUF::TensorType;
 
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -616,8 +628,8 @@ TEST_CASE("FusedGateUpSiluGemvQ8_1WithEpilogue matches fused gate/up output and 
 
   const QuantizedWeightInfo gate_raw{
       d_gate.ptr, static_cast<int>(TensorType::Q4_K), kN * kK};
-  const QuantizedWeightInfo up_raw{
-      d_up.ptr, static_cast<int>(TensorType::Q4_K), kN * kK};
+  const QuantizedWeightInfo up_raw{d_up.ptr, static_cast<int>(TensorType::Q4_K),
+                                   kN * kK};
 
   REQUIRE(FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
       gate_raw, up_raw, d_act.ptr, d_out_ref.ptr, kM, kN, kK, s));
@@ -714,7 +726,7 @@ TEST_CASE("BatchedRoPE + BatchedKvAppendStrided unfused path runs correctly",
   dsid.Upload(hsid);
 
   CUDA_CHECK(cuda_kernel::BatchedRoPE<half>(dq.ptr, dk.ptr, kB, kNH, kNKV, kHD,
-                                             dnp.ptr, 10000.0f, s));
+                                            dnp.ptr, 10000.0f, s));
   CUDA_CHECK(cuda_kernel::BatchedKvAppendStrided<half>(
       dk.ptr, dv.ptr, dc.ptr, dsid.ptr, dnp.ptr, 0, kB, kKvDim, kSlotStr,
       kLayStr, kKvStr, s));
@@ -833,8 +845,8 @@ TEST_CASE("BatchedRoPE preserves vector magnitude",
   std::vector<int> hnp = {42};
   dnp.Upload(hnp);
 
-  CUDA_CHECK(cuda_kernel::BatchedRoPE<half>(
-      dq.ptr, dk.ptr, kB, kNH, kNKV, kHD, dnp.ptr, 10000.0f, s));
+  CUDA_CHECK(cuda_kernel::BatchedRoPE<half>(dq.ptr, dk.ptr, kB, kNH, kNKV, kHD,
+                                            dnp.ptr, 10000.0f, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
 
   // Check output magnitudes match input
@@ -918,7 +930,8 @@ TEST_CASE("FusedSoftmax handles very low temperature",
   // All other probs should be near zero
   float sum_others = 0.0f;
   for (int i = 0; i < kV; ++i)
-    if (i != 7) sum_others += hp[i];
+    if (i != 7)
+      sum_others += hp[i];
   REQUIRE(sum_others < 0.001f);
   CUDA_CHECK(cudaStreamDestroy(s));
 }
@@ -935,7 +948,7 @@ TEST_CASE("FusedBiasAddTriple with realistic Qwen2 geometry",
     SKIP("No CUDA device available");
 
   // Qwen2.5-3B: num_heads=16, num_kv_heads=2, head_dim=128
-  constexpr int kR = 1; // single decode token
+  constexpr int kR = 1;        // single decode token
   constexpr int kQ = 16 * 128; // 2048
   constexpr int kK = 2 * 128;  // 256
   constexpr int kV = 2 * 128;  // 256
@@ -956,9 +969,15 @@ TEST_CASE("FusedBiasAddTriple with realistic Qwen2 geometry",
   DeviceBuf<half> dqu(kR * kQ), dku(kR * kK), dvu(kR * kV);
   DeviceBuf<half> dqf(kR * kQ), dkf(kR * kK), dvf(kR * kV);
   DeviceBuf<half> dqb(kQ), dkb(kK), dvb(kV);
-  dqu.Upload(hq); dku.Upload(hk); dvu.Upload(hv);
-  dqf.Upload(hq); dkf.Upload(hk); dvf.Upload(hv);
-  dqb.Upload(hqb); dkb.Upload(hkb); dvb.Upload(hvb);
+  dqu.Upload(hq);
+  dku.Upload(hk);
+  dvu.Upload(hv);
+  dqf.Upload(hq);
+  dkf.Upload(hk);
+  dvf.Upload(hv);
+  dqb.Upload(hqb);
+  dkb.Upload(hkb);
+  dvb.Upload(hvb);
 
   // Unfused
   CUDA_CHECK(cuda_kernel::BiasAdd<half>(dqu.ptr, dqb.ptr, kR, kQ, s));
@@ -1000,16 +1019,19 @@ TEST_CASE("RmsNorm with hidden_size=2048 (Qwen2.5-3B)",
   FillRandomHalfRange(hw, rng, 0.8f, 1.2f);
 
   DeviceBuf<half> dru(kN), drf(kN), di(kN), dw(kH), dou(kN), dof(kN);
-  dru.Upload(hr); drf.Upload(hr);
-  di.Upload(hi); dw.Upload(hw);
+  dru.Upload(hr);
+  drf.Upload(hr);
+  di.Upload(hi);
+  dw.Upload(hw);
 
   // Unfused
   CUDA_CHECK(cuda_kernel::ResidualAdd<half>(dru.ptr, di.ptr, kN, s));
-  CUDA_CHECK(cuda_kernel::RmsNorm<half>(dru.ptr, dw.ptr, dou.ptr, kR, kH, kEps, s));
+  CUDA_CHECK(
+      cuda_kernel::RmsNorm<half>(dru.ptr, dw.ptr, dou.ptr, kR, kH, kEps, s));
 
   // Fused
-  CUDA_CHECK(cuda_kernel::ResidualAddRmsNorm<half>(
-      drf.ptr, di.ptr, dw.ptr, dof.ptr, kR, kH, kEps, s));
+  CUDA_CHECK(cuda_kernel::ResidualAddRmsNorm<half>(drf.ptr, di.ptr, dw.ptr,
+                                                   dof.ptr, kR, kH, kEps, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
 
   REQUIRE(MaxAbsDiffHalf(dru.ptr, drf.ptr, kN) < kTol);

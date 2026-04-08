@@ -2,12 +2,12 @@
 
 #include "model/gguf_tokenizer.h"
 #include "model/llama_tokenizer.h"
-#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 
 #include <filesystem>
-#include <unordered_map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace inferflux;
@@ -26,7 +26,7 @@ std::vector<std::string> ByteLevelVocab() {
   vocab[7] = "w";
   vocab[8] = "r";
   vocab[9] = "d";
-  vocab[10] = "\xc4\xa0";       // Ġ
+  vocab[10] = "\xc4\xa0"; // Ġ
   vocab[11] = "he";
   vocab[12] = "hel";
   vocab[13] = "hell";
@@ -41,9 +41,9 @@ std::vector<std::string> ByteLevelVocab() {
 
 std::vector<std::string> ByteLevelMerges() {
   return {
-      "h e",            "he l",           "hel l",    "hell o",
-      "\xc4\xa0 w",     "\xc4\xa0w o",    "\xc4\xa0wo r",
-      "\xc4\xa0wor l",  "\xc4\xa0worl d",
+      "h e",          "he l",          "hel l",
+      "hell o",       "\xc4\xa0 w",    "\xc4\xa0w o",
+      "\xc4\xa0wo r", "\xc4\xa0wor l", "\xc4\xa0worl d",
   };
 }
 
@@ -99,13 +99,15 @@ TEST_CASE("GGUFTokenizer matches llama tokenizer on local Qwen GGUF prompts",
   const std::string model_path =
       "models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf";
   if (!std::filesystem::exists(model_path)) {
-    SUCCEED("Local Qwen GGUF model not present; skipping tokenizer parity check");
+    SUCCEED(
+        "Local Qwen GGUF model not present; skipping tokenizer parity check");
     return;
   }
 
   GGUFTokenizer gguf_tok;
   if (!gguf_tok.Load(model_path)) {
-    SUCCEED("GGUF model lacks embedded tokenizer metadata; skipping parity check");
+    SUCCEED(
+        "GGUF model lacks embedded tokenizer metadata; skipping parity check");
     return;
   }
 
@@ -118,7 +120,8 @@ TEST_CASE("GGUFTokenizer matches llama tokenizer on local Qwen GGUF prompts",
       "Paris",
       "Hola mundo",
       "Three prime numbers greater than 10 are",
-      "List the highest-impact ways to reduce cloud infrastructure cost for a GPU inference service without causing major reliability regressions.",
+      "List the highest-impact ways to reduce cloud infrastructure cost for a "
+      "GPU inference service without causing major reliability regressions.",
   };
 
   for (const auto &prompt : prompts) {
@@ -146,7 +149,8 @@ TEST_CASE("LlamaCppBackend treats GGUF end-of-generation tokens as terminal",
 
   GGUFTokenizer gguf_tok;
   if (!gguf_tok.Load(model_path)) {
-    SUCCEED("GGUF model lacks tokenizer metadata; skipping terminal-token check");
+    SUCCEED(
+        "GGUF model lacks tokenizer metadata; skipping terminal-token check");
     return;
   }
 

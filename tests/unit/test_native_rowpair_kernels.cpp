@@ -14,8 +14,8 @@
 
 namespace native = inferflux::runtime::cuda::native;
 namespace GGUF = native::GGUF;
-using inferflux::NativeExecutionPolicy;
 using inferflux::FusedQuantGemm;
+using inferflux::NativeExecutionPolicy;
 using inferflux::PackedProjectionSpec;
 using inferflux::QuantizedWeightInfo;
 
@@ -31,8 +31,8 @@ unsigned short EncodeHalfBits(float value) {
 std::vector<half> MakeWaveTensor(size_t count, float scale, float bias = 0.0f) {
   std::vector<half> out(count);
   for (size_t i = 0; i < count; ++i) {
-    const float value = bias + scale * std::sin(0.173f * static_cast<float>(i) +
-                                                0.031f);
+    const float value =
+        bias + scale * std::sin(0.173f * static_cast<float>(i) + 0.031f);
     out[i] = __float2half(value);
   }
   return out;
@@ -45,15 +45,17 @@ std::vector<native::block_q4_k> MakeQ4Rows(int rows, int blocks_per_row,
   for (int row = 0; row < rows; ++row) {
     for (int blk = 0; blk < blocks_per_row; ++blk) {
       auto &block = blocks[static_cast<size_t>(row) * blocks_per_row + blk];
-      block.d = EncodeHalfBits(0.02f * static_cast<float>(((row + blk + seed) % 4) + 1));
-      block.dmin = EncodeHalfBits(0.01f * static_cast<float>(((row + blk + seed) % 3) + 1));
+      block.d = EncodeHalfBits(
+          0.02f * static_cast<float>(((row + blk + seed) % 4) + 1));
+      block.dmin = EncodeHalfBits(
+          0.01f * static_cast<float>(((row + blk + seed) % 3) + 1));
       for (int i = 0; i < 12; ++i) {
-        block.scales[i] = static_cast<unsigned char>((seed * 17 + row * 7 +
-                                                     blk * 11 + i * 5) & 0xFF);
+        block.scales[i] = static_cast<unsigned char>(
+            (seed * 17 + row * 7 + blk * 11 + i * 5) & 0xFF);
       }
       for (int i = 0; i < QK_K / 2; ++i) {
-        block.qs[i] = static_cast<unsigned char>((seed * 11 + row * 13 +
-                                                  blk * 19 + i * 3) & 0xFF);
+        block.qs[i] = static_cast<unsigned char>(
+            (seed * 11 + row * 13 + blk * 19 + i * 3) & 0xFF);
       }
     }
   }
@@ -88,7 +90,8 @@ TEST_CASE("Native grouped row-pair FFN path matches generic grouping",
 
   const auto w0 = MakeQ4Rows(kN0, blocks_per_row, 3);
   const auto w1 = MakeQ4Rows(kN1, blocks_per_row, 7);
-  const auto input = MakeWaveTensor(static_cast<size_t>(kM) * kK, 0.015f, -0.002f);
+  const auto input =
+      MakeWaveTensor(static_cast<size_t>(kM) * kK, 0.015f, -0.002f);
 
   native::block_q4_k *d_w0 = nullptr;
   native::block_q4_k *d_w1 = nullptr;
@@ -105,9 +108,8 @@ TEST_CASE("Native grouped row-pair FFN path matches generic grouping",
                      w1.size() * sizeof(native::block_q4_k)) == cudaSuccess);
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_input),
                      input.size() * sizeof(half)) == cudaSuccess);
-      REQUIRE(cudaMalloc(&d_act_q8_1,
-                     static_cast<size_t>(kM) * (kK / QK8_1) *
-                         sizeof(native::block_q8_1)) ==
+  REQUIRE(cudaMalloc(&d_act_q8_1, static_cast<size_t>(kM) * (kK / QK8_1) *
+                                      sizeof(native::block_q8_1)) ==
           cudaSuccess);
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out_generic),
                      static_cast<size_t>(kM) * (kN0 + kN1) * sizeof(half)) ==
@@ -150,8 +152,8 @@ TEST_CASE("Native grouped row-pair FFN path matches generic grouping",
   NativeExecutionPolicy rowpair_policy;
   rowpair_policy.enable_experimental_q81_grouped_rowpair_w4 = true;
 
-  REQUIRE(FusedQuantGemm::GemvQ8_1Pair(projections, d_act_q8_1, kM, kK,
-                                       stream, &default_policy));
+  REQUIRE(FusedQuantGemm::GemvQ8_1Pair(projections, d_act_q8_1, kM, kK, stream,
+                                       &default_policy));
   REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
   REQUIRE(FusedQuantGemm::GemvQ8_1Pair(projections_rowpair, d_act_q8_1, kM, kK,
                                        stream, &rowpair_policy));
@@ -163,7 +165,7 @@ TEST_CASE("Native grouped row-pair FFN path matches generic grouping",
       CopyDeviceHalfs(d_out_rowpair, static_cast<size_t>(kM) * (kN0 + kN1));
   for (size_t i = 0; i < generic_output.size(); ++i) {
     const float diff = std::fabs(__half2float(generic_output[i]) -
-                                __half2float(rowpair_output[i]));
+                                 __half2float(rowpair_output[i]));
     REQUIRE(diff < 1e-3f);
   }
 
@@ -191,7 +193,8 @@ TEST_CASE("Native down-proj row-pair kernel matches reference math",
   const int blocks_per_row = kK / QK_K;
 
   const auto weights = MakeQ4Rows(kN, blocks_per_row, 11);
-  const auto input = MakeWaveTensor(static_cast<size_t>(kM) * kK, 0.009f, -0.001f);
+  const auto input =
+      MakeWaveTensor(static_cast<size_t>(kM) * kK, 0.009f, -0.001f);
 
   native::block_q4_k *d_w = nullptr;
   half *d_input = nullptr;
@@ -202,17 +205,19 @@ TEST_CASE("Native down-proj row-pair kernel matches reference math",
   REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
 
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_w),
-                     weights.size() * sizeof(native::block_q4_k)) == cudaSuccess);
+                     weights.size() * sizeof(native::block_q4_k)) ==
+          cudaSuccess);
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_input),
                      input.size() * sizeof(half)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_act_q8_1,
-                     static_cast<size_t>(kM) * (kK / QK8_1) *
-                         sizeof(native::block_q8_1)) ==
+  REQUIRE(cudaMalloc(&d_act_q8_1, static_cast<size_t>(kM) * (kK / QK8_1) *
+                                      sizeof(native::block_q8_1)) ==
           cudaSuccess);
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out),
-                     static_cast<size_t>(kM) * kN * sizeof(half)) == cudaSuccess);
+                     static_cast<size_t>(kM) * kN * sizeof(half)) ==
+          cudaSuccess);
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_deq),
-                     static_cast<size_t>(kN) * kK * sizeof(half)) == cudaSuccess);
+                     static_cast<size_t>(kN) * kK * sizeof(half)) ==
+          cudaSuccess);
 
   REQUIRE(cudaMemcpy(d_w, weights.data(),
                      weights.size() * sizeof(native::block_q4_k),
@@ -225,9 +230,8 @@ TEST_CASE("Native down-proj row-pair kernel matches reference math",
   QuantizedWeightInfo info{d_w, static_cast<int>(GGUF::TensorType::Q4_K),
                            static_cast<int64_t>(kN) * kK};
   NativeExecutionPolicy policy;
-  REQUIRE(
-      FusedQuantGemm::GemvQ8_1(info, d_act_q8_1, d_out, kM, kN, kK, stream,
-                                &policy));
+  REQUIRE(FusedQuantGemm::GemvQ8_1(info, d_act_q8_1, d_out, kM, kN, kK, stream,
+                                   &policy));
   REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
 
   REQUIRE(native::dequantize_q4_k(d_w, d_deq, static_cast<size_t>(kN) * kK,
@@ -250,8 +254,7 @@ TEST_CASE("Native down-proj row-pair kernel matches reference math",
       std::memcpy(&scale_half, &a.ds, sizeof(scale_half));
       const float scale = __half2float(scale_half);
       for (int j = 0; j < QK8_1; ++j) {
-        act_ref[m * kK + blk * QK8_1 + j] =
-            scale * static_cast<float>(a.qs[j]);
+        act_ref[m * kK + blk * QK8_1 + j] = scale * static_cast<float>(a.qs[j]);
       }
     }
   }
@@ -284,8 +287,7 @@ TEST_CASE("Native down-proj row-pair kernel matches reference math",
 
 #else
 
-TEST_CASE("Native row-pair kernel parity requires CUDA",
-          "[native_rowpair]") {
+TEST_CASE("Native row-pair kernel parity requires CUDA", "[native_rowpair]") {
   SUCCEED("Native row-pair kernel parity tests require CUDA.");
 }
 

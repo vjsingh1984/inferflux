@@ -1,6 +1,6 @@
-#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/backends/cuda/cuda_backend.h"
 #include "runtime/backends/cuda/inferflux_cuda_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 
 #include <nlohmann/json.hpp>
 
@@ -34,16 +34,15 @@ struct Options {
 };
 
 void PrintUsage(const char *argv0) {
-  std::cerr
-      << "Usage: " << argv0
-      << " --backend <inferflux_cuda|llama_cpp_cuda>"
-         " --model <path> [--prompt <text> | --prompt-file <path>]"
-         " [--top-n <int>] [--max-tokens <int>]\n";
+  std::cerr << "Usage: " << argv0
+            << " --backend <inferflux_cuda|llama_cpp_cuda>"
+               " --model <path> [--prompt <text> | --prompt-file <path>]"
+               " [--top-n <int>] [--max-tokens <int>]\n";
 }
 
 bool ParseBoolFlag(const std::string &value) {
-  return value == "1" || value == "true" || value == "TRUE" ||
-         value == "yes" || value == "on";
+  return value == "1" || value == "true" || value == "TRUE" || value == "yes" ||
+         value == "on";
 }
 
 bool ParseArgs(int argc, char **argv, Options *out) {

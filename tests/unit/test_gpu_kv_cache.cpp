@@ -174,7 +174,8 @@ TEST_CASE("KvCacheGpu: seq slot IDs must fit within max_batch",
     SKIP("No CUDA device available");
   }
 
-  constexpr int kSchedulerMaxSlots = 16; // subset of scheduler's kMaxSequenceSlots
+  constexpr int kSchedulerMaxSlots =
+      16; // subset of scheduler's kMaxSequenceSlots
 
   // Allocate with enough slots for the scheduler
   KvCacheGpu cache;
@@ -219,8 +220,7 @@ TEST_CASE("KvCacheGpu: seq slot IDs must fit within max_batch",
   // Read back and verify each slot has its own data (no corruption)
   for (int i = 0; i < kSchedulerMaxSlots; ++i) {
     std::vector<half> readback(kKvDim);
-    REQUIRE(cudaMemcpy(readback.data(), cache.GetK(0, i),
-                       kKvDim * sizeof(half),
+    REQUIRE(cudaMemcpy(readback.data(), cache.GetK(0, i), kKvDim * sizeof(half),
                        cudaMemcpyDeviceToHost) == cudaSuccess);
     for (int j = 0; j < kKvDim; ++j) {
       float expected = static_cast<float>(i * 100 + j);

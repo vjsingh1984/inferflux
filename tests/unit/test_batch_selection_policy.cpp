@@ -8,8 +8,7 @@
 
 using namespace inferflux;
 
-TEST_CASE("Factory creates correct policy types",
-          "[batch_selection_policy]") {
+TEST_CASE("Factory creates correct policy types", "[batch_selection_policy]") {
   auto pa = CreateBatchSelectionPolicy(SchedulerBatchPolicy::kPriorityAge);
   REQUIRE(std::string(pa->Name()) == "priority_age");
 
@@ -21,10 +20,8 @@ TEST_CASE("Factory creates correct policy types",
   REQUIRE(std::string(tb->Name()) == "throughput_balanced");
 }
 
-TEST_CASE("PriorityAge ignores prefix affinity",
-          "[batch_selection_policy]") {
-  auto policy =
-      CreateBatchSelectionPolicy(SchedulerBatchPolicy::kPriorityAge);
+TEST_CASE("PriorityAge ignores prefix affinity", "[batch_selection_policy]") {
+  auto policy = CreateBatchSelectionPolicy(SchedulerBatchPolicy::kPriorityAge);
   REQUIRE_FALSE(policy->UsesPrefixAffinity());
 
   ScoringItem without{/*age_ms=*/1000.0, /*priority=*/3, /*sequence=*/1,
@@ -34,10 +31,8 @@ TEST_CASE("PriorityAge ignores prefix affinity",
   REQUIRE(policy->Score(without) == policy->Score(with));
 }
 
-TEST_CASE("LpmPriority boosts by affinity/32",
-          "[batch_selection_policy]") {
-  auto policy =
-      CreateBatchSelectionPolicy(SchedulerBatchPolicy::kLpmPriority);
+TEST_CASE("LpmPriority boosts by affinity/32", "[batch_selection_policy]") {
+  auto policy = CreateBatchSelectionPolicy(SchedulerBatchPolicy::kLpmPriority);
   REQUIRE(policy->UsesPrefixAffinity());
 
   ScoringItem base{1000.0, 3, 1, 0.0};
@@ -76,8 +71,7 @@ TEST_CASE("Age contribution is consistent across policies",
 }
 
 TEST_CASE("Priority adds directly to score", "[batch_selection_policy]") {
-  auto policy =
-      CreateBatchSelectionPolicy(SchedulerBatchPolicy::kPriorityAge);
+  auto policy = CreateBatchSelectionPolicy(SchedulerBatchPolicy::kPriorityAge);
 
   ScoringItem item{0.0, 5, 1, 0.0}; // no age, priority=5
   REQUIRE(policy->Score(item) == Catch::Approx(5.0));
@@ -85,12 +79,11 @@ TEST_CASE("Priority adds directly to score", "[batch_selection_policy]") {
 
 TEST_CASE("Sort by Score produces correct ordering",
           "[batch_selection_policy]") {
-  auto policy =
-      CreateBatchSelectionPolicy(SchedulerBatchPolicy::kLpmPriority);
+  auto policy = CreateBatchSelectionPolicy(SchedulerBatchPolicy::kLpmPriority);
 
   // Three items: low-priority old, high-priority new, medium with affinity
-  ScoringItem old_low{6000.0, 1, 10, 0.0};     // 1 + 3.0 = 4.0
-  ScoringItem new_high{0.0, 5, 20, 0.0};        // 5 + 0.0 = 5.0
+  ScoringItem old_low{6000.0, 1, 10, 0.0};       // 1 + 3.0 = 4.0
+  ScoringItem new_high{0.0, 5, 20, 0.0};         // 5 + 0.0 = 5.0
   ScoringItem mid_affinity{2000.0, 2, 30, 96.0}; // 2 + 1.0 + 3.0 = 6.0
 
   std::vector<ScoringItem> items = {old_low, new_high, mid_affinity};

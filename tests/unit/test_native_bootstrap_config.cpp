@@ -32,8 +32,9 @@ TEST_CASE("NativeBootstrapConfig: uses hinted KV precision and default sizing",
   REQUIRE(config.kv_budget_ratio == Catch::Approx(0.30));
 }
 
-TEST_CASE("NativeBootstrapConfig: records valid overrides and invalid raw values",
-          "[native_bootstrap]") {
+TEST_CASE(
+    "NativeBootstrapConfig: records valid overrides and invalid raw values",
+    "[native_bootstrap]") {
   ScopedEnvVar dtype("INFERFLUX_CUDA_DTYPE", "FP16");
   ScopedEnvVar kv_dtype("INFERFLUX_CUDA_KV_DTYPE", "bf16");
   ScopedEnvVar kv_batch("INFERFLUX_CUDA_KV_MAX_BATCH", "bad");
@@ -51,8 +52,8 @@ TEST_CASE("NativeBootstrapConfig: records valid overrides and invalid raw values
   REQUIRE(config.kv_max_seq == 8192);
   REQUIRE(config.kv_max_seq_overridden);
   REQUIRE_FALSE(config.kv_auto_tune);
-  REQUIRE(config.kv_budget_bytes == static_cast<std::size_t>(256) * 1024U *
-                                         1024U);
+  REQUIRE(config.kv_budget_bytes ==
+          static_cast<std::size_t>(256) * 1024U * 1024U);
   REQUIRE(config.kv_budget_ratio == Catch::Approx(0.30));
   REQUIRE(config.invalid_kv_free_mem_ratio == "bad");
 }

@@ -607,8 +607,7 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
     loader.SetDequantizedCachePolicy(policy);
 
     const std::string gguf_name = "blk.0.attn_q.weight";
-    const std::string internal_name =
-        "model.layers.0.self_attn.q_proj.weight";
+    const std::string internal_name = "model.layers.0.self_attn.q_proj.weight";
     const std::vector<uint64_t> shape = {4096, 2048}; // 8,388,608 elements
     const size_t dequantized_bytes =
         shape[0] * shape[1] * sizeof(half); // ~16 MiB
@@ -628,8 +627,7 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
             cudaSuccess);
     lacc.quantized_buffer_size() = quantized_bytes;
     REQUIRE(cudaMemcpy(lacc.d_quantized_buffer(), tensor.cpu_data.data(),
-                       quantized_bytes, cudaMemcpyHostToDevice) ==
-            cudaSuccess);
+                       quantized_bytes, cudaMemcpyHostToDevice) == cudaSuccess);
 
     tensor.gpu_data = lacc.d_quantized_buffer();
     tensor.gpu_offset = 0;
@@ -699,8 +697,7 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
     loader.SetDequantizedCachePolicy(DequantizedCachePolicy::kModelLifetime);
 
     const std::string gguf_name = "blk.0.attn_q.weight";
-    const std::string internal_name =
-        "model.layers.0.self_attn.q_proj.weight";
+    const std::string internal_name = "model.layers.0.self_attn.q_proj.weight";
     const std::vector<uint64_t> shape = {4096, 2048}; // 8,388,608 elements
     const size_t quantized_bytes =
         CalcTensorSize(GGUF::TensorType::Q8_0, shape);
@@ -718,8 +715,7 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
             cudaSuccess);
     lacc.quantized_buffer_size() = quantized_bytes;
     REQUIRE(cudaMemcpy(lacc.d_quantized_buffer(), tensor.cpu_data.data(),
-                       quantized_bytes, cudaMemcpyHostToDevice) ==
-            cudaSuccess);
+                       quantized_bytes, cudaMemcpyHostToDevice) == cudaSuccess);
 
     tensor.gpu_data = lacc.d_quantized_buffer();
     tensor.gpu_offset = 0;
@@ -764,7 +760,8 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
     run_policy_contract(DequantizedCachePolicy::kNone);
   }
 
-  SECTION("model policy retains dequantized buffers across request boundaries") {
+  SECTION(
+      "model policy retains dequantized buffers across request boundaries") {
     run_model_policy_contract();
   }
 #else

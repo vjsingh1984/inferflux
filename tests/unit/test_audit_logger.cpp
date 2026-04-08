@@ -20,7 +20,7 @@ TEST_CASE("AuditLogger disabled without path", "[audit]") {
 TEST_CASE("AuditLogger writes valid JSON lines", "[audit]") {
   auto tmp_path =
       std::filesystem::temp_directory_path() / "inferflux_audit_test.jsonl";
-  std::filesystem::remove(tmp_path);  // clean up any leftover from prior run
+  std::filesystem::remove(tmp_path); // clean up any leftover from prior run
   {
     inferflux::AuditLogger logger(tmp_path.string());
     REQUIRE(logger.Enabled());

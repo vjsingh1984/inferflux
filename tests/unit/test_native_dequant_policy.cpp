@@ -68,8 +68,9 @@ TEST_CASE("InferfluxCudaExecutor dequant policy parser uses none as default",
   CHECK(acc.dequantized_cache_policy_hint() == "none");
 }
 
-TEST_CASE("InferfluxCudaExecutor dequant policy parser accepts none batch model",
-          "[native_forward][dequant_policy]") {
+TEST_CASE(
+    "InferfluxCudaExecutor dequant policy parser accepts none batch model",
+    "[native_forward][dequant_policy]") {
   InferfluxCudaExecutor executor;
   ExecutorTestAccess acc(executor);
 

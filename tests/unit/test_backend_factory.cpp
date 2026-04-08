@@ -147,10 +147,10 @@ TEST_CASE("BackendFactory explicit inferflux_cuda hint uses native or "
 }
 
 #ifdef INFERFLUX_HAS_CUDA
-TEST_CASE(
-    "BackendFactory strict inferflux policy rejects explicit inferflux_cuda when"
-    " native kernels are not ready",
-    "[backend_factory]") {
+TEST_CASE("BackendFactory strict inferflux policy rejects explicit "
+          "inferflux_cuda when"
+          " native kernels are not ready",
+          "[backend_factory]") {
   if (InferfluxCudaBackend::NativeKernelsReady()) {
     SUCCEED("native kernels ready; strict rejection no longer applies");
     return;
@@ -362,10 +362,8 @@ TEST_CASE("BackendFactory NormalizeHintList deduplicates and falls back",
 
 TEST_CASE("BackendFactory NormalizeHint keeps explicit provider hints",
           "[backend_factory]") {
-  REQUIRE(BackendFactory::NormalizeHint("INFERFLUX_CUDA") ==
-          "inferflux_cuda");
-  REQUIRE(BackendFactory::NormalizeHint("LLAMA_CPP_CUDA") ==
-          "llama_cpp_cuda");
+  REQUIRE(BackendFactory::NormalizeHint("INFERFLUX_CUDA") == "inferflux_cuda");
+  REQUIRE(BackendFactory::NormalizeHint("LLAMA_CPP_CUDA") == "llama_cpp_cuda");
 }
 
 TEST_CASE("BackendFactory NormalizeHint canonicalizes legacy aliases",

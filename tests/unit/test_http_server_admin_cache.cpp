@@ -29,20 +29,20 @@ using json = nlohmann::json;
 namespace inferflux {
 namespace {
 
-std::unique_ptr<Scheduler> MakeSchedulerWithPrefix(SimpleTokenizer &tokenizer,
-                                                   std::shared_ptr<PagedKVCache> cache,
-                                                   std::shared_ptr<RadixPrefixCache> prefix_cache) {
+std::unique_ptr<Scheduler>
+MakeSchedulerWithPrefix(SimpleTokenizer &tokenizer,
+                        std::shared_ptr<PagedKVCache> cache,
+                        std::shared_ptr<RadixPrefixCache> prefix_cache) {
   auto device = std::make_shared<CPUDeviceContext>();
   DisaggregatedConfig disagg_config;
   return std::make_unique<Scheduler>(tokenizer, device, std::move(cache),
-                                     nullptr, nullptr,
-                                     std::move(prefix_cache),
+                                     nullptr, nullptr, std::move(prefix_cache),
                                      FairnessConfig{}, disagg_config);
 }
 
 } // namespace
 
-#ifndef _WIN32  // socketpair() not available on Windows
+#ifndef _WIN32 // socketpair() not available on Windows
 namespace {
 
 std::string ReadAll(int fd) {
@@ -65,8 +65,7 @@ TEST_CASE("HttpServer admin cache endpoint includes memory payload",
       16, 1024, PagedKVCache::EvictionPolicy::kLRU);
   auto prefix_cache = std::make_shared<RadixPrefixCache>(
       paged_kv, [](int) {}, RadixPrefixCacheLimits{64, 8});
-  auto scheduler =
-      MakeSchedulerWithPrefix(tokenizer, paged_kv, prefix_cache);
+  auto scheduler = MakeSchedulerWithPrefix(tokenizer, paged_kv, prefix_cache);
 
   const auto retained_blocks = paged_kv->ReserveBlocks(2);
   prefix_cache->Insert(std::vector<int>(32, 7), retained_blocks,
@@ -101,11 +100,10 @@ TEST_CASE("HttpServer admin cache endpoint includes memory payload",
   int fds[2];
   REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
 
-  const std::string request =
-      "GET /v1/admin/cache HTTP/1.1\r\n"
-      "Host: localhost\r\n"
-      "Authorization: Bearer admin-key\r\n"
-      "\r\n";
+  const std::string request = "GET /v1/admin/cache HTTP/1.1\r\n"
+                              "Host: localhost\r\n"
+                              "Authorization: Bearer admin-key\r\n"
+                              "\r\n";
   REQUIRE(::write(fds[0], request.data(),
                   static_cast<unsigned long>(request.size())) ==
           static_cast<ssize_t>(request.size()));
@@ -130,13 +128,11 @@ TEST_CASE("HttpServer admin cache endpoint includes memory payload",
 
   REQUIRE(body["memory"]["inferflux_cuda_model"]["model"] == "qwen2.5-3b");
   REQUIRE(body["memory"]["inferflux_cuda_model"]["reserved_bytes"] == 4096);
-  REQUIRE(
-      body["memory"]["inferflux_cuda_model"]["domains"]["kv_cache"]
-          ["reserved_bytes"] == 1024);
+  REQUIRE(body["memory"]["inferflux_cuda_model"]["domains"]["kv_cache"]
+              ["reserved_bytes"] == 1024);
 
   REQUIRE(body["memory"]["inferflux_cuda_kv"]["total_bytes"] == 2048);
-  REQUIRE(
-      body["memory"]["inferflux_cuda_kv"]["prefix_retained_bytes"] == 512);
+  REQUIRE(body["memory"]["inferflux_cuda_kv"]["prefix_retained_bytes"] == 512);
   REQUIRE(body["memory"]["inferflux_cuda_kv"]["prefix_retained_sequences"] ==
           1);
 
@@ -150,6 +146,6 @@ TEST_CASE("HttpServer admin cache endpoint includes memory payload",
 }
 
 } // namespace
-#endif  // _WIN32
+#endif // _WIN32
 
 } // namespace inferflux

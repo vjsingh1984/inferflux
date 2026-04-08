@@ -42,8 +42,7 @@ std::unique_ptr<Scheduler> MakeScheduler(SimpleTokenizer &tokenizer,
   DisaggregatedConfig disagg_config;
   disagg_config.decode_pool_size = 1;
   if (with_transport) {
-    disagg_config.kv_transport =
-        std::make_shared<disaggregated::KVChannel>(8);
+    disagg_config.kv_transport = std::make_shared<disaggregated::KVChannel>(8);
   }
   return std::make_unique<Scheduler>(tokenizer, device, cache, nullptr, nullptr,
                                      nullptr, FairnessConfig{}, disagg_config);
@@ -84,8 +83,8 @@ TEST_CASE("HttpServer ready status reports healthy distributed decode pool",
   server->SetRole(HttpServer::PoolRole::kDecode);
   server->SetModelReady(true);
 
-  REQUIRE(WaitForCondition(
-      [&]() { return scheduler->LiveDecodeWorkers() == 1; }));
+  REQUIRE(
+      WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
 
   const auto status = server->EvaluateReadyStatus();
   REQUIRE(status.ready);
@@ -110,8 +109,8 @@ TEST_CASE(
   server->SetRole(HttpServer::PoolRole::kDecode);
   server->SetModelReady(true);
 
-  REQUIRE(WaitForCondition(
-      [&]() { return scheduler->LiveDecodeWorkers() == 1; }));
+  REQUIRE(
+      WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
 
   metrics.RecordDisaggKVTicketStage("timed_out");
   metrics.RecordDisaggKVTicketStage("timed_out");
@@ -128,12 +127,11 @@ TEST_CASE(
   REQUIRE(status.reason == "distributed kv transport degraded");
 }
 
-TEST_CASE(
-    "HttpServer ready status fails when distributed KV timeout debt hits "
-    "threshold despite intervening commit",
-    "[http_server]") {
-  ScopedEnvVar streak_threshold("INFERFLUX_READYZ_DISAGG_TIMEOUT_STREAK_THRESHOLD",
-                                "5");
+TEST_CASE("HttpServer ready status fails when distributed KV timeout debt hits "
+          "threshold despite intervening commit",
+          "[http_server]") {
+  ScopedEnvVar streak_threshold(
+      "INFERFLUX_READYZ_DISAGG_TIMEOUT_STREAK_THRESHOLD", "5");
   ScopedEnvVar debt_threshold("INFERFLUX_READYZ_DISAGG_TIMEOUT_DEBT_THRESHOLD",
                               "2");
 
@@ -144,8 +142,8 @@ TEST_CASE(
   server->SetRole(HttpServer::PoolRole::kDecode);
   server->SetModelReady(true);
 
-  REQUIRE(WaitForCondition(
-      [&]() { return scheduler->LiveDecodeWorkers() == 1; }));
+  REQUIRE(
+      WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
 
   metrics.RecordDisaggKVTicketStage("timed_out");
   metrics.RecordDisaggKVTicketStage("committed");
@@ -171,8 +169,8 @@ TEST_CASE("HttpServer ready status recovers after a committed KV handoff",
   server->SetRole(HttpServer::PoolRole::kDecode);
   server->SetModelReady(true);
 
-  REQUIRE(WaitForCondition(
-      [&]() { return scheduler->LiveDecodeWorkers() == 1; }));
+  REQUIRE(
+      WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
 
   metrics.RecordDisaggKVTicketStage("timed_out");
   metrics.RecordDisaggKVTicketStage("timed_out");
@@ -196,8 +194,8 @@ TEST_CASE("HttpServer generation admission stays open by default when "
   server->SetRole(HttpServer::PoolRole::kDecode);
   server->SetModelReady(true);
 
-  REQUIRE(WaitForCondition(
-      [&]() { return scheduler->LiveDecodeWorkers() == 1; }));
+  REQUIRE(
+      WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
 
   metrics.RecordDisaggKVTicketStage("timed_out");
   metrics.RecordDisaggKVTicketStage("timed_out");
@@ -211,8 +209,8 @@ TEST_CASE("HttpServer generation admission stays open by default when "
 TEST_CASE("HttpServer generation admission fails closed when configured and "
           "distributed transport is degraded",
           "[http_server]") {
-  ScopedEnvVar fail_closed(
-      "INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED", "true");
+  ScopedEnvVar fail_closed("INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED",
+                           "true");
 
   SimpleTokenizer tokenizer;
   auto scheduler = MakeScheduler(tokenizer, true);
@@ -221,8 +219,8 @@ TEST_CASE("HttpServer generation admission fails closed when configured and "
   server->SetRole(HttpServer::PoolRole::kDecode);
   server->SetModelReady(true);
 
-  REQUIRE(WaitForCondition(
-      [&]() { return scheduler->LiveDecodeWorkers() == 1; }));
+  REQUIRE(
+      WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
 
   metrics.RecordDisaggKVTicketStage("timed_out");
   metrics.RecordDisaggKVTicketStage("timed_out");
@@ -238,8 +236,8 @@ TEST_CASE("HttpServer generation admission fails closed when configured and "
 TEST_CASE("HttpServer generation admission ignores fail-closed policy without "
           "KV transport",
           "[http_server]") {
-  ScopedEnvVar fail_closed(
-      "INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED", "true");
+  ScopedEnvVar fail_closed("INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED",
+                           "true");
 
   SimpleTokenizer tokenizer;
   auto scheduler = MakeScheduler(tokenizer, false);
@@ -248,8 +246,8 @@ TEST_CASE("HttpServer generation admission ignores fail-closed policy without "
   server->SetRole(HttpServer::PoolRole::kDecode);
   server->SetModelReady(true);
 
-  REQUIRE(WaitForCondition(
-      [&]() { return scheduler->LiveDecodeWorkers() == 1; }));
+  REQUIRE(
+      WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
 
   metrics.RecordDisaggKVTicketStage("timed_out");
   metrics.RecordDisaggKVTicketStage("timed_out");
@@ -269,8 +267,8 @@ TEST_CASE("HttpServer ignores distributed timeout streak without KV transport",
   server->SetRole(HttpServer::PoolRole::kDecode);
   server->SetModelReady(true);
 
-  REQUIRE(WaitForCondition(
-      [&]() { return scheduler->LiveDecodeWorkers() == 1; }));
+  REQUIRE(
+      WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
 
   metrics.RecordDisaggKVTicketStage("timed_out");
   metrics.RecordDisaggKVTicketStage("timed_out");
@@ -282,8 +280,9 @@ TEST_CASE("HttpServer ignores distributed timeout streak without KV transport",
   REQUIRE(status.disagg_timeout_streak == 0);
 }
 
-TEST_CASE("HttpServer admin pools status mirrors readiness and scheduler gauges",
-          "[http_server]") {
+TEST_CASE(
+    "HttpServer admin pools status mirrors readiness and scheduler gauges",
+    "[http_server]") {
   SimpleTokenizer tokenizer;
   auto scheduler = MakeScheduler(tokenizer, true);
   MetricsRegistry metrics;
@@ -298,8 +297,8 @@ TEST_CASE("HttpServer admin pools status mirrors readiness and scheduler gauges"
   server->SetRole(HttpServer::PoolRole::kDecode);
   server->SetModelReady(true);
 
-  REQUIRE(WaitForCondition(
-      [&]() { return scheduler->LiveDecodeWorkers() == 1; }));
+  REQUIRE(
+      WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
 
   metrics.RecordDisaggKVTicketStage("enqueued");
   metrics.RecordDisaggKVTicketStage("enqueued");
@@ -342,8 +341,8 @@ TEST_CASE("HttpServer admin pools status tolerates missing metrics registry",
   server->SetRole(HttpServer::PoolRole::kDecode);
   server->SetModelReady(true);
 
-  REQUIRE(WaitForCondition(
-      [&]() { return scheduler->LiveDecodeWorkers() == 1; }));
+  REQUIRE(
+      WaitForCondition([&]() { return scheduler->LiveDecodeWorkers() == 1; }));
 
   const auto status = server->EvaluateAdminPoolsStatus();
   REQUIRE(status.pool_health.ready);
@@ -356,8 +355,7 @@ TEST_CASE("HttpServer admin pools status tolerates missing metrics registry",
   REQUIRE_FALSE(status.distributed_kv.enqueue_rejections_total.has_value());
   REQUIRE_FALSE(status.distributed_kv.enqueue_exhausted_total.has_value());
   REQUIRE_FALSE(status.distributed_kv.tickets_enqueued_total.has_value());
-  REQUIRE_FALSE(
-      status.distributed_kv.tickets_acknowledged_total.has_value());
+  REQUIRE_FALSE(status.distributed_kv.tickets_acknowledged_total.has_value());
   REQUIRE_FALSE(status.distributed_kv.tickets_committed_total.has_value());
   REQUIRE_FALSE(status.distributed_kv.tickets_timed_out_total.has_value());
 }
