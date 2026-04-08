@@ -1064,11 +1064,11 @@ send_inferflux_request() {
     prompt_json=$(printf '%s' "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
 
     local response
-    response=$(curl -sf -X POST "http://127.0.0.1:$port/v1/completions" \
+    response=$(curl -sf -X POST "http://127.0.0.1:$port/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $API_KEY" \
         -H "x-inferflux-request-id: $request_id" \
-        -d "{\"model\":\"default\",\"prompt\":$prompt_json,\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
+        -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":$prompt_json}],\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
         --max-time 120 2>/dev/null) || {
         echo "ERROR" > "$output_file"
         return 1
@@ -1081,7 +1081,8 @@ send_inferflux_request() {
     text=$(echo "$response" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-text = d.get('choices', [{}])[0].get('text', '')
+c = d.get('choices', [{}])[0]
+text = c.get('message', {}).get('content', c.get('text', ''))
 tokens = d.get('usage', {}).get('completion_tokens', 0)
 print(json.dumps({'request_id': '$request_id', 'text': text.strip(), 'tokens': tokens, 'latency_ms': $latency_ms}))
 " 2>/dev/null) || {
@@ -1099,10 +1100,13 @@ send_ollama_request() {
 
     local start_ns=$(date +%s%N)
 
+    local prompt_json
+    prompt_json=$(printf '%s' "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+
     local response
-    response=$(curl -sf -X POST "${OLLAMA_HOST}/api/generate" \
+    response=$(curl -sf -X POST "${OLLAMA_HOST}/api/chat" \
         -H "Content-Type: application/json" \
-        -d "{\"model\":\"${OLLAMA_MODEL:-qwen2.5:3b}\",\"prompt\":$(printf '%s' "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),\"options\":{\"num_predict\":$max_tokens,\"temperature\":0.0},\"stream\":false}" \
+        -d "{\"model\":\"${OLLAMA_MODEL:-qwen2.5:3b}\",\"messages\":[{\"role\":\"user\",\"content\":$prompt_json}],\"options\":{\"num_predict\":$max_tokens,\"temperature\":0.0},\"stream\":false}" \
         --max-time 120 2>/dev/null) || {
         echo "ERROR" > "$output_file"
         return 1
@@ -1115,8 +1119,9 @@ send_ollama_request() {
     text=$(echo "$response" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-text = d.get('response', '')
-tokens = len(text.split())  # Ollama doesn't return token count
+msg = d.get('message', {})
+text = msg.get('content', d.get('response', ''))
+tokens = d.get('eval_count', len(text.split()))
 print(json.dumps({'request_id': '$request_id', 'text': text.strip(), 'tokens': tokens, 'latency_ms': $latency_ms}))
 " 2>/dev/null) || {
         echo "PARSE_ERROR" > "$output_file"
@@ -1148,9 +1153,9 @@ send_openai_request() {
     prompt_json=$(printf '%s' "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
 
     local response
-    response=$(curl -sf -X POST "${host}/v1/completions" \
+    response=$(curl -sf -X POST "${host}/v1/chat/completions" \
         -H "Content-Type: application/json" \
-        -d "{\"model\":\"${model}\",\"prompt\":$prompt_json,\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
+        -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":$prompt_json}],\"max_tokens\":$max_tokens,\"temperature\":0.0}" \
         --max-time 120 2>/dev/null) || {
         echo "ERROR" > "$output_file"
         return 1
@@ -1163,7 +1168,8 @@ send_openai_request() {
     text=$(echo "$response" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-text = d.get('choices', [{}])[0].get('text', '')
+c = d.get('choices', [{}])[0]
+text = c.get('message', {}).get('content', c.get('text', ''))
 tokens = d.get('usage', {}).get('completion_tokens', 0)
 print(json.dumps({'request_id': '$request_id', 'text': text.strip(), 'tokens': tokens, 'latency_ms': $latency_ms}))
 " 2>/dev/null) || {
@@ -1226,27 +1232,27 @@ run_benchmark() {
     case "$backend_kind" in
         ollama)
             driver_backend_kind="ollama"
-            driver_endpoint="${OLLAMA_HOST}/api/generate"
+            driver_endpoint="${OLLAMA_HOST}/api/chat"
             driver_model="${OLLAMA_MODEL:-qwen2.5:3b}"
             ;;
         lmstudio)
             driver_backend_kind="openai"
-            driver_endpoint="${LMSTUDIO_HOST}/v1/completions"
+            driver_endpoint="${LMSTUDIO_HOST}/v1/chat/completions"
             driver_model="${LMSTUDIO_MODEL}"
             ;;
         vllm)
             driver_backend_kind="openai"
-            driver_endpoint="${VLLM_HOST}/v1/completions"
+            driver_endpoint="${VLLM_HOST}/v1/chat/completions"
             driver_model="${VLLM_MODEL}"
             ;;
         sglang)
             driver_backend_kind="openai"
-            driver_endpoint="${SGLANG_HOST}/v1/completions"
+            driver_endpoint="${SGLANG_HOST}/v1/chat/completions"
             driver_model="${SGLANG_MODEL}"
             ;;
         *)
             driver_backend_kind="inferflux"
-            driver_endpoint="http://127.0.0.1:${port_or_url}/v1/completions"
+            driver_endpoint="http://127.0.0.1:${port_or_url}/v1/chat/completions"
             driver_model="default"
             ;;
     esac

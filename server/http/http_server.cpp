@@ -2611,15 +2611,27 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
 
     // §2.3 model-native chat template path.
-    // When a real model is loaded and the request came as a chat messages
-    // array, format the conversation using the model's built-in template
-    // (llama_chat_apply_template).  Tool definitions are injected as the first
-    // system message so the model-specific role tokens wrap them correctly.
-    // When no model is available (stub mode) or the template is unsupported, we
-    // fall back to FlattenMessages + BuildToolSystemPrompt (existing
-    // behaviour).
+    // When a real model is loaded, format the conversation using the model's
+    // built-in template (llama_chat_apply_template).  Tool definitions are
+    // injected as the first system message so the model-specific role tokens
+    // wrap them correctly.
+    //
+    // /v1/completions with a raw prompt is auto-wrapped as a user message so
+    // instruct-tuned models receive proper chat formatting.  This eliminates
+    // the semantic divergence between native and llama.cpp backends that occurs
+    // when raw text is fed to instruction-tuned models without special tokens.
+    //
+    // When no model is available (stub mode) or the template is unsupported,
+    // we fall back to FlattenMessages + BuildToolSystemPrompt.
     bool use_native_template = false;
-    if (parsed.prompt.empty() && !parsed.messages.empty()) {
+
+    // Auto-wrap raw /v1/completions prompt as a chat user message.
+    if (!parsed.prompt.empty() && parsed.messages.empty()) {
+      parsed.messages.push_back({/*role=*/"user", /*content=*/parsed.prompt});
+      parsed.prompt.clear();
+    }
+
+    if (!parsed.messages.empty()) {
       auto *router = scheduler_->Router();
       if (router) {
         auto *info = router->Resolve(parsed.model);
