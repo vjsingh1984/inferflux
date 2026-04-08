@@ -128,19 +128,7 @@ struct InferenceRequest {
   bool session_lease_acquired{false};
   std::string prompt;
   int max_tokens{256};
-  int priority{0};         // Higher = more urgent. 0 = default.
-  int priority_level{0};   // Cached priority level (for fairness controller).
-  int service_tokens{0};   // Tokens consumed so far (fairness accounting).
-  int timeslice_tokens{0}; // Timeslice cap when fairness preemption is enabled.
-  int remaining_decode_tokens{-1}; // Remaining tokens after fairness slice.
-  int reported_prompt_tokens{
-      -1}; // Prompt tokens counted once for metrics/logs.
-  int total_completion_tokens{
-      0}; // Completion tokens accumulated across slices.
-  int last_timeslice_tokens{
-      0}; // Last applied fairness slice limit (observability).
-  bool fairness_yielded{
-      false}; // True when the last slice yielded for fairness.
+  int priority{0}; // Higher = more urgent. 0 = default.
   bool json_mode{false};
   // Phased prefill/decode state (§2.5 Option A).
   // Set by Scheduler::ProcessBatch after calling LlamaCppBackend::Prefill().
@@ -174,30 +162,6 @@ struct InferenceRequest {
   bool stream{false};
   bool cancelled{false};
   RequestPhase phase{RequestPhase::kPending};
-  bool has_response_format{false};
-  std::string response_format_type;    // "json_object", "grammar", etc.
-  std::string response_format_schema;  // Raw JSON schema string (if provided).
-  std::string response_format_grammar; // Resolved GBNF string.
-  std::string response_format_root{"root"};
-  bool response_format_ready{
-      false}; // True once grammar string compiled/resolved.
-  // Feature gate for backend/model capability checks. Historically used for
-  // response_format, now reused for all request-level feature compatibility.
-  bool response_format_supported{true};
-  std::string response_format_error;
-  StructuredConstraint response_constraint;
-
-  // Persistent execution state for step-wise batch execution.
-  // These fields allow BatchExecutor to pause and resume a request at any token
-  // step without losing progress.
-  bool exec_initialized{false};
-  bool exec_active{true};
-  int exec_tokens_generated{0};
-  int exec_decode_limit{0};
-  int exec_current_token{-1};
-  bool exec_slice_active{false};
-  bool exec_in_prefill{false};
-  InferenceResult exec_result{};
 
   std::vector<DecodedImage>
       images; // §2.2: decoded images (parallel to <__media__> markers).
@@ -249,10 +213,7 @@ struct InferenceRequest {
   // The matched stop sequence is NOT included in the completion text.
   std::vector<std::string> stop;
 
-  // --- Grouped sub-struct views (Phase C1) ---
-  // These aggregate related flat fields into logical groups.  Callers
-  // should migrate from flat fields to these sub-structs file-by-file.
-  // Eventually the flat fields above will be deprecated.
+  // Grouped sub-structs for related concerns.
   ResponseFormatState response_format{};
   ExecutionState execution{};
   FairnessState fairness{};

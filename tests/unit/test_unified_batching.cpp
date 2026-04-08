@@ -139,7 +139,8 @@ public:
 
   bool TryGreedyBurstDecodeTokens(int sequence_id, int n_past_start,
                                   int first_token_id,
-                                  const SamplingParams &sampling, int max_tokens,
+                                  const SamplingParams &sampling,
+                                  int max_tokens,
                                   std::vector<BurstDecodeOutput> *outputs,
                                   std::string *reason) override {
     (void)sequence_id;
@@ -193,13 +194,11 @@ class EmptyGenerateBackend : public LlamaCppBackend {
 public:
   bool IsReady() const override { return true; }
 
-  std::string
-  Generate(const std::string &, int,
-           const std::function<bool(const std::string &, const TokenLogprob *)>
-               &,
-           const std::function<bool()> &, int,
-           std::vector<TokenLogprob> *,
-           const std::vector<std::string> &) override {
+  std::string Generate(
+      const std::string &, int,
+      const std::function<bool(const std::string &, const TokenLogprob *)> &,
+      const std::function<bool()> &, int, std::vector<TokenLogprob> *,
+      const std::vector<std::string> &) override {
     return {};
   }
 
@@ -263,8 +262,7 @@ private:
 
 int64_t ReadEmptyGenerationsTotal() {
   const std::string output = GlobalMetrics().RenderPrometheus();
-  const std::string key =
-      "inferflux_empty_generations_total{backend=\"cpu\"} ";
+  const std::string key = "inferflux_empty_generations_total{backend=\"cpu\"} ";
   auto pos = output.find(key);
   if (pos == std::string::npos) {
     return 0;
@@ -342,7 +340,7 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     REQUIRE(mock_backend->calls[2].inputs[0].request_logits);
 
     REQUIRE(req.phase == RequestPhase::kFinished);
-    REQUIRE(req.total_completion_tokens == 5);
+    REQUIRE(req.fairness.total_completion_tokens == 5);
   }
 
   SECTION("Interleaved Prefill and Decode") {
@@ -434,7 +432,7 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     req.sequence_id = 41;
     req.bpe_prompt_tokens.assign(40, 1);
     req.max_tokens = 1;
-    req.remaining_decode_tokens = 1;
+    req.fairness.remaining_decode_tokens = 1;
     req.block_table = {41};
 
     RequestBatch batch;
@@ -466,7 +464,7 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     req_prefill_a.sequence_id = 51;
     req_prefill_a.bpe_prompt_tokens.assign(10, 1);
     req_prefill_a.max_tokens = 1;
-    req_prefill_a.remaining_decode_tokens = 1;
+    req_prefill_a.fairness.remaining_decode_tokens = 1;
     req_prefill_a.block_table = {51};
 
     InferenceRequest req_prefill_b;
@@ -476,7 +474,7 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     req_prefill_b.sequence_id = 52;
     req_prefill_b.bpe_prompt_tokens.assign(10, 2);
     req_prefill_b.max_tokens = 1;
-    req_prefill_b.remaining_decode_tokens = 1;
+    req_prefill_b.fairness.remaining_decode_tokens = 1;
     req_prefill_b.block_table = {52};
 
     InferenceRequest req_decode;
@@ -486,7 +484,7 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     req_decode.first_token = 42;
     req_decode.first_piece = "x";
     req_decode.max_tokens = 2;
-    req_decode.remaining_decode_tokens = 2;
+    req_decode.fairness.remaining_decode_tokens = 2;
     req_decode.sequence_id = 53;
     req_decode.block_table = {53};
 
@@ -519,7 +517,7 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     req.sequence_id = 61;
     req.bpe_prompt_tokens = {1, 2, 3, 4};
     req.max_tokens = 5;
-    req.remaining_decode_tokens = 5;
+    req.fairness.remaining_decode_tokens = 5;
     req.block_table = {61};
 
     RequestBatch batch;
@@ -528,10 +526,10 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     auto results = tuned_executor->ExecuteBatch(batch, {bounded_backend});
 
     REQUIRE(results.size() == 1);
-    REQUIRE(req.fairness_yielded);
+    REQUIRE(req.fairness.yielded);
     REQUIRE(req.phase == RequestPhase::kPending);
-    REQUIRE(req.total_completion_tokens == 2);
-    REQUIRE(req.remaining_decode_tokens == 3);
+    REQUIRE(req.fairness.total_completion_tokens == 2);
+    REQUIRE(req.fairness.remaining_decode_tokens == 3);
     REQUIRE(results[0].completion_tokens == 2);
   }
 
@@ -685,22 +683,22 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     req_prefill.model = "mock";
     req_prefill.sequence_id = 11;
     req_prefill.n_past = 0;
-    req_prefill.exec_active = true;
-    req_prefill.exec_in_prefill = true;
+    req_prefill.execution.active = true;
+    req_prefill.execution.in_prefill = true;
     req_prefill.prefill_offset = 0;
-    req_prefill.exec_decode_limit = 2;
-    req_prefill.exec_tokens_generated = 0;
+    req_prefill.execution.decode_limit = 2;
+    req_prefill.execution.tokens_generated = 0;
     req_prefill.bpe_prompt_tokens.assign(48, 1);
 
     InferenceRequest req_decode;
     req_decode.model = "mock";
     req_decode.sequence_id = 12;
     req_decode.n_past = 8;
-    req_decode.exec_active = true;
-    req_decode.exec_in_prefill = false;
-    req_decode.exec_decode_limit = 2;
-    req_decode.exec_tokens_generated = 0;
-    req_decode.exec_current_token = 42;
+    req_decode.execution.active = true;
+    req_decode.execution.in_prefill = false;
+    req_decode.execution.decode_limit = 2;
+    req_decode.execution.tokens_generated = 0;
+    req_decode.execution.current_token = 42;
 
     RequestBatch step_batch;
     step_batch.requests = {&req_prefill, &req_decode};
@@ -733,22 +731,22 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     req_prefill_a.model = "mock";
     req_prefill_a.sequence_id = 30;
     req_prefill_a.n_past = 0;
-    req_prefill_a.exec_active = true;
-    req_prefill_a.exec_in_prefill = true;
+    req_prefill_a.execution.active = true;
+    req_prefill_a.execution.in_prefill = true;
     req_prefill_a.prefill_offset = 0;
-    req_prefill_a.exec_decode_limit = 1;
-    req_prefill_a.exec_tokens_generated = 0;
+    req_prefill_a.execution.decode_limit = 1;
+    req_prefill_a.execution.tokens_generated = 0;
     req_prefill_a.bpe_prompt_tokens.assign(12, 1);
 
     InferenceRequest req_prefill_b;
     req_prefill_b.model = "mock";
     req_prefill_b.sequence_id = 31;
     req_prefill_b.n_past = 0;
-    req_prefill_b.exec_active = true;
-    req_prefill_b.exec_in_prefill = true;
+    req_prefill_b.execution.active = true;
+    req_prefill_b.execution.in_prefill = true;
     req_prefill_b.prefill_offset = 0;
-    req_prefill_b.exec_decode_limit = 1;
-    req_prefill_b.exec_tokens_generated = 0;
+    req_prefill_b.execution.decode_limit = 1;
+    req_prefill_b.execution.tokens_generated = 0;
     req_prefill_b.bpe_prompt_tokens.assign(12, 2);
 
     RequestBatch step_batch;
@@ -764,7 +762,8 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     REQUIRE(async_backend->submit_calls.front().inputs[1].tokens.size() == 3);
   }
 
-  SECTION("ExecuteUnifiedBatchStep uses native burst helper for singleton decode") {
+  SECTION(
+      "ExecuteUnifiedBatchStep uses native burst helper for singleton decode") {
     GlobalMetrics().Reset();
     auto burst_backend = std::make_shared<MockBurstUnifiedBackend>();
     LlamaCppBackend::BurstDecodeOutput burst0;
@@ -781,11 +780,11 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     req_decode.model = "mock";
     req_decode.sequence_id = 12;
     req_decode.n_past = 8;
-    req_decode.exec_active = true;
-    req_decode.exec_in_prefill = false;
-    req_decode.exec_decode_limit = 3;
-    req_decode.exec_tokens_generated = 0;
-    req_decode.exec_current_token = 42;
+    req_decode.execution.active = true;
+    req_decode.execution.in_prefill = false;
+    req_decode.execution.decode_limit = 3;
+    req_decode.execution.tokens_generated = 0;
+    req_decode.execution.current_token = 42;
 
     RequestBatch step_batch;
     step_batch.requests = {&req_decode};
@@ -795,10 +794,10 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     REQUIRE(burst_backend->burst_calls == 1);
     REQUIRE(burst_backend->unified_calls == 0);
     REQUIRE(req_decode.n_past == 10);
-    REQUIRE(req_decode.exec_tokens_generated == 2);
-    REQUIRE(req_decode.exec_current_token == 44);
-    REQUIRE(req_decode.exec_result.completion == "xy");
-    REQUIRE(req_decode.exec_active);
+    REQUIRE(req_decode.execution.tokens_generated == 2);
+    REQUIRE(req_decode.execution.current_token == 44);
+    REQUIRE(req_decode.execution.result.completion == "xy");
+    REQUIRE(req_decode.execution.active);
     REQUIRE(ReadMetricTotal(
                 "inferflux_scheduler_decode_worker_execution_path_total{path=\""
                 "direct_stepwise_native_burst\"} ") == 1);
@@ -807,7 +806,8 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
                 "reason=\"scheduler_stepwise\"} ") == 0);
   }
 
-  SECTION("ExecuteUnifiedBatchStep records scheduler_stepwise only when burst is blocked by batch shape") {
+  SECTION("ExecuteUnifiedBatchStep records scheduler_stepwise only when burst "
+          "is blocked by batch shape") {
     GlobalMetrics().Reset();
     auto burst_backend = std::make_shared<MockBurstUnifiedBackend>();
 
@@ -815,15 +815,15 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
     req_a.model = "mock";
     req_a.sequence_id = 12;
     req_a.n_past = 8;
-    req_a.exec_active = true;
-    req_a.exec_in_prefill = false;
-    req_a.exec_decode_limit = 3;
-    req_a.exec_tokens_generated = 0;
-    req_a.exec_current_token = 42;
+    req_a.execution.active = true;
+    req_a.execution.in_prefill = false;
+    req_a.execution.decode_limit = 3;
+    req_a.execution.tokens_generated = 0;
+    req_a.execution.current_token = 42;
 
     InferenceRequest req_b = req_a;
     req_b.sequence_id = 13;
-    req_b.exec_current_token = 52;
+    req_b.execution.current_token = 52;
 
     RequestBatch step_batch;
     step_batch.requests = {&req_a, &req_b};
@@ -902,9 +902,10 @@ TEST_CASE("BatchExecutor keeps async phased completions isolated per request",
   REQUIRE(req_decode.phase == RequestPhase::kFinished);
 }
 
-TEST_CASE("BatchExecutor resumes fairness-sliced seeded decode without re-emitting"
-          " first_piece",
-          "[unified_batch]") {
+TEST_CASE(
+    "BatchExecutor resumes fairness-sliced seeded decode without re-emitting"
+    " first_piece",
+    "[unified_batch]") {
   SimpleTokenizer tokenizer;
   auto device = std::make_shared<CPUDeviceContext>();
   auto cache = std::make_shared<PagedKVCache>(
@@ -912,8 +913,8 @@ TEST_CASE("BatchExecutor resumes fairness-sliced seeded decode without re-emitti
   auto router = std::make_shared<SingleModelRouter>();
   BatchExecutor::UnifiedBatchTuning tuning;
   tuning.decode_burst_tokens = 1;
-  auto executor = std::make_unique<BatchExecutor>(
-      &tokenizer, device, cache, router, nullptr, tuning);
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr, tuning);
   auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
 
   LlamaCppBackend::UnifiedBatchOutput b1;
@@ -935,7 +936,7 @@ TEST_CASE("BatchExecutor resumes fairness-sliced seeded decode without re-emitti
   req.first_token = 600;
   req.first_piece = "B0";
   req.max_tokens = 3;
-  req.remaining_decode_tokens = 3;
+  req.fairness.remaining_decode_tokens = 3;
   req.block_table = {404};
 
   RequestBatch batch;
@@ -946,21 +947,21 @@ TEST_CASE("BatchExecutor resumes fairness-sliced seeded decode without re-emitti
   REQUIRE(first[0].completion == "B0");
   REQUIRE(req.accumulated_output == "B0");
   REQUIRE(req.phase == RequestPhase::kPending);
-  REQUIRE(req.remaining_decode_tokens == 2);
+  REQUIRE(req.fairness.remaining_decode_tokens == 2);
 
   auto second = executor->ExecuteBatch(batch, {backend});
   REQUIRE(second.size() == 1);
   REQUIRE(second[0].completion == "B1");
   REQUIRE(req.accumulated_output == "B0B1");
   REQUIRE(req.phase == RequestPhase::kPending);
-  REQUIRE(req.remaining_decode_tokens == 1);
+  REQUIRE(req.fairness.remaining_decode_tokens == 1);
 
   auto third = executor->ExecuteBatch(batch, {backend});
   REQUIRE(third.size() == 1);
   REQUIRE(third[0].completion == "B2");
   REQUIRE(req.accumulated_output == "B0B1B2");
   REQUIRE(req.phase == RequestPhase::kFinished);
-  REQUIRE(req.total_completion_tokens == 3);
+  REQUIRE(req.fairness.total_completion_tokens == 3);
 }
 
 TEST_CASE("BatchExecutor resumes fairness-sliced unified prefill decode with"
@@ -973,8 +974,8 @@ TEST_CASE("BatchExecutor resumes fairness-sliced unified prefill decode with"
   auto router = std::make_shared<SingleModelRouter>();
   BatchExecutor::UnifiedBatchTuning tuning;
   tuning.decode_burst_tokens = 1;
-  auto executor = std::make_unique<BatchExecutor>(
-      &tokenizer, device, cache, router, nullptr, tuning);
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr, tuning);
   auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
 
   LlamaCppBackend::UnifiedBatchOutput a0;
@@ -995,7 +996,7 @@ TEST_CASE("BatchExecutor resumes fairness-sliced unified prefill decode with"
   req.sequence_id = 505;
   req.bpe_prompt_tokens = {1, 2};
   req.max_tokens = 2;
-  req.remaining_decode_tokens = 2;
+  req.fairness.remaining_decode_tokens = 2;
   req.block_table = {505};
 
   RequestBatch batch;
@@ -1006,14 +1007,14 @@ TEST_CASE("BatchExecutor resumes fairness-sliced unified prefill decode with"
   REQUIRE(first[0].completion == "A0");
   REQUIRE(req.accumulated_output == "A0");
   REQUIRE(req.phase == RequestPhase::kPending);
-  REQUIRE(req.remaining_decode_tokens == 1);
+  REQUIRE(req.fairness.remaining_decode_tokens == 1);
 
   auto second = executor->ExecuteBatch(batch, {backend});
   REQUIRE(second.size() == 1);
   REQUIRE(second[0].completion == "A1");
   REQUIRE(req.accumulated_output == "A0A1");
   REQUIRE(req.phase == RequestPhase::kFinished);
-  REQUIRE(req.total_completion_tokens == 2);
+  REQUIRE(req.fairness.total_completion_tokens == 2);
 }
 
 TEST_CASE("BatchExecutor keeps interleaved fairness-sliced phased requests"
@@ -1026,8 +1027,8 @@ TEST_CASE("BatchExecutor keeps interleaved fairness-sliced phased requests"
   auto router = std::make_shared<SingleModelRouter>();
   BatchExecutor::UnifiedBatchTuning tuning;
   tuning.decode_burst_tokens = 1;
-  auto executor = std::make_unique<BatchExecutor>(
-      &tokenizer, device, cache, router, nullptr, tuning);
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr, tuning);
   auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
 
   LlamaCppBackend::UnifiedBatchOutput a0;
@@ -1057,7 +1058,7 @@ TEST_CASE("BatchExecutor keeps interleaved fairness-sliced phased requests"
   req_prefill.sequence_id = 606;
   req_prefill.bpe_prompt_tokens = {1, 2};
   req_prefill.max_tokens = 2;
-  req_prefill.remaining_decode_tokens = 2;
+  req_prefill.fairness.remaining_decode_tokens = 2;
   req_prefill.block_table = {606};
 
   InferenceRequest req_decode;
@@ -1069,7 +1070,7 @@ TEST_CASE("BatchExecutor keeps interleaved fairness-sliced phased requests"
   req_decode.first_token = 900;
   req_decode.first_piece = "B0";
   req_decode.max_tokens = 3;
-  req_decode.remaining_decode_tokens = 3;
+  req_decode.fairness.remaining_decode_tokens = 3;
   req_decode.block_table = {707};
 
   RequestBatch batch;
@@ -1112,8 +1113,8 @@ TEST_CASE("BatchExecutor threads request and lease identity into unified batch"
   auto router = std::make_shared<SingleModelRouter>();
   BatchExecutor::UnifiedBatchTuning tuning;
   tuning.decode_burst_tokens = 1;
-  auto executor = std::make_unique<BatchExecutor>(
-      &tokenizer, device, cache, router, nullptr, tuning);
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr, tuning);
   auto backend = std::make_shared<MockAsyncUnifiedBackend>();
 
   InferenceRequest req;
@@ -1125,7 +1126,7 @@ TEST_CASE("BatchExecutor threads request and lease identity into unified batch"
   req.sequence_generation = 12;
   req.first_token = 808;
   req.max_tokens = 1;
-  req.remaining_decode_tokens = 1;
+  req.fairness.remaining_decode_tokens = 1;
   req.block_table = {909};
 
   RequestBatch batch;
@@ -1141,10 +1142,9 @@ TEST_CASE("BatchExecutor threads request and lease identity into unified batch"
   REQUIRE(input.sequence_id == 909);
 }
 
-TEST_CASE(
-    "BatchExecutor ignores invisible control-token steps in async phased "
-    "generation",
-    "[unified_batch]") {
+TEST_CASE("BatchExecutor ignores invisible control-token steps in async phased "
+          "generation",
+          "[unified_batch]") {
   SimpleTokenizer tokenizer;
   auto device = std::make_shared<CPUDeviceContext>();
   auto cache = std::make_shared<PagedKVCache>(
@@ -1191,13 +1191,14 @@ TEST_CASE(
   REQUIRE(results[0].completion == "AB");
   REQUIRE(results[0].completion_tokens == 2);
   REQUIRE(req.accumulated_output == "AB");
-  REQUIRE(req.total_completion_tokens == 2);
+  REQUIRE(req.fairness.total_completion_tokens == 2);
   REQUIRE(req.phase == RequestPhase::kFinished);
   REQUIRE(streamed == std::vector<std::string>{"A", "B"});
 }
 
-TEST_CASE("BatchExecutor treats empty backend generation as zero-token sentinel",
-          "[unified_batch]") {
+TEST_CASE(
+    "BatchExecutor treats empty backend generation as zero-token sentinel",
+    "[unified_batch]") {
   SimpleTokenizer tokenizer;
   auto device = std::make_shared<CPUDeviceContext>();
   auto cache = std::make_shared<PagedKVCache>(

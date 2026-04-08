@@ -2549,11 +2549,11 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
     req.json_mode = parsed.json_mode;
     if (parsed.has_response_format) {
-      req.has_response_format = true;
-      req.response_format_type = parsed.response_format_type;
-      req.response_format_schema = parsed.response_format_schema;
-      req.response_format_grammar = parsed.response_format_grammar;
-      req.response_format_root = parsed.response_format_root;
+      req.response_format.has_format = true;
+      req.response_format.type = parsed.response_format_type;
+      req.response_format.schema = parsed.response_format_schema;
+      req.response_format.grammar = parsed.response_format_grammar;
+      req.response_format.root = parsed.response_format_root;
     }
     req.stream = parsed.stream;
     if (parsed.logprobs) {

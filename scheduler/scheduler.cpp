@@ -86,7 +86,7 @@ void LogSequenceSlotEvent(std::string_view stage,
   LogSequenceSlotEvent(stage, static_cast<int64_t>(inference.id),
                        inference.sequence_id, inference.sequence_generation,
                        inference.phase, inference.n_past,
-                       inference.remaining_decode_tokens, detail);
+                       inference.fairness.remaining_decode_tokens, detail);
 }
 
 } // namespace
@@ -160,19 +160,20 @@ std::size_t EstimateQueueTokenCost(const InferenceRequest &inference,
   if (decode_limit <= 0) {
     decode_limit = 1;
   }
-  if (inference.remaining_decode_tokens >= 0) {
-    decode_limit = std::min(decode_limit, inference.remaining_decode_tokens);
+  if (inference.fairness.remaining_decode_tokens >= 0) {
+    decode_limit =
+        std::min(decode_limit, inference.fairness.remaining_decode_tokens);
   }
 
-  int predicted_slice_limit = inference.timeslice_tokens;
+  int predicted_slice_limit = inference.fairness.timeslice_tokens;
   // BuildBatchLocked runs before ApplyFairness; predict the same slice cap the
   // fairness pass will apply for lower-priority requests.
   if (predicted_slice_limit <= 0 && fairness_config.max_timeslice_tokens > 0 &&
       inference.priority < fairness_config.high_priority_threshold) {
     predicted_slice_limit = fairness_config.max_timeslice_tokens;
-    if (inference.remaining_decode_tokens > 0) {
-      predicted_slice_limit =
-          std::min(predicted_slice_limit, inference.remaining_decode_tokens);
+    if (inference.fairness.remaining_decode_tokens > 0) {
+      predicted_slice_limit = std::min(
+          predicted_slice_limit, inference.fairness.remaining_decode_tokens);
     }
   }
   if (predicted_slice_limit > 0) {
@@ -313,7 +314,7 @@ bool HasValidUnifiedStepState(const InferenceRequest &req) {
   if (req.first_token >= 0) {
     return true;
   }
-  if (req.exec_initialized) {
+  if (req.execution.initialized) {
     return true;
   }
   if (req.n_past == 0 && !req.bpe_prompt_tokens.empty()) {
@@ -339,49 +340,52 @@ void ResetUnifiedStepState(InferenceRequest *req) {
   if (!req) {
     return;
   }
-  req->exec_initialized = false;
-  req->exec_active = true;
-  req->exec_tokens_generated = 0;
-  req->exec_decode_limit = 0;
-  req->exec_current_token = -1;
-  req->exec_slice_active = false;
-  req->exec_in_prefill = false;
-  req->exec_result = InferenceResult{};
+  req->execution.initialized = false;
+  req->execution.active = true;
+  req->execution.tokens_generated = 0;
+  req->execution.decode_limit = 0;
+  req->execution.current_token = -1;
+  req->execution.slice_active = false;
+  req->execution.in_prefill = false;
+  req->execution.result = InferenceResult{};
 }
 
 void PrimeUnifiedDecodeStepState(InferenceRequest *req) {
-  if (!req || req->exec_initialized) {
+  if (!req || req->execution.initialized) {
     return;
   }
 
   ResetUnifiedStepState(req);
-  req->exec_initialized = true;
-  req->exec_result.model_id = ResolveResultModelId(*req);
-  req->exec_result.prompt_tokens = static_cast<int>(req->prompt_tokens.size());
-  req->exec_result.completion = req->accumulated_output;
+  req->execution.initialized = true;
+  req->execution.result.model_id = ResolveResultModelId(*req);
+  req->execution.result.prompt_tokens =
+      static_cast<int>(req->prompt_tokens.size());
+  req->execution.result.completion = req->accumulated_output;
 
-  const int prior_completion_tokens = std::max(0, req->total_completion_tokens);
-  int remaining_decode_tokens = req->remaining_decode_tokens;
+  const int prior_completion_tokens =
+      std::max(0, req->fairness.total_completion_tokens);
+  int remaining_decode_tokens = req->fairness.remaining_decode_tokens;
   if (remaining_decode_tokens < 0) {
     remaining_decode_tokens =
         std::max(0, req->max_tokens - prior_completion_tokens);
   }
-  req->exec_tokens_generated = prior_completion_tokens;
-  req->exec_decode_limit = prior_completion_tokens + remaining_decode_tokens;
-  req->exec_slice_active = true;
+  req->execution.tokens_generated = prior_completion_tokens;
+  req->execution.decode_limit =
+      prior_completion_tokens + remaining_decode_tokens;
+  req->execution.slice_active = true;
 
   if (req->n_past >= 0 && req->first_token >= 0) {
-    req->exec_current_token = req->first_token;
+    req->execution.current_token = req->first_token;
     const std::string piece = req->first_piece;
     req->first_piece.clear();
 
     bool stop_hit = false;
     if (!piece.empty()) {
-      req->exec_tokens_generated++;
-      req->exec_result.completion += piece;
+      req->execution.tokens_generated++;
+      req->execution.result.completion += piece;
       std::string emit_piece;
-      stop_hit =
-          ApplyStop(piece, req->exec_result.completion, req->stop, &emit_piece);
+      stop_hit = ApplyStop(piece, req->execution.result.completion, req->stop,
+                           &emit_piece);
       if (req->on_token && !emit_piece.empty()) {
         GlobalMetrics().RecordStreamTokens(1);
         req->on_token(emit_piece, nullptr);
@@ -390,48 +394,48 @@ void PrimeUnifiedDecodeStepState(InferenceRequest *req) {
 
     if (stop_hit ||
         (req->cancellation_flag && req->cancellation_flag->load()) ||
-        req->exec_tokens_generated >= req->exec_decode_limit) {
-      req->exec_active = false;
+        req->execution.tokens_generated >= req->execution.decode_limit) {
+      req->execution.active = false;
     }
   } else if (req->n_past == 0 && !req->bpe_prompt_tokens.empty()) {
-    req->exec_in_prefill = true;
+    req->execution.in_prefill = true;
   } else if (req->n_past > 0 && !req->bpe_prompt_tokens.empty() &&
              req->prefill_offset > 0 &&
              req->prefill_offset <
                  static_cast<int>(req->bpe_prompt_tokens.size())) {
     req->n_past = req->prefill_offset;
-    req->exec_in_prefill = true;
+    req->execution.in_prefill = true;
   } else {
-    req->exec_active = false;
-    req->exec_result.completion = "[batch state error]";
+    req->execution.active = false;
+    req->execution.result.completion = "[batch state error]";
   }
 
-  req->accumulated_output = req->exec_result.completion;
-  req->total_completion_tokens = req->exec_tokens_generated;
-  req->remaining_decode_tokens =
-      std::max(0, req->exec_decode_limit - req->exec_tokens_generated);
+  req->accumulated_output = req->execution.result.completion;
+  req->fairness.total_completion_tokens = req->execution.tokens_generated;
+  req->fairness.remaining_decode_tokens = std::max(
+      0, req->execution.decode_limit - req->execution.tokens_generated);
 }
 
 bool ShouldContinueUnifiedDecodeStep(const InferenceRequest &req) {
-  if (!req.exec_initialized || !req.exec_active) {
+  if (!req.execution.initialized || !req.execution.active) {
     return false;
   }
-  if (req.exec_in_prefill) {
+  if (req.execution.in_prefill) {
     return true;
   }
-  return req.exec_tokens_generated < req.exec_decode_limit;
+  return req.execution.tokens_generated < req.execution.decode_limit;
 }
 
 void SyncUnifiedDecodeStepProgress(InferenceRequest *req) {
-  if (!req || !req->exec_initialized) {
+  if (!req || !req->execution.initialized) {
     return;
   }
-  req->accumulated_output = req->exec_result.completion;
-  req->total_completion_tokens = req->exec_tokens_generated;
-  req->remaining_decode_tokens =
-      std::max(0, req->exec_decode_limit - req->exec_tokens_generated);
+  req->accumulated_output = req->execution.result.completion;
+  req->fairness.total_completion_tokens = req->execution.tokens_generated;
+  req->fairness.remaining_decode_tokens = std::max(
+      0, req->execution.decode_limit - req->execution.tokens_generated);
   if (ShouldContinueUnifiedDecodeStep(*req)) {
-    req->first_token = req->exec_current_token;
+    req->first_token = req->execution.current_token;
     req->first_piece.clear();
   }
 }
@@ -445,20 +449,20 @@ void FinalizeUnifiedDecodeStepResult(InferenceRequest *req,
   SyncUnifiedDecodeStepProgress(req);
   result->model_id = ResolveResultModelId(*req);
   result->completion = req->accumulated_output;
-  result->completion_tokens = req->total_completion_tokens;
-  result->prompt_tokens = req->reported_prompt_tokens >= 0
-                              ? req->reported_prompt_tokens
+  result->completion_tokens = req->fairness.total_completion_tokens;
+  result->prompt_tokens = req->fairness.reported_prompt_tokens >= 0
+                              ? req->fairness.reported_prompt_tokens
                               : static_cast<int>(req->prompt_tokens.size());
   if (result->completion.empty() && !result->no_backend) {
     result->completion = std::string(kBackendEmptyResponseText);
     GlobalMetrics().RecordEmptyGeneration();
   }
 
-  req->service_tokens = req->total_completion_tokens;
+  req->fairness.service_tokens = req->fairness.total_completion_tokens;
   req->phase = RequestPhase::kFinished;
-  req->fairness_yielded = false;
-  req->timeslice_tokens = 0;
-  req->last_timeslice_tokens = 0;
+  req->fairness.yielded = false;
+  req->fairness.timeslice_tokens = 0;
+  req->fairness.last_timeslice_tokens = 0;
   ResetUnifiedStepState(req);
 }
 
@@ -718,9 +722,9 @@ bool Scheduler::CanAppendToStickyStepBatchLocked(
   const auto &inference = pending->inference;
   return pending->resolved_backend.get() == sticky_step_backend.get() &&
          HasValidUnifiedStepState(inference) &&
-         !inference.response_constraint.has_grammar &&
-         !inference.collect_logprobs && !inference.has_response_format &&
-         inference.response_format_supported;
+         !inference.response_format.constraint.has_grammar &&
+         !inference.collect_logprobs && !inference.response_format.has_format &&
+         inference.response_format.supported;
 }
 
 std::size_t Scheduler::AppendCompatiblePendingDecodeLocked(
@@ -1013,10 +1017,10 @@ void Scheduler::DecodeWorkerLoop() {
 
     std::size_t decode_tokens = 0;
     for (const auto &pending : batch) {
-      int slice_tokens = pending->inference.timeslice_tokens;
+      int slice_tokens = pending->inference.fairness.timeslice_tokens;
       if (slice_tokens <= 0) {
-        if (pending->inference.remaining_decode_tokens > 0) {
-          slice_tokens = pending->inference.remaining_decode_tokens;
+        if (pending->inference.fairness.remaining_decode_tokens > 0) {
+          slice_tokens = pending->inference.fairness.remaining_decode_tokens;
         } else {
           slice_tokens = pending->inference.max_tokens;
         }
@@ -1043,9 +1047,10 @@ void Scheduler::DecodeWorkerLoop() {
         const auto &inference = pending->inference;
         const auto &backend = pending->resolved_backend;
         if (!HasBoundDecodeBackend(inference, backend) || !backend ||
-            !backend->IsReady() || !inference.response_format_supported ||
-            inference.response_constraint.has_grammar ||
-            inference.collect_logprobs || inference.has_response_format) {
+            !backend->IsReady() || !inference.response_format.supported ||
+            inference.response_format.constraint.has_grammar ||
+            inference.collect_logprobs ||
+            inference.response_format.has_format) {
           return nullptr;
         }
         if (sticky_step_backend && backend.get() != sticky_step_backend.get()) {
@@ -1142,13 +1147,13 @@ void Scheduler::DecodeWorkerLoop() {
 
     for (auto &pending : batch) {
       auto *inference = &pending->inference;
-      if (!inference->response_format_supported) {
+      if (!inference->response_format.supported) {
         InferenceResult error;
         error.no_backend = true;
         error.completion =
-            inference->response_format_error.empty()
+            inference->response_format.error.empty()
                 ? "Selected model does not support requested features"
-                : inference->response_format_error;
+                : inference->response_format.error;
         pending->promise.set_value(std::move(error));
         // Return the sequence slot and KV blocks so they are not leaked.
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -1166,14 +1171,15 @@ void Scheduler::DecodeWorkerLoop() {
         }
         continue;
       }
-      if (inference->has_response_format && !inference->response_format_ready) {
+      if (inference->response_format.has_format &&
+          !inference->response_format.ready) {
         StructuredConstraint constraint;
         std::string adapter_error;
         if (!StructuredOutputAdapter::BuildConstraint(
-                inference->response_format_type,
-                inference->response_format_schema,
-                inference->response_format_grammar,
-                inference->response_format_root, &constraint, &adapter_error)) {
+                inference->response_format.type,
+                inference->response_format.schema,
+                inference->response_format.grammar,
+                inference->response_format.root, &constraint, &adapter_error)) {
           InferenceResult error;
           error.no_backend = true;
           error.completion = adapter_error.empty()
@@ -1195,8 +1201,8 @@ void Scheduler::DecodeWorkerLoop() {
           }
           continue;
         }
-        inference->response_constraint = constraint;
-        inference->response_format_ready = true;
+        inference->response_format.constraint = constraint;
+        inference->response_format.ready = true;
       }
       if (slot_manager_ && inference->sequence_id >= 0) {
         slot_manager_->MarkProcessing(inference->sequence_id);
@@ -1219,8 +1225,9 @@ void Scheduler::DecodeWorkerLoop() {
         const auto &backend = overrides[i];
         if (!backend || !backend->IsReady() ||
             !HasValidUnifiedStepState(*inference) ||
-            inference->response_constraint.has_grammar ||
-            inference->collect_logprobs || inference->has_response_format) {
+            inference->response_format.constraint.has_grammar ||
+            inference->collect_logprobs ||
+            inference->response_format.has_format) {
           use_stepwise_decode = false;
           break;
         }
@@ -1297,7 +1304,7 @@ void Scheduler::DecodeWorkerLoop() {
           continue;
         }
         FinalizeUnifiedDecodeStepResult(inference, &result);
-      } else if (inference->fairness_yielded) {
+      } else if (inference->fairness.yielded) {
         auto now = std::chrono::steady_clock::now();
         pending->enqueue_time = now;
         PrepareFairnessDecodeRequeue(inference, now);
@@ -1308,12 +1315,14 @@ void Scheduler::DecodeWorkerLoop() {
 
       if (!use_stepwise_decode && !inference->accumulated_output.empty()) {
         result.completion = inference->accumulated_output;
-        if (inference->total_completion_tokens > 0) {
-          result.completion_tokens = inference->total_completion_tokens;
+        if (inference->fairness.total_completion_tokens > 0) {
+          result.completion_tokens =
+              inference->fairness.total_completion_tokens;
         }
       }
-      if (!use_stepwise_decode && inference->reported_prompt_tokens >= 0) {
-        result.prompt_tokens = inference->reported_prompt_tokens;
+      if (!use_stepwise_decode &&
+          inference->fairness.reported_prompt_tokens >= 0) {
+        result.prompt_tokens = inference->fairness.reported_prompt_tokens;
       }
 
       // Return KV memory and sequence slot.  Both must happen together.
@@ -1379,14 +1388,15 @@ std::future<InferenceResult> Scheduler::Generate(InferenceRequest request) {
   if (pending->inference.max_tokens <= 0) {
     pending->inference.max_tokens = 1;
   }
-  pending->inference.remaining_decode_tokens = pending->inference.max_tokens;
+  pending->inference.fairness.remaining_decode_tokens =
+      pending->inference.max_tokens;
   pending->inference.accumulated_output.clear();
   ResetUnifiedStepState(&pending->inference);
   if (pending->inference.prompt_tokens.empty()) {
     pending->inference.prompt_tokens =
         tokenizer_.Encode(pending->inference.prompt);
   }
-  pending->inference.reported_prompt_tokens =
+  pending->inference.fairness.reported_prompt_tokens =
       static_cast<int>(pending->inference.prompt_tokens.size());
   pending->inference.output_tokens.clear();
   pending->inference.first_token_time = {};
@@ -1748,7 +1758,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // path so the backend can apply a single consistent sampler/grammar
         // state. Phased prefill + Decode() would split sampler state across
         // phases and force sequence-state handoff between heterogeneous paths.
-        if (inf.collect_logprobs || inf.has_response_format) {
+        if (inf.collect_logprobs || inf.response_format.has_format) {
           inf.n_past = -1;
           inf.prompt_bpe_tokens = 0;
           ResetSequenceLease(&inf);
@@ -1902,7 +1912,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           const bool can_defer_to_unified_prefill =
               !use_decode_workers_ && pending->resolved_backend &&
               pending->resolved_backend->SupportsAsyncUnifiedBatch() &&
-              !inf.collect_logprobs && !inf.has_response_format &&
+              !inf.collect_logprobs && !inf.response_format.has_format &&
               !inf.has_images && !inf.bpe_prompt_tokens.empty();
           if (can_defer_to_unified_prefill) {
             int prefill_start = 0;
@@ -2186,13 +2196,13 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   exec_pending.reserve(selection.pending.size());
   for (auto &pending : selection.pending) {
     auto *inference = &pending->inference;
-    if (!inference->response_format_supported) {
+    if (!inference->response_format.supported) {
       InferenceResult error;
       error.no_backend = true;
       error.completion =
-          inference->response_format_error.empty()
+          inference->response_format.error.empty()
               ? "Selected model does not support requested features"
-              : inference->response_format_error;
+              : inference->response_format.error;
       if (inference->session_lease_acquired &&
           RequestUsesSessionHandle(*inference)) {
         FinalizeSessionLease(pending.get(), false);
@@ -2208,14 +2218,14 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       pending->promise.set_value(std::move(error));
       continue;
     }
-    if (inference->has_response_format) {
+    if (inference->response_format.has_format) {
       StructuredConstraint constraint;
       std::string adapter_error;
       if (!StructuredOutputAdapter::BuildConstraint(
-              inference->response_format_type,
-              inference->response_format_schema,
-              inference->response_format_grammar,
-              inference->response_format_root, &constraint, &adapter_error)) {
+              inference->response_format.type,
+              inference->response_format.schema,
+              inference->response_format.grammar,
+              inference->response_format.root, &constraint, &adapter_error)) {
         InferenceResult error;
         error.no_backend = true;
         error.completion = adapter_error.empty()
@@ -2236,11 +2246,11 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         pending->promise.set_value(std::move(error));
         continue;
       }
-      inference->response_constraint = constraint;
-      inference->response_format_ready = true;
+      inference->response_format.constraint = constraint;
+      inference->response_format.ready = true;
     } else {
-      inference->response_constraint = StructuredConstraint{};
-      inference->response_format_ready = false;
+      inference->response_format.constraint = StructuredConstraint{};
+      inference->response_format.ready = false;
     }
     if (slot_manager_ && inference->sequence_id >= 0) {
       slot_manager_->MarkProcessing(inference->sequence_id);
@@ -2265,7 +2275,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     if (i < responses.size()) {
       result = std::move(responses[i]);
     }
-    if (inference->fairness_yielded) {
+    if (inference->fairness.yielded) {
       const int slice_tokens = result.completion_tokens;
       auto now = std::chrono::steady_clock::now();
       pending->enqueue_time = now;
@@ -2276,8 +2286,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       Span fairness_span(
           "scheduler.fairness.yield", tracing::ChildContext(parent_ctx),
           [req_id = inference->id,
-           remaining = inference->remaining_decode_tokens,
-           slice = inference->last_timeslice_tokens, slice_tokens](
+           remaining = inference->fairness.remaining_decode_tokens,
+           slice = inference->fairness.last_timeslice_tokens, slice_tokens](
               const std::string &name, const SpanContext &ctx, double ms) {
             std::cout << "[fairness] " << name << " request=" << req_id
                       << " trace=" << ctx.trace_id << " limit=" << slice
@@ -2291,12 +2301,12 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     }
     if (!inference->accumulated_output.empty()) {
       result.completion = inference->accumulated_output;
-      if (inference->total_completion_tokens > 0) {
-        result.completion_tokens = inference->total_completion_tokens;
+      if (inference->fairness.total_completion_tokens > 0) {
+        result.completion_tokens = inference->fairness.total_completion_tokens;
       }
     }
-    if (inference->reported_prompt_tokens >= 0) {
-      result.prompt_tokens = inference->reported_prompt_tokens;
+    if (inference->fairness.reported_prompt_tokens >= 0) {
+      result.prompt_tokens = inference->fairness.reported_prompt_tokens;
     }
     // Return the llama.cpp KV memory and the sequence slot to the pool.
     // ExecuteRequest intentionally leaves sequence_id set so both operations
@@ -2311,7 +2321,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     const bool session_owned = inference->session_lease_acquired &&
                                RequestUsesSessionHandle(*inference);
     if (prefix_cache_ && inference->sequence_id >= 0 &&
-        !inference->fairness_yielded && !session_owned) {
+        !inference->fairness.yielded && !session_owned) {
       // Concatenate prompt BPE tokens and any generated output BPE tokens.
       // (Simplified: we use prompt_bpe_tokens for the architectural
       // foundation).
@@ -2383,16 +2393,17 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
   batch_entries.reserve(selection->pending.size());
   for (std::size_t i = 0; i < selection->pending.size(); ++i) {
     auto &pending = selection->pending[i];
-    pending->inference.priority_level = pending->inference.priority;
-    if (pending->inference.total_completion_tokens > 0 &&
-        pending->inference.remaining_decode_tokens > 0) {
-      metrics_->RecordFairnessResume(pending->inference.priority_level);
+    pending->inference.fairness.priority_level = pending->inference.priority;
+    if (pending->inference.fairness.total_completion_tokens > 0 &&
+        pending->inference.fairness.remaining_decode_tokens > 0) {
+      metrics_->RecordFairnessResume(
+          pending->inference.fairness.priority_level);
       SpanContext parent_ctx;
       parent_ctx.trace_id = pending->inference.trace_id;
       Span resume_span(
           "scheduler.fairness.resume", tracing::ChildContext(parent_ctx),
           [req_id = pending->inference.id,
-           remaining = pending->inference.remaining_decode_tokens](
+           remaining = pending->inference.fairness.remaining_decode_tokens](
               const std::string &name, const SpanContext &ctx, double ms) {
             std::cout << "[fairness] " << name << " request=" << req_id
                       << " trace=" << ctx.trace_id << " remaining=" << remaining
@@ -2401,7 +2412,7 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
       resume_span.Finish();
     }
     batch_entries.push_back(FairnessEntry{
-        &pending->inference, pending->inference.priority_level, i});
+        &pending->inference, pending->inference.fairness.priority_level, i});
   }
   struct QueueItem {
     std::shared_ptr<PendingRequest> pending;
@@ -2412,20 +2423,20 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
   queue_refs.reserve(pending_prefill_.size() + pending_decode_.size());
   for (std::size_t i = 0; i < pending_prefill_.size(); ++i) {
     auto &pending = pending_prefill_[i];
-    pending->inference.priority_level = pending->inference.priority;
+    pending->inference.fairness.priority_level = pending->inference.priority;
     queue_refs.push_back(QueueItem{pending, false, i});
   }
   for (std::size_t i = 0; i < pending_decode_.size(); ++i) {
     auto &pending = pending_decode_[i];
-    pending->inference.priority_level = pending->inference.priority;
+    pending->inference.fairness.priority_level = pending->inference.priority;
     queue_refs.push_back(QueueItem{pending, true, i});
   }
   std::vector<FairnessEntry> queue_entries;
   queue_entries.reserve(queue_refs.size());
   for (std::size_t i = 0; i < queue_refs.size(); ++i) {
-    queue_entries.push_back(
-        FairnessEntry{&queue_refs[i].pending->inference,
-                      queue_refs[i].pending->inference.priority_level, i});
+    queue_entries.push_back(FairnessEntry{
+        &queue_refs[i].pending->inference,
+        queue_refs[i].pending->inference.fairness.priority_level, i});
   }
 
   auto decision = fairness_controller_.Evaluate(batch_entries, queue_entries);
@@ -2451,7 +2462,8 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
       pending_prefill_.push_back(displaced);
     }
     batch_entries[decision.batch_index].request = &queued->inference;
-    metrics_->RecordFairnessPreemption(queued->inference.priority_level);
+    metrics_->RecordFairnessPreemption(
+        queued->inference.fairness.priority_level);
     UpdateQueueDepthLocked();
   }
   fairness_controller_.ApplyTimeslice(&batch_entries);
@@ -2722,8 +2734,8 @@ void Scheduler::ResolveBackends(
       }
       pending->resolved_backend.reset();
       pending->inference.resolved_model.clear();
-      pending->inference.response_format_supported = true;
-      pending->inference.response_format_error.clear();
+      pending->inference.response_format.supported = true;
+      pending->inference.response_format.error.clear();
     }
     return;
   }
@@ -2734,16 +2746,16 @@ void Scheduler::ResolveBackends(
     }
     pending->resolved_backend.reset();
     pending->inference.resolved_model.clear();
-    pending->inference.response_format_supported = true;
-    pending->inference.response_format_error.clear();
+    pending->inference.response_format.supported = true;
+    pending->inference.response_format.error.clear();
 
     BackendFeatureRequirements requirements =
         BuildGenerationFeatureRequirements(
             pending->inference.stream, pending->inference.collect_logprobs,
-            pending->inference.has_response_format,
+            pending->inference.response_format.has_format,
             pending->inference.has_images,
             speculative_decoder_ && speculative_decoder_->Enabled() &&
-                !pending->inference.has_response_format);
+                !pending->inference.response_format.has_format);
 
     auto selection =
         SelectModelForRequest(router_.get(), pending->inference.model,
@@ -2754,8 +2766,8 @@ void Scheduler::ResolveBackends(
       continue;
     }
     if (selection.status == ModelSelectionStatus::kUnsupported) {
-      pending->inference.response_format_supported = false;
-      pending->inference.response_format_error =
+      pending->inference.response_format.supported = false;
+      pending->inference.response_format.error =
           selection.reason.empty()
               ? "Selected model does not support requested features"
               : selection.reason;
@@ -2823,7 +2835,7 @@ bool Scheduler::TrySwapOut(InferenceRequest &inf) {
     inf.block_table.clear();
     inf.is_swapped = true;
     metrics_->RecordFairnessPreemption(
-        inf.priority_level); // Reuse preemption metric for swap
+        inf.fairness.priority_level); // Reuse preemption metric for swap
     return true;
   } catch (const std::exception &) {
     return false;

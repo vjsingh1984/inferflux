@@ -64,10 +64,10 @@ void FairnessController::ApplyTimeslice(
       continue;
     }
     int limit = config_.max_timeslice_tokens;
-    if (entry.request->remaining_decode_tokens > 0) {
-      limit = std::min(limit, entry.request->remaining_decode_tokens);
+    if (entry.request->fairness.remaining_decode_tokens > 0) {
+      limit = std::min(limit, entry.request->fairness.remaining_decode_tokens);
     }
-    entry.request->timeslice_tokens = limit;
+    entry.request->fairness.timeslice_tokens = limit;
   }
 }
 

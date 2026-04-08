@@ -133,7 +133,7 @@ public:
       : backend_(backend ? backend.get() : nullptr) {
     if (!backend_)
       return;
-    const auto &c = req.response_constraint;
+    const auto &c = req.response_format.constraint;
     backend_->SetupSampler(c.has_grammar ? c.grammar : "",
                            c.has_grammar ? c.root : "", req.sampling);
     active_ = true;
@@ -264,8 +264,9 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
       be = ResolveBackend(req->model, nullptr);
     }
     if (HasValidUnifiedPhasedState(*req) &&
-        !req->response_constraint.has_grammar && !req->collect_logprobs &&
-        !req->has_response_format && be && be->IsReady()) {
+        !req->response_format.constraint.has_grammar &&
+        !req->collect_logprobs && !req->response_format.has_format && be &&
+        be->IsReady()) {
       auto *key = be.get();
       auto it = group_index_by_backend.find(key);
       if (it == group_index_by_backend.end()) {
@@ -323,7 +324,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   ExecutionOutcome outcome;
   auto &response = outcome.result;
   response.prompt_tokens = static_cast<int>(inference.prompt_tokens.size());
-  inference.fairness_yielded = false;
+  inference.fairness.yielded = false;
 
   if (inference.cancellation_flag && inference.cancellation_flag->load()) {
     inference.phase = RequestPhase::kAborted;
@@ -346,12 +347,14 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
 
   bool backend_ready = backend && backend->IsReady();
   bool backend_empty_generation = false;
-  int slice_limit = inference.timeslice_tokens;
-  inference.last_timeslice_tokens = slice_limit;
-  inference.timeslice_tokens = 0; // consumed; refreshed on next fairness pass.
+  int slice_limit = inference.fairness.timeslice_tokens;
+  inference.fairness.last_timeslice_tokens = slice_limit;
+  inference.fairness.timeslice_tokens =
+      0; // consumed; refreshed on next fairness pass.
   int decode_limit = inference.max_tokens;
-  if (inference.remaining_decode_tokens >= 0) {
-    decode_limit = std::min(decode_limit, inference.remaining_decode_tokens);
+  if (inference.fairness.remaining_decode_tokens >= 0) {
+    decode_limit =
+        std::min(decode_limit, inference.fairness.remaining_decode_tokens);
   }
   if (slice_limit > 0) {
     decode_limit = std::min(decode_limit, slice_limit);
@@ -374,10 +377,10 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
     if (backend_ready) {
       response.prompt_tokens = backend->TokenCount(inference.prompt);
     }
-    if (inference.total_completion_tokens == 0) {
-      inference.reported_prompt_tokens = response.prompt_tokens;
-      if (inference.service_tokens == 0) {
-        inference.service_tokens = response.prompt_tokens;
+    if (inference.fairness.total_completion_tokens == 0) {
+      inference.fairness.reported_prompt_tokens = response.prompt_tokens;
+      if (inference.fairness.service_tokens == 0) {
+        inference.fairness.service_tokens = response.prompt_tokens;
       }
     }
     outcome.prefill_ms = prefill_timer.ElapsedMs();
@@ -403,7 +406,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   SamplerScope sampler_scope(inference, backend);
 
   if (speculative_decoder_ && speculative_decoder_->Enabled() &&
-      !inference.has_response_format &&
+      !inference.response_format.has_format &&
       (!inference.cancellation_flag || !inference.cancellation_flag->load())) {
     auto draft =
         speculative_decoder_->Draft(inference.prompt_tokens, decode_limit);
@@ -507,11 +510,11 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
     }
   }
   // finish_reason="length" when the full max_tokens budget is exhausted.
-  // inference.total_completion_tokens holds prior-slice counts; adding this
-  // slice's count gives the running total.  Fairness mid-slice yields will
+  // inference.fairness.total_completion_tokens holds prior-slice counts; adding
+  // this slice's count gives the running total.  Fairness mid-slice yields will
   // not trigger this because their partial total stays below max_tokens.
   if (!response.no_backend && inference.max_tokens > 0 &&
-      inference.total_completion_tokens + response.completion_tokens >=
+      inference.fairness.total_completion_tokens + response.completion_tokens >=
           inference.max_tokens) {
     response.finish_reason_length = true;
   }
@@ -520,31 +523,33 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   if (inference.n_past >= 0 && response.completion_tokens > 0) {
     inference.n_past += response.completion_tokens;
   }
-  bool first_slice = (inference.total_completion_tokens == 0);
+  bool first_slice = (inference.fairness.total_completion_tokens == 0);
   int fairness_delta = response.completion_tokens;
   if (first_slice) {
     int prompt_component = response.prompt_tokens;
-    if (prompt_component <= 0 && inference.reported_prompt_tokens >= 0) {
-      prompt_component = inference.reported_prompt_tokens;
+    if (prompt_component <= 0 &&
+        inference.fairness.reported_prompt_tokens >= 0) {
+      prompt_component = inference.fairness.reported_prompt_tokens;
     }
     fairness_delta += prompt_component;
   }
   if (fairness_delta > 0) {
-    metrics_.RecordFairnessTokens(inference.priority_level, fairness_delta);
+    metrics_.RecordFairnessTokens(inference.fairness.priority_level,
+                                  fairness_delta);
   }
-  inference.service_tokens += response.completion_tokens;
-  inference.total_completion_tokens += response.completion_tokens;
+  inference.fairness.service_tokens += response.completion_tokens;
+  inference.fairness.total_completion_tokens += response.completion_tokens;
   bool fairness_active = slice_limit > 0;
   bool exhausted_slice =
       fairness_active && response.completion_tokens >= decode_limit;
   const int remaining_after_slice =
-      (inference.remaining_decode_tokens >= 0)
-          ? std::max(0, inference.remaining_decode_tokens -
+      (inference.fairness.remaining_decode_tokens >= 0)
+          ? std::max(0, inference.fairness.remaining_decode_tokens -
                             response.completion_tokens)
           : -1;
   if (fairness_active && exhausted_slice && remaining_after_slice > 0) {
-    inference.fairness_yielded = true;
-    metrics_.RecordFairnessYield(inference.priority_level,
+    inference.fairness.yielded = true;
+    metrics_.RecordFairnessYield(inference.fairness.priority_level,
                                  response.completion_tokens,
                                  remaining_after_slice);
     inference.phase = RequestPhase::kPending;
@@ -553,17 +558,18 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   }
 
   bool needs_json_validation =
-      inference.json_mode || inference.response_constraint.require_json_object;
+      inference.json_mode ||
+      inference.response_format.constraint.require_json_object;
   if (needs_json_validation) {
     try {
       auto parsed = json::parse(response.completion);
-      if (inference.response_constraint.require_json_object &&
+      if (inference.response_format.constraint.require_json_object &&
           !parsed.is_object()) {
         throw std::runtime_error("model output was not a JSON object");
       }
       response.completion = parsed.dump();
     } catch (const std::exception &) {
-      if (inference.response_constraint.require_json_object &&
+      if (inference.response_format.constraint.require_json_object &&
           !response.no_backend) {
         response.no_backend = true;
         response.completion =
@@ -571,7 +577,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
         response.completion_tokens = 0;
         inference.output_tokens.clear();
         inference.phase = RequestPhase::kFinished;
-        inference.fairness_yielded = false;
+        inference.fairness.yielded = false;
         if (cache_ && kv_page >= 0) {
           cache_->ReleaseBlocks(inference.block_table);
           kv_page = -1;
@@ -592,8 +598,8 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   if (!response.completion.empty() &&
       !IsNonAccumulatingCompletion(response.completion)) {
     inference.accumulated_output.append(response.completion);
-    if (inference.remaining_decode_tokens >= 0) {
-      inference.remaining_decode_tokens = remaining_after_slice;
+    if (inference.fairness.remaining_decode_tokens >= 0) {
+      inference.fairness.remaining_decode_tokens = remaining_after_slice;
     }
   }
 
@@ -607,7 +613,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   }
 
   inference.first_token_time = std::chrono::steady_clock::now();
-  inference.service_tokens += response.completion_tokens;
+  inference.fairness.service_tokens += response.completion_tokens;
 
   // KV memory release and slot bookkeeping (FreeSequence + FreeSeqSlot) are
   // intentionally handled by the scheduler (ProcessBatch / DecodeWorkerLoop)
@@ -640,19 +646,19 @@ BatchExecutor::ExecuteBatchDecodePhased(
   for (std::size_t i = 0; i < n; ++i) {
     auto *req = eligible[i];
     auto &out = outcomes[i].result;
-    req->fairness_yielded = false;
+    req->fairness.yielded = false;
     out.model_id =
         req->resolved_model.empty() ? req->model : req->resolved_model;
     out.prompt_tokens = static_cast<int>(req->prompt_tokens.size());
 
     // Compute per-request decode limit respecting fairness timeslice.
     int limit = req->max_tokens;
-    if (req->remaining_decode_tokens >= 0) {
-      limit = std::min(limit, req->remaining_decode_tokens);
+    if (req->fairness.remaining_decode_tokens >= 0) {
+      limit = std::min(limit, req->fairness.remaining_decode_tokens);
     }
-    int slice = req->timeslice_tokens;
-    req->last_timeslice_tokens = slice;
-    req->timeslice_tokens = 0;
+    int slice = req->fairness.timeslice_tokens;
+    req->fairness.last_timeslice_tokens = slice;
+    req->fairness.timeslice_tokens = 0;
     if (slice > 0) {
       limit = std::min(limit, slice);
     }
@@ -765,30 +771,31 @@ BatchExecutor::ExecuteBatchDecodePhased(
     outcomes[i].decode_ms = decode_ms / static_cast<double>(n);
 
     // Fairness token accounting.
-    bool first_slice = (req->total_completion_tokens == 0);
+    bool first_slice = (req->fairness.total_completion_tokens == 0);
     int fairness_delta = gen;
     if (first_slice) {
       int prompt_comp = out.prompt_tokens;
-      if (prompt_comp <= 0 && req->reported_prompt_tokens >= 0) {
-        prompt_comp = req->reported_prompt_tokens;
+      if (prompt_comp <= 0 && req->fairness.reported_prompt_tokens >= 0) {
+        prompt_comp = req->fairness.reported_prompt_tokens;
       }
       fairness_delta += prompt_comp;
     }
     if (fairness_delta > 0) {
-      metrics_.RecordFairnessTokens(req->priority_level, fairness_delta);
+      metrics_.RecordFairnessTokens(req->fairness.priority_level,
+                                    fairness_delta);
     }
-    req->service_tokens += gen;
-    req->total_completion_tokens += gen;
+    req->fairness.service_tokens += gen;
+    req->fairness.total_completion_tokens += gen;
 
     // Fairness yield decision.
     bool exhausted = states[i].slice_active && gen >= states[i].decode_limit;
     const int remaining_after_slice =
-        (req->remaining_decode_tokens >= 0)
-            ? std::max(0, req->remaining_decode_tokens - gen)
+        (req->fairness.remaining_decode_tokens >= 0)
+            ? std::max(0, req->fairness.remaining_decode_tokens - gen)
             : -1;
     if (states[i].slice_active && exhausted && remaining_after_slice > 0) {
-      req->fairness_yielded = true;
-      metrics_.RecordFairnessYield(req->priority_level, gen,
+      req->fairness.yielded = true;
+      metrics_.RecordFairnessYield(req->fairness.priority_level, gen,
                                    remaining_after_slice);
       req->phase = RequestPhase::kPending;
       req->first_token = states[i].current_token;
@@ -802,8 +809,8 @@ BatchExecutor::ExecuteBatchDecodePhased(
     if (!out.completion.empty() &&
         !IsNonAccumulatingCompletion(out.completion)) {
       req->accumulated_output.append(out.completion);
-      if (req->remaining_decode_tokens >= 0) {
-        req->remaining_decode_tokens = remaining_after_slice;
+      if (req->fairness.remaining_decode_tokens >= 0) {
+        req->fairness.remaining_decode_tokens = remaining_after_slice;
       }
     }
 
@@ -839,18 +846,18 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
   for (std::size_t i = 0; i < n; ++i) {
     auto *req = eligible[i];
     auto &out = outcomes[i].result;
-    req->fairness_yielded = false;
+    req->fairness.yielded = false;
     out.model_id =
         req->resolved_model.empty() ? req->model : req->resolved_model;
     out.prompt_tokens = static_cast<int>(req->prompt_tokens.size());
 
     int limit = req->max_tokens;
-    if (req->remaining_decode_tokens >= 0) {
-      limit = std::min(limit, req->remaining_decode_tokens);
+    if (req->fairness.remaining_decode_tokens >= 0) {
+      limit = std::min(limit, req->fairness.remaining_decode_tokens);
     }
-    int slice = req->timeslice_tokens;
-    req->last_timeslice_tokens = slice;
-    req->timeslice_tokens = 0;
+    int slice = req->fairness.timeslice_tokens;
+    req->fairness.last_timeslice_tokens = slice;
+    req->fairness.timeslice_tokens = 0;
     if (slice > 0) {
       limit = std::min(limit, slice);
     }
@@ -1174,29 +1181,30 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     out.completion_tokens = gen;
     outcomes[i].decode_ms = total_ms / static_cast<double>(n);
 
-    bool first_slice = (req->total_completion_tokens == 0);
+    bool first_slice = (req->fairness.total_completion_tokens == 0);
     int fairness_delta = gen;
     if (first_slice) {
       int prompt_comp = out.prompt_tokens;
-      if (prompt_comp <= 0 && req->reported_prompt_tokens >= 0) {
-        prompt_comp = req->reported_prompt_tokens;
+      if (prompt_comp <= 0 && req->fairness.reported_prompt_tokens >= 0) {
+        prompt_comp = req->fairness.reported_prompt_tokens;
       }
       fairness_delta += prompt_comp;
     }
     if (fairness_delta > 0) {
-      metrics_.RecordFairnessTokens(req->priority_level, fairness_delta);
+      metrics_.RecordFairnessTokens(req->fairness.priority_level,
+                                    fairness_delta);
     }
-    req->service_tokens += gen;
-    req->total_completion_tokens += gen;
+    req->fairness.service_tokens += gen;
+    req->fairness.total_completion_tokens += gen;
 
     bool exhausted = states[i].slice_active && gen >= states[i].decode_limit;
     const int remaining_after_slice =
-        (req->remaining_decode_tokens >= 0)
-            ? std::max(0, req->remaining_decode_tokens - gen)
+        (req->fairness.remaining_decode_tokens >= 0)
+            ? std::max(0, req->fairness.remaining_decode_tokens - gen)
             : -1;
     if (states[i].slice_active && exhausted && remaining_after_slice > 0) {
-      req->fairness_yielded = true;
-      metrics_.RecordFairnessYield(req->priority_level, gen,
+      req->fairness.yielded = true;
+      metrics_.RecordFairnessYield(req->fairness.priority_level, gen,
                                    remaining_after_slice);
       req->phase = RequestPhase::kPending;
       req->first_token = states[i].current_token;
@@ -1209,8 +1217,8 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     if (!out.completion.empty() &&
         !IsNonAccumulatingCompletion(out.completion)) {
       req->accumulated_output.append(out.completion);
-      if (req->remaining_decode_tokens >= 0) {
-        req->remaining_decode_tokens = remaining_after_slice;
+      if (req->fairness.remaining_decode_tokens >= 0) {
+        req->fairness.remaining_decode_tokens = remaining_after_slice;
       }
     }
     LogUnifiedAssemblyState("finalize", *req, std::string_view{},
@@ -1248,16 +1256,16 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
   int active_prefill_reqs = 0;
   int active_decode_reqs = 0;
   for (auto *req : batch.requests) {
-    if (!req->exec_active || req->phase == RequestPhase::kFinished ||
+    if (!req->execution.active || req->phase == RequestPhase::kFinished ||
         req->phase == RequestPhase::kAborted) {
       continue;
     }
     if (req->cancellation_flag && req->cancellation_flag->load()) {
       continue;
     }
-    if (req->exec_in_prefill) {
+    if (req->execution.in_prefill) {
       active_prefill_reqs++;
-    } else if (req->exec_tokens_generated < req->exec_decode_limit) {
+    } else if (req->execution.tokens_generated < req->execution.decode_limit) {
       active_decode_reqs++;
     }
   }
@@ -1270,18 +1278,18 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
   std::vector<InferenceRequest *> active_reqs;
 
   for (auto *req : batch.requests) {
-    if (!req->exec_active || req->phase == RequestPhase::kFinished ||
+    if (!req->execution.active || req->phase == RequestPhase::kFinished ||
         req->phase == RequestPhase::kAborted) {
       continue;
     }
 
     if (req->cancellation_flag && req->cancellation_flag->load()) {
-      req->exec_active = false;
+      req->execution.active = false;
       req->phase = RequestPhase::kAborted;
       continue;
     }
 
-    if (req->exec_in_prefill) {
+    if (req->execution.in_prefill) {
       int remaining =
           static_cast<int>(req->bpe_prompt_tokens.size()) - req->prefill_offset;
       int chunk_size = std::min(remaining, prefill_chunk_cap);
@@ -1290,7 +1298,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
             "unified_step", static_cast<std::size_t>(remaining - chunk_size));
       }
       if (chunk_size <= 0) {
-        req->exec_in_prefill = false;
+        req->execution.in_prefill = false;
         continue;
       }
       bool is_last_chunk = (req->prefill_offset + chunk_size >=
@@ -1301,12 +1309,12 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
       batch_inputs.push_back(MakeUnifiedBatchInput(
           *req, req->prefill_offset, std::move(chunk), is_last_chunk));
       active_reqs.push_back(req);
-    } else if (req->exec_tokens_generated < req->exec_decode_limit) {
+    } else if (req->execution.tokens_generated < req->execution.decode_limit) {
       batch_inputs.push_back(MakeUnifiedBatchInput(
-          *req, req->n_past, {req->exec_current_token}, true));
+          *req, req->n_past, {req->execution.current_token}, true));
       active_reqs.push_back(req);
     } else {
-      req->exec_active = false;
+      req->execution.active = false;
       req->phase = RequestPhase::kFinished;
     }
   }
@@ -1320,8 +1328,8 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
   if (active_prefill_reqs == 0 && active_decode_reqs == 1) {
     InferenceRequest *burst_req = nullptr;
     for (auto *req : active_reqs) {
-      if (!req->exec_in_prefill &&
-          req->exec_tokens_generated < req->exec_decode_limit) {
+      if (!req->execution.in_prefill &&
+          req->execution.tokens_generated < req->execution.decode_limit) {
         burst_req = req;
         break;
       }
@@ -1329,48 +1337,49 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     if (burst_req) {
       std::vector<LlamaCppBackend::BurstDecodeOutput> burst_outputs;
       std::string burst_reason;
-      const int remaining_tokens = std::max(
-          1, burst_req->exec_decode_limit - burst_req->exec_tokens_generated);
+      const int remaining_tokens =
+          std::max(1, burst_req->execution.decode_limit -
+                          burst_req->execution.tokens_generated);
       if (backend->TryGreedyBurstDecodeTokens(
               burst_req->sequence_id, burst_req->n_past,
-              burst_req->exec_current_token, burst_req->sampling,
+              burst_req->execution.current_token, burst_req->sampling,
               remaining_tokens, &burst_outputs, &burst_reason)) {
         metrics_.RecordDecodeWorkerExecutionPath(
             "direct_stepwise_native_burst");
         for (const auto &burst_out : burst_outputs) {
           burst_req->n_past += 1;
-          burst_req->exec_current_token = burst_out.token;
+          burst_req->execution.current_token = burst_out.token;
 
           if (burst_out.terminal || burst_out.token < 0) {
-            burst_req->exec_active = false;
+            burst_req->execution.active = false;
             break;
           }
 
           bool stop_hit = false;
           if (IsVisibleGeneratedPiece(burst_out.piece)) {
-            burst_req->exec_tokens_generated++;
-            burst_req->exec_result.completion += burst_out.piece;
+            burst_req->execution.tokens_generated++;
+            burst_req->execution.result.completion += burst_out.piece;
             std::string emit_piece;
-            stop_hit =
-                ApplyStop(burst_out.piece, burst_req->exec_result.completion,
-                          burst_req->stop, &emit_piece);
+            stop_hit = ApplyStop(burst_out.piece,
+                                 burst_req->execution.result.completion,
+                                 burst_req->stop, &emit_piece);
             if (burst_req->on_token && !emit_piece.empty()) {
               metrics_.RecordStreamTokens(1);
               burst_req->on_token(emit_piece, nullptr);
               if (burst_req->cancellation_flag &&
                   burst_req->cancellation_flag->load()) {
-                burst_req->exec_active = false;
+                burst_req->execution.active = false;
               }
             }
           }
           if (stop_hit) {
-            burst_req->exec_active = false;
+            burst_req->execution.active = false;
           }
-          if (burst_req->exec_tokens_generated >=
-              burst_req->exec_decode_limit) {
-            burst_req->exec_active = false;
+          if (burst_req->execution.tokens_generated >=
+              burst_req->execution.decode_limit) {
+            burst_req->execution.active = false;
           }
-          if (!burst_req->exec_active) {
+          if (!burst_req->execution.active) {
             break;
           }
         }
@@ -1382,7 +1391,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
 
   if (native_step_backend) {
     for (auto *req : batch.requests) {
-      if (!req || !req->exec_active || req->exec_in_prefill ||
+      if (!req || !req->execution.active || req->execution.in_prefill ||
           req->phase == RequestPhase::kFinished ||
           req->phase == RequestPhase::kAborted) {
         continue;
@@ -1390,7 +1399,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
       if (req->cancellation_flag && req->cancellation_flag->load()) {
         continue;
       }
-      if (req->exec_tokens_generated < req->exec_decode_limit) {
+      if (req->execution.tokens_generated < req->execution.decode_limit) {
         metrics_.RecordInferfluxCudaBurstDecodeIneligible("decode",
                                                           "scheduler_stepwise");
       }
@@ -1409,7 +1418,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     prefill_positions.reserve(batch_inputs.size());
 
     for (std::size_t j = 0; j < batch_inputs.size(); ++j) {
-      if (active_reqs[j]->exec_in_prefill) {
+      if (active_reqs[j]->execution.in_prefill) {
         prefill_positions.push_back(j);
         prefill_inputs.push_back(batch_inputs[j]);
       } else {
@@ -1472,7 +1481,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
   }
   if (step_outputs.empty()) {
     for (auto *req : active_reqs)
-      req->exec_active = false;
+      req->execution.active = false;
     return;
   }
 
@@ -1480,74 +1489,74 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     auto *req = active_reqs[j];
     const auto &res = step_outputs[j];
 
-    if (req->exec_in_prefill) {
+    if (req->execution.in_prefill) {
       req->prefill_offset += static_cast<int>(batch_inputs[j].tokens.size());
       if (req->prefill_offset >=
           static_cast<int>(req->bpe_prompt_tokens.size())) {
-        req->exec_in_prefill = false;
+        req->execution.in_prefill = false;
         if (!res.ok || res.token < 0) {
-          req->exec_active = false;
+          req->execution.active = false;
           continue;
         }
-        req->exec_current_token = res.token;
+        req->execution.current_token = res.token;
         req->n_past = req->prefill_offset;
 
         std::string piece = res.piece;
         bool stop_hit = false;
         if (IsVisibleGeneratedPiece(piece)) {
-          req->exec_tokens_generated++;
-          req->exec_result.completion += piece;
+          req->execution.tokens_generated++;
+          req->execution.result.completion += piece;
           std::string emit_piece;
-          stop_hit = ApplyStop(piece, req->exec_result.completion, req->stop,
-                               &emit_piece);
+          stop_hit = ApplyStop(piece, req->execution.result.completion,
+                               req->stop, &emit_piece);
           if (req->on_token && !emit_piece.empty()) {
             metrics_.RecordStreamTokens(1);
             req->on_token(emit_piece, nullptr);
           }
           if (stop_hit)
-            req->exec_active = false;
+            req->execution.active = false;
         }
-        if (req->exec_tokens_generated >= req->exec_decode_limit) {
-          req->exec_active = false;
+        if (req->execution.tokens_generated >= req->execution.decode_limit) {
+          req->execution.active = false;
         }
         LogUnifiedAssemblyState("step_prefill_emit", *req, piece,
-                                req->exec_result.completion, res.token,
-                                req->exec_tokens_generated, req->n_past,
-                                stop_hit, req->exec_active);
+                                req->execution.result.completion, res.token,
+                                req->execution.tokens_generated, req->n_past,
+                                stop_hit, req->execution.active);
       }
     } else {
       req->n_past += 1;
       if (!res.ok || res.token < 0) {
-        req->exec_active = false;
+        req->execution.active = false;
         continue;
       }
-      req->exec_current_token = res.token;
+      req->execution.current_token = res.token;
 
       std::string piece = res.piece;
       bool stop_hit = false;
       if (IsVisibleGeneratedPiece(piece)) {
-        req->exec_tokens_generated++;
-        req->exec_result.completion += piece;
+        req->execution.tokens_generated++;
+        req->execution.result.completion += piece;
         std::string emit_piece;
-        stop_hit = ApplyStop(piece, req->exec_result.completion, req->stop,
+        stop_hit = ApplyStop(piece, req->execution.result.completion, req->stop,
                              &emit_piece);
         if (req->on_token && !emit_piece.empty()) {
           metrics_.RecordStreamTokens(1);
           req->on_token(emit_piece, nullptr);
           if (req->cancellation_flag && req->cancellation_flag->load()) {
-            req->exec_active = false;
+            req->execution.active = false;
           }
         }
       }
       if (stop_hit)
-        req->exec_active = false;
-      if (req->exec_tokens_generated >= req->exec_decode_limit) {
-        req->exec_active = false;
+        req->execution.active = false;
+      if (req->execution.tokens_generated >= req->execution.decode_limit) {
+        req->execution.active = false;
       }
       LogUnifiedAssemblyState("step_decode_emit", *req, piece,
-                              req->exec_result.completion, res.token,
-                              req->exec_tokens_generated, req->n_past, stop_hit,
-                              req->exec_active);
+                              req->execution.result.completion, res.token,
+                              req->execution.tokens_generated, req->n_past,
+                              stop_hit, req->execution.active);
     }
   }
 }

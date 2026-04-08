@@ -336,7 +336,6 @@ private:
   static std::atomic<int> global_submission_ticket_;
 };
 
-
 class PromptRecordingSliceBackend final : public LlamaCppBackend {
 public:
   explicit PromptRecordingSliceBackend(std::vector<std::string> outputs)
@@ -344,13 +343,11 @@ public:
 
   bool IsReady() const override { return true; }
 
-  std::string
-  Generate(const std::string &prompt, int,
-           const std::function<bool(const std::string &, const TokenLogprob *)>
-               &,
-           const std::function<bool()> &, int,
-           std::vector<TokenLogprob> *,
-           const std::vector<std::string> &) override {
+  std::string Generate(
+      const std::string &prompt, int,
+      const std::function<bool(const std::string &, const TokenLogprob *)> &,
+      const std::function<bool()> &, int, std::vector<TokenLogprob> *,
+      const std::vector<std::string> &) override {
     seen_prompts_.push_back(prompt);
     if (next_output_ >= outputs_.size()) {
       return {};
@@ -417,7 +414,9 @@ public:
   }
 
   void SetReady(bool ready) { ready_.store(ready, std::memory_order_relaxed); }
-  int BeginCalls() const { return begin_calls_.load(std::memory_order_relaxed); }
+  int BeginCalls() const {
+    return begin_calls_.load(std::memory_order_relaxed);
+  }
   int PollCalls() const { return poll_calls_.load(std::memory_order_relaxed); }
   int LastSequenceId() const {
     return last_sequence_id_.load(std::memory_order_relaxed);
@@ -801,8 +800,7 @@ TEST_CASE("Scheduler defers slot reuse until backend free fence is ready",
   REQUIRE(slot_manager->GetRetiringSlotCount() == 1);
   REQUIRE(slot_manager->GetUsedSlotCount() == 0);
   // Free = max_slots - retiring(1).  Retiring slots are not counted as free.
-  const int remaining_free =
-      static_cast<int>(slot_manager->GetMaxSlots()) - 1;
+  const int remaining_free = static_cast<int>(slot_manager->GetMaxSlots()) - 1;
   REQUIRE(slot_manager->GetFreeSlotCount() ==
           static_cast<size_t>(remaining_free));
   REQUIRE(GlobalMetrics().GetSchedulerDeferredSequenceRetirements() == 1);
@@ -834,8 +832,7 @@ TEST_CASE("Scheduler defers slot reuse until backend free fence is ready",
   REQUIRE(GlobalMetrics().GetSchedulerDeferredSequenceRetirements() == 0);
   REQUIRE(ReadScalarMetric(
               "inferflux_scheduler_deferred_sequence_retirements_completed_"
-              "total{backend=\"cpu\"} ") ==
-          deferred_completed_before + 1);
+              "total{backend=\"cpu\"} ") == deferred_completed_before + 1);
 
   scheduler.FreeSeqSlot(reacquired_slot, reacquired_generation);
   for (const auto &[held_slot, held_generation] : held_slots) {
@@ -897,10 +894,11 @@ TEST_CASE("Scheduler routes decode-ready prefill requests directly to decode",
   pending->inference.model = info.id;
   pending->inference.resolved_model = info.id;
   pending->inference.prompt = "decode ready";
-  pending->inference.prompt_tokens = tokenizer.Encode(pending->inference.prompt);
+  pending->inference.prompt_tokens =
+      tokenizer.Encode(pending->inference.prompt);
   pending->inference.bpe_prompt_tokens = {1, 2, 3, 4};
   pending->inference.max_tokens = 2;
-  pending->inference.remaining_decode_tokens = 2;
+  pending->inference.fairness.remaining_decode_tokens = 2;
   pending->inference.phase = RequestPhase::kPrefill;
   pending->enqueue_time = std::chrono::steady_clock::now();
   pending->inference.enqueue_time = pending->enqueue_time;
@@ -1016,10 +1014,12 @@ TEST_CASE("Scheduler decode worker rebuilds stepwise decode cohorts",
       "inferflux_scheduler_decode_worker_batch_size_total{bucket=\"2\"} ");
   const int64_t bucket1_before = ReadScalarMetric(
       "inferflux_scheduler_decode_worker_batch_size_total{bucket=\"1\"} ");
-  const int64_t direct_before = ReadScalarMetric(
-      "inferflux_scheduler_decode_worker_execution_path_total{path=\"direct_stepwise\"} ");
-  const int64_t general_before = ReadScalarMetric(
-      "inferflux_scheduler_decode_worker_execution_path_total{path=\"general\"} ");
+  const int64_t direct_before =
+      ReadScalarMetric("inferflux_scheduler_decode_worker_execution_path_total{"
+                       "path=\"direct_stepwise\"} ");
+  const int64_t general_before =
+      ReadScalarMetric("inferflux_scheduler_decode_worker_execution_path_total{"
+                       "path=\"general\"} ");
 
   Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
                       FairnessConfig{}, disagg_config, ModelSelectionOptions{},
@@ -1048,10 +1048,12 @@ TEST_CASE("Scheduler decode worker rebuilds stepwise decode cohorts",
       "inferflux_scheduler_decode_worker_batch_size_total{bucket=\"2\"} ");
   const int64_t bucket1_after = ReadScalarMetric(
       "inferflux_scheduler_decode_worker_batch_size_total{bucket=\"1\"} ");
-  const int64_t direct_after = ReadScalarMetric(
-      "inferflux_scheduler_decode_worker_execution_path_total{path=\"direct_stepwise\"} ");
-  const int64_t general_after = ReadScalarMetric(
-      "inferflux_scheduler_decode_worker_execution_path_total{path=\"general\"} ");
+  const int64_t direct_after =
+      ReadScalarMetric("inferflux_scheduler_decode_worker_execution_path_total{"
+                       "path=\"direct_stepwise\"} ");
+  const int64_t general_after =
+      ReadScalarMetric("inferflux_scheduler_decode_worker_execution_path_total{"
+                       "path=\"general\"} ");
   REQUIRE(bucket2_after - bucket2_before == 2);
   REQUIRE(bucket1_after - bucket1_before == 0);
   REQUIRE(direct_after - direct_before == 2);
@@ -1083,7 +1085,7 @@ TEST_CASE("Scheduler sticky decode fill skips incompatible queue head",
     pending->inference.sequence_generation = 1;
     pending->inference.n_past = 4;
     pending->inference.first_token = 101;
-    pending->inference.response_format_supported = true;
+    pending->inference.response_format.supported = true;
     pending->resolved_backend = backend;
     return pending;
   };
@@ -1117,16 +1119,16 @@ TEST_CASE("Scheduler sticky decode fill skips incompatible queue head",
     REQUIRE(acc.pending_decode().size() == 1);
     REQUIRE(acc.pending_decode()[0] == incompatible);
   }
-  REQUIRE(ReadScalarMetric(
-              "inferflux_scheduler_decode_worker_sticky_merge_total{merged=\"2\"} ") -
+  REQUIRE(ReadScalarMetric("inferflux_scheduler_decode_worker_sticky_merge_"
+                           "total{merged=\"2\"} ") -
               sticky_merge_events_before ==
           1);
-  REQUIRE(ReadScalarMetric(
-              "inferflux_scheduler_decode_worker_sticky_merged_requests_total ") -
-              sticky_merged_requests_before ==
-          2);
+  REQUIRE(
+      ReadScalarMetric(
+          "inferflux_scheduler_decode_worker_sticky_merged_requests_total ") -
+          sticky_merged_requests_before ==
+      2);
 }
-
 
 TEST_CASE("Scheduler preserves bound backend for in-flight decode requests",
           "[scheduler]") {
@@ -1196,7 +1198,8 @@ TEST_CASE("Scheduler batch selection deduplicates one pending request leaked "
   auto pending = std::make_shared<Scheduler::PendingRequest>();
   pending->inference.id = 42;
   pending->inference.prompt = "duplicate queue entry";
-  pending->inference.prompt_tokens = tokenizer.Encode(pending->inference.prompt);
+  pending->inference.prompt_tokens =
+      tokenizer.Encode(pending->inference.prompt);
   pending->inference.phase = RequestPhase::kPending;
   pending->priority = 0;
   pending->priority_level = 0;
@@ -1289,7 +1292,8 @@ TEST_CASE("Scheduler unified mode records decode assembly selection metrics",
     auto pending = std::make_shared<Scheduler::PendingRequest>();
     pending->inference.id = id;
     pending->inference.prompt = "decode assembly";
-    pending->inference.prompt_tokens = tokenizer.Encode(pending->inference.prompt);
+    pending->inference.prompt_tokens =
+        tokenizer.Encode(pending->inference.prompt);
     pending->inference.phase = RequestPhase::kDecode;
     pending->inference.n_past = 4;
     pending->priority = 0;
@@ -1299,10 +1303,12 @@ TEST_CASE("Scheduler unified mode records decode assembly selection metrics",
     return pending;
   };
 
-  const int64_t ready_before = ReadScalarMetric(
-      "inferflux_scheduler_decode_assembly_ready_total{mode=\"unified\",bucket=\"2\"} ");
-  const int64_t selected_before = ReadScalarMetric(
-      "inferflux_scheduler_decode_assembly_selected_total{mode=\"unified\",bucket=\"2\"} ");
+  const int64_t ready_before =
+      ReadScalarMetric("inferflux_scheduler_decode_assembly_ready_total{mode="
+                       "\"unified\",bucket=\"2\"} ");
+  const int64_t selected_before =
+      ReadScalarMetric("inferflux_scheduler_decode_assembly_selected_total{"
+                       "mode=\"unified\",bucket=\"2\"} ");
 
   {
     SchedulerTestAccess acc(scheduler);
@@ -1313,12 +1319,12 @@ TEST_CASE("Scheduler unified mode records decode assembly selection metrics",
     REQUIRE(selection.pending.size() == 2);
   }
 
-  REQUIRE(ReadScalarMetric(
-              "inferflux_scheduler_decode_assembly_ready_total{mode=\"unified\",bucket=\"2\"} ") -
+  REQUIRE(ReadScalarMetric("inferflux_scheduler_decode_assembly_ready_total{"
+                           "mode=\"unified\",bucket=\"2\"} ") -
               ready_before ==
           1);
-  REQUIRE(ReadScalarMetric(
-              "inferflux_scheduler_decode_assembly_selected_total{mode=\"unified\",bucket=\"2\"} ") -
+  REQUIRE(ReadScalarMetric("inferflux_scheduler_decode_assembly_selected_total{"
+                           "mode=\"unified\",bucket=\"2\"} ") -
               selected_before ==
           1);
 }
@@ -1384,7 +1390,7 @@ TEST_CASE("PrepareFairnessDecodeRequeue preserves original prompt state",
   req.sequence_id = 7;
   req.sequence_generation = 3;
   req.n_past = 11;
-  req.remaining_decode_tokens = 2;
+  req.fairness.remaining_decode_tokens = 2;
   req.accumulated_output = "AB";
 
   const auto now = std::chrono::steady_clock::now();
@@ -1435,9 +1441,9 @@ TEST_CASE("Scheduler fairness requeue does not mutate prompt between slices",
   auto result = scheduler.Generate(std::move(req)).get();
   REQUIRE_FALSE(result.no_backend);
   REQUIRE(result.completion == "ABC");
-  REQUIRE(backend->SeenPrompts() ==
-          std::vector<std::string>{"seed prompt", "seed prompt",
-                                   "seed prompt"});
+  REQUIRE(backend->SeenPrompts() == std::vector<std::string>{"seed prompt",
+                                                             "seed prompt",
+                                                             "seed prompt"});
 }
 
 TEST_CASE("Scheduler fails fast when distributed enqueue retries are exhausted",
@@ -1746,8 +1752,8 @@ TEST_CASE("FairnessController evaluation", "[fairness]") {
   FairnessController controller(cfg);
 
   InferenceRequest low, high;
-  low.priority_level = 1;
-  high.priority_level = 10;
+  low.fairness.priority_level = 1;
+  high.fairness.priority_level = 10;
 
   std::vector<FairnessEntry> batch{{&low, 1, 0}};
   std::vector<FairnessEntry> queue{{&high, 10, 0}};
@@ -1772,18 +1778,18 @@ TEST_CASE("Scheduler fairness preemption keeps decode requests on decode queue",
   auto decode_pending = std::make_shared<Scheduler::PendingRequest>();
   decode_pending->priority = 1;
   decode_pending->inference.priority = 1;
-  decode_pending->inference.priority_level = 1;
+  decode_pending->inference.fairness.priority_level = 1;
   decode_pending->inference.id = 101;
   decode_pending->inference.phase = RequestPhase::kDecode;
   decode_pending->inference.sequence_id = 6;
   decode_pending->inference.sequence_generation = 7;
   decode_pending->inference.n_past = 12;
-  decode_pending->inference.remaining_decode_tokens = 16;
+  decode_pending->inference.fairness.remaining_decode_tokens = 16;
 
   auto high_pending = std::make_shared<Scheduler::PendingRequest>();
   high_pending->priority = 10;
   high_pending->inference.priority = 10;
-  high_pending->inference.priority_level = 10;
+  high_pending->inference.fairness.priority_level = 10;
   high_pending->inference.id = 202;
   high_pending->inference.phase = RequestPhase::kPending;
 
@@ -1804,7 +1810,7 @@ TEST_CASE("Scheduler fairness preemption keeps decode requests on decode queue",
   REQUIRE(decode_pending->inference.sequence_id == 6);
   REQUIRE(decode_pending->inference.sequence_generation == 7);
   REQUIRE(decode_pending->inference.n_past == 12);
-  REQUIRE(decode_pending->inference.remaining_decode_tokens == 16);
+  REQUIRE(decode_pending->inference.fairness.remaining_decode_tokens == 16);
 }
 
 TEST_CASE(
