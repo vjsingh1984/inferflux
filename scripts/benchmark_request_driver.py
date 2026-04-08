@@ -137,7 +137,7 @@ def request_ollama(endpoint: str, model: str, prompt: str, max_tokens: int,
                    request_id: str, stream: bool) -> Dict:
     payload = {
         "model": model,
-        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
         "options": {"num_predict": max_tokens, "temperature": 0.0},
         "stream": stream,
     }
@@ -169,8 +169,9 @@ def request_ollama(endpoint: str, model: str, prompt: str, max_tokens: int,
         tokens = parsed["tokens"]
     else:
         body = json.loads(proc.stdout)
-        text = body.get("response", "").strip()
-        tokens = len(text.split())
+        msg = body.get("message", {})
+        text = msg.get("content", body.get("response", "")).strip()
+        tokens = body.get("eval_count", len(text.split()))
     return {
         "request_id": request_id,
         "text": text,
