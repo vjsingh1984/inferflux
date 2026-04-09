@@ -213,22 +213,28 @@ def worker(index: int, prompt: str, args: argparse.Namespace) -> Dict:
 
 
 def run_warmup(prompts: List[str], args: argparse.Namespace) -> None:
-    for i in range(min(2, len(prompts))):
+    # Warmup absorbs CUDA JIT kernel compilation (can take 30-60s on first
+    # run after a CUDA toolkit upgrade or clean build).  We send up to 4
+    # sequential warmup requests with a generous timeout to ensure the model
+    # is fully compiled before timed benchmarks begin.
+    warmup_count = min(4, len(prompts))
+    for i in range(warmup_count):
         request_id = f"warmup-{i}"
         try:
             if args.backend_kind == "ollama":
-                request_ollama(args.endpoint, args.model, prompts[i], args.max_tokens,
-                               request_id, args.stream)
+                request_ollama(args.endpoint, args.model, prompts[i],
+                               min(args.max_tokens, 16),
+                               request_id, False)
             else:
                 request_openai(
                     args.endpoint,
                     args.model,
                     prompts[i],
-                    args.max_tokens,
+                    min(args.max_tokens, 16),  # Short warmup responses
                     request_id,
                     args.api_key,
                     inferflux_style=(args.backend_kind == "inferflux"),
-                    stream=args.stream,
+                    stream=False,
                 )
         except Exception:
             pass

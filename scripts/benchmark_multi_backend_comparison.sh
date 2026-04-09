@@ -1853,6 +1853,23 @@ main() {
             log "GPU memory after $backend startup: ${mem_after_start} MB (delta: +${mem_for_model} MB)"
         fi
 
+        # Pre-benchmark warmup: send a few sequential requests to prime the
+        # model (load KV pages, warm caches, trigger any lazy initialization).
+        # The Python driver also runs its own warmup, but this ensures the
+        # very first request has already completed before timing begins.
+        if [ "$backend_kind" = "inferflux" ]; then
+            local warmup_endpoint="http://127.0.0.1:${port_or_url}/v1/chat/completions"
+            log "  Pre-benchmark warmup (3 sequential requests)..."
+            for warmup_i in 1 2 3; do
+                curl -sf --max-time 60 \
+                    -H "Content-Type: application/json" \
+                    -H "Authorization: Bearer $API_KEY" \
+                    -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":8,"temperature":0.0}' \
+                    "$warmup_endpoint" > /dev/null 2>&1 || true
+            done
+            log "  Warmup complete"
+        fi
+
         for concurrency in "${CONCURRENCY_ARRAY[@]}"; do
             echo ""
             header "Benchmarking: $backend @ concurrency=$concurrency"
