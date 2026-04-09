@@ -2867,7 +2867,7 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         float eff_rep = sp.repetition_penalty;
         float eff_freq = sp.frequency_penalty;
         if (sp.temperature == 0.0f && eff_rep == 1.0f && eff_freq == 0.0f) {
-          eff_rep = 1.1f;
+          eff_rep = 1.15f;
         }
         if (eff_rep == 1.0f && eff_freq == 0.0f && sp.presence_penalty == 0.0f)
           continue;
@@ -3081,7 +3081,7 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         float eff_freq_penalty = input.sampling.frequency_penalty;
         if (input.sampling.temperature == 0.0f && eff_rep_penalty == 1.0f &&
             eff_freq_penalty == 0.0f) {
-          eff_rep_penalty = 1.1f; // Mild default for greedy decode
+          eff_rep_penalty = 1.15f; // Default penalty for greedy decode to prevent loops
         }
         if (!history.empty() &&
             (eff_rep_penalty != 1.0f || eff_freq_penalty != 0.0f ||
