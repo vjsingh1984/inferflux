@@ -1507,7 +1507,7 @@ BackendInterface::ModelMetadata LlamaCppBackend::GetModelMetadata() const {
   if (!model_)
     return meta;
   auto get_str = [&](const char *key) -> std::string {
-    char buf[256] = {};
+    char buf[4096] = {};
     int32_t len = llama_model_meta_val_str(model_, key, buf, sizeof(buf));
     return len > 0 ? std::string(buf, static_cast<size_t>(len)) : "";
   };
@@ -1516,19 +1516,32 @@ BackendInterface::ModelMetadata LlamaCppBackend::GetModelMetadata() const {
     int32_t len = llama_model_meta_val_str(model_, key, buf, sizeof(buf));
     return len > 0 ? std::atoi(buf) : 0;
   };
+
+  // Architecture name (e.g., "qwen2", "llama", "gemma")
   meta.architecture = get_str("general.architecture");
+  std::string arch = meta.architecture; // prefix for arch-specific keys
+
+  // Quantization from general.file_type or general.size_label
   meta.quantization = get_str("general.file_type");
-  meta.context_length = get_int("llm.context_length");
-  if (meta.context_length == 0) {
-    meta.context_length =
-        context_ ? static_cast<int>(llama_n_ctx(context_)) : 0;
+  if (meta.quantization.empty()) {
+    meta.quantization = get_str("general.size_label");
   }
-  meta.embedding_length = get_int("llm.embedding_length");
-  meta.num_layers = get_int("llm.block_count");
-  meta.num_heads = get_int("llm.attention.head_count");
-  meta.num_kv_heads = get_int("llm.attention.head_count_kv");
+
+  // Architecture-prefixed keys (GGUF stores as "{arch}.block_count" etc.)
+  meta.context_length = get_int((arch + ".context_length").c_str());
+  meta.embedding_length = get_int((arch + ".embedding_length").c_str());
+  meta.num_layers = get_int((arch + ".block_count").c_str());
+  meta.num_heads = get_int((arch + ".attention.head_count").c_str());
+  meta.num_kv_heads = get_int((arch + ".attention.head_count_kv").c_str());
+
+  // Fallback to llama context size if metadata didn't have context_length
+  if (meta.context_length == 0 && context_) {
+    meta.context_length = static_cast<int>(llama_n_ctx(context_));
+  }
+
   meta.chat_template = get_str("tokenizer.chat_template");
-  // Rough parameter count: embedding_length² × num_layers × 12 (Q/K/V/O + gate/up/down + norms)
+
+  // Rough parameter count from model dimensions
   if (meta.embedding_length > 0 && meta.num_layers > 0) {
     meta.parameter_count = static_cast<int64_t>(meta.embedding_length) *
                            meta.embedding_length * meta.num_layers * 12;
