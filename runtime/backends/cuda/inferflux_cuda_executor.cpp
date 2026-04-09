@@ -2203,6 +2203,7 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
     int top_k;
     float top_p;
     uint32_t seed;
+    SamplingParams sampling;
   };
   std::vector<DecodeEntry> decode_group;
   std::vector<int> prefill_indices;
@@ -2215,7 +2216,8 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
           {static_cast<int>(i), input.request_id, input.client_request_id,
            input.tokens[0], input.n_past, input.sequence_id,
            input.sequence_generation, input.sampling.temperature,
-           input.sampling.top_k, input.sampling.top_p, input.sampling.seed});
+           input.sampling.top_k, input.sampling.top_p, input.sampling.seed,
+           input.sampling});
     } else {
       prefill_indices.push_back(static_cast<int>(i));
     }
@@ -2757,6 +2759,7 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
     int top_k;
     float top_p;
     uint32_t seed;
+    SamplingParams sampling;
   };
   std::vector<DecodeEntry> decode_group;
   std::vector<int> prefill_indices;
@@ -2768,7 +2771,8 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
           {static_cast<int>(i), input.request_id, input.client_request_id,
            input.tokens[0], input.n_past, input.sequence_id,
            input.sequence_generation, input.sampling.temperature,
-           input.sampling.top_k, input.sampling.top_p, input.sampling.seed});
+           input.sampling.top_k, input.sampling.top_p, input.sampling.seed,
+           input.sampling});
     } else {
       prefill_indices.push_back(static_cast<int>(i));
     }
@@ -2856,9 +2860,42 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         continue;
       }
 
+      // Apply per-sequence repetition penalties before batch sampling.
+      for (int b = 0; b < B; ++b) {
+        const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+        const auto &sp = entry.sampling;
+        if (sp.repetition_penalty == 1.0f && sp.frequency_penalty == 0.0f &&
+            sp.presence_penalty == 0.0f)
+          continue;
+        auto it = sequence_recent_tokens_.find(entry.sequence_id);
+        if (it == sequence_recent_tokens_.end() || it->second.empty())
+          continue;
+        std::unordered_map<int, int> freq;
+        for (int t : it->second) freq[t]++;
+        std::vector<int> ids, counts;
+        ids.reserve(freq.size());
+        counts.reserve(freq.size());
+        for (auto &[id, cnt] : freq) {
+          ids.push_back(id);
+          counts.push_back(cnt);
+        }
+        float *seq_logits = d_logits_ + b * model_config_.vocab_size;
+        sampler_->ApplyPenalties(seq_logits, ids, counts,
+                                sp.repetition_penalty, sp.frequency_penalty,
+                                sp.presence_penalty);
+      }
       sampler_->EnqueueSampleBatch(d_logits_, B, batch_temps, batch_top_ks,
                                    batch_top_ps, batch_seeds);
       sampler_->CollectSampleBatch(&sampled_tokens);
+      // Record sampled tokens in per-sequence histories.
+      for (int b = 0; b < B; ++b) {
+        const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+        auto &history = sequence_recent_tokens_[entry.sequence_id];
+        history.push_back(sampled_tokens[b]);
+        if (static_cast<int>(history.size()) > kPenaltyWindowSize) {
+          history.erase(history.begin());
+        }
+      }
 
       // Set up device-side relay for the NEXT decode token: copy sampled
       // token IDs directly to the graph's input buffer on device and
@@ -3031,10 +3068,41 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
       if (record_prefill_timing) {
         cudaEventRecord(sampling_start_, compute_stream_);
       }
+      // Apply repetition/frequency/presence penalties before sampling.
+      {
+        auto &history = sequence_recent_tokens_[input.sequence_id];
+        if (!history.empty() &&
+            (input.sampling.repetition_penalty != 1.0f ||
+             input.sampling.frequency_penalty != 0.0f ||
+             input.sampling.presence_penalty != 0.0f)) {
+          // Build unique token list with frequency counts
+          std::unordered_map<int, int> freq;
+          for (int t : history) freq[t]++;
+          std::vector<int> ids, counts;
+          ids.reserve(freq.size());
+          counts.reserve(freq.size());
+          for (auto &[id, cnt] : freq) {
+            ids.push_back(id);
+            counts.push_back(cnt);
+          }
+          sampler_->ApplyPenalties(d_logits_, ids, counts,
+                                  input.sampling.repetition_penalty,
+                                  input.sampling.frequency_penalty,
+                                  input.sampling.presence_penalty);
+        }
+      }
       sampler_->EnqueueSample(d_logits_, input.sampling.temperature,
                               input.sampling.top_k, input.sampling.top_p,
                               input.sampling.seed);
       int token_id = sampler_->CollectSample();
+      // Record token in per-sequence history for future penalty application
+      {
+        auto &history = sequence_recent_tokens_[input.sequence_id];
+        history.push_back(token_id);
+        if (static_cast<int>(history.size()) > kPenaltyWindowSize) {
+          history.erase(history.begin());
+        }
+      }
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
       LogNativeTopLogits("primary_prefill", d_logits_, model_config_.vocab_size,
                          input.request_id, input.client_request_id,
@@ -3340,6 +3408,7 @@ void InferfluxCudaExecutor::NativeFreeSequence(int sequence_id) {
                     "cudaStreamSynchronize(prefill_stream_,free_sequence)");
   }
   kv_cache_->ClearSequence(sequence_id);
+  sequence_recent_tokens_.erase(sequence_id);
 #endif
 }
 

@@ -303,6 +303,11 @@ private:
 #endif
   std::unique_ptr<ITokenizer> tokenizer_;
 
+  // Per-sequence recent token history for repetition penalty.
+  // Maps sequence_id → circular buffer of last N generated tokens.
+  static constexpr int kPenaltyWindowSize = 64;
+  std::unordered_map<int, std::vector<int>> sequence_recent_tokens_;
+
   // Device logits buffer
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   float *d_logits_{nullptr};
