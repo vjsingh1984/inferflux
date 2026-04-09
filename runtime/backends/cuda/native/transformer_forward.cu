@@ -928,26 +928,69 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   //   - Batched decode: max_batch_size_ sequences x 1 token each
   size_t rows = static_cast<size_t>(std::max(max_seq_len_, max_batch_size_));
 
+  // Always-live buffers (cannot alias).
   if (!alloc(&d_hidden_, rows * hidden_size_))
     return false;
   if (!alloc(&d_residual_, rows * hidden_size_))
     return false;
   if (!alloc(&d_norm_out_, rows * hidden_size_))
     return false;
-  if (!alloc(&d_q_, rows * num_heads_ * head_dim_))
-    return false;
-  if (!alloc(&d_k_new_, rows * num_kv_heads_ * head_dim_))
-    return false;
-  if (!alloc(&d_v_new_, rows * num_kv_heads_ * head_dim_))
-    return false;
-  if (!alloc(&d_attn_out_, rows * num_heads_ * head_dim_))
-    return false;
-  if (!alloc(&d_ffn_gate_, rows * intermediate_size_))
-    return false;
-  if (!alloc(&d_ffn_up_, rows * intermediate_size_))
-    return false;
-  if (!alloc(&d_ffn_down_, rows * hidden_size_))
-    return false;
+
+  // Memory pool: attention and FFN buffers never overlap in the layer loop.
+  // Attention phase uses d_q_, d_k_new_, d_v_new_, d_attn_out_.
+  // FFN phase uses d_ffn_gate_, d_ffn_up_, d_ffn_down_.
+  // We allocate the larger set (FFN gate+up) and alias attention into it.
+  //
+  //   d_ffn_gate_ [rows * intermediate_size]:
+  //     ├── d_q_      [rows * num_heads * head_dim]     (aliased)
+  //     ├── d_k_new_  [rows * num_kv_heads * head_dim]  (aliased, offset)
+  //     └── d_v_new_  [rows * num_kv_heads * head_dim]  (aliased, offset)
+  //   d_ffn_up_   [rows * intermediate_size]:
+  //     └── d_attn_out_ [rows * num_heads * head_dim]   (aliased)
+  //   d_ffn_down_ = d_norm_out_ (aliased, same size: rows * hidden_size)
+  //     d_norm_out_ is consumed before down-proj writes.
+
+  const size_t q_elems = rows * static_cast<size_t>(num_heads_ * head_dim_);
+  const size_t k_elems = rows * static_cast<size_t>(num_kv_heads_ * head_dim_);
+  const size_t v_elems = k_elems;
+  const size_t attn_out_elems = q_elems;
+  const size_t gate_elems = rows * static_cast<size_t>(intermediate_size_);
+  const size_t up_elems = gate_elems;
+
+  // Verify aliasing fits: attention buffers must fit inside FFN buffers.
+  if (q_elems + k_elems + v_elems > gate_elems ||
+      attn_out_elems > up_elems) {
+    // Fallback: allocate separately (no aliasing possible for this model).
+    if (!alloc(&d_q_, q_elems))
+      return false;
+    if (!alloc(&d_k_new_, k_elems))
+      return false;
+    if (!alloc(&d_v_new_, v_elems))
+      return false;
+    if (!alloc(&d_attn_out_, attn_out_elems))
+      return false;
+    if (!alloc(&d_ffn_gate_, gate_elems))
+      return false;
+    if (!alloc(&d_ffn_up_, up_elems))
+      return false;
+    if (!alloc(&d_ffn_down_, rows * hidden_size_))
+      return false;
+  } else {
+    // Allocate FFN gate+up (the larger pair) and alias attention into them.
+    if (!alloc(&d_ffn_gate_, gate_elems))
+      return false;
+    if (!alloc(&d_ffn_up_, up_elems))
+      return false;
+    // Alias attention buffers into d_ffn_gate_ (contiguous sub-regions).
+    d_q_ = d_ffn_gate_;
+    d_k_new_ = d_ffn_gate_ + q_elems;
+    d_v_new_ = d_ffn_gate_ + q_elems + k_elems;
+    // Alias d_attn_out_ into d_ffn_up_.
+    d_attn_out_ = d_ffn_up_;
+    // Alias d_ffn_down_ into d_norm_out_ (same size, non-overlapping lifetime).
+    d_ffn_down_ = d_norm_out_;
+    aliased_attn_ffn_ = true;
+  }
   const size_t packed_width = static_cast<size_t>(
       PackedActivationWidth(hidden_size_, intermediate_size_));
   err = cudaMalloc(&d_packed_activation_, rows * packed_width * sizeof(int8_t));
@@ -1011,7 +1054,7 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   //       + partial_max [B * num_kv_heads * splits * gqa_ratio] float
   //       + partial_sum [B * num_kv_heads * splits * gqa_ratio] float
   {
-    constexpr int kSplits = 16; // must match kFlashDecodeSplits in flash_attention.cu
+    constexpr int kSplits = 8; // must match kFlashDecodeSplits in flash_attention.cu
     const int gqa_ratio = (num_kv_heads_ > 0 && num_heads_ > num_kv_heads_)
                               ? (num_heads_ / num_kv_heads_)
                               : 1;
@@ -1043,14 +1086,27 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
 
   free_buf(&d_hidden_);
   free_buf(&d_residual_);
-  free_buf(&d_norm_out_);
-  free_buf(&d_q_);
-  free_buf(&d_k_new_);
-  free_buf(&d_v_new_);
-  free_buf(&d_attn_out_);
-  free_buf(&d_ffn_gate_);
-  free_buf(&d_ffn_up_);
-  free_buf(&d_ffn_down_);
+  if (aliased_attn_ffn_) {
+    // Attention buffers alias d_ffn_gate_/d_ffn_up_ — only free the FFN pair.
+    // d_ffn_down_ aliases d_norm_out_ — only free d_norm_out_.
+    d_q_ = nullptr;
+    d_k_new_ = nullptr;
+    d_v_new_ = nullptr;
+    d_attn_out_ = nullptr;
+    d_ffn_down_ = nullptr;
+    free_buf(&d_ffn_gate_);
+    free_buf(&d_ffn_up_);
+    free_buf(&d_norm_out_);
+  } else {
+    free_buf(&d_norm_out_);
+    free_buf(&d_q_);
+    free_buf(&d_k_new_);
+    free_buf(&d_v_new_);
+    free_buf(&d_attn_out_);
+    free_buf(&d_ffn_gate_);
+    free_buf(&d_ffn_up_);
+    free_buf(&d_ffn_down_);
+  }
   free_buf(&d_logits_typed_);
   if (d_packed_activation_) {
     cudaFree(d_packed_activation_);

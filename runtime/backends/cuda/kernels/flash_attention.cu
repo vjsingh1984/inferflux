@@ -1078,9 +1078,9 @@ __global__ void FlashDecodeMultiSeqStridedKernel(
 }
 
 // Number of KV-length splits for parallel FlashDecode.
-// Chosen to match llama.cpp's strategy (16 splits) which uses enough blocks
-// to saturate the GPU's SMs without excessive reduction overhead.
-constexpr int kFlashDecodeSplits = 16;
+// 8 splits provides sufficient SM saturation for Ada/Ampere GPUs (76-128 SMs)
+// while halving the split workspace memory vs the original 16-split design.
+constexpr int kFlashDecodeSplits = 8;
 
 // Minimum KV length before enabling split-K parallelism.
 // Below this threshold, a single block per KV head is fast enough.

@@ -158,6 +158,7 @@ private:
   T *d_ffn_gate_{nullptr};
   T *d_ffn_up_{nullptr};
   T *d_ffn_down_{nullptr};
+  bool aliased_attn_ffn_{false}; // True when attn buffers alias FFN memory.
   int8_t *d_packed_activation_{nullptr};
   float *d_packed_activation_scales_{nullptr};
   void *d_act_q8_1_{nullptr};     // Pre-quantized Q8_1 activation buffer
