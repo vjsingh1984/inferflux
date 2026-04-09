@@ -438,6 +438,19 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
   info.is_moe = selection.backend->IsMoE();
   info.n_experts = selection.backend->ExpertCount();
   info.n_active_experts = selection.backend->ActiveExperts();
+  // Populate GGUF metadata for /v1/models API.
+  {
+    auto meta = selection.backend->GetModelMetadata();
+    info.gguf.architecture = meta.architecture;
+    info.gguf.quantization = meta.quantization;
+    info.gguf.parameter_count = meta.parameter_count;
+    info.gguf.context_length = meta.context_length;
+    info.gguf.embedding_length = meta.embedding_length;
+    info.gguf.num_layers = meta.num_layers;
+    info.gguf.num_heads = meta.num_heads;
+    info.gguf.num_kv_heads = meta.num_kv_heads;
+    info.gguf.chat_template = meta.chat_template;
+  }
   if (selected_path != path || selected_format != resolved_format) {
     log::Info("single_model_router", "Resolved model source for '" + path +
                                          "': effective_path='" + selected_path +

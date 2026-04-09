@@ -1502,6 +1502,40 @@ int LlamaCppBackend::ActiveExperts() const {
   return std::atoi(buf);
 }
 
+BackendInterface::ModelMetadata LlamaCppBackend::GetModelMetadata() const {
+  ModelMetadata meta;
+  if (!model_)
+    return meta;
+  auto get_str = [&](const char *key) -> std::string {
+    char buf[256] = {};
+    int32_t len = llama_model_meta_val_str(model_, key, buf, sizeof(buf));
+    return len > 0 ? std::string(buf, static_cast<size_t>(len)) : "";
+  };
+  auto get_int = [&](const char *key) -> int {
+    char buf[32] = {};
+    int32_t len = llama_model_meta_val_str(model_, key, buf, sizeof(buf));
+    return len > 0 ? std::atoi(buf) : 0;
+  };
+  meta.architecture = get_str("general.architecture");
+  meta.quantization = get_str("general.file_type");
+  meta.context_length = get_int("llm.context_length");
+  if (meta.context_length == 0) {
+    meta.context_length =
+        context_ ? static_cast<int>(llama_n_ctx(context_)) : 0;
+  }
+  meta.embedding_length = get_int("llm.embedding_length");
+  meta.num_layers = get_int("llm.block_count");
+  meta.num_heads = get_int("llm.attention.head_count");
+  meta.num_kv_heads = get_int("llm.attention.head_count_kv");
+  meta.chat_template = get_str("tokenizer.chat_template");
+  // Rough parameter count: embedding_length² × num_layers × 12 (Q/K/V/O + gate/up/down + norms)
+  if (meta.embedding_length > 0 && meta.num_layers > 0) {
+    meta.parameter_count = static_cast<int64_t>(meta.embedding_length) *
+                           meta.embedding_length * meta.num_layers * 12;
+  }
+  return meta;
+}
+
 LlamaCppBackend::PerfSnapshot LlamaCppBackend::TakePerf() {
   BackendStateLock lock(backend_state_mutex_);
   auto snap = last_perf_;

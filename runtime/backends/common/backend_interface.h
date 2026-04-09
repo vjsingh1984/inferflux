@@ -244,6 +244,20 @@ public:
   virtual int ContextSize() const { return 0; }
   virtual bool FlashAttentionEnabled() const { return false; }
 
+  // GGUF model metadata for /v1/models API (Ollama-style model details).
+  struct ModelMetadata {
+    std::string architecture;   // "qwen2", "llama", "gemma", etc.
+    std::string quantization;   // "Q4_K_M", "Q6_K", "F16", etc.
+    int64_t parameter_count{0}; // Total parameters (approx).
+    int context_length{0};      // max_position_embeddings.
+    int embedding_length{0};    // hidden_size.
+    int num_layers{0};
+    int num_heads{0};
+    int num_kv_heads{0};        // GQA heads.
+    std::string chat_template;  // Jinja2 template from GGUF metadata.
+  };
+  virtual ModelMetadata GetModelMetadata() const { return {}; }
+
   virtual PerfSnapshot TakePerf() { return {}; }
 
   virtual std::vector<TopLogitEntry> TopLogitsForParity(int top_n) {

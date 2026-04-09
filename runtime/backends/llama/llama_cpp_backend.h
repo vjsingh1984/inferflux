@@ -130,6 +130,7 @@ public:
   bool IsMoE() const override;
   int ExpertCount() const override;
   int ActiveExperts() const override;
+  ModelMetadata GetModelMetadata() const override;
 
   // Vision-aware generation.
   std::string GenerateWithImages(
