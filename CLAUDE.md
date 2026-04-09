@@ -183,24 +183,21 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 
 Only structured output (grammar-constrained generation) still delegates to the llama.cpp parity backend. Logprobs and embeddings are native.
 
-**Verified benchmark** (RTX 4000 Ada 20GB, Qwen2.5-3B Q4_K_M, Apr 9 2026):
+**Verified benchmark** (RTX 4000 Ada 20GB, Qwen2.5-3B Q4_K_M, Apr 9 2026, 2-run avg):
 ```
 Backend             c=1 tok/s   c=4 tok/s   c=8 tok/s   Scale   GPU Peak   Accuracy
 ───────────────     ─────────   ─────────   ─────────   ─────   ────────   ────────
-inferflux_cuda         73.8       135.6       160.9     2.2x    10112 MB   16/16 ✓
-llama_cpp_cuda          1.2¹      161.0       150.3      —       7609 MB   16/16 ✓
-Ollama²                73.6        86.6        85.1     1.2x     7621 MB   16/16 ✓
-LM Studio²             55.0        78.1        67.9     1.2x     7621 MB   16/16 ✓
+inferflux_cuda        73.3       133.6       159.9     2.2x    10095 MB   16/16 ✓
+llama_cpp_cuda          *¹       150.5       156.4      —       7640 MB   16/16 ✓
+Ollama²               72.0        85.6        85.5     1.2x     6398 MB   16/16 ✓
+LM Studio²            83.7        87.3        71.8     0.9x     7629 MB   16/16 ✓
 
-¹ Cold-start JIT compilation after CUDA 13 rebuild; steady-state ~93 tok/s.
+¹ llama_cpp c=1 unreliable (4-5/16 timeout due to GGML graph optimization).
 ² Both use llama.cpp (confirmed: identical memory ±12 MB, 0.90+ cosine).
 
-                    inferflux vs llama_cpp parity:
-                    c=1: 0.79x  c=4: 0.84x  c=8: 1.07x FASTER
-                    Memory: +2503 MB (pre-allocated scratch/KV workspace)
-
-Key result: inferflux_cuda BEATS llama_cpp_cuda at c=8 (161 vs 150 tok/s)
-with 100% accuracy parity after chat template + repetition penalty fixes.
+inferflux_cuda parity: c=4 0.89x | c=8 1.02x (at parity) | Memory +2455 MB
+inferflux_cuda vs Ollama: 1.87x FASTER at c=8
+inferflux_cuda vs LM Studio: 2.23x FASTER at c=8
 ```
 
 **Quality fixes applied:**

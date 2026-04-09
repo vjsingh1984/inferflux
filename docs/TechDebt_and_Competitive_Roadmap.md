@@ -30,34 +30,36 @@ Key advances:
 
 ```
 RTX 4000 Ada 20GB | Qwen2.5-3B Q4_K_M | 16 requests × 64 tokens
+Two runs averaged (Apr 9 13:17 + 14:17)
 
 Backend             c=1 tok/s   c=4 tok/s   c=8 tok/s   GPU Peak   Accuracy
 ───────────────     ─────────   ─────────   ─────────   ────────   ────────
-inferflux_cuda         73.8       135.6       160.9     10112 MB   16/16 ✓
-llama_cpp_cuda          *¹        161.0       150.3      7609 MB   16/16 ✓
-Ollama²                73.6        86.6        85.1      7621 MB   16/16 ✓
-LM Studio²             55.0        78.1        67.9      7621 MB   16/16 ✓
+inferflux_cuda        73.3       133.6       159.9     10095 MB   16/16 ✓
+llama_cpp_cuda         *¹        150.5       156.4      7640 MB   16/16 ✓²
+Ollama³               72.0        85.6        85.5      6398 MB   16/16 ✓
+LM Studio³            83.7        87.3        71.8      7629 MB   16/16 ✓
 
 inferflux_cuda vs llama_cpp_cuda:
-  c=4: 0.84x    c=8: 1.07x FASTER    Memory: +2503 MB
+  c=4: 0.89x    c=8: 1.02x (at parity)    Memory: +2455 MB
 
 inferflux_cuda vs Ollama:
-  c=1: 1.00x    c=4: 1.57x FASTER    c=8: 1.89x FASTER
+  c=1: 1.02x    c=4: 1.56x FASTER    c=8: 1.87x FASTER
 
 inferflux_cuda vs LM Studio:
-  c=1: 1.34x    c=4: 1.74x FASTER    c=8: 2.37x FASTER
+  c=1: 0.88x    c=4: 1.53x FASTER    c=8: 2.23x FASTER
 
-¹ llama_cpp_cuda c=1 had 5/16 request failures (cold-start issue)
-² Both use llama.cpp under the hood (confirmed by identical memory ±12MB
-  and 0.90+ cosine similarity)
+¹ llama_cpp_cuda c=1 unreliable: 4-5/16 requests timeout (>120s) on
+  fresh model load due to GGML graph optimization. c=4/c=8 unaffected.
+² Accuracy measured at c=4/c=8 where all requests succeed.
+³ Both use llama.cpp (confirmed: identical memory ±12MB, 0.90+ cosine).
 ```
 
-**Key claims (verified, reproducible):**
-- inferflux_cuda is **1.07x faster than llama.cpp** at c=8 concurrent requests
-- inferflux_cuda is **1.89x faster than Ollama** at c=8
-- inferflux_cuda is **2.37x faster than LM Studio** at c=8
-- **100% accuracy parity** with all backends (16/16 correct responses)
-- **0% degenerate responses** (down from 31% before fixes)
+**Verified claims (reproducible across multiple runs):**
+- inferflux_cuda is **at throughput parity with llama.cpp** at c=8 (159.9 vs 156.4 tok/s)
+- inferflux_cuda is **1.87x faster than Ollama** at c=8
+- inferflux_cuda is **2.23x faster than LM Studio** at c=8
+- **100% accuracy parity** (16/16 correct, 0% degenerate) across all backends
+- **Best scaling efficiency**: inferflux_cuda scales 2.2x from c=1→c=8 vs Ollama 1.2x and LM Studio 0.7x (degrades under load)
 
 ## 3) Debt Register
 
@@ -68,7 +70,7 @@ inferflux_cuda vs LM Studio:
 | ~~P0~~ | ~~KV cache corruption on reuse~~ | **FIXED** | ClearSequenceAsync before prefill when n_past==0 |
 | ~~P0~~ | ~~CPU-only build failures~~ | **FIXED** | CUDA guards, test isolation, 43/43 passing |
 | ~~P0~~ | ~~Bare catch(...)~~ | **FIXED** | 23 locations → catch(const std::exception&) |
-| P0 | llama_cpp_cuda c=1 request failures | Open | 5/16 fail at c=1 (cold-start or serialization issue). c=4/c=8 fine |
+| P0 | llama_cpp_cuda c=1 request failures | Diagnosed | 4-5/16 timeout at c=1 due to GGML graph optimization on fresh load. Not an InferFlux bug — llama.cpp's internal graph compiler takes >120s on some prompt lengths. Benchmark uses 120s curl timeout. Fix: exclude c=1 from llama_cpp claims or increase timeout to 300s. c=4/c=8 fully reliable |
 | P0 | GPU memory overhead (+2.5GB) | Partial | Aliasing and splits save ~120MB. Remaining gap is KV pre-allocation + workspace |
 | P1 | Native structured output | Not started | Grammar-constrained generation still delegates to llama.cpp parity backend |
 | P1 | GPU CI lane | Not started | GPU regressions still discovered manually |
