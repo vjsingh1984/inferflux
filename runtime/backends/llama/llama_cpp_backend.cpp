@@ -1521,10 +1521,32 @@ BackendInterface::ModelMetadata LlamaCppBackend::GetModelMetadata() const {
   meta.architecture = get_str("general.architecture");
   std::string arch = meta.architecture; // prefix for arch-specific keys
 
-  // Quantization from general.file_type or general.size_label
-  meta.quantization = get_str("general.file_type");
-  if (meta.quantization.empty()) {
-    meta.quantization = get_str("general.size_label");
+  // Quantization: general.file_type is a u32 enum in GGUF, map to string.
+  // See llama.cpp ggml/include/ggml.h enum ggml_ftype for values.
+  {
+    int ft = get_int("general.file_type");
+    switch (ft) {
+    case 0: meta.quantization = "F32"; break;
+    case 1: meta.quantization = "F16"; break;
+    case 2: meta.quantization = "Q4_0"; break;
+    case 3: meta.quantization = "Q4_1"; break;
+    case 7: meta.quantization = "Q8_0"; break;
+    case 8: meta.quantization = "Q5_0"; break;
+    case 9: meta.quantization = "Q5_1"; break;
+    case 10: meta.quantization = "Q2_K"; break;
+    case 11: meta.quantization = "Q3_K_S"; break;
+    case 12: meta.quantization = "Q3_K_M"; break;
+    case 13: meta.quantization = "Q3_K_L"; break;
+    case 14: meta.quantization = "Q4_K_S"; break;
+    case 15: meta.quantization = "Q4_K_M"; break;
+    case 16: meta.quantization = "Q5_K_S"; break;
+    case 17: meta.quantization = "Q5_K_M"; break;
+    case 18: meta.quantization = "Q6_K"; break;
+    default:
+      meta.quantization = get_str("general.size_label");
+      if (meta.quantization.empty())
+        meta.quantization = "unknown(" + std::to_string(ft) + ")";
+    }
   }
 
   // Architecture-prefixed keys (GGUF stores as "{arch}.block_count" etc.)
