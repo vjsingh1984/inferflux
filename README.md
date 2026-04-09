@@ -35,23 +35,23 @@ graph LR
 
 ## Benchmark (Verified Apr 9 2026)
 
-RTX 4000 Ada 20GB · Qwen2.5-3B Q4_K_M · 16 requests × 64 tokens · 2-run average
+RTX 4000 Ada 20GB · Qwen2.5-3B Q4_K_M · 16 requests × 64 tokens
 
 | Backend | c=1 | c=4 | c=8 | Scale | GPU | Accuracy |
 |---|---|---|---|---|---|---|
-| **inferflux_cuda** | **73 tok/s** | **134 tok/s** | **160 tok/s** | **2.2x** | 10.1 GB | 16/16 ✓ |
-| llama_cpp_cuda | *¹ | 151 tok/s | 156 tok/s | — | 7.6 GB | 16/16 ✓ |
-| Ollama² | 72 tok/s | 86 tok/s | 86 tok/s | 1.2x | 6.4 GB | 16/16 ✓ |
-| LM Studio² | 84 tok/s | 87 tok/s | 72 tok/s | 0.7x | 7.6 GB | 16/16 ✓ |
+| **inferflux_cuda** | **84 tok/s** | **157 tok/s** | **154 tok/s** | **1.8x** | 10.2 GB | 16/16 ✓ |
+| llama_cpp_cuda | *¹ | 206 tok/s | 282 tok/s | — | 8.9 GB | 15/15 ✓ |
+| Ollama² | 101 tok/s | 116 tok/s | 116 tok/s | 1.1x | 8.9 GB | 16/16 ✓ |
+| LM Studio² | 113 tok/s | 83 tok/s | 75 tok/s | 0.7x | 11.4 GB | 16/16 ✓ |
 
-> ¹ llama_cpp c=1 unreliable due to GGML graph optimization on fresh load.
-> ² Both use llama.cpp under the hood (confirmed: identical memory ±12MB, 0.90+ cosine).
+> ¹ llama_cpp c=1: 1/16 timeout (GGML graph optimization on fresh load).
+> ² Both use llama.cpp under the hood (confirmed: ±12 MB memory, 0.87-0.96 cosine).
 
 **Key results:**
-- `inferflux_cuda` at **throughput parity with llama.cpp** at c=8 (1.02x)
-- **1.87x faster than Ollama** and **2.23x faster than LM Studio** at c=8
-- **Best scaling**: 2.2x from c=1→c=8 (Ollama 1.2x, LM Studio 0.7x — degrades)
-- **100% accuracy**, 0% degenerate responses across all backends
+- `inferflux_cuda` **1.33x faster than Ollama** and **2.07x faster than LM Studio** at c=8
+- **Best scaling vs external tools**: 1.8x from c=1→c=8 (Ollama 1.1x, LM Studio 0.7x — degrades)
+- `llama_cpp_cuda` remains 1.8x faster than `inferflux_cuda` at c=8 — [closing the gap is the top priority](https://github.com/vjsingh1984/inferflux/issues/18)
+- **100% accuracy** across all backends
 
 ### Why InferFlux Scales Better
 

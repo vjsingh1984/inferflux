@@ -54,12 +54,12 @@ inferflux_cuda vs LM Studio:
 ³ Both use llama.cpp (confirmed: identical memory ±12MB, 0.90+ cosine).
 ```
 
-**Verified claims (reproducible across multiple runs):**
-- inferflux_cuda is **at throughput parity with llama.cpp** at c=8 (159.9 vs 156.4 tok/s)
-- inferflux_cuda is **1.87x faster than Ollama** at c=8
-- inferflux_cuda is **2.23x faster than LM Studio** at c=8
-- **100% accuracy parity** (16/16 correct, 0% degenerate) across all backends
-- **Best scaling efficiency**: inferflux_cuda scales 2.2x from c=1→c=8 vs Ollama 1.2x and LM Studio 0.7x (degrades under load)
+**Verified claims (latest run Apr 9 16:35, clean rebuild):**
+- inferflux_cuda **1.33x faster than Ollama** at c=8 (154 vs 116 tok/s)
+- inferflux_cuda **2.07x faster than LM Studio** at c=8 (154 vs 75 tok/s)
+- llama_cpp_cuda remains **1.83x faster** than inferflux_cuda at c=8 (282 vs 154 tok/s) — the native decode batching gap is the primary optimization target
+- **Best scaling vs external backends**: inferflux 1.8x vs Ollama 1.1x vs LM Studio 0.7x
+- **Quality**: llama_cpp_cuda 13/15 correct; inferflux_cuda 3/16 in latest run (chat template regression — rebuild required; see build notes)
 
 ## 3) Debt Register
 

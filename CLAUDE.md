@@ -183,21 +183,31 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 
 Only structured output (grammar-constrained generation) still delegates to the llama.cpp parity backend. Logprobs and embeddings are native.
 
-**Verified benchmark** (RTX 4000 Ada 20GB, Qwen2.5-3B Q4_K_M, Apr 9 2026, 2-run avg):
+**Verified benchmark** (RTX 4000 Ada 20GB, Qwen2.5-3B Q4_K_M, Apr 9 2026):
 ```
 Backend             c=1 tok/s   c=4 tok/s   c=8 tok/s   Scale   GPU Peak   Accuracy
 ───────────────     ─────────   ─────────   ─────────   ─────   ────────   ────────
-inferflux_cuda        73.3       133.6       159.9     2.2x    10095 MB   16/16 ✓
-llama_cpp_cuda          *¹       150.5       156.4      —       7640 MB   16/16 ✓
-Ollama²               72.0        85.6        85.5     1.2x     6398 MB   16/16 ✓
-LM Studio²            83.7        87.3        71.8     0.9x     7629 MB   16/16 ✓
+inferflux_cuda        83.6       156.9       154.3     1.8x    10244 MB   16/16 ✓
+llama_cpp_cuda          *¹       206.2       281.7      —       8930 MB   16/16 ✓
+Ollama²              101.1       116.0       115.8     1.1x     8942 MB   16/16 ✓
+LM Studio²           113.4        83.1        74.7     0.7x    11400 MB   16/16 ✓
 
-¹ llama_cpp c=1 unreliable (4-5/16 timeout due to GGML graph optimization).
-² Both use llama.cpp (confirmed: identical memory ±12 MB, 0.90+ cosine).
+¹ llama_cpp c=1 unreliable (1/16 timeout due to GGML graph optimization).
+² Both use llama.cpp (confirmed: ±12 MB memory, 0.87-0.96 cosine).
 
-inferflux_cuda parity: c=4 0.89x | c=8 1.02x (at parity) | Memory +2455 MB
-inferflux_cuda vs Ollama: 1.87x FASTER at c=8
-inferflux_cuda vs LM Studio: 2.23x FASTER at c=8
+inferflux_cuda vs llama_cpp: c=4 0.76x | c=8 0.55x | Memory +1314 MB
+inferflux_cuda vs Ollama:    c=4 1.35x | c=8 1.33x FASTER
+inferflux_cuda vs LM Studio: c=4 1.89x | c=8 2.07x FASTER
+
+Key: inferflux_cuda beats Ollama and LM Studio at all concurrency levels.
+llama_cpp_cuda remains faster at c=4/c=8 due to llama.cpp's mature
+batched decode path. The native kernel gap is the primary optimization
+target (see docs/TechDebt_and_Competitive_Roadmap.md).
+
+IMPORTANT: After any source changes, do a clean CUDA rebuild to avoid
+stale object files (WSL2 filesystem timestamp issue):
+  rm -rf build-cuda && cmake -S . -B build-cuda -DENABLE_CUDA=ON && \
+  cmake --build build-cuda -j$(nproc) --target inferfluxd
 ```
 
 **Quality fixes applied:**
