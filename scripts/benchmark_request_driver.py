@@ -78,7 +78,8 @@ def request_openai(endpoint: str, model: str, prompt: str, max_tokens: int,
         payload["prompt"] = prompt
     cmd = [
         "curl",
-        "-sf",
+        "-s",             # Silent (no progress)
+        "--max-time", "120",  # Explicit HTTP timeout
         "-X",
         "POST",
         endpoint,
@@ -95,11 +96,13 @@ def request_openai(endpoint: str, model: str, prompt: str, max_tokens: int,
         cmd,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=130,  # Python timeout slightly longer than curl timeout
         check=False,
     )
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or "curl request failed")
+        # Capture the actual response body for error diagnosis
+        err_detail = proc.stderr.strip() or proc.stdout.strip() or "curl request failed"
+        raise RuntimeError(f"rc={proc.returncode}: {err_detail[:200]}")
     latency_ms = (time.time_ns() - started) // 1_000_000
     if stream:
         parsed = _parse_openai_stream(proc.stdout)
@@ -204,11 +207,12 @@ def worker(index: int, prompt: str, args: argparse.Namespace) -> Dict:
             )
         output_path.write_text(json.dumps(result), encoding="utf-8")
         return result
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
-        write_error(output_path, "ERROR")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            json.JSONDecodeError) as e:
+        write_error(output_path, f"ERROR: {e}")
         return {}
-    except Exception:
-        write_error(output_path, "PARSE_ERROR")
+    except Exception as e:
+        write_error(output_path, f"PARSE_ERROR: {e}")
         return {}
 
 
