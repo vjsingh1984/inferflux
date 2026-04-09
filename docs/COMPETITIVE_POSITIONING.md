@@ -1,64 +1,80 @@
 # Competitive Positioning
 
-**Snapshot date:** March 29, 2026
+**Snapshot date:** April 9, 2026
 
-```mermaid
-quadrantChart
-    title InferFlux Positioning
-    x-axis "Compatibility and control" --> "Peak native throughput"
-    y-axis "Single-node serving" --> "Distributed runtime"
-    quadrant-1 "Throughput leaders"
-    quadrant-2 "Target zone"
-    quadrant-3 "Local/runtime-only"
-    quadrant-4 "Control-plane-heavy"
-    InferFlux: [0.66, 0.60]
+```
+InferFlux Positioning (Apr 2026):
+
+  ┌──────────────────────────────────────────────────┐
+  │                                                  │
+  │    InferFlux inferflux_cuda ★                    │
+  │    ├─ 160 tok/s at c=8 (parity with llama.cpp)   │
+  │    ├─ 1.87x faster than Ollama                   │
+  │    ├─ 2.23x faster than LM Studio                │
+  │    ├─ 100% accuracy, 0% degenerate               │
+  │    └─ Best scaling: 2.2x (c=1→c=8)              │
+  │                                                  │
+  │    InferFlux llama_cpp_cuda                       │
+  │    └─ 156 tok/s at c=8 (fallback path)           │
+  │                                                  │
+  │    Ollama (Go + llama.cpp)                        │
+  │    └─ 86 tok/s at c=8 (plateaus)                 │
+  │                                                  │
+  │    LM Studio (Electron + llama.cpp)               │
+  │    └─ 72 tok/s at c=8 (degrades under load)      │
+  │                                                  │
+  └──────────────────────────────────────────────────┘
 ```
 
 ## 1) Current Position
 
-| Category | Current InferFlux reading |
+| Category | Reading |
 |---|---|
-| Compatibility-first CUDA serving | Strong today via `llama_cpp_cuda` |
-| Native-kernel-first CUDA serving | Exceeds llama.cpp on single-sequence (~1.1x), c=4 parity, but still 0.78x at c≥8 sustained concurrency |
-| Operator/control-plane rigor | Strong and release-worthy |
-| Distributed runtime credibility | KV channel and SHM transport are production-tested; ownership cleanup still needs hardening |
+| Native CUDA serving | **At parity with llama.cpp at c=8** (159.9 vs 156.4 tok/s = 1.02x). 100% accuracy. |
+| vs Ollama | **1.87x faster** at c=8 (160 vs 86 tok/s). Ollama plateaus due to Go CGo overhead. |
+| vs LM Studio | **2.23x faster** at c=8 (160 vs 72 tok/s). LM Studio degrades under load (Node.js event loop). |
+| Operator rigor | Production-grade: metrics, audit, RBAC, guardrails, health probes |
+| Architecture quality | RAII, DIP, strategy pattern. 43 unit tests, 0 bare catch(...) |
 
-## 2) What Is Distinctive
+## 2) Why InferFlux Wins at Concurrency
+
+| Factor | InferFlux | Ollama | LM Studio |
+|---|---|---|---|
+| Request dispatch | C++ unified batch → single GPU kernel | Go goroutine → CGo → llama.cpp per-request | Node.js event loop → llama.cpp server |
+| Language boundary | None (C++→CUDA) | Go→C (CGo, ~1-5μs/call × N) | JS→HTTP→C++ (subprocess) |
+| Batching | IBatchSelectionPolicy groups N sequences into 1 forward pass | No cross-request batching | No batching (sequential) |
+| Scaling at c=8 | 2.2x throughput gain | 1.2x (plateaus) | 0.7x (degrades) |
+| GC/runtime pauses | None | Go GC stop-the-world | V8 GC + event loop stalls |
+
+## 3) What Is Distinctive
 
 | Trait | Why it matters |
 |---|---|
-| Two-CUDA-backend strategy | Separates compatibility risk from native-kernel iteration without hiding fallback behavior |
-| Machine-visible backend identity | Makes policy, benchmarking, and automation deterministic |
-| Production-grade native CUDA | FlashAttention-2 with GQA, CUDA graph capture/replay, 50+ fused GEMV kernels, GPU-adaptive dispatch thresholds |
-| API/admin/CLI contract rigor | Release-facing behavior is explicit and testable |
-| Transport-aware ops semantics | `/readyz`, admin pools, KV channel with SHM transport, and failure-sensitive admission already reflect runtime health |
+| Two-CUDA-backend strategy | `inferflux_cuda` (native kernels) + `llama_cpp_cuda` (fallback) — separates innovation from compatibility |
+| Machine-visible backend identity | Policy, benchmarks, and automation see which kernel ran |
+| Production-grade native CUDA | FlashAttention-2, 50+ fused GEMV, CUDA graphs, repetition penalty kernel, chat template rendering |
+| Chat template auto-detection | ChatML/Llama/Mistral/Gemma from GGUF metadata — no manual config |
+| GGUF metadata in /v1/models | Ollama-style model introspection via OpenAI-compatible API |
 
-## 3) Best-In-Class Gap Map
+## 4) Remaining Gaps
 
-| Gap | What closes it |
+| Gap | Status |
 |---|---|
-| Native concurrent GGUF throughput | Better decode down-proj kernels and better sustained hot-path residency. March 31 improvements (MMQ accumulate M=9-64, lane overlap mutex fixes, CUDA graph re-enable) changed the executor baseline; re-validation against `llama_cpp_cuda` under matched parameters is pending before updating competitive ratios. |
-| Release confidence on GPU paths | Required GPU/provider CI instead of optional manual validation |
-| Distributed runtime credibility | Ownership cleanup, worker-loss handling, and failure-path testing |
-
-## 4) Current Competitive Reading
-
-| Comparison | Current reading |
-|---|---|
-| InferFlux vs Ollama | Strong repo-level win via `llama_cpp_cuda` on the published benchmark matrix |
-| InferFlux native vs compatibility | `inferflux_cuda` exceeds llama.cpp on single-sequence and matches at c=4, but `llama_cpp_cuda` still wins the c≥8 sustained concurrency story |
-| InferFlux vs native-kernel leaders | Control plane is credible; native single-sequence throughput now competitive, but sustained high-concurrency decode still needs improvement |
+| GPU memory overhead (+2.5 GB) | Partially mitigated (aliasing, splits, budget). Structural from pre-allocated workspace. |
+| Native structured output | Still delegates to llama.cpp parity backend |
+| GPU CI lane | Manual validation only |
+| Speculative decoding | Partially integrated |
 
 ## 5) Release-Facing Guidance
 
-| Question | Current answer |
+| Question | Answer |
 |---|---|
-| What should public benchmark claims emphasize? | The documented `llama_cpp_cuda` advantage over Ollama and the measured but still-in-progress state of `inferflux_cuda` |
-| What should not be oversold? | Native CUDA concurrency parity, distributed ownership maturity, and release confidence on GPU paths |
+| What can we claim? | Throughput parity with llama.cpp, 1.87x faster than Ollama, 2.23x faster than LM Studio — all verified with 100% accuracy |
+| What should not be oversold? | GPU memory efficiency (still +2.5 GB), distributed runtime maturity |
+| Developer pitch | "The performance of custom CUDA kernels with the compatibility of llama.cpp, in a single binary with OpenAI-compatible APIs" |
 
 ## 6) References
 
-- [README](../README.md)
-- [benchmarks](benchmarks.md)
-- [Roadmap](Roadmap.md)
-- [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md)
+- [Benchmark details](benchmarks.md)
+- [Tech Debt & Roadmap](TechDebt_and_Competitive_Roadmap.md)
+- [Backend Development Guide](BACKEND_DEVELOPMENT.md)

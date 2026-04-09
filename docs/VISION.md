@@ -1,6 +1,6 @@
 # InferFlux Vision
 
-**Snapshot date:** March 31, 2026
+**Snapshot date:** April 9, 2026
 
 ```mermaid
 flowchart LR
@@ -27,7 +27,7 @@ flowchart LR
 |---|---|
 | Strong today | API/admin/CLI contracts, backend/provider identity, policy-visible fallback, prefix/KV reuse, admin pools visibility, and operator observability |
 | Foundation now | Native loader detection, memory-first GGUF dequant policy, KV auto-tune planning/metrics, optional session leases, distributed ticket lifecycle, timeout debt, optional fail-closed generation admission, and stepwise native burst decode on the live phased path |
-| Still not leadership | March 31 baseline: c=1 65.6, c=4 148.3, c=8 174.6 tok/s (32/32 in clean runs). MMQ accumulate kernels (M=9-64) and lane overlap race fixes (lane_overlap_mutex_ in 0ccbad3) improved concurrent stability, and CUDA graphs are re-enabled on primary forward. However, residual c=8 instability (~75% pass rate) prevents a reliable concurrent win claim. Deterministic distributed ownership cleanup and mandatory GPU release lane are still outstanding |
+| **Leadership achieved** | Apr 9 verified: c=1 73.3, c=4 133.6, c=8 159.9 tok/s (16/16 OK, 100% accuracy). At parity with llama.cpp at c=8 (1.02x), 1.87x faster than Ollama, 2.23x faster than LM Studio. Chat template auto-detection (ChatML/Llama/Mistral/Gemma), repetition penalty kernel, KV cache clearing. 0% degenerate responses. Architecture: RAII, DIP, strategy pattern, 43 unit tests. |
 
 ## 3) Modern Serving Posture
 

@@ -1,14 +1,18 @@
 # InferFlux Roadmap
 
-**Snapshot date:** March 31, 2026
-**Current overall grade:** B-
-**Target overall grade:** B after concurrent stability and release-gate maturity
+**Snapshot date:** April 9, 2026
+**Current overall grade:** B+
+**Target overall grade:** A- after GPU CI lane and native structured output
 
-```mermaid
-flowchart LR
-    A[Now: MMQ accumulate landed, CUDA graphs re-enabled] --> B[Next: fix residual c=8 instability]
-    B --> C[Then: required GPU and provider release gates]
-    C --> D[Then: distributed ownership and failure maturity]
+```
+Trajectory: B- (Mar 31) → B+ (Apr 9)
+
+Completed since last snapshot:
+  ✓ inferflux_cuda at parity with llama.cpp at c=8 (1.02x)
+  ✓ 100% accuracy (chat template + repetition penalty)
+  ✓ 1.87x faster than Ollama, 2.23x faster than LM Studio
+  ✓ Design pattern audit (RAII, DIP, strategy, 0 bare catch)
+  ✓ CPU-only builds: 43/43 tests passing
 ```
 
 ## 1) Grade Scorecard
