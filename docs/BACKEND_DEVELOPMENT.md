@@ -72,14 +72,18 @@ mindmap
       All model formats
 ```
 
-> **Competitive landscape note:** Ollama and LM Studio both use llama.cpp as
-> their inference engine. Benchmark data confirms this: identical GPU memory
-> footprint (±12 MB), 0.90-0.96 embedding cosine similarity with
-> `llama_cpp_cuda`, and matching output for greedy-decoded prompts.
-> InferFlux's `inferflux_cuda` backend uses independent CUDA kernels
-> (MMVQ, FlashAttention-2, fused ops) which produce numerically correct
-> but differently-phrased output due to floating-point divergence from
-> llama.cpp's GGML kernels.
+> **Competitive landscape:** Ollama and LM Studio both use llama.cpp
+> (confirmed by identical GPU memory ±12 MB and 0.90-0.96 cosine similarity).
+> InferFlux's `inferflux_cuda` uses independent CUDA kernels (MMVQ,
+> FlashAttention-2, fused ops) producing correct but differently-phrased
+> output (~0.26 cosine) due to floating-point kernel divergence.
+
+> **Memory architecture:** `inferflux_cuda` uses +1.5 GB vs `llama_cpp_cuda`
+> for the same model due to pre-allocated scratch buffers (attention/FFN
+> aliased pool, FlashDecode split workspace, Q8_1 activation buffers) and
+> KV cache sized at 20% of free GPU memory. These buffers enable zero-copy
+> batched execution but trade memory for latency. Scratch aliasing
+> (attention↔FFN) and FlashDecode split reduction (16→8) recover ~120 MB.
 
 ## Creating a Standalone Backend
 

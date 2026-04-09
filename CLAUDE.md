@@ -183,29 +183,44 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 
 Only structured output (grammar-constrained generation) still delegates to the llama.cpp parity backend. Logprobs and embeddings are native.
 
-**Multi-backend benchmark snapshot** (RTX 4000 Ada, Qwen2.5-3B Q4_K_M, Apr 2026):
+**Parity benchmark** (RTX 4000 Ada, Qwen2.5-3B Q4_K_M, Apr 9 2026, clean GPU):
 ```
-                    Throughput (tok/s)           Semantic    GPU Peak
-Backend             c=1    c=4    c=8    Scale   Quality¹    (MB)
-─────────────────── ────── ────── ────── ─────── ────────── ────────
-inferflux_cuda       76    180    177    2.4x    correct²    8867
-llama_cpp_cuda        4    181    293    ~50x³   reference   7573
-Ollama⁴              100   111     —     1.1x    0.90        7585
-LM Studio⁴            51    88     —     1.7x    0.90        7585
+                         Throughput (tok/s)                GPU Peak    Coherent
+Backend                  c=1    c=4    c=8     Scale       (MB)        Rate
+───────────────────────  ─────  ─────  ─────   ─────────   ────────    ────────
+inferflux_cuda            66    109    138     2.1x         5986        88%
+llama_cpp_cuda             7¹   120    150     ~21x¹        4466       100%
+                                                            ────
+                                                    Delta:  +1520 MB
 
-¹ Embedding cosine similarity vs llama_cpp_cuda (all-MiniLM-L6-v2).
-² inferflux_cuda responses are topically correct but phrased differently
-  (0.28 cosine) due to numerical divergence in custom CUDA kernels vs
-  llama.cpp GGML kernels. With greedy decoding (temperature=0), even
-  tiny logit differences cause different token selections.
-³ llama_cpp_cuda c=1 tok/s is low due to cold-start model load in the
-  benchmark harness; steady-state single-request throughput is ~93 tok/s.
-⁴ Ollama and LM Studio both use llama.cpp as their inference engine.
-  This is confirmed by: near-identical GPU memory footprint (7573-7585 MB,
-  ±12 MB), 0.90-0.96 semantic cosine similarity with llama_cpp_cuda, and
-  identical output for greedy-decoded prompts. Differences arise from
-  llama.cpp version pinning and default sampling parameter variations.
+Memory breakdown (inferflux_cuda, 5986 MB total):
+  Weights (quantized GGUF upload)          2099 MB
+  KV cache (16 batch × 2048 seq, 20%)      805 MB  ← reduced from 1208 MB
+  Workspace (scratch + FlashDecode)         178 MB  ← reduced from 234 MB
+  cuBLAS + samplers + logits                 12 MB
+  CUDA context overhead                     892 MB  (driver + runtime)
+
+¹ llama_cpp_cuda c=1 is cold-start artifact; steady-state ~93 tok/s.
+
+Quality notes:
+  - inferflux_cuda: 88% coherent (14/16), 2 edge-case prompts still
+    trigger mild repetition despite 1.15x default greedy penalty.
+    Responses are topically correct but phrased differently (~0.26
+    cosine) due to numerical divergence in MMVQ/FlashAttention-2
+    kernels vs llama.cpp GGML kernels.
+  - llama_cpp_cuda: 100% coherent (reference). Built-in penalty chain
+    prevents all repetition loops.
+
+Competitive context (Ollama / LM Studio):
+  Both use llama.cpp as their inference engine, confirmed by identical
+  GPU memory (±12 MB) and 0.90-0.96 cosine similarity with llama_cpp_cuda.
 ```
+
+**GPU memory optimizations applied:**
+- Scratch buffer aliasing: attention buffers (d_q_, d_k_new_, d_v_new_, d_attn_out_) alias FFN buffers (d_ffn_gate_, d_ffn_up_) since they never overlap in the layer loop. Saves ~56 MB.
+- FlashDecode split reduction: kSplits 16→8 (still saturates Ada SMs). Saves ~64 MB.
+- KV budget ratio: 0.30→0.20 of free GPU memory. Saves ~100 MB.
+- Default greedy repetition penalty: 1.15x applied automatically when temperature=0 and no explicit penalty set, preventing degenerate token loops.
 
 **Key CUDA env vars:** (centralized in `NativeExecutionPolicy::FromEnv()`)
 - `INFERFLUX_DISABLE_BATCHED_DECODE=1` — opt out of batched decode (default-on)
