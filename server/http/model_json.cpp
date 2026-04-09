@@ -46,7 +46,7 @@ json BuildBackendExposureJson(const ModelInfo &info) {
 }
 
 json BuildModelIdentityJson(const ModelInfo &info) {
-  return json{
+  json model = {
       {"id", info.id},
       {"path", info.path},
       {"source_path", ModelSourcePath(info)},
@@ -58,6 +58,25 @@ json BuildModelIdentityJson(const ModelInfo &info) {
       {"ready", info.ready},
       {"capabilities", BuildCapabilitiesJson(info.capabilities)},
   };
+  // GGUF metadata (Ollama-style model details).
+  const auto &g = info.gguf;
+  if (!g.architecture.empty() || g.parameter_count > 0) {
+    model["details"] = {
+        {"architecture", g.architecture},
+        {"quantization", g.quantization},
+        {"parameter_count", g.parameter_count},
+        {"context_length", g.context_length},
+        {"embedding_length", g.embedding_length},
+        {"num_layers", g.num_layers},
+        {"num_heads", g.num_heads},
+        {"num_kv_heads", g.num_kv_heads},
+    };
+    if (!g.chat_template.empty()) {
+      model["details"]["chat_template"] =
+          g.chat_template.substr(0, 200); // Truncate for display
+    }
+  }
+  return model;
 }
 
 json BuildOpenAIModelJson(const ModelInfo &info, int64_t created_ts) {

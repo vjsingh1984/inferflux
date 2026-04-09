@@ -42,6 +42,21 @@ struct ModelInfo {
   bool is_moe{false};
   int n_experts{0};        // Total expert count (llm.expert_count).
   int n_active_experts{0}; // Active experts per token (llm.expert_used_count).
+
+  // GGUF model metadata (populated from GGUF KV during load).
+  // Enables Ollama-style `show` with architecture, quantization, and context.
+  struct GgufMetadata {
+    std::string architecture;      // "qwen2", "llama", "gemma", etc.
+    std::string quantization;      // "Q4_K_M", "Q6_K", "F16", etc.
+    int64_t parameter_count{0};    // Total parameters (approx).
+    int context_length{0};         // max_position_embeddings.
+    int embedding_length{0};       // hidden_size.
+    int num_layers{0};             // num_hidden_layers.
+    int num_heads{0};              // num_attention_heads.
+    int num_kv_heads{0};           // num_key_value_heads (GQA).
+    std::string chat_template;     // Jinja2 template from metadata.
+  };
+  GgufMetadata gguf{};
 };
 
 // --- Segregated model router interfaces (Phase D2) ---
