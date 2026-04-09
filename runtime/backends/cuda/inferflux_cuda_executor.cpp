@@ -2864,8 +2864,12 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
       for (int b = 0; b < B; ++b) {
         const auto &entry = decode_group[offset + static_cast<size_t>(b)];
         const auto &sp = entry.sampling;
-        if (sp.repetition_penalty == 1.0f && sp.frequency_penalty == 0.0f &&
-            sp.presence_penalty == 0.0f)
+        float eff_rep = sp.repetition_penalty;
+        float eff_freq = sp.frequency_penalty;
+        if (sp.temperature == 0.0f && eff_rep == 1.0f && eff_freq == 0.0f) {
+          eff_rep = 1.1f;
+        }
+        if (eff_rep == 1.0f && eff_freq == 0.0f && sp.presence_penalty == 0.0f)
           continue;
         auto it = sequence_recent_tokens_.find(entry.sequence_id);
         if (it == sequence_recent_tokens_.end() || it->second.empty())
@@ -2880,8 +2884,7 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
           counts.push_back(cnt);
         }
         float *seq_logits = d_logits_ + b * model_config_.vocab_size;
-        sampler_->ApplyPenalties(seq_logits, ids, counts,
-                                sp.repetition_penalty, sp.frequency_penalty,
+        sampler_->ApplyPenalties(seq_logits, ids, counts, eff_rep, eff_freq,
                                 sp.presence_penalty);
       }
       sampler_->EnqueueSampleBatch(d_logits_, B, batch_temps, batch_top_ks,
@@ -3069,11 +3072,19 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         cudaEventRecord(sampling_start_, compute_stream_);
       }
       // Apply repetition/frequency/presence penalties before sampling.
+      // When greedy decoding (temperature==0) and no explicit penalty is set,
+      // apply a minimal default penalty to prevent degenerate repetition
+      // loops that occur with some instruct-tuned models.
       {
         auto &history = sequence_recent_tokens_[input.sequence_id];
+        float eff_rep_penalty = input.sampling.repetition_penalty;
+        float eff_freq_penalty = input.sampling.frequency_penalty;
+        if (input.sampling.temperature == 0.0f && eff_rep_penalty == 1.0f &&
+            eff_freq_penalty == 0.0f) {
+          eff_rep_penalty = 1.1f; // Mild default for greedy decode
+        }
         if (!history.empty() &&
-            (input.sampling.repetition_penalty != 1.0f ||
-             input.sampling.frequency_penalty != 0.0f ||
+            (eff_rep_penalty != 1.0f || eff_freq_penalty != 0.0f ||
              input.sampling.presence_penalty != 0.0f)) {
           // Build unique token list with frequency counts
           std::unordered_map<int, int> freq;
@@ -3085,9 +3096,8 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
             ids.push_back(id);
             counts.push_back(cnt);
           }
-          sampler_->ApplyPenalties(d_logits_, ids, counts,
-                                  input.sampling.repetition_penalty,
-                                  input.sampling.frequency_penalty,
+          sampler_->ApplyPenalties(d_logits_, ids, counts, eff_rep_penalty,
+                                  eff_freq_penalty,
                                   input.sampling.presence_penalty);
         }
       }
