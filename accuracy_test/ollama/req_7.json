@@ -1,0 +1,1 @@
+{"request_id": "bench-c1-7", "text": "{\n  \"tasks\": {\n    \"create\": {\n      \"method\": \"POST\",\n      \"path\": \"/tasks\"\n    },\n    \"update\": {\n      \"method\": \"PUT\",\n      \"path\": \"/tasks/{id}\"\n    },\n    \"delete\": {\n      \"method\": \"DELETE\",\n      \"", "tokens": 64, "latency_ms": 626}
