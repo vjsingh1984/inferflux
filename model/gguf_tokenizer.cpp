@@ -16,17 +16,32 @@ bool GGUFTokenizer::Load(const std::string &model_path) {
       loader.TokenizerPieces(), loader.TokenizerMerges(),
       loader.TokenizerPreTokenizer(), loader.TokenizerBosTokenId(),
       loader.TokenizerEosTokenId(), loader.TokenizerAddBosToken(),
-      loader.TokenizerChatTemplate());
+      loader.TokenizerChatTemplate(), loader.TokenizerTokenTypes());
 }
 
 bool GGUFTokenizer::InitializeFromMetadata(
     const std::vector<std::string> &pieces,
     const std::vector<std::string> &merges,
     const std::string &pre_tokenizer_hint, int bos_token_id, int eos_token_id,
-    bool add_bos_token, const std::string &chat_template) {
+    bool add_bos_token, const std::string &chat_template,
+    const std::vector<int32_t> &token_types) {
+  // Build special_ids from GGUF token_type array.
+  // GGUF token types: 1=normal, 2=unknown, 3=control, 4=user_defined,
+  // 5=unused, 6=byte. Type 3 (control) marks special tokens like
+  // <|im_start|>, <|im_end|>, <|endoftext|>.
+  std::unordered_set<int32_t> special_ids;
+  for (size_t i = 0; i < token_types.size(); ++i) {
+    if (token_types[i] == 3) { // control token
+      special_ids.insert(static_cast<int32_t>(i));
+    }
+  }
+  log::Debug("gguf_tokenizer",
+             "Token types: " + std::to_string(token_types.size()) +
+                 " entries, " + std::to_string(special_ids.size()) +
+                 " control tokens");
   if (!inner_.InitializeFromBpeData(pieces, merges, pre_tokenizer_hint,
                                     bos_token_id, eos_token_id, chat_template,
-                                    add_bos_token)) {
+                                    add_bos_token, special_ids)) {
     return false;
   }
   chat_template_ = chat_template;
@@ -70,9 +85,9 @@ namespace {
 
 // Strategy: ChatML (Qwen, TinyLlama, Yi, Phi, OpenChat, Gemma, etc.)
 // Format: <|im_start|>role\ncontent<|im_end|>\n
-std::string RenderChatML(
-    const std::vector<std::pair<std::string, std::string>> &messages,
-    bool add_assistant_prefix) {
+std::string
+RenderChatML(const std::vector<std::pair<std::string, std::string>> &messages,
+             bool add_assistant_prefix) {
   std::string out;
   for (const auto &[role, content] : messages) {
     out += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
@@ -85,9 +100,9 @@ std::string RenderChatML(
 
 // Strategy: Llama-2 / Llama-3 instruct
 // Format: [INST] <<SYS>>\nsystem\n<</SYS>>\n\nuser [/INST] assistant </s>
-std::string RenderLlama(
-    const std::vector<std::pair<std::string, std::string>> &messages,
-    bool add_assistant_prefix) {
+std::string
+RenderLlama(const std::vector<std::pair<std::string, std::string>> &messages,
+            bool add_assistant_prefix) {
   std::string out;
   bool first_user = true;
   for (const auto &[role, content] : messages) {
@@ -111,9 +126,9 @@ std::string RenderLlama(
 
 // Strategy: Mistral / Mixtral
 // Format: [INST] content [/INST] (no system wrapping)
-std::string RenderMistral(
-    const std::vector<std::pair<std::string, std::string>> &messages,
-    bool add_assistant_prefix) {
+std::string
+RenderMistral(const std::vector<std::pair<std::string, std::string>> &messages,
+              bool add_assistant_prefix) {
   std::string out;
   for (const auto &[role, content] : messages) {
     if (role == "user") {
@@ -130,9 +145,9 @@ std::string RenderMistral(
 
 // Strategy: Gemma (Google)
 // Format: <start_of_turn>role\ncontent<end_of_turn>\n
-std::string RenderGemma(
-    const std::vector<std::pair<std::string, std::string>> &messages,
-    bool add_assistant_prefix) {
+std::string
+RenderGemma(const std::vector<std::pair<std::string, std::string>> &messages,
+            bool add_assistant_prefix) {
   std::string out;
   for (const auto &[role, content] : messages) {
     out += "<start_of_turn>" + role + "\n" + content + "<end_of_turn>\n";

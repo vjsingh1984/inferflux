@@ -124,6 +124,9 @@ public:
   int TokenizerEosTokenId() const { return tokenizer_eos_token_id_; }
   int TokenizerBosTokenId() const { return tokenizer_bos_token_id_; }
   bool TokenizerAddBosToken() const { return tokenizer_add_bos_token_; }
+  const std::vector<int32_t> &TokenizerTokenTypes() const {
+    return tokenizer_token_types_;
+  }
 
   /**
    * @brief Get GGUF to internal tensor name mapping
@@ -169,6 +172,7 @@ private:
   int tokenizer_eos_token_id_{-1};
   int tokenizer_bos_token_id_{-1};
   bool tokenizer_add_bos_token_{true};
+  std::vector<int32_t> tokenizer_token_types_;
 
   // Tensors (keyed by GGUF name)
   std::unordered_map<std::string, GGUFTensorData> tensors_;

@@ -78,6 +78,8 @@ private:
   std::unordered_map<std::string, int32_t> merge_rank_;
 
   std::unordered_set<int32_t> special_ids_;
+  // Special token strings sorted by length (longest first) for greedy matching.
+  std::vector<std::pair<std::string, int32_t>> special_token_strings_;
   int32_t bos_id_{1};
   int32_t eos_id_{2};
   int32_t vocab_size_{0};

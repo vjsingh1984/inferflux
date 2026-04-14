@@ -2,6 +2,7 @@
 #include "runtime/string_utils.h"
 #include "server/logging/logger.h"
 
+#include <algorithm>
 #include <climits>
 #include <fstream>
 #include <sstream>
@@ -228,6 +229,7 @@ void MlxTokenizer::Reset() {
   id_to_token_.clear();
   merge_rank_.clear();
   special_ids_.clear();
+  special_token_strings_.clear();
   bos_id_ = 1;
   eos_id_ = 2;
   vocab_size_ = 0;
@@ -305,6 +307,24 @@ bool MlxTokenizer::InitializeFromBpeData(
   if (eos_id_ >= 0) {
     special_ids_.insert(eos_id_);
   }
+
+  // Build sorted list of special token strings for greedy matching during
+  // encoding. Only include tokens with multi-char surface forms (single chars
+  // are handled naturally by BPE).
+  special_token_strings_.clear();
+  for (int32_t id : special_ids_) {
+    if (id >= 0 && id < vocab_size_) {
+      const auto &tok = id_to_token_[static_cast<size_t>(id)];
+      if (tok.size() > 1) {
+        special_token_strings_.push_back({tok, id});
+      }
+    }
+  }
+  // Sort longest-first for greedy matching.
+  std::sort(special_token_strings_.begin(), special_token_strings_.end(),
+            [](const auto &a, const auto &b) {
+              return a.first.size() > b.first.size();
+            });
 
   loaded_ = true;
   return true;
@@ -426,11 +446,28 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
       chat_template_ = cfg["chat_template"].get<std::string>();
   }
 
+  // Build special token string list for greedy matching.
+  special_token_strings_.clear();
+  for (int32_t id : special_ids_) {
+    if (id >= 0 && id < vocab_size_) {
+      const auto &tok = id_to_token_[static_cast<size_t>(id)];
+      if (tok.size() > 1) {
+        special_token_strings_.push_back({tok, id});
+      }
+    }
+  }
+  std::sort(special_token_strings_.begin(), special_token_strings_.end(),
+            [](const auto &a, const auto &b) {
+              return a.first.size() > b.first.size();
+            });
+
   loaded_ = true;
   log::Info("mlx_tokenizer",
             "Loaded: vocab=" + std::to_string(vocab_size_) +
-                " merges=" + std::to_string(merge_rank_.size()) + " bos=" +
-                std::to_string(bos_id_) + " eos=" + std::to_string(eos_id_));
+                " merges=" + std::to_string(merge_rank_.size()) +
+                " bos=" + std::to_string(bos_id_) +
+                " eos=" + std::to_string(eos_id_) + " special_tokens=" +
+                std::to_string(special_token_strings_.size()));
   return true;
 }
 
@@ -447,25 +484,64 @@ MlxTokenizerResult MlxTokenizer::Encode(const std::string &text,
   if (add_bos && add_bos_token_ && bos_id_ >= 0)
     result.ids.push_back(bos_id_);
 
-  const auto pre_tokens = PreTokenize(text);
-  for (const auto &pre_tok : pre_tokens) {
-    for (const auto &sub : BpeEncode(pre_tok)) {
-      auto it = vocab_.find(sub);
-      if (it != vocab_.end()) {
-        result.ids.push_back(it->second);
-      } else {
-        // Unknown sub-token: try byte-fallback (emit byte-level token IDs).
-        bool found_any = false;
-        for (unsigned char b : sub) {
-          const std::string byte_str = ByteToUnicode(b);
-          auto bit = vocab_.find(byte_str);
-          if (bit != vocab_.end()) {
-            result.ids.push_back(bit->second);
-            found_any = true;
-          }
+  // Split text around special tokens first. Special tokens (e.g.
+  // <|im_start|>, <|im_end|>) must be emitted as single token IDs, not
+  // broken into bytes by the BPE encoder.
+  struct Segment {
+    std::string text;
+    int32_t special_id{-1}; // >= 0 → emit this ID directly
+  };
+  std::vector<Segment> segments;
+  if (special_token_strings_.empty()) {
+    segments.push_back({text, -1});
+  } else {
+    size_t pos = 0;
+    while (pos < text.size()) {
+      bool matched = false;
+      for (const auto &[tok_str, tok_id] : special_token_strings_) {
+        if (pos + tok_str.size() <= text.size() &&
+            text.compare(pos, tok_str.size(), tok_str) == 0) {
+          segments.push_back({"", tok_id});
+          pos += tok_str.size();
+          matched = true;
+          break;
         }
-        if (!found_any && vocab_.count("")) {
-          result.ids.push_back(vocab_.at("")); // unk
+      }
+      if (!matched) {
+        if (segments.empty() || segments.back().special_id >= 0) {
+          segments.push_back({"", -1});
+        }
+        segments.back().text += text[pos];
+        ++pos;
+      }
+    }
+  }
+
+  for (const auto &seg : segments) {
+    if (seg.special_id >= 0) {
+      result.ids.push_back(seg.special_id);
+      continue;
+    }
+    const auto pre_tokens = PreTokenize(seg.text);
+    for (const auto &pre_tok : pre_tokens) {
+      for (const auto &sub : BpeEncode(pre_tok)) {
+        auto it = vocab_.find(sub);
+        if (it != vocab_.end()) {
+          result.ids.push_back(it->second);
+        } else {
+          // Unknown sub-token: try byte-fallback (emit byte-level token IDs).
+          bool found_any = false;
+          for (unsigned char b : sub) {
+            const std::string byte_str = ByteToUnicode(b);
+            auto bit = vocab_.find(byte_str);
+            if (bit != vocab_.end()) {
+              result.ids.push_back(bit->second);
+              found_any = true;
+            }
+          }
+          if (!found_any && vocab_.count("")) {
+            result.ids.push_back(vocab_.at("")); // unk
+          }
         }
       }
     }

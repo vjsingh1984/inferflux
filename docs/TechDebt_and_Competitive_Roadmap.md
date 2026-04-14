@@ -1,17 +1,22 @@
 # InferFlux Tech Debt and Competitive Roadmap
 
-**Snapshot date:** April 9, 2026
-**Current overall grade:** B+
+**Snapshot date:** April 14, 2026
+**Current overall grade:** B
 
 ```
-Grade trajectory:  B- (Mar 31) → B+ (Apr 9)
+Grade trajectory:  B- (Mar 31) → B+ (Apr 9) → B (Apr 14)
 
 Key advances:
-  ✓ inferflux_cuda BEATS llama_cpp_cuda at c=8 (161 vs 150 tok/s)
-  ✓ 100% accuracy parity (chat template + repetition penalty)
+  ✓ Tokenizer fix: GGUF special token types + llama.cpp tokenizer for encoding
+  ✓ Chat template: strategy-based renderer (ChatML/Llama/Mistral/Gemma)
   ✓ Design pattern audit: RAII, DIP, strategy pattern, 0 bare catch(...)
   ✓ CPU-only builds: 43/43 tests passing
   ✓ Benchmark: embedding-based semantic similarity, 4-backend comparison
+
+Grade lowered B+→B: inferflux_cuda quality regression identified —
+  native CUDA forward pass produces ~60% divergent responses vs llama.cpp
+  reference. Tokenization verified correct; root cause is numerical
+  precision in native kernels.
 ```
 
 ## 1) Dimension Grades
@@ -54,12 +59,12 @@ inferflux_cuda vs LM Studio:
 ³ Both use llama.cpp (confirmed: identical memory ±12MB, 0.90+ cosine).
 ```
 
-**Verified claims (latest run Apr 9 16:35, clean rebuild):**
-- inferflux_cuda **1.33x faster than Ollama** at c=8 (154 vs 116 tok/s)
-- inferflux_cuda **2.07x faster than LM Studio** at c=8 (154 vs 75 tok/s)
-- llama_cpp_cuda remains **1.83x faster** than inferflux_cuda at c=8 (282 vs 154 tok/s) — the native decode batching gap is the primary optimization target
-- **Best scaling vs external backends**: inferflux 1.8x vs Ollama 1.1x vs LM Studio 0.7x
-- **Quality**: llama_cpp_cuda 13/15 correct; inferflux_cuda 3/16 in latest run (chat template regression — rebuild required; see build notes)
+**Verified claims (latest run Apr 14 2026, clean rebuild with tokenizer fix):**
+- inferflux_cuda **1.16x faster than Ollama** at c=8 (131 vs 113 tok/s)
+- inferflux_cuda **1.88x faster than LM Studio** at c=8 (131 vs 70 tok/s)
+- llama_cpp_cuda remains **2.15x faster** than inferflux_cuda at c=8 (282 vs 131 tok/s)
+- **Best scaling vs external backends**: inferflux 2.0x vs llama_cpp 2.5x vs Ollama 1.2x vs LM Studio 0.6x
+- **Quality**: llama_cpp_cuda 16/16 correct; inferflux_cuda ~40% correct (native CUDA numerical precision issue — tokenization verified correct, root cause is in forward pass kernels)
 
 ## 3) Debt Register
 

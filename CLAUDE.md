@@ -183,25 +183,27 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 
 Only structured output (grammar-constrained generation) still delegates to the llama.cpp parity backend. Logprobs and embeddings are native.
 
-**Verified benchmark** (RTX 4000 Ada 20GB, Qwen2.5-3B Q4_K_M, Apr 9 2026):
+**Verified benchmark** (RTX 4000 Ada 20GB, Qwen2.5-3B Q4_K_M, Apr 14 2026):
 ```
-Backend             c=1 tok/s   c=4 tok/s   c=8 tok/s   Scale   GPU Peak   Accuracy
+Backend             c=1 tok/s   c=4 tok/s   c=8 tok/s   Scale   GPU Peak   Quality
 ───────────────     ─────────   ─────────   ─────────   ─────   ────────   ────────
-inferflux_cuda        83.6       156.9       154.3     1.8x    10244 MB   16/16 ✓
-llama_cpp_cuda          *¹       206.2       281.7      —       8930 MB   16/16 ✓
-Ollama²              101.1       116.0       115.8     1.1x     8942 MB   16/16 ✓
-LM Studio²           113.4        83.1        74.7     0.7x    11400 MB   16/16 ✓
+llama_cpp_cuda       113.0       205.6       281.7     2.5x     5422 MB   16/16 ✓
+inferflux_cuda        66.1       133.6       130.9     2.0x     6014 MB   partial¹
+Ollama²               98.1       111.2       112.6     1.2x     5434 MB   16/16 ✓
+LM Studio²           108.6        81.0        69.5     0.6x     7892 MB   16/16 ✓
 
-¹ llama_cpp c=1 unreliable (1/16 timeout due to GGML graph optimization).
+¹ inferflux_cuda: tokenization and chat template rendering verified correct.
+  Native CUDA forward pass has numerical precision drift causing ~60% of
+  responses to diverge from reference. Accuracy parity is the top priority.
 ² Both use llama.cpp (confirmed: ±12 MB memory, 0.87-0.96 cosine).
 
-inferflux_cuda vs llama_cpp: c=4 0.76x | c=8 0.55x | Memory +1314 MB
-inferflux_cuda vs Ollama:    c=4 1.35x | c=8 1.33x FASTER
-inferflux_cuda vs LM Studio: c=4 1.89x | c=8 2.07x FASTER
+inferflux_cuda vs llama_cpp: c=4 0.65x | c=8 0.46x | Memory +592 MB
+inferflux_cuda vs Ollama:    c=4 1.20x | c=8 1.16x FASTER
+inferflux_cuda vs LM Studio: c=4 1.65x | c=8 1.88x FASTER
 
-Key: inferflux_cuda beats Ollama and LM Studio at all concurrency levels.
-llama_cpp_cuda remains faster at c=4/c=8 due to llama.cpp's mature
-batched decode path. The native kernel gap is the primary optimization
+Key: llama_cpp_cuda is the recommended production backend.
+inferflux_cuda beats Ollama and LM Studio at all concurrency levels.
+Native kernel numerical parity with llama.cpp is the primary optimization
 target (see docs/TechDebt_and_Competitive_Roadmap.md).
 
 IMPORTANT: After any source changes, do a clean CUDA rebuild to avoid
@@ -211,8 +213,11 @@ stale object files (WSL2 filesystem timestamp issue):
 ```
 
 **Quality fixes applied:**
-- Chat template rendering: strategy-based renderer (ChatML/Llama/Mistral/Gemma) auto-detected from GGUF metadata. Previously a stub returning empty → 43% accuracy. Now 100%.
-- Repetition penalty: CUDA kernel + per-sequence token tracking. Default 1.15x for greedy decode. Previously missing entirely → 31% degenerate loops. Now 0%.
+- Chat template rendering: strategy-based renderer (ChatML/Llama/Mistral/Gemma) auto-detected from GGUF metadata. Previously a stub returning empty → 43% accuracy.
+- Repetition penalty: CUDA kernel + per-sequence token tracking. Default 1.15x for greedy decode. Previously missing entirely → 31% degenerate loops.
+- Tokenizer: GGUF special token type parsing (control tokens from tokenizer.ggml.token_type). LlamaTokenizer used for encoding (correct regex pre-tokenization), GGUFTokenizer used for chat template rendering.
+- KV cache clearing: ClearSequenceAsync on prefill when n_past==0.
+- Remaining quality gap: native CUDA forward pass numerical precision (~60% response divergence from llama.cpp reference). This is the top priority for the inferflux_cuda backend.
 - KV cache clearing: `ClearSequenceAsync()` on prefill when `n_past==0`. Prevents stale data corruption on sequence reuse.
 
 **GPU memory optimizations:**

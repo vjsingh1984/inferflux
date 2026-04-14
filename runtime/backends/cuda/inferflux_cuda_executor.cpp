@@ -1884,10 +1884,31 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
     return false;
   }
 
-  // 6. Load tokenizer. GGUF models prefer metadata-backed BPE so strict
-  // native startup does not re-enter llama.cpp just to tokenize prompts.
+  // 6. Load tokenizer. Use llama.cpp's proven tokenizer (LlamaTokenizer) for
+  // Encode/Decode — it handles all regex-based pre-tokenization patterns
+  // (GPT-2, Qwen2, LLaMA-3, etc.) correctly. The GGUF metadata tokenizer
+  // (GGUFTokenizer) is used only for chat template rendering via
+  // NativeFormatChat(), where its strategy-based renderer (ChatML/Llama/
+  // Mistral/Gemma) is the authoritative path.
   {
     tokenizer_.reset();
+    const std::string tokenizer_path =
+        model_loader_ ? loaded_model_path_.string() : loader_->GetModelPath();
+    const std::string model_format =
+        model_loader_ ? model_loader_->GetFormat() : "safetensors";
+    tokenizer_ = CreateTokenizer(tokenizer_path, model_format);
+    if (!tokenizer_) {
+      log::Error("inferflux_cuda_executor",
+                 "Failed to initialize tokenizer for model path: " +
+                     tokenizer_path);
+      return false;
+    }
+    log::Info("inferflux_cuda_executor",
+              "Initialized tokenizer (llama.cpp) for model: " + tokenizer_path);
+
+    // Initialize GGUF chat template renderer for NativeFormatChat(). This is
+    // separate from the main tokenizer — it only renders chat messages into
+    // the correct template format (ChatML, Llama, Mistral, Gemma).
     if (auto *gguf_loader =
             dynamic_cast<runtime::cuda::native::GGUFModelLoader *>(
                 model_loader_.get())) {
@@ -1898,29 +1919,12 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
               gguf_loader->TokenizerBosTokenId(),
               gguf_loader->TokenizerEosTokenId(),
               gguf_loader->TokenizerAddBosToken(),
-              gguf_loader->TokenizerChatTemplate())) {
-        tokenizer_ = std::move(gguf_tokenizer);
+              gguf_loader->TokenizerChatTemplate(),
+              gguf_loader->TokenizerTokenTypes())) {
+        chat_template_tokenizer_ = std::move(gguf_tokenizer);
         log::Info("inferflux_cuda_executor",
-                  "Initialized GGUF metadata tokenizer");
-      } else {
-        fallback_mode_ = true;
-        fallback_reason_ =
-            "native GGUF tokenizer unavailable; using llama.cpp tokenizer";
-        log::Warn("inferflux_cuda_executor", fallback_reason_);
+                  "Initialized GGUF chat template renderer");
       }
-    }
-    const std::string tokenizer_path =
-        model_loader_ ? loaded_model_path_.string() : loader_->GetModelPath();
-    const std::string model_format =
-        model_loader_ ? model_loader_->GetFormat() : "safetensors";
-    if (!tokenizer_) {
-      tokenizer_ = CreateTokenizer(tokenizer_path, model_format);
-    }
-    if (!tokenizer_) {
-      log::Error("inferflux_cuda_executor",
-                 "Failed to initialize tokenizer for model path: " +
-                     tokenizer_path);
-      return false;
     }
   }
 
@@ -2875,7 +2879,8 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         if (it == sequence_recent_tokens_.end() || it->second.empty())
           continue;
         std::unordered_map<int, int> freq;
-        for (int t : it->second) freq[t]++;
+        for (int t : it->second)
+          freq[t]++;
         std::vector<int> ids, counts;
         ids.reserve(freq.size());
         counts.reserve(freq.size());
@@ -2885,7 +2890,7 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         }
         float *seq_logits = d_logits_ + b * model_config_.vocab_size;
         sampler_->ApplyPenalties(seq_logits, ids, counts, eff_rep, eff_freq,
-                                sp.presence_penalty);
+                                 sp.presence_penalty);
       }
       sampler_->EnqueueSampleBatch(d_logits_, B, batch_temps, batch_top_ks,
                                    batch_top_ps, batch_seeds);
@@ -3081,14 +3086,16 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         float eff_freq_penalty = input.sampling.frequency_penalty;
         if (input.sampling.temperature == 0.0f && eff_rep_penalty == 1.0f &&
             eff_freq_penalty == 0.0f) {
-          eff_rep_penalty = 1.15f; // Default penalty for greedy decode to prevent loops
+          eff_rep_penalty =
+              1.15f; // Default penalty for greedy decode to prevent loops
         }
         if (!history.empty() &&
             (eff_rep_penalty != 1.0f || eff_freq_penalty != 0.0f ||
              input.sampling.presence_penalty != 0.0f)) {
           // Build unique token list with frequency counts
           std::unordered_map<int, int> freq;
-          for (int t : history) freq[t]++;
+          for (int t : history)
+            freq[t]++;
           std::vector<int> ids, counts;
           ids.reserve(freq.size());
           counts.reserve(freq.size());
@@ -3097,8 +3104,8 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
             counts.push_back(cnt);
           }
           sampler_->ApplyPenalties(d_logits_, ids, counts, eff_rep_penalty,
-                                  eff_freq_penalty,
-                                  input.sampling.presence_penalty);
+                                   eff_freq_penalty,
+                                   input.sampling.presence_penalty);
         }
       }
       sampler_->EnqueueSample(d_logits_, input.sampling.temperature,
@@ -3632,10 +3639,15 @@ InferfluxCudaRuntime::ChatResult InferfluxCudaExecutor::NativeFormatChat(
     const std::vector<std::pair<std::string, std::string>> &messages,
     bool add_assistant_prefix) const {
   ChatResult result;
-  if (!tokenizer_) {
+  // Prefer the dedicated chat template renderer (GGUFTokenizer with
+  // strategy-based rendering). Fall back to the main tokenizer.
+  const ITokenizer *tmpl_tok = chat_template_tokenizer_
+                                   ? chat_template_tokenizer_.get()
+                                   : tokenizer_.get();
+  if (!tmpl_tok) {
     return result;
   }
-  auto chat = tokenizer_->ApplyChatTemplate(messages, add_assistant_prefix);
+  auto chat = tmpl_tok->ApplyChatTemplate(messages, add_assistant_prefix);
   result.prompt = std::move(chat.prompt);
   result.valid = chat.valid;
   return result;

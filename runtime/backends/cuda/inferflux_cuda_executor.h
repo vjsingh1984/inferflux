@@ -302,6 +302,9 @@ private:
   std::unique_ptr<QuantizedWeightMapAdapter> quantized_weight_adapter_;
 #endif
   std::unique_ptr<ITokenizer> tokenizer_;
+  // GGUF chat template renderer (separate from tokenizer_). Used only for
+  // NativeFormatChat() to render ChatML/Llama/Mistral/Gemma templates.
+  std::unique_ptr<ITokenizer> chat_template_tokenizer_;
 
   // Per-sequence recent token history for repetition penalty.
   // Maps sequence_id → circular buffer of last N generated tokens.

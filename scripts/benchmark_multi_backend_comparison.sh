@@ -707,9 +707,10 @@ start_inferflux_server() {
 
     if [ -n "$BACKEND_STARTUP_TIMEOUT_SEC" ]; then
         startup_timeout="$BACKEND_STARTUP_TIMEOUT_SEC"
-    elif [ "$backend" = "llama_cpp_cuda" ]; then
+    elif [ "$backend" = "llama_cpp_cuda" ] || [ "$backend" = "inferflux_cuda" ]; then
         # Cold GGUF llama.cpp loads on WSL2 can exceed 60s even when the backend
-        # is healthy. Give the compatibility path a larger default window so
+        # is healthy. inferflux_cuda also loads a llama.cpp tokenizer instance
+        # which adds CPU model load time. Give both a larger default window so
         # startup latency does not masquerade as a throughput failure.
         startup_timeout=180
     fi

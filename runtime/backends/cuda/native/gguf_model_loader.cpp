@@ -383,6 +383,7 @@ bool GGUFModelLoader::ParseKeyValuePairs(FILE *file) {
   tokenizer_merges_.clear();
   tokenizer_pre_.clear();
   tokenizer_chat_template_.clear();
+  tokenizer_token_types_.clear();
   tokenizer_eos_token_id_ = -1;
   tokenizer_bos_token_id_ = -1;
 
@@ -699,6 +700,36 @@ bool GGUFModelLoader::ParseKeyValuePairs(FILE *file) {
           return false;
         }
         tokenizer_merges_.push_back(std::move(merge));
+      }
+      continue;
+    }
+
+    if (key == "tokenizer.ggml.token_type" && type == GGUF::ValueType::ARRAY) {
+      uint32_t elem_type_raw = 0;
+      uint64_t arr_len = 0;
+      if (!ReadU32(file, &elem_type_raw) ||
+          !GGUFReader::ReadUint64(file, &arr_len)) {
+        return false;
+      }
+      if (static_cast<GGUF::ValueType>(elem_type_raw) !=
+          GGUF::ValueType::INT32) {
+        for (uint64_t idx = 0; idx < arr_len; ++idx) {
+          if (!GGUFReader::SkipValue(
+                  file, static_cast<GGUF::ValueType>(elem_type_raw))) {
+            return false;
+          }
+        }
+        continue;
+      }
+      tokenizer_token_types_.resize(static_cast<size_t>(std::min<uint64_t>(
+          arr_len, static_cast<uint64_t>(std::numeric_limits<size_t>::max()))));
+      for (uint64_t idx = 0; idx < arr_len; ++idx) {
+        uint32_t tt = 0;
+        if (!ReadU32(file, &tt)) {
+          return false;
+        }
+        tokenizer_token_types_[static_cast<size_t>(idx)] =
+            static_cast<int32_t>(tt);
       }
       continue;
     }

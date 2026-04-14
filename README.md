@@ -33,25 +33,25 @@ graph LR
     style F fill:#90be6d
 ```
 
-## Benchmark (Verified Apr 9 2026)
+## Benchmark (Verified Apr 14 2026)
 
 RTX 4000 Ada 20GB · Qwen2.5-3B Q4_K_M · 16 requests × 64 tokens
 
-| Backend | c=1 | c=4 | c=8 | Scale | GPU | Accuracy |
+| Backend | c=1 | c=4 | c=8 | Scale | GPU | Quality |
 |---|---|---|---|---|---|---|
-| **inferflux_cuda** | **84 tok/s** | **157 tok/s** | **154 tok/s** | **1.8x** | 10.2 GB | 16/16 ✓ |
-| llama_cpp_cuda | *¹ | 206 tok/s | 282 tok/s | — | 8.9 GB | 15/15 ✓ |
-| Ollama² | 101 tok/s | 116 tok/s | 116 tok/s | 1.1x | 8.9 GB | 16/16 ✓ |
-| LM Studio² | 113 tok/s | 83 tok/s | 75 tok/s | 0.7x | 11.4 GB | 16/16 ✓ |
+| llama_cpp_cuda | 113 tok/s | 206 tok/s | 282 tok/s | 2.5x | 5.4 GB | 16/16 ✓ |
+| **inferflux_cuda** | **66 tok/s** | **134 tok/s** | **131 tok/s** | **2.0x** | 6.0 GB | ⚠️ partial¹ |
+| Ollama² | 98 tok/s | 111 tok/s | 113 tok/s | 1.2x | 5.4 GB | 16/16 ✓ |
+| LM Studio² | 109 tok/s | 81 tok/s | 70 tok/s | 0.6x | 7.9 GB | 16/16 ✓ |
 
-> ¹ llama_cpp c=1: 1/16 timeout (GGML graph optimization on fresh load).
+> ¹ inferflux_cuda: correct tokenization and chat template rendering verified; native CUDA kernel numerical precision causes ~60% of responses to diverge from reference. Accuracy parity is the [top priority](https://github.com/vjsingh1984/inferflux/issues/18).
 > ² Both use llama.cpp under the hood (confirmed: ±12 MB memory, 0.87-0.96 cosine).
 
 **Key results:**
-- `inferflux_cuda` **1.33x faster than Ollama** and **2.07x faster than LM Studio** at c=8
-- **Best scaling vs external tools**: 1.8x from c=1→c=8 (Ollama 1.1x, LM Studio 0.7x — degrades)
-- `llama_cpp_cuda` remains 1.8x faster than `inferflux_cuda` at c=8 — [closing the gap is the top priority](https://github.com/vjsingh1984/inferflux/issues/18)
-- **100% accuracy** across all backends
+- `inferflux_cuda` **1.16x faster than Ollama** and **1.88x faster than LM Studio** at c=8
+- **Best scaling vs external tools**: 2.0x from c=1→c=8 (Ollama 1.2x, LM Studio 0.6x — degrades)
+- `llama_cpp_cuda` remains 2.2x faster than `inferflux_cuda` at c=8 — [closing the gap is the top priority](https://github.com/vjsingh1984/inferflux/issues/18)
+- `llama_cpp_cuda` achieves **100% accuracy** — recommended production backend
 
 ### Why InferFlux Scales Better
 
@@ -80,8 +80,8 @@ Details: [docs/TechDebt_and_Competitive_Roadmap.md](docs/TechDebt_and_Competitiv
 | State | Reading |
 |---|---|
 | Strong today | API/admin/CLI contracts, backend identity, chat template rendering (ChatML/Llama/Mistral/Gemma), GGUF metadata API |
-| Proven advantage | `inferflux_cuda` at parity with llama.cpp at c=8, **1.87x faster** than Ollama, **2.23x faster** than LM Studio |
-| Native CUDA | `inferflux_cuda` production-ready: 100% accuracy, 0% degenerate, 50+ fused GEMV kernels, FlashAttention-2, repetition penalty |
+| Proven advantage | `llama_cpp_cuda` 2.5x faster than Ollama, 4x faster than LM Studio at c=8. `inferflux_cuda` 1.16x faster than Ollama, 1.88x faster than LM Studio |
+| Native CUDA | `inferflux_cuda` functional with correct tokenization and chat templates. 50+ fused GEMV kernels, FlashAttention-2, repetition penalty. Accuracy parity with llama.cpp is the top priority |
 | Architecture | RAII, DIP (registry-based backend factory), strategy pattern (batch selection), MetricsRegistry DI, InferenceRequest decomposed |
 | Still open | GPU memory overhead (+2.5 GB), native structured output, GPU CI lane, speculative decoding integration |
 

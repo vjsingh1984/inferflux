@@ -19,7 +19,8 @@ public:
                               const std::string &pre_tokenizer_hint,
                               int bos_token_id, int eos_token_id,
                               bool add_bos_token = true,
-                              const std::string &chat_template = "");
+                              const std::string &chat_template = "",
+                              const std::vector<int32_t> &token_types = {});
 
   std::vector<int> Tokenize(const std::string &text,
                             bool add_bos = true) const override;
