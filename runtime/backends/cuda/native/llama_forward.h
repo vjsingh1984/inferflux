@@ -159,6 +159,12 @@ private:
   T *d_ffn_up_{nullptr};
   T *d_ffn_down_{nullptr};
   bool aliased_attn_ffn_{false}; // True when attn buffers alias FFN memory.
+  // FP32 residual stream (when enable_fp32_residual is active).  Keeps the
+  // residual in full precision across all 36 layers to prevent FP16
+  // quantization error from compounding over multi-token generation.
+  float *d_residual_f32_{nullptr};
+  bool fp32_residual_active_{false};
+
   int8_t *d_packed_activation_{nullptr};
   float *d_packed_activation_scales_{nullptr};
   void *d_act_q8_1_{nullptr};     // Pre-quantized Q8_1 activation buffer

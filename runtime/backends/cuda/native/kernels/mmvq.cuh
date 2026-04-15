@@ -4,6 +4,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 namespace inferflux {
 namespace runtime {
@@ -272,10 +273,12 @@ __global__ void inferflux_mmvq_q4k_bias(
 }
 
 // Q4_K × Q8_1 MMVQ accumulate variant (adds to existing output)
-template <int ncols>
+// OutputT = half (default): read-modify-write via __half2float/__float2half
+// OutputT = float: pure FP32 accumulation for FP32 residual stream
+template <int ncols, typename OutputT = half>
 __global__ void inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
                          const block_q8_1 *__restrict__ act_q8_1,
-                         half *__restrict__ output, int N, int K,
+                         OutputT *__restrict__ output, int N, int K,
                          int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
@@ -378,7 +381,11 @@ __global__ void inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
       float sum = 0.0f;
       for (int w = 0; w < kMmvqWarps; ++w)
         sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+      if constexpr (std::is_same_v<OutputT, float>) {
+        output[row * N + out_idx] = sum + output[row * N + out_idx];
+      } else {
+        output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+      }
     }
   }
 }
@@ -600,10 +607,10 @@ __global__ void inferflux_mmvq_q6k_vec(const block_q6_k *__restrict__ weight,
 }
 
 // Q6_K × Q8_1 MMVQ accumulate variant (adds to existing output)
-template <int ncols>
+template <int ncols, typename OutputT = half>
 __global__ void inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
                           const block_q8_1 *__restrict__ act_q8_1,
-                          half *__restrict__ output, int N, int K,
+                          OutputT *__restrict__ output, int N, int K,
                           int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
@@ -696,16 +703,20 @@ __global__ void inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
       float sum = 0.0f;
       for (int w = 0; w < kMmvqWarps; ++w)
         sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+      if constexpr (std::is_same_v<OutputT, float>) {
+        output[row * N + out_idx] = sum + output[row * N + out_idx];
+      } else {
+        output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+      }
     }
   }
 }
 
 // Q6_K x Q8_1 MMVQ accumulate variant with vectorized weight loads.
-template <int ncols>
+template <int ncols, typename OutputT = half>
 __global__ void inferflux_mmvq_q6k_accum_vec(
     const block_q6_k *__restrict__ weight,
-    const block_q8_1 *__restrict__ act_q8_1, half *__restrict__ output, int N,
+    const block_q8_1 *__restrict__ act_q8_1, OutputT *__restrict__ output, int N,
     int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
@@ -798,8 +809,12 @@ __global__ void inferflux_mmvq_q6k_accum_vec(
       float sum = 0.0f;
       for (int w = 0; w < kMmvqWarps; ++w)
         sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] =
-          __float2half(sum + __half2float(output[row * N + out_idx]));
+      if constexpr (std::is_same_v<OutputT, float>) {
+        output[row * N + out_idx] = sum + output[row * N + out_idx];
+      } else {
+        output[row * N + out_idx] =
+            __float2half(sum + __half2float(output[row * N + out_idx]));
+      }
     }
   }
 }
@@ -890,10 +905,10 @@ __global__ void inferflux_mmvq_q8_0(const block_q8_0 *__restrict__ weight,
 }
 
 // Q8_0 × Q8_1 MMVQ accumulate variant (adds to existing output)
-template <int ncols>
+template <int ncols, typename OutputT = half>
 __global__ void inferflux_mmvq_q8_0_accum(const block_q8_0 *__restrict__ weight,
                                            const block_q8_1 *__restrict__ act_q8_1,
-                                           half *__restrict__ output, int N, int K,
+                                           OutputT *__restrict__ output, int N, int K,
                                            int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
@@ -966,7 +981,11 @@ __global__ void inferflux_mmvq_q8_0_accum(const block_q8_0 *__restrict__ weight,
       float sum = 0.0f;
       for (int w = 0; w < kMmvqWarps; ++w)
         sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+      if constexpr (std::is_same_v<OutputT, float>) {
+        output[row * N + out_idx] = sum + output[row * N + out_idx];
+      } else {
+        output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+      }
     }
   }
 }
@@ -1055,10 +1074,10 @@ __global__ void inferflux_mmvq_q8k(const block_q8_k *__restrict__ weight,
 }
 
 // Q8_K × Q8_1 MMVQ accumulate variant (adds to existing output)
-template <int ncols>
+template <int ncols, typename OutputT = half>
 __global__ void inferflux_mmvq_q8k_accum(const block_q8_k *__restrict__ weight,
                                           const block_q8_1 *__restrict__ act_q8_1,
-                                          half *__restrict__ output, int N, int K,
+                                          OutputT *__restrict__ output, int N, int K,
                                           int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
@@ -1129,7 +1148,11 @@ __global__ void inferflux_mmvq_q8k_accum(const block_q8_k *__restrict__ weight,
       float sum = 0.0f;
       for (int w = 0; w < kMmvqWarps; ++w)
         sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+      if constexpr (std::is_same_v<OutputT, float>) {
+        output[row * N + out_idx] = sum + output[row * N + out_idx];
+      } else {
+        output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+      }
     }
   }
 }

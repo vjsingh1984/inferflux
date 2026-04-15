@@ -115,6 +115,48 @@ cudaError_t SiluMulQuantizeRowsSymmetric(const half *gate, const half *up,
                                          cudaStream_t stream);
 
 // ============================================================================
+// Mixed-precision kernels (FP32 residual + FP16 weights/activations)
+// ============================================================================
+
+/**
+ * RmsNormMixed: reads FP32 residual, normalizes in FP32, writes T output.
+ * Used when the residual stream is kept in FP32 for numerical precision.
+ */
+template <typename T>
+cudaError_t RmsNormMixed(const float *input, const T *weight, T *output,
+                         int count, int hidden_size, float eps,
+                         cudaStream_t stream);
+
+/**
+ * ResidualAddMixed: residual(FP32) += input(T).
+ * Adds a T-precision input (e.g., O-projection output) into the FP32 residual
+ * without truncating to FP16.
+ */
+template <typename T>
+cudaError_t ResidualAddMixed(float *residual, const T *input, int count,
+                             cudaStream_t stream);
+
+/**
+ * ResidualAddRmsNormMixed: residual(FP32) += input(T); output(T) =
+ * RmsNorm(residual). Fused version that keeps the residual in FP32 while
+ * outputting the normalized result in T for downstream projections.
+ */
+template <typename T>
+cudaError_t ResidualAddRmsNormMixed(float *residual, const T *input,
+                                    const T *weight, T *output, int count,
+                                    int hidden_size, float eps,
+                                    cudaStream_t stream);
+
+/**
+ * EmbeddingLookupF32: look up embeddings from a T table, write FP32 output.
+ * Initializes the FP32 residual stream from the embedding table.
+ */
+template <typename T>
+cudaError_t EmbeddingLookupF32(const T *table, const int *token_ids,
+                               float *output, int seq_len, int hidden_size,
+                               cudaStream_t stream);
+
+// ============================================================================
 // Batched kernels for multi-sequence decode
 // ============================================================================
 

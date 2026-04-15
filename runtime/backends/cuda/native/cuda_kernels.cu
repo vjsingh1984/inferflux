@@ -461,6 +461,171 @@ cudaError_t BiasAdd(T *output, const T *bias, int rows, int bias_dim,
 }
 
 // ============================================================================
+// Mixed-precision kernels (FP32 residual + T weights/activations)
+// ============================================================================
+
+// RmsNormMixed: reads FP32 input, normalizes in FP32, writes T output.
+template <typename T>
+__global__ void RmsNormMixedKernel(const float *__restrict__ input,
+                                   const T *__restrict__ weight,
+                                   T *__restrict__ output, int hidden_size,
+                                   float eps) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const float *x = input + row * hidden_size;
+  T *y = output + row * hidden_size;
+
+  extern __shared__ float shared[];
+
+  float local_sum = 0.0f;
+  for (int i = tid; i < hidden_size; i += blockDim.x) {
+    float val = x[i]; // already FP32
+    local_sum += val * val;
+  }
+  shared[tid] = local_sum;
+  __syncthreads();
+
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      shared[tid] += shared[tid + s];
+    }
+    __syncthreads();
+  }
+
+  float rms = rsqrtf(shared[0] / static_cast<float>(hidden_size) + eps);
+
+  for (int i = tid; i < hidden_size; i += blockDim.x) {
+    float val = x[i] * rms * DtypeTraits<T>::to_float(weight[i]);
+    y[i] = DtypeTraits<T>::from_float(val);
+  }
+}
+
+template <typename T>
+cudaError_t RmsNormMixed(const float *input, const T *weight, T *output,
+                         int count, int hidden_size, float eps,
+                         cudaStream_t stream) {
+  int threads = min(1024, hidden_size);
+  int t = 1;
+  while (t < threads)
+    t <<= 1;
+  threads = t;
+  int smem = threads * sizeof(float);
+  RmsNormMixedKernel<T>
+      <<<count, threads, smem, stream>>>(input, weight, output, hidden_size,
+                                         eps);
+  return cudaGetLastError();
+}
+
+// ResidualAddMixed: residual(FP32) += input(T).
+template <typename T>
+__global__ void ResidualAddMixedKernel(float *__restrict__ residual,
+                                       const T *__restrict__ input, int count) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count)
+    return;
+  residual[idx] += DtypeTraits<T>::to_float(input[idx]);
+}
+
+template <typename T>
+cudaError_t ResidualAddMixed(float *residual, const T *input, int count,
+                             cudaStream_t stream) {
+  int threads = 256;
+  int blocks = (count + threads - 1) / threads;
+  ResidualAddMixedKernel<T>
+      <<<blocks, threads, 0, stream>>>(residual, input, count);
+  return cudaGetLastError();
+}
+
+// ResidualAddRmsNormMixed: residual(FP32) += input(T); output(T) =
+// RmsNorm(residual).
+template <typename T>
+__global__ void
+ResidualAddRmsNormMixedKernel(float *__restrict__ residual,
+                              const T *__restrict__ input,
+                              const T *__restrict__ weight,
+                              T *__restrict__ output, int hidden_size,
+                              float eps) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  float *res_row = residual + row * hidden_size;
+  T *out_row = output + row * hidden_size;
+
+  extern __shared__ float shared[];
+
+  // Pass 1: residual += input (in FP32), compute sum of squares
+  float local_sum = 0.0f;
+  for (int i = tid; i < hidden_size; i += blockDim.x) {
+    float val = res_row[i] + DtypeTraits<T>::to_float(input[row * hidden_size + i]);
+    res_row[i] = val; // stays FP32
+    local_sum += val * val;
+  }
+  shared[tid] = local_sum;
+  __syncthreads();
+
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      shared[tid] += shared[tid + s];
+    }
+    __syncthreads();
+  }
+
+  float rms = rsqrtf(shared[0] / static_cast<float>(hidden_size) + eps);
+
+  // Pass 2: normalize and write T output
+  for (int i = tid; i < hidden_size; i += blockDim.x) {
+    float val = res_row[i] * rms * DtypeTraits<T>::to_float(weight[i]);
+    out_row[i] = DtypeTraits<T>::from_float(val);
+  }
+}
+
+template <typename T>
+cudaError_t ResidualAddRmsNormMixed(float *residual, const T *input,
+                                    const T *weight, T *output, int count,
+                                    int hidden_size, float eps,
+                                    cudaStream_t stream) {
+  int threads = min(1024, hidden_size);
+  int t = 1;
+  while (t < threads)
+    t <<= 1;
+  threads = t;
+  int smem = threads * sizeof(float);
+  ResidualAddRmsNormMixedKernel<T>
+      <<<count, threads, smem, stream>>>(residual, input, weight, output,
+                                         hidden_size, eps);
+  return cudaGetLastError();
+}
+
+// EmbeddingLookupF32: look up embeddings from T table, write FP32 output.
+template <typename T>
+__global__ void EmbeddingLookupF32Kernel(const T *__restrict__ table,
+                                         const int *__restrict__ token_ids,
+                                         float *__restrict__ output,
+                                         int seq_len, int hidden_size) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = seq_len * hidden_size;
+  if (idx >= total)
+    return;
+
+  int pos = idx / hidden_size;
+  int dim = idx % hidden_size;
+  int token_id = token_ids[pos];
+
+  output[idx] = DtypeTraits<T>::to_float(table[token_id * hidden_size + dim]);
+}
+
+template <typename T>
+cudaError_t EmbeddingLookupF32(const T *table, const int *token_ids,
+                               float *output, int seq_len, int hidden_size,
+                               cudaStream_t stream) {
+  int total = seq_len * hidden_size;
+  int threads = 256;
+  int blocks = (total + threads - 1) / threads;
+  EmbeddingLookupF32Kernel<T><<<blocks, threads, 0, stream>>>(
+      table, token_ids, output, seq_len, hidden_size);
+  return cudaGetLastError();
+}
+
+// ============================================================================
 // Explicit template instantiations
 // ============================================================================
 
@@ -866,6 +1031,31 @@ template cudaError_t MeanPool<half>(const half *, float *, int, int,
                                     cudaStream_t);
 template cudaError_t MeanPool<__nv_bfloat16>(const __nv_bfloat16 *, float *,
                                               int, int, cudaStream_t);
+
+// Mixed-precision instantiations
+template cudaError_t RmsNormMixed<half>(const float *, const half *, half *,
+                                        int, int, float, cudaStream_t);
+template cudaError_t RmsNormMixed<__nv_bfloat16>(const float *,
+                                                  const __nv_bfloat16 *,
+                                                  __nv_bfloat16 *, int, int,
+                                                  float, cudaStream_t);
+template cudaError_t ResidualAddMixed<half>(float *, const half *, int,
+                                            cudaStream_t);
+template cudaError_t ResidualAddMixed<__nv_bfloat16>(float *,
+                                                      const __nv_bfloat16 *,
+                                                      int, cudaStream_t);
+template cudaError_t ResidualAddRmsNormMixed<half>(float *, const half *,
+                                                    const half *, half *, int,
+                                                    int, float, cudaStream_t);
+template cudaError_t ResidualAddRmsNormMixed<__nv_bfloat16>(
+    float *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *,
+    int, int, float, cudaStream_t);
+template cudaError_t EmbeddingLookupF32<half>(const half *, const int *,
+                                               float *, int, int,
+                                               cudaStream_t);
+template cudaError_t EmbeddingLookupF32<__nv_bfloat16>(const __nv_bfloat16 *,
+                                                        const int *, float *,
+                                                        int, int, cudaStream_t);
 
 // ============================================================================
 // Device-side token relay for zero-copy decode loop

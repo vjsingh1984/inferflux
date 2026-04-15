@@ -53,6 +53,11 @@ struct NativeExecutionPolicy {
   bool enable_q6k_vectorized{false};                // P4
   bool enable_gate_up_silu_q81_epilogue{false};     // P5
 
+  // Precision: keep residual stream in FP32 to match llama.cpp numerical
+  // behavior.  FP16 roundtripping across 36 layers compounds quantization
+  // error, causing multi-token response divergence (Jaccard ~0.10).
+  bool enable_fp32_residual{true};
+
   static NativeExecutionPolicy FromEnv() {
     NativeExecutionPolicy policy;
     policy.enable_batched_decode =
@@ -142,6 +147,8 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_Q6K_VECTORIZED", false);
     policy.enable_gate_up_silu_q81_epilogue =
         ParseBoolEnv("INFERFLUX_ENABLE_GATE_UP_SILU_Q81_EPILOGUE", false);
+    policy.enable_fp32_residual =
+        ParseBoolEnv("INFERFLUX_CUDA_FP32_RESIDUAL", true);
     return policy;
   }
 };

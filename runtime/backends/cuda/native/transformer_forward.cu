@@ -1073,6 +1073,27 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
     }
   }
 
+  // FP32 residual stream: avoids FP16 quantization error compounding across
+  // layers during multi-token generation.  Same size as d_residual_ but 4
+  // bytes per element instead of 2.
+  if (execution_policy_.enable_fp32_residual) {
+    const size_t f32_bytes = rows * hidden_size_ * sizeof(float);
+    err = cudaMalloc(&d_residual_f32_, f32_bytes);
+    if (err != cudaSuccess) {
+      log::Warn("llama_forward",
+                "FP32 residual alloc failed (" + std::to_string(f32_bytes) +
+                    " bytes), falling back to FP16 residual");
+      d_residual_f32_ = nullptr;
+      fp32_residual_active_ = false;
+    } else {
+      fp32_residual_active_ = true;
+      device_workspace_bytes_ += f32_bytes;
+      log::Info("llama_forward",
+                "FP32 residual enabled (" + std::to_string(f32_bytes / 1024) +
+                    " KB)");
+    }
+  }
+
   return true;
 }
 
@@ -1128,6 +1149,11 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
     cudaFree(d_attn_split_workspace_);
     d_attn_split_workspace_ = nullptr;
     attn_split_workspace_bytes_ = 0;
+  }
+  if (d_residual_f32_) {
+    cudaFree(d_residual_f32_);
+    d_residual_f32_ = nullptr;
+    fp32_residual_active_ = false;
   }
 
   if (d_token_ids_) {
