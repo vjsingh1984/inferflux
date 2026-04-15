@@ -1,10 +1,10 @@
 # InferFlux Tech Debt and Competitive Roadmap
 
-**Snapshot date:** April 14, 2026
+**Snapshot date:** April 15, 2026
 **Current overall grade:** B
 
 ```
-Grade trajectory:  B- (Mar 31) → B+ (Apr 9) → B (Apr 14)
+Grade trajectory:  B- (Mar 31) → B+ (Apr 9) → B (Apr 14) → B (Apr 15)
 
 Key advances:
   ✓ Tokenizer fix: GGUF special token types + llama.cpp tokenizer for encoding
@@ -12,11 +12,15 @@ Key advances:
   ✓ Design pattern audit: RAII, DIP, strategy pattern, 0 bare catch(...)
   ✓ CPU-only builds: 43/43 tests passing
   ✓ Benchmark: embedding-based semantic similarity, 4-backend comparison
+  ✓ CUDA graph retry (3 retries before permanent disable)
+  ✓ KV cache sizing: kMinKvBatch 32→4, default kv_max_batch 32→16
+  ✓ FlashDecode split-K attention with workspace
+  ✓ Spin-wait disabled on Linux/WSL2 (cudaEventSynchronize instead)
 
-Grade lowered B+→B: inferflux_cuda quality regression identified —
-  native CUDA forward pass produces ~60% divergent responses vs llama.cpp
-  reference. Tokenization verified correct; root cause is numerical
-  precision in native kernels.
+Grade held at B: first-token logit parity excellent (top-5 Jaccard 1.0,
+  delta <0.04), but multi-token generation still diverges (~10% Jaccard).
+  MMVQ kernels use same precision as llama.cpp (__dp4a + FP32 accum).
+  Root cause likely in attention/RoPE/RmsNorm/residual accumulation order.
 ```
 
 ## 1) Dimension Grades
@@ -31,40 +35,40 @@ Grade lowered B+→B: inferflux_cuda quality regression identified —
 | TDD and CI maturity | B+ | 43/43 CPU tests, CUDA guards for CPU-only builds, embedding-based benchmark quality scoring |
 | OSS release readiness | B | Canonical docs updated, benchmark with semantic similarity, GGUF metadata in /v1/models |
 
-## 2) Competitive Benchmark (Verified Apr 9, 2026)
+## 2) Competitive Benchmark (Verified Apr 15, 2026)
 
 ```
 RTX 4000 Ada 20GB | Qwen2.5-3B Q4_K_M | 16 requests × 64 tokens
-Two runs averaged (Apr 9 13:17 + 14:17)
+Clean rebuild, 32-prompt suite, WSL2
 
-Backend             c=1 tok/s   c=4 tok/s   c=8 tok/s   GPU Peak   Accuracy
-───────────────     ─────────   ─────────   ─────────   ────────   ────────
-inferflux_cuda        73.3       133.6       159.9     10095 MB   16/16 ✓
-llama_cpp_cuda         *¹        150.5       156.4      7640 MB   16/16 ✓²
-Ollama³               72.0        85.6        85.5      6398 MB   16/16 ✓
-LM Studio³            83.7        87.3        71.8      7629 MB   16/16 ✓
+Backend             c=1 tok/s   c=4 tok/s   c=8 tok/s   Scale   GPU Peak   Success
+───────────────     ─────────   ─────────   ─────────   ─────   ────────   ───────
+inferflux_cuda        76.3       153.4       168.1     2.2x    7079 MB    16/16 ✓
+llama_cpp_cuda        99.8       184.4       252.8     2.5x    5811 MB    16/16 ✓
+Ollama¹               ~98        ~111        ~113     1.2x    5434 MB    16/16 ✓
+LM Studio¹           ~109         ~81         ~70     0.6x    7892 MB    16/16 ✓
 
 inferflux_cuda vs llama_cpp_cuda:
-  c=4: 0.89x    c=8: 1.02x (at parity)    Memory: +2455 MB
+  c=1: 0.76x    c=4: 0.83x    c=8: 0.66x    Memory: +1268 MB
 
 inferflux_cuda vs Ollama:
-  c=1: 1.02x    c=4: 1.56x FASTER    c=8: 1.87x FASTER
+  c=1: 0.78x    c=4: 1.38x FASTER    c=8: 1.49x FASTER
 
 inferflux_cuda vs LM Studio:
-  c=1: 0.88x    c=4: 1.53x FASTER    c=8: 2.23x FASTER
+  c=1: 0.70x    c=4: 1.89x FASTER    c=8: 2.40x FASTER
 
-¹ llama_cpp_cuda c=1 unreliable: 4-5/16 requests timeout (>120s) on
-  fresh model load due to GGML graph optimization. c=4/c=8 unaffected.
-² Accuracy measured at c=4/c=8 where all requests succeed.
-³ Both use llama.cpp (confirmed: identical memory ±12MB, 0.90+ cosine).
+¹ Ollama/LM Studio numbers from Apr 14 run (remote host 192.168.1.20).
+  Both use llama.cpp (confirmed: ±12 MB memory, 0.87-0.96 cosine).
 ```
 
-**Verified claims (latest run Apr 14 2026, clean rebuild with tokenizer fix):**
-- inferflux_cuda **1.16x faster than Ollama** at c=8 (131 vs 113 tok/s)
-- inferflux_cuda **1.88x faster than LM Studio** at c=8 (131 vs 70 tok/s)
-- llama_cpp_cuda remains **2.15x faster** than inferflux_cuda at c=8 (282 vs 131 tok/s)
-- **Best scaling vs external backends**: inferflux 2.0x vs llama_cpp 2.5x vs Ollama 1.2x vs LM Studio 0.6x
-- **Quality**: llama_cpp_cuda 16/16 correct; inferflux_cuda ~40% correct (native CUDA numerical precision issue — tokenization verified correct, root cause is in forward pass kernels)
+**Verified claims (Apr 15 2026, clean rebuild):**
+- inferflux_cuda **1.49x faster than Ollama** at c=8 (168 vs 113 tok/s)
+- inferflux_cuda **2.40x faster than LM Studio** at c=8 (168 vs 70 tok/s)
+- llama_cpp_cuda remains **1.50x faster** than inferflux_cuda at c=8 (253 vs 168 tok/s)
+- **Scaling**: inferflux 2.2x vs llama_cpp 2.5x vs Ollama 1.2x vs LM Studio 0.6x
+- **First-token parity**: top-5 Jaccard 1.0, logit delta <0.04 across 3 prompts
+- **Multi-token quality**: Mean Jaccard ~0.10 (responses diverge over sequences; MMVQ kernels verified same precision as llama.cpp — root cause is elsewhere in pipeline)
+- **Memory**: +1268 MB overhead (down from +2455 MB after KV cache right-sizing)
 
 ## 3) Debt Register
 

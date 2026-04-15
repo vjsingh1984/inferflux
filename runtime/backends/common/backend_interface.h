@@ -253,8 +253,8 @@ public:
     int embedding_length{0};    // hidden_size.
     int num_layers{0};
     int num_heads{0};
-    int num_kv_heads{0};        // GQA heads.
-    std::string chat_template;  // Jinja2 template from GGUF metadata.
+    int num_kv_heads{0};       // GQA heads.
+    std::string chat_template; // Jinja2 template from GGUF metadata.
   };
   virtual ModelMetadata GetModelMetadata() const { return {}; }
 

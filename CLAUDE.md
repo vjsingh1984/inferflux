@@ -178,33 +178,34 @@ All config knobs live in `config/server.yaml` and can be overridden with `INFERF
 ## CUDA Development
 
 **Two-backend architecture:** The CUDA path has two providers that both accept GGUF models:
-- `inferflux_cuda` (`runtime/backends/cuda/inferflux_cuda_backend.cpp`, `inferflux_cuda_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp), FlashAttention-2 with GQA and multi-sequence decode, CUDA graph capture/replay, MMQ accumulate kernels (M=9-64 residual fusion). Use for **single-request optimization** and native feature development. Verified throughput (RTX 4000 Ada, Qwen2.5-3B Q4_K_M): c=1 82 tok/s (0.82x vs llama.cpp 100), c=4 165 tok/s (1.13x FASTER than llama.cpp 146), c=8 176 tok/s (0.82x vs llama.cpp 213). Zero crashes at all concurrency levels. Memory: 284 MB idle overhead vs llama.cpp.
+- `inferflux_cuda` (`runtime/backends/cuda/inferflux_cuda_backend.cpp`, `inferflux_cuda_executor.cpp`) — first-party CUDA kernels, no llama.cpp dependency at inference time. Owns logprobs, embeddings, batched decode, 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp), FlashAttention-2 with GQA and multi-sequence decode, CUDA graph capture/replay with retry logic (3 retries before permanent disable), MMQ accumulate kernels (M=9-64 residual fusion), FlashDecode split-K attention. Use for **single-request optimization** and native feature development. Verified throughput (RTX 4000 Ada, Qwen2.5-3B Q4_K_M): c=1 76 tok/s (0.76x vs llama.cpp 100), c=4 153 tok/s (0.83x vs llama.cpp 184), c=8 168 tok/s (0.66x vs llama.cpp 253). Zero crashes at all concurrency levels. Memory: +1268 MB overhead vs llama.cpp.
 - `llama_cpp_cuda` — delegates to llama.cpp for inference. **Use for concurrent workloads**. Higher throughput today, lower ceiling for InferFlux-specific innovation.
 
 Only structured output (grammar-constrained generation) still delegates to the llama.cpp parity backend. Logprobs and embeddings are native.
 
-**Verified benchmark** (RTX 4000 Ada 20GB, Qwen2.5-3B Q4_K_M, Apr 14 2026):
+**Verified benchmark** (RTX 4000 Ada 20GB, Qwen2.5-3B Q4_K_M, Apr 15 2026):
 ```
 Backend             c=1 tok/s   c=4 tok/s   c=8 tok/s   Scale   GPU Peak   Quality
 ───────────────     ─────────   ─────────   ─────────   ─────   ────────   ────────
-llama_cpp_cuda       113.0       205.6       281.7     2.5x     5422 MB   16/16 ✓
-inferflux_cuda        66.1       133.6       130.9     2.0x     6014 MB   partial¹
-Ollama²               98.1       111.2       112.6     1.2x     5434 MB   16/16 ✓
-LM Studio²           108.6        81.0        69.5     0.6x     7892 MB   16/16 ✓
+llama_cpp_cuda        99.8       184.4       252.8     2.5x     5811 MB   16/16 ✓
+inferflux_cuda        76.3       153.4       168.1     2.2x     7079 MB   partial¹
+Ollama²               ~98        ~111        ~113     1.2x     5434 MB   16/16 ✓
+LM Studio²           ~109         ~81         ~70     0.6x     7892 MB   16/16 ✓
 
-¹ inferflux_cuda: tokenization and chat template rendering verified correct.
-  Native CUDA forward pass has numerical precision drift causing ~60% of
-  responses to diverge from reference. Accuracy parity is the top priority.
-² Both use llama.cpp (confirmed: ±12 MB memory, 0.87-0.96 cosine).
+¹ inferflux_cuda: first-token logit parity excellent (top-5 Jaccard 1.0,
+  delta <0.04). Multi-token responses diverge (~10% Jaccard). MMVQ kernels
+  use same precision as llama.cpp (__dp4a + FP32 accum + FP16 output).
+  Divergence root cause under investigation (attention/RoPE/residual path).
+² Ollama/LM Studio from Apr 14 run (remote host). Both use llama.cpp.
 
-inferflux_cuda vs llama_cpp: c=4 0.65x | c=8 0.46x | Memory +592 MB
-inferflux_cuda vs Ollama:    c=4 1.20x | c=8 1.16x FASTER
-inferflux_cuda vs LM Studio: c=4 1.65x | c=8 1.88x FASTER
+inferflux_cuda vs llama_cpp: c=1 0.76x | c=4 0.83x | c=8 0.66x | Memory +1268 MB
+inferflux_cuda vs Ollama:    c=4 1.38x | c=8 1.49x FASTER
+inferflux_cuda vs LM Studio: c=4 1.89x | c=8 2.40x FASTER
 
 Key: llama_cpp_cuda is the recommended production backend.
-inferflux_cuda beats Ollama and LM Studio at all concurrency levels.
-Native kernel numerical parity with llama.cpp is the primary optimization
-target (see docs/TechDebt_and_Competitive_Roadmap.md).
+inferflux_cuda beats Ollama and LM Studio at c>=4.
+Primary bottleneck: FFN MMVQ kernels (45% of decode time).
+See docs/TechDebt_and_Competitive_Roadmap.md for optimization roadmap.
 
 IMPORTANT: After any source changes, do a clean CUDA rebuild to avoid
 stale object files (WSL2 filesystem timestamp issue):
@@ -217,13 +218,14 @@ stale object files (WSL2 filesystem timestamp issue):
 - Repetition penalty: CUDA kernel + per-sequence token tracking. Default 1.15x for greedy decode. Previously missing entirely → 31% degenerate loops.
 - Tokenizer: GGUF special token type parsing (control tokens from tokenizer.ggml.token_type). LlamaTokenizer used for encoding (correct regex pre-tokenization), GGUFTokenizer used for chat template rendering.
 - KV cache clearing: ClearSequenceAsync on prefill when n_past==0.
-- Remaining quality gap: native CUDA forward pass numerical precision (~60% response divergence from llama.cpp reference). This is the top priority for the inferflux_cuda backend.
-- KV cache clearing: `ClearSequenceAsync()` on prefill when `n_past==0`. Prevents stale data corruption on sequence reuse.
+- Remaining quality gap: multi-token response divergence (~10% Jaccard similarity). First-token logit parity is excellent (top-5 Jaccard 1.0, delta <0.04). MMVQ kernels use the same precision as llama.cpp (__dp4a int8 dot products, FP32 accumulation, FP16 output). Root cause under investigation — likely in attention, RoPE, RmsNorm, or residual stream accumulation order rather than MMVQ kernels.
 
 **GPU memory optimizations:**
 - Scratch buffer aliasing: attention↔FFN buffers share memory (never live simultaneously). Saves ~56 MB.
 - FlashDecode splits: 16→8 (still saturates Ada SMs). Saves ~64 MB.
 - KV budget: 0.30→0.20 of free GPU memory. Saves ~100 MB.
+- KV batch right-sizing: kMinKvBatch 32→4, default kv_max_batch 32→16. Saves ~288 MB.
+- Total memory overhead vs llama.cpp: +1268 MB (down from +2455 MB).
 
 **Key CUDA env vars:** (centralized in `NativeExecutionPolicy::FromEnv()`)
 - `INFERFLUX_DISABLE_BATCHED_DECODE=1` — opt out of batched decode (default-on)
