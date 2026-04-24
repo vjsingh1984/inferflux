@@ -243,9 +243,11 @@ stale object files (WSL2 filesystem timestamp issue):
 - `INFERFLUX_BATCH_DEQUANT_CACHE=0|1` — permanently cache dequantized projection weights instead of using scratch buffer (trades GPU memory for prefill performance, default off)
 - `INFERFLUX_GEMV_V2=1` — enable v2 cooperative-warp GEMV kernels (experimental, slower on Ada)
 - `INFERFLUX_CUDA_TIMING_SAMPLE_RATE=N` — record CUDA event timing every Nth batch (0=off)
+- `INFERFLUX_CUDA_FP32_RESIDUAL=0|1` — FP32 residual stream to prevent FP16 quantization error compounding across layers (default on)
 - `INFERFLUX_CUDA_PHASE_OVERLAP` — enable prefill/decode lane overlap
 - `INFERFLUX_CUDA_ATTENTION_KERNEL` — force attention kernel (`auto`, `fa2`, `standard`)
 - `INFERFLUX_CUDA_KV_MAX_BATCH` / `INFERFLUX_CUDA_KV_MAX_SEQ` — KV cache sizing
+- `INFERFLUX_CUDA_KV_BASE_SLOTS=N` — hybrid KV cache: N dense base slots + per-slot overflow (0=all dense, default 0)
 
 **InferFlux CUDA kernel files:**
 - `runtime/backends/cuda/native/kernels/fused_dequant_gemv.cuh` — V1 GEMV kernels (column-major, 8 warps/block, used for pair/triple M>8 fallback)

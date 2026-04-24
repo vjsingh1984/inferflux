@@ -262,6 +262,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   add_library(inferflux_cuda_kernels STATIC
     runtime/backends/cuda/native/cuda_kernels.cu
     runtime/backends/cuda/native/kv_cache_gpu.cu
+    runtime/backends/cuda/native/hybrid_kv_cache_gpu.cu
     runtime/backends/cuda/native/gpu_sampler.cu
     runtime/backends/cuda/kernels/flash_attention.cu
     # GGUF dequantization kernels
@@ -697,6 +698,14 @@ if(ENABLE_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/external
   )
   target_link_libraries(inferflux_first_token_probe PRIVATE inferflux_core)
+
+  add_executable(inferflux_attention_profile_probe
+    tests/tools/attention_profile_probe.cpp
+  )
+  target_include_directories(inferflux_attention_profile_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external
+  )
+  target_link_libraries(inferflux_attention_profile_probe PRIVATE inferflux_core)
 
   add_executable(inferflux_kernel_count_probe
     tests/tools/kernel_count_probe.cpp

@@ -17,6 +17,7 @@
 #include "runtime/backends/cuda/native/cuda_kernels.cuh"
 #include "runtime/backends/cuda/native/cuda_sync_trace.h"
 #include "runtime/backends/cuda/native/gpu_sampler.h"
+#include "runtime/backends/cuda/native/hybrid_kv_cache_gpu.h"
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
 #include "runtime/backends/cuda/native/model_forward.h"
 #include "runtime/backends/cuda/native/model_forward_factory.h"
@@ -1697,7 +1698,41 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
                        : ""));
   }
 
-  if (kv_precision_ == runtime::cuda::native::KvPrecision::kBf16) {
+  const int kv_base_slots = bootstrap_config_.kv_base_slots;
+  if (!bootstrap_config_.invalid_kv_base_slots.empty()) {
+    log::Warn("inferflux_cuda_executor",
+              "Ignoring invalid INFERFLUX_CUDA_KV_BASE_SLOTS='" +
+                  bootstrap_config_.invalid_kv_base_slots + "'");
+  }
+
+  if (kv_base_slots > 0) {
+    // Hybrid KV cache: dense base + per-slot overflow
+    if (kv_precision_ == runtime::cuda::native::KvPrecision::kBf16) {
+      auto cache = std::make_unique<HybridKvCacheGpuTyped<__nv_bfloat16>>();
+      if (!cache->Allocate(config.num_hidden_layers,
+                           config.num_key_value_heads, config.head_dim,
+                           max_seq, max_batch, kv_base_slots)) {
+        log::Error("inferflux_cuda_executor",
+                   "Failed to allocate hybrid BF16 KV cache");
+        return false;
+      }
+      kv_cache_ = std::move(cache);
+    } else {
+      auto cache = std::make_unique<HybridKvCacheGpuTyped<half>>();
+      if (!cache->Allocate(config.num_hidden_layers,
+                           config.num_key_value_heads, config.head_dim,
+                           max_seq, max_batch, kv_base_slots)) {
+        log::Error("inferflux_cuda_executor",
+                   "Failed to allocate hybrid FP16 KV cache");
+        return false;
+      }
+      kv_cache_ = std::move(cache);
+    }
+    log::Info("inferflux_cuda_executor",
+              "Using hybrid KV cache: base_slots=" +
+                  std::to_string(kv_base_slots) +
+                  ", max_batch=" + std::to_string(max_batch));
+  } else if (kv_precision_ == runtime::cuda::native::KvPrecision::kBf16) {
     auto cache = std::make_unique<KvCacheGpuTyped<__nv_bfloat16>>();
     if (!cache->Allocate(config.num_hidden_layers, config.num_key_value_heads,
                          config.head_dim, max_seq, max_batch)) {
@@ -3705,6 +3740,25 @@ std::vector<float> InferfluxCudaExecutor::NativeEmbed(const std::string &text) {
 #else
   (void)text;
   return {};
+#endif
+}
+
+AttentionTensorData InferfluxCudaExecutor::CaptureAttentionTensors() {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!model_forward_) {
+    AttentionTensorData result;
+    result.ok = false;
+    result.error = "No model forward pass available";
+    return result;
+  }
+
+  // Forward to the model forward implementation
+  return model_forward_->CaptureAttentionTensors();
+#else
+  AttentionTensorData result;
+  result.ok = false;
+  result.error = "Native kernels not ready";
+  return result;
 #endif
 }
 

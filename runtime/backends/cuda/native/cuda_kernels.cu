@@ -982,6 +982,59 @@ template cudaError_t BatchedKvAppendStrided<__nv_bfloat16>(
     cudaStream_t);
 
 // ============================================================================
+// BatchedKvAppendIndirect: scatter-copy K/V using slot base pointer table
+// ============================================================================
+
+template <typename T>
+__global__ void BatchedKvAppendIndirectKernel(
+    const T *__restrict__ k_new, const T *__restrict__ v_new,
+    T *const *__restrict__ slot_base_ptrs,
+    const int *__restrict__ d_seq_ids, const int *__restrict__ d_n_past,
+    int layer, int batch_size, int kv_dim, size_t layer_stride,
+    size_t kv_stride) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch_size * kv_dim;
+  if (idx >= total)
+    return;
+
+  const int b = idx / kv_dim;
+  const int d = idx % kv_dim;
+  T *slot = slot_base_ptrs[d_seq_ids[b]];
+  const size_t layer_offset = static_cast<size_t>(layer) * layer_stride;
+  const size_t token_offset =
+      static_cast<size_t>(d_n_past[b]) * kv_dim + static_cast<size_t>(d);
+  const size_t k_offset = layer_offset + token_offset;
+  const size_t v_offset = layer_offset + kv_stride + token_offset;
+
+  slot[k_offset] = k_new[idx];
+  slot[v_offset] = v_new[idx];
+}
+
+template <typename T>
+cudaError_t BatchedKvAppendIndirect(const T *k_new, const T *v_new,
+                                    T *const *slot_base_ptrs,
+                                    const int *d_seq_ids, const int *d_n_past,
+                                    int layer, int batch_size, int kv_dim,
+                                    size_t layer_stride, size_t kv_stride,
+                                    cudaStream_t stream) {
+  const int total = batch_size * kv_dim;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  BatchedKvAppendIndirectKernel<T>
+      <<<blocks, threads, 0, stream>>>(k_new, v_new, slot_base_ptrs, d_seq_ids,
+                                       d_n_past, layer, batch_size, kv_dim,
+                                       layer_stride, kv_stride);
+  return cudaGetLastError();
+}
+
+template cudaError_t BatchedKvAppendIndirect<half>(
+    const half *, const half *, half *const *, const int *, const int *, int,
+    int, int, size_t, size_t, cudaStream_t);
+template cudaError_t BatchedKvAppendIndirect<__nv_bfloat16>(
+    const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *const *,
+    const int *, const int *, int, int, int, size_t, size_t, cudaStream_t);
+
+// ============================================================================
 // Mean-pooling kernel for embedding extraction
 // ============================================================================
 
@@ -1129,6 +1182,44 @@ cudaError_t DeviceCheckEos(const int *sampled_tokens, int batch_size,
       sampled_tokens, batch_size, eos_token_id, d_has_eos);
   return cudaGetLastError();
 }
+
+// Convert half/bfloat16 to float kernel
+template <typename T>
+__global__ void ConvertHalfToFloatKernel(const T *__restrict__ input,
+                                         float *__restrict__ output,
+                                         size_t num_elements) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < num_elements) {
+    if constexpr (std::is_same_v<T, half>) {
+      output[idx] = __half2float(input[idx]);
+    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+      output[idx] = __bfloat162float(input[idx]);
+    }
+  }
+}
+
+template <typename T>
+cudaError_t ConvertHalfToFloat(const T *d_input, float *d_output,
+                                size_t num_elements, cudaStream_t stream) {
+  if (num_elements == 0) {
+    return cudaSuccess;
+  }
+
+  const int block_size = 256;
+  const int num_blocks = (num_elements + block_size - 1) / block_size;
+
+  ConvertHalfToFloatKernel<T><<<num_blocks, block_size, 0, stream>>>(
+      d_input, d_output, num_elements);
+
+  return cudaGetLastError();
+}
+
+// Explicit instantiations
+template cudaError_t ConvertHalfToFloat<half>(const half *, float *, size_t,
+                                                cudaStream_t);
+template cudaError_t ConvertHalfToFloat<__nv_bfloat16>(const __nv_bfloat16 *,
+                                                         float *, size_t,
+                                                         cudaStream_t);
 
 } // namespace cuda_kernel
 } // namespace inferflux

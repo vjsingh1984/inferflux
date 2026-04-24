@@ -240,6 +240,7 @@ public:
   int NativeVocabSize() const override;
   std::vector<float> NativeEmbed(const std::string &text) override;
   int NativeEmbedDims() const override;
+  AttentionTensorData CaptureAttentionTensors() override;
   const runtime::cuda::native::ModelMemoryLedger &MemoryLedger() const {
     return memory_ledger_;
   }

@@ -196,6 +196,18 @@ cudaError_t BatchedKvAppendStrided(const T *k_new, const T *v_new,
                                    size_t slot_stride, size_t layer_stride,
                                    size_t kv_stride, cudaStream_t stream);
 
+/**
+ * BatchedKvAppendIndirect: Same as Strided but uses slot base pointer table.
+ * Supports hybrid KV cache where slots may not be contiguous.
+ */
+template <typename T>
+cudaError_t BatchedKvAppendIndirect(const T *k_new, const T *v_new,
+                                    T *const *slot_base_ptrs,
+                                    const int *d_seq_ids, const int *d_n_past,
+                                    int layer, int batch_size, int kv_dim,
+                                    size_t layer_stride, size_t kv_stride,
+                                    cudaStream_t stream);
+
 // ============================================================================
 // Embedding extraction kernels
 // ============================================================================
@@ -242,6 +254,14 @@ cudaError_t AppendTokenToBuffer(const int *sampled_token, int *token_buffer,
 cudaError_t DeviceCheckEos(const int *sampled_tokens, int batch_size,
                             int eos_token_id, int *d_has_eos,
                             cudaStream_t stream);
+
+/**
+ * ConvertHalfToFloat: Convert half/bfloat16 tensor to float on device.
+ * Used by attention tensor profiling to capture intermediate tensors.
+ */
+template <typename T>
+cudaError_t ConvertHalfToFloat(const T *d_input, float *d_output,
+                                size_t num_elements, cudaStream_t stream);
 
 } // namespace cuda_kernel
 } // namespace inferflux

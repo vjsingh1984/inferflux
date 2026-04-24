@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/backends/common/backend_interface.h"
 #include "runtime/backends/gpu/gpu_accelerated_backend.h"
 
 #include <filesystem>
@@ -12,6 +13,8 @@ public:
   CudaBackend();
 
   std::string Name() const override { return "llama_cpp_cuda"; }
+
+  AttentionTensorData CaptureAttentionTensors() override;
 };
 
 } // namespace inferflux

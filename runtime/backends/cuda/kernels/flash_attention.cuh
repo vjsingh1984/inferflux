@@ -58,5 +58,21 @@ cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
                                        void *split_workspace = nullptr,
                                        size_t split_workspace_bytes = 0);
 
+/**
+ * FlashDecodeMultiSeqIndirect: Batched decode attention using slot base
+ * pointer table. Builds K/V pointer arrays from slot_base_ptrs, then
+ * dispatches to FlashDecodeMultiSeq.
+ *
+ * ptr_workspace: device buffer for K/V pointer arrays.
+ *   Required size: 2 * batch_size * sizeof(T*).
+ */
+template <typename T>
+cudaError_t FlashDecodeMultiSeqIndirect(
+    const T *Q, T *const *slot_base_ptrs, T *O, const int *d_seq_ids,
+    const int *d_kv_lens, int layer, int batch_size, int num_heads,
+    int num_kv_heads, int head_dim, size_t layer_stride, size_t kv_stride,
+    float scale, cudaStream_t stream, void *ptr_workspace,
+    size_t ptr_workspace_bytes);
+
 } // namespace cuda_kernel
 } // namespace inferflux

@@ -5,6 +5,7 @@
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
 #include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/weight_map.h"
+#include "runtime/backends/common/backend_interface.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -161,6 +162,14 @@ public:
    * Model type name for logging.
    */
   virtual std::string ModelType() const = 0;
+
+  /**
+   * Capture intermediate attention tensors for debugging/profiling.
+   * Default implementation returns empty data with "not implemented" message.
+   */
+  virtual AttentionTensorData CaptureAttentionTensors() {
+    return {{}, false, "Not implemented for this model type"};
+  }
 };
 
 } // namespace inferflux

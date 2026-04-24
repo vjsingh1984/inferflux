@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/model_forward.h"
+#include "runtime/backends/common/backend_interface.h"
 #include <algorithm>
 #include <array>
 
@@ -126,6 +127,10 @@ public:
   bool EmbedForward(const std::vector<int> &token_ids, int sequence_id,
                     float *d_output) override;
 
+  /// Capture intermediate attention tensors for debugging/profiling.
+  /// Only returns data when INFERFLUX_DEBUG_ATTENTION_TENSORS=1.
+  AttentionTensorData CaptureAttentionTensors();
+
 private:
   // Model config
   int hidden_size_{0};
@@ -200,6 +205,26 @@ private:
   NativeExecutionPolicy execution_policy_{};
   std::size_t device_workspace_bytes_{0};
   std::size_t host_workspace_bytes_{0};
+
+  // Attention tensor capture for debugging/profiling.
+  // Only active when INFERFLUX_DEBUG_ATTENTION_TENSORS=1.
+  bool capture_attention_tensors_{false};
+
+  // Device-side snapshot info (for deferred download)
+  struct DeviceTensorSnapshot {
+    int layer_idx{-1};
+    std::string operation;
+    float *d_data{nullptr};  // Device pointer (always float)
+    size_t num_elements{0};
+    std::vector<int> shape;
+  };
+  std::vector<DeviceTensorSnapshot> device_snapshots_;
+
+  // Helper method to snapshot a tensor to device memory
+  template <typename TensorT>
+  void SnapshotTensorToDevice(const std::string &operation, int layer_idx,
+                               const TensorT *device_ptr,
+                               const std::vector<int> &shape);
 
   bool AllocateScratch();
 };

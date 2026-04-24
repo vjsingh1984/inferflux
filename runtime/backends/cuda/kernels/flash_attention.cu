@@ -1230,5 +1230,66 @@ template cudaError_t FlashDecodeMultiSeqStrided<__nv_bfloat16>(
     const int *, int, int, int, int, int, size_t, size_t, size_t, float,
     cudaStream_t, void *, size_t);
 
+// ============================================================================
+// FlashDecodeMultiSeqIndirect: Build K/V pointer arrays from slot_base_ptrs,
+// then dispatch to existing FlashDecodeMultiSeq (pointer-based).
+// Supports hybrid KV cache where slots may not be contiguous.
+// ============================================================================
+
+template <typename T>
+__global__ void BuildKVPtrsFromSlotsKernel(
+    T *const *__restrict__ slot_base_ptrs,
+    const int *__restrict__ seq_ids, int layer, int batch_size,
+    size_t layer_stride, size_t kv_stride,
+    const T **__restrict__ out_k_ptrs, const T **__restrict__ out_v_ptrs) {
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= batch_size)
+    return;
+  const T *slot = slot_base_ptrs[seq_ids[b]];
+  const T *k_base = slot + static_cast<size_t>(layer) * layer_stride;
+  out_k_ptrs[b] = k_base;
+  out_v_ptrs[b] = k_base + kv_stride;
+}
+
+template <typename T>
+cudaError_t FlashDecodeMultiSeqIndirect(
+    const T *Q, T *const *slot_base_ptrs, T *O, const int *d_seq_ids,
+    const int *d_kv_lens, int layer, int batch_size, int num_heads,
+    int num_kv_heads, int head_dim, size_t layer_stride, size_t kv_stride,
+    float scale, cudaStream_t stream, void *ptr_workspace,
+    size_t ptr_workspace_bytes) {
+  // ptr_workspace must hold 2 * batch_size * sizeof(T*)
+  const size_t required = 2 * static_cast<size_t>(batch_size) * sizeof(T *);
+  if (!ptr_workspace || ptr_workspace_bytes < required) {
+    return cudaErrorInvalidValue;
+  }
+
+  const T **d_k_ptrs = static_cast<const T **>(ptr_workspace);
+  const T **d_v_ptrs = d_k_ptrs + batch_size;
+
+  // Build K/V pointer arrays from slot_base_ptrs
+  const int threads = 64;
+  const int blocks = (batch_size + threads - 1) / threads;
+  BuildKVPtrsFromSlotsKernel<T><<<blocks, threads, 0, stream>>>(
+      slot_base_ptrs, d_seq_ids, layer, batch_size, layer_stride, kv_stride,
+      d_k_ptrs, d_v_ptrs);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess)
+    return err;
+
+  // Dispatch to existing pointer-based FlashDecode
+  return FlashDecodeMultiSeq<T>(Q, d_k_ptrs, d_v_ptrs, O, d_kv_lens,
+                                batch_size, num_heads, num_kv_heads, head_dim,
+                                scale, stream);
+}
+
+template cudaError_t FlashDecodeMultiSeqIndirect<half>(
+    const half *, half *const *, half *, const int *, const int *, int, int,
+    int, int, int, size_t, size_t, float, cudaStream_t, void *, size_t);
+template cudaError_t FlashDecodeMultiSeqIndirect<__nv_bfloat16>(
+    const __nv_bfloat16 *, __nv_bfloat16 *const *, __nv_bfloat16 *,
+    const int *, const int *, int, int, int, int, int, size_t, size_t, float,
+    cudaStream_t, void *, size_t);
+
 } // namespace cuda_kernel
 } // namespace inferflux

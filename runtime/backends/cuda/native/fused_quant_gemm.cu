@@ -1414,6 +1414,111 @@ bool DispatchQ8_1MmvqAccumQ8K(const void *data, const void *act_q8_1,
                                                         M, N, K, stream);
 }
 
+// ============================================================================
+// MMVQ FP32 accumulate dispatch (float* output for FP32 residual stream)
+// ============================================================================
+
+bool DispatchQ8_1MmvqAccumF32Q4K(const void *data, const void *act_q8_1,
+                                  float *output, int M, int N, int K,
+                                  cudaStream_t stream) {
+  return DispatchMmvqAccumF32<block_q4_k,
+                               inferflux_mmvq_q4k_accum<1, float>,
+                               inferflux_mmvq_q4k_accum<2, float>,
+                               inferflux_mmvq_q4k_accum<4, float>,
+                               inferflux_mmvq_q4k_accum<8, float>>(
+      data, act_q8_1, output, M, N, K, stream);
+}
+
+bool DispatchQ8_1MmvqAccumF32Q6K(const void *data, const void *act_q8_1,
+                                  float *output, int M, int N, int K,
+                                  cudaStream_t stream) {
+  return DispatchMmvqAccumF32<block_q6_k,
+                               inferflux_mmvq_q6k_accum<1, float>,
+                               inferflux_mmvq_q6k_accum<2, float>,
+                               inferflux_mmvq_q6k_accum<4, float>,
+                               inferflux_mmvq_q6k_accum<8, float>>(
+      data, act_q8_1, output, M, N, K, stream);
+}
+
+bool DispatchQ8_1MmvqAccumF32Q6KVec(const void *data, const void *act_q8_1,
+                                     float *output, int M, int N, int K,
+                                     cudaStream_t stream) {
+  return DispatchMmvqAccumF32<block_q6_k,
+                               inferflux_mmvq_q6k_accum_vec<1, float>,
+                               inferflux_mmvq_q6k_accum_vec<2, float>,
+                               inferflux_mmvq_q6k_accum_vec<4, float>,
+                               inferflux_mmvq_q6k_accum_vec<8, float>>(
+      data, act_q8_1, output, M, N, K, stream);
+}
+
+bool DispatchQ8_1MmvqAccumF32Q8_0(const void *data, const void *act_q8_1,
+                                   float *output, int M, int N, int K,
+                                   cudaStream_t stream) {
+  return DispatchMmvqAccumF32<block_q8_0,
+                               inferflux_mmvq_q8_0_accum<1, float>,
+                               inferflux_mmvq_q8_0_accum<2, float>,
+                               inferflux_mmvq_q8_0_accum<4, float>,
+                               inferflux_mmvq_q8_0_accum<8, float>>(
+      data, act_q8_1, output, M, N, K, stream);
+}
+
+bool DispatchQ8_1MmvqAccumF32Q8K(const void *data, const void *act_q8_1,
+                                  float *output, int M, int N, int K,
+                                  cudaStream_t stream) {
+  return DispatchMmvqAccumF32<block_q8_k,
+                               inferflux_mmvq_q8k_accum<1, float>,
+                               inferflux_mmvq_q8k_accum<2, float>,
+                               inferflux_mmvq_q8k_accum<4, float>,
+                               inferflux_mmvq_q8k_accum<8, float>>(
+      data, act_q8_1, output, M, N, K, stream);
+}
+
+// Top-level FP32 accum dispatchers (MMVQ only, M<=8 — decode path)
+bool DispatchQ8_1GemvAccumF32Q4K(const void *data, const void *act_q8_1,
+                                  float *output, int M, int N, int K,
+                                  cudaStream_t stream) {
+  if (M <= 8)
+    return DispatchQ8_1MmvqAccumF32Q4K(data, act_q8_1, output, M, N, K,
+                                        stream);
+  return false;
+}
+
+bool DispatchQ8_1GemvAccumF32Q6K(const void *data, const void *act_q8_1,
+                                  float *output, int M, int N, int K,
+                                  cudaStream_t stream) {
+  if (M <= 8) {
+    const auto &policy = ResolveExecutionPolicy(nullptr);
+    const auto &gpu = GetGpuProfile();
+    const bool auto_enable_small_ada =
+        gpu.initialized && gpu.sm_major == 8 && gpu.sm_minor == 9 && M <= 2;
+    if (policy.enable_q6k_vectorized || auto_enable_small_ada) {
+      return DispatchQ8_1MmvqAccumF32Q6KVec(data, act_q8_1, output, M, N, K,
+                                             stream);
+    }
+    return DispatchQ8_1MmvqAccumF32Q6K(data, act_q8_1, output, M, N, K,
+                                        stream);
+  }
+  return false;
+}
+
+bool DispatchQ8_1GemvAccumF32Q8_0(const void *data, const void *act_q8_1,
+                                   float *output, int M, int N, int K,
+                                   cudaStream_t stream) {
+  if (M <= 8)
+    return DispatchQ8_1MmvqAccumF32Q8_0(data, act_q8_1, output, M, N, K,
+                                         stream);
+  return false;
+}
+
+bool DispatchQ8_1GemvAccumF32Q8K(const void *data, const void *act_q8_1,
+                                  float *output, int M, int N, int K,
+                                  cudaStream_t stream) {
+  if (M <= 8)
+    return DispatchQ8_1MmvqAccumF32Q8K(data, act_q8_1, output, M, N, K,
+                                        stream);
+  return false;
+}
+
 // Forward declarations for MMQ accumulate dispatch (defined after MMQ section)
 bool DispatchMmqAccumQ4K(const void *data, const void *act_q8_1, half *output,
                          int M, int N, int K, cudaStream_t stream);
@@ -1839,6 +1944,20 @@ void FusedQuantGemm::FusedRmsNormQuantizeQ8_1(const half *residual,
       residual, norm_weight, output, K, rms_norm_eps);
 }
 
+void FusedQuantGemm::FusedRmsNormQuantizeQ8_1(const float *residual,
+                                              const half *norm_weight,
+                                              void *output_q8_1, int M, int K,
+                                              float rms_norm_eps,
+                                              cudaStream_t stream) {
+  using namespace runtime::cuda::native;
+  auto *output = static_cast<block_q8_1 *>(output_q8_1);
+  size_t smem = static_cast<size_t>(K) * sizeof(float) +
+                kGemvWarpsPerBlock * sizeof(float);
+  fused_rmsnorm_quantize_q8_1_kernel_f32<<<M, kGemvThreadsPerBlock, smem,
+                                           stream>>>(residual, norm_weight,
+                                                     output, K, rms_norm_eps);
+}
+
 bool FusedQuantGemm::SupportsQ8_1Activations(int quant_type) {
   auto qtype = static_cast<GGUF::TensorType>(quant_type);
   return GetQ8_1DispatchEntry(qtype).fn != nullptr;
@@ -2054,6 +2173,82 @@ bool FusedQuantGemm::GemvQ8_1Accum(const QuantizedWeightInfo &weight,
               std::string("Using MMVQ accumulate kernel for ") + entry.name +
                   " (M=" + std::to_string(M) + ", N=" + std::to_string(N) +
                   ", K=" + std::to_string(K) + ")");
+  }
+
+  return entry.fn(weight.data, act_q8_1, output, M, N, K, stream);
+}
+
+// ============================================================================
+// FP32 accumulate dispatch table + public API
+// ============================================================================
+
+using Q8_1DispatchF32Fn = bool (*)(const void *data, const void *act_q8_1,
+                                    float *output, int M, int N, int K,
+                                    cudaStream_t stream);
+
+struct Q8_1DispatchF32Entry {
+  Q8_1DispatchF32Fn fn;
+  const char *name;
+};
+
+const Q8_1DispatchF32Entry &
+GetQ8_1AccumF32DispatchEntry(GGUF::TensorType qtype) {
+  static const bool dp4a = GetGpuProfile().has_dp4a;
+  static const Q8_1DispatchF32Entry table[kMaxTensorType] = {
+      {nullptr, nullptr},                                          // 0: F32
+      {nullptr, nullptr},                                          // 1: F16
+      {nullptr, nullptr},                                          // 2: Q4_0
+      {nullptr, nullptr},                                          // 3: Q4_1
+      {nullptr, nullptr},                                          // 4: (unused)
+      {nullptr, nullptr},                                          // 5: (unused)
+      {nullptr, nullptr},                                          // 6: Q5_0
+      {nullptr, nullptr},                                          // 7: Q5_1
+      {dp4a ? DispatchQ8_1GemvAccumF32Q8_0 : nullptr, "Q8_0"},    // 8
+      {nullptr, nullptr},                                          // 9: Q8_1
+      {nullptr, nullptr},                                          // 10: Q2_K
+      {nullptr, nullptr},                                          // 11: Q3_K
+      {dp4a ? DispatchQ8_1GemvAccumF32Q4K : nullptr, "Q4_K"},     // 12
+      {nullptr, nullptr},                                          // 13: Q5_K
+      {dp4a ? DispatchQ8_1GemvAccumF32Q6K : nullptr, "Q6_K"},     // 14
+      {dp4a ? DispatchQ8_1GemvAccumF32Q8K : nullptr, "Q8_K"},     // 15
+  };
+
+  static const Q8_1DispatchF32Entry empty = {nullptr, nullptr};
+  auto idx = static_cast<uint32_t>(qtype);
+  if (idx >= kMaxTensorType)
+    return empty;
+  return table[idx];
+}
+
+bool FusedQuantGemm::GemvQ8_1AccumF32(const QuantizedWeightInfo &weight,
+                                       const void *act_q8_1, float *output,
+                                       int M, int N, int K,
+                                       cudaStream_t stream,
+                                       const NativeExecutionPolicy *policy) {
+  ScopedExecutionPolicyOverride scoped(policy);
+  if (!weight.data || weight.quant_type < 0 || !act_q8_1)
+    return false;
+  if (ResolveExecutionPolicy(policy).disable_fused_gemv)
+    return false;
+
+  auto qtype = static_cast<GGUF::TensorType>(weight.quant_type);
+  const auto &entry = GetQ8_1AccumF32DispatchEntry(qtype);
+  if (!entry.fn)
+    return false;
+
+  const FusedDispatchGeometry geometry{M, N, K, 1, true, false};
+  if (!ShouldUseFusedPath(weight.quant_type, geometry))
+    return false;
+
+  static bool logged[kMaxTensorType] = {};
+  auto idx = static_cast<uint32_t>(qtype);
+  if (idx < kMaxTensorType && !logged[idx] && entry.name) {
+    logged[idx] = true;
+    log::Info("fused_quant_gemm",
+              std::string("Using MMVQ FP32 accumulate kernel for ") +
+                  entry.name + " (M=" + std::to_string(M) +
+                  ", N=" + std::to_string(N) + ", K=" + std::to_string(K) +
+                  ")");
   }
 
   return entry.fn(weight.data, act_q8_1, output, M, N, K, stream);

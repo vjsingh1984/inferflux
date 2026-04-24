@@ -8,6 +8,10 @@
 namespace inferflux {
 
 template <typename T> KvCacheGpuTyped<T>::~KvCacheGpuTyped() {
+  if (d_slot_base_ptrs_) {
+    cudaFree(d_slot_base_ptrs_);
+    d_slot_base_ptrs_ = nullptr;
+  }
   if (buffer_) {
     cudaFree(buffer_);
     buffer_ = nullptr;
@@ -43,6 +47,24 @@ bool KvCacheGpuTyped<T>::Allocate(int num_layers, int num_kv_heads,
   }
 
   cudaMemset(buffer_, 0, total_bytes_);
+
+  // Build device-resident slot base pointer table for indirect kernel access.
+  std::vector<T *> h_ptrs(max_batch_size);
+  for (int i = 0; i < max_batch_size; ++i) {
+    h_ptrs[i] = buffer_ + static_cast<size_t>(i) * slot_stride_;
+  }
+  err = cudaMalloc(&d_slot_base_ptrs_,
+                   max_batch_size * sizeof(T *));
+  if (err != cudaSuccess) {
+    log::Error("kv_cache_gpu",
+               "cudaMalloc failed for slot base ptrs: " +
+                   std::string(cudaGetErrorString(err)));
+    cudaFree(buffer_);
+    buffer_ = nullptr;
+    return false;
+  }
+  cudaMemcpy(d_slot_base_ptrs_, h_ptrs.data(),
+             max_batch_size * sizeof(T *), cudaMemcpyHostToDevice);
 
   log::Info(
       "kv_cache_gpu",

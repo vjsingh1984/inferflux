@@ -31,6 +31,21 @@ struct PerfSnapshot {
   int32_t generated_tokens{0};
 };
 
+/// Snapshot of intermediate attention tensors for debugging/profiling.
+struct AttentionTensorSnapshot {
+  int layer_idx{-1};
+  std::string operation;  // "qkv_projection", "rope", "attention_scores", etc.
+  std::vector<float> data;  // Flattened tensor data (on host)
+  std::vector<int> shape;   // Tensor shape [batch, seq, heads, dim]
+};
+
+/// Container for attention tensor snapshots across all layers.
+struct AttentionTensorData {
+  std::vector<AttentionTensorSnapshot> snapshots;
+  bool ok{false};
+  std::string error;
+};
+
 /// Result of applying a chat template.
 struct ChatTemplateResult {
   bool valid{false};
@@ -263,6 +278,12 @@ public:
   virtual std::vector<TopLogitEntry> TopLogitsForParity(int top_n) {
     (void)top_n;
     return {};
+  }
+
+  /// Capture intermediate attention tensors for debugging/profiling.
+  /// Only implemented when INFERFLUX_DEBUG_ATTENTION_TENSORS=1.
+  virtual AttentionTensorData CaptureAttentionTensors() {
+    return {{}, false, "Not implemented for this backend"};
   }
 
   /// Report the full capability set of this backend.

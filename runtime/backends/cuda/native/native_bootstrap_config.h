@@ -17,6 +17,8 @@ struct NativeBootstrapConfig {
   std::string invalid_kv_max_batch;
   std::string invalid_kv_max_seq;
   std::string invalid_kv_budget_mb;
+  int kv_base_slots{0}; // 0 = all dense (backward compat), >0 = hybrid
+  std::string invalid_kv_base_slots;
   std::string invalid_kv_free_mem_ratio;
 
   static NativeBootstrapConfig

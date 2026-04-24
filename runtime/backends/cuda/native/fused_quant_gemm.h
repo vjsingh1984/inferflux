@@ -146,6 +146,15 @@ public:
                                        float rms_norm_eps, cudaStream_t stream);
 
   /**
+   * FP32 residual variant: reads float* residual, normalizes, quantizes to
+   * Q8_1. No FP16 intermediate — reads FP32 directly into shared memory.
+   */
+  static void FusedRmsNormQuantizeQ8_1(const float *residual,
+                                       const half *norm_weight,
+                                       void *output_q8_1, int M, int K,
+                                       float rms_norm_eps, cudaStream_t stream);
+
+  /**
    * GEMV using pre-quantized Q8_1 activations.
    * Per-32-element block scales provide better precision than per-row.
    * No shared memory needed for activations (reads from L2 cache).
@@ -182,6 +191,18 @@ public:
                             const void *act_q8_1, half *output, int M, int N,
                             int K, cudaStream_t stream,
                             const NativeExecutionPolicy *policy = nullptr);
+
+  /**
+   * GEMV using pre-quantized Q8_1 activations with FP32 accumulate mode.
+   * output(float)[i] += gemv_result[i] instead of output(half)[i] += ...
+   * Used to accumulate O-proj and down-proj directly into the FP32 residual
+   * stream, eliminating FP16 truncation at layer boundaries.
+   * Currently supports MMVQ path only (M<=8, covers all decode).
+   */
+  static bool GemvQ8_1AccumF32(const QuantizedWeightInfo &weight,
+                                const void *act_q8_1, float *output, int M,
+                                int N, int K, cudaStream_t stream,
+                                const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * MMQ-style tiled down-projection path for transformed GGUF weights.

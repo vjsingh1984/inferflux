@@ -27,6 +27,30 @@ public:
   virtual size_t GetMemoryUsage() const = 0;
   virtual int MaxSeqLen() const = 0;
   virtual int MaxBatchSize() const = 0;
+
+  /// Device pointer table: slot_base_ptrs[seq_id] → base of that slot's KV
+  /// memory. Used by indirect kernels for hybrid KV cache support.
+  /// Returns nullptr if not available.
+  virtual void *SlotBasePtrsDevice() const { return nullptr; }
+  /// True if the KV cache is a single contiguous buffer (stride-based kernels
+  /// can be used). False for hybrid/paged caches requiring indirect kernels.
+  virtual bool IsContiguous() const { return false; }
+  /// Contiguous buffer base, or nullptr for non-contiguous caches.
+  virtual void *ContiguousBuffer() const { return nullptr; }
+  virtual size_t SlotStride() const = 0;
+  virtual size_t LayerStride() const = 0;
+  virtual size_t KvStride() const = 0;
+  virtual int KvDim() const = 0;
+
+  /// Type-erased K/V access for use from templated forward pass code.
+  /// Returns device pointer to K cache for (layer, seq_id).
+  virtual void *GetKVoid(int layer, int seq_id) const = 0;
+  /// Returns device pointer to V cache for (layer, seq_id).
+  virtual void *GetVVoid(int layer, int seq_id) const = 0;
+  /// Type-erased KV append.
+  virtual cudaError_t AppendVoid(int layer, int seq_id, int start_pos,
+                                 int seq_len, const void *k_new,
+                                 const void *v_new, cudaStream_t stream) = 0;
 };
 
 /**
@@ -68,10 +92,13 @@ public:
                       const T **h_k_ptrs, const T **h_v_ptrs) const;
 
   T *Buffer() const { return buffer_; }
-  size_t SlotStride() const { return slot_stride_; }
-  size_t LayerStride() const { return layer_stride_; }
-  size_t KvStride() const { return kv_stride_; }
-  int KvDim() const { return kv_dim_; }
+  bool IsContiguous() const override { return true; }
+  void *ContiguousBuffer() const override { return buffer_; }
+  size_t SlotStride() const override { return slot_stride_; }
+  size_t LayerStride() const override { return layer_stride_; }
+  size_t KvStride() const override { return kv_stride_; }
+  int KvDim() const override { return kv_dim_; }
+  void *SlotBasePtrsDevice() const override { return d_slot_base_ptrs_; }
 
   void ClearSequence(int seq_id) override;
   void ClearSequenceAsync(int seq_id, cudaStream_t stream) override;
@@ -85,8 +112,23 @@ public:
   int MaxSeqLen() const override { return max_seq_len_; }
   int MaxBatchSize() const override { return max_batch_size_; }
 
+  void *GetKVoid(int layer, int seq_id) const override {
+    return GetK(layer, seq_id);
+  }
+  void *GetVVoid(int layer, int seq_id) const override {
+    return GetV(layer, seq_id);
+  }
+  cudaError_t AppendVoid(int layer, int seq_id, int start_pos, int seq_len,
+                         const void *k_new, const void *v_new,
+                         cudaStream_t stream) override {
+    return Append(layer, seq_id, start_pos, seq_len,
+                  static_cast<const T *>(k_new), static_cast<const T *>(v_new),
+                  stream);
+  }
+
 private:
   T *buffer_{nullptr};
+  T **d_slot_base_ptrs_{nullptr};
   size_t total_bytes_{0};
 
   int num_layers_{0};

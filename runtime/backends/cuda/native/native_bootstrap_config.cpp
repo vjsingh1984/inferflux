@@ -98,6 +98,15 @@ NativeBootstrapConfig::FromEnv(const std::string &kv_precision_hint) {
     }
   }
 
+  if (const char *env = std::getenv("INFERFLUX_CUDA_KV_BASE_SLOTS")) {
+    int val = 0;
+    if (ParsePositiveIntSetting(env, &val) && val <= 128) {
+      config.kv_base_slots = val;
+    } else {
+      config.invalid_kv_base_slots = env;
+    }
+  }
+
   if (const char *env = std::getenv("INFERFLUX_CUDA_KV_FREE_MEM_RATIO")) {
     double parsed = 0.0;
     if (ParsePositiveDoubleSetting(env, &parsed) && parsed <= 1.0) {

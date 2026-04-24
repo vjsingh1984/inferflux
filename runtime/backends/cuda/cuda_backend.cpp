@@ -8,6 +8,15 @@ namespace inferflux {
 CudaBackend::CudaBackend()
     : GpuAcceleratedBackend(std::make_unique<CudaDeviceStrategy>()) {}
 
+AttentionTensorData CudaBackend::CaptureAttentionTensors() {
+  // llama.cpp backend doesn't support intermediate tensor capture
+  AttentionTensorData result;
+  result.ok = false;
+  result.error = "Attention tensor capture not supported for llama_cpp_cuda backend. "
+                 "This feature is only available for inferflux_cuda backend.";
+  return result;
+}
+
 #ifdef INFERFLUX_HAS_CUDA
 static const bool kCudaRegistered =
     (BackendRegistry::Instance().Register(

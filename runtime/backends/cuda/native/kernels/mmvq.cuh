@@ -275,7 +275,9 @@ __global__ void inferflux_mmvq_q4k_bias(
 // Q4_K × Q8_1 MMVQ accumulate variant (adds to existing output)
 // OutputT = half (default): read-modify-write via __half2float/__float2half
 // OutputT = float: pure FP32 accumulation for FP32 residual stream
-template <int ncols, typename OutputT = half>
+// UseAtomic = true (default): use atomicAdd for FP32 output (safe for residual accumulation)
+// UseAtomic = false: direct write (faster, only safe when no race conditions)
+template <int ncols, typename OutputT = half, bool UseAtomic = true>
 __global__ void inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
                          const block_q8_1 *__restrict__ act_q8_1,
                          OutputT *__restrict__ output, int N, int K,
@@ -382,7 +384,15 @@ __global__ void inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
       for (int w = 0; w < kMmvqWarps; ++w)
         sum += warp_sums[c * kMmvqWarps + w];
       if constexpr (std::is_same_v<OutputT, float>) {
-        output[row * N + out_idx] = sum + output[row * N + out_idx];
+        // Atomic FP32 accumulate: prevents race condition when multiple blocks
+        // write to same output location (e.g., grouped projections or residual
+        // accumulation across layers)
+        if constexpr (UseAtomic) {
+          atomicAdd(&output[row * N + out_idx], sum);
+        } else {
+          // Direct write: faster when safe (no race conditions)
+          output[row * N + out_idx] = sum;
+        }
       } else {
         output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
       }
@@ -607,7 +617,7 @@ __global__ void inferflux_mmvq_q6k_vec(const block_q6_k *__restrict__ weight,
 }
 
 // Q6_K × Q8_1 MMVQ accumulate variant (adds to existing output)
-template <int ncols, typename OutputT = half>
+template <int ncols, typename OutputT = half, bool UseAtomic = true>
 __global__ void inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
                           const block_q8_1 *__restrict__ act_q8_1,
                           OutputT *__restrict__ output, int N, int K,
@@ -704,7 +714,13 @@ __global__ void inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
       for (int w = 0; w < kMmvqWarps; ++w)
         sum += warp_sums[c * kMmvqWarps + w];
       if constexpr (std::is_same_v<OutputT, float>) {
-        output[row * N + out_idx] = sum + output[row * N + out_idx];
+        // Atomic FP32 accumulate: prevents race condition
+        if constexpr (UseAtomic) {
+          atomicAdd(&output[row * N + out_idx], sum);
+        } else {
+          // Direct write: faster when safe (no race conditions)
+          output[row * N + out_idx] = sum;
+        }
       } else {
         output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
       }
@@ -713,7 +729,7 @@ __global__ void inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
 }
 
 // Q6_K x Q8_1 MMVQ accumulate variant with vectorized weight loads.
-template <int ncols, typename OutputT = half>
+template <int ncols, typename OutputT = half, bool UseAtomic = true>
 __global__ void inferflux_mmvq_q6k_accum_vec(
     const block_q6_k *__restrict__ weight,
     const block_q8_1 *__restrict__ act_q8_1, OutputT *__restrict__ output, int N,
@@ -810,7 +826,8 @@ __global__ void inferflux_mmvq_q6k_accum_vec(
       for (int w = 0; w < kMmvqWarps; ++w)
         sum += warp_sums[c * kMmvqWarps + w];
       if constexpr (std::is_same_v<OutputT, float>) {
-        output[row * N + out_idx] = sum + output[row * N + out_idx];
+        // Atomic FP32 accumulate: prevents race condition
+        atomicAdd(&output[row * N + out_idx], sum);
       } else {
         output[row * N + out_idx] =
             __float2half(sum + __half2float(output[row * N + out_idx]));
@@ -905,7 +922,7 @@ __global__ void inferflux_mmvq_q8_0(const block_q8_0 *__restrict__ weight,
 }
 
 // Q8_0 × Q8_1 MMVQ accumulate variant (adds to existing output)
-template <int ncols, typename OutputT = half>
+template <int ncols, typename OutputT = half, bool UseAtomic = true>
 __global__ void inferflux_mmvq_q8_0_accum(const block_q8_0 *__restrict__ weight,
                                            const block_q8_1 *__restrict__ act_q8_1,
                                            OutputT *__restrict__ output, int N, int K,
@@ -982,7 +999,13 @@ __global__ void inferflux_mmvq_q8_0_accum(const block_q8_0 *__restrict__ weight,
       for (int w = 0; w < kMmvqWarps; ++w)
         sum += warp_sums[c * kMmvqWarps + w];
       if constexpr (std::is_same_v<OutputT, float>) {
-        output[row * N + out_idx] = sum + output[row * N + out_idx];
+        // Atomic FP32 accumulate: prevents race condition
+        if constexpr (UseAtomic) {
+          atomicAdd(&output[row * N + out_idx], sum);
+        } else {
+          // Direct write: faster when safe (no race conditions)
+          output[row * N + out_idx] = sum;
+        }
       } else {
         output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
       }
@@ -1074,7 +1097,7 @@ __global__ void inferflux_mmvq_q8k(const block_q8_k *__restrict__ weight,
 }
 
 // Q8_K × Q8_1 MMVQ accumulate variant (adds to existing output)
-template <int ncols, typename OutputT = half>
+template <int ncols, typename OutputT = half, bool UseAtomic = true>
 __global__ void inferflux_mmvq_q8k_accum(const block_q8_k *__restrict__ weight,
                                           const block_q8_1 *__restrict__ act_q8_1,
                                           OutputT *__restrict__ output, int N, int K,
@@ -1149,7 +1172,13 @@ __global__ void inferflux_mmvq_q8k_accum(const block_q8_k *__restrict__ weight,
       for (int w = 0; w < kMmvqWarps; ++w)
         sum += warp_sums[c * kMmvqWarps + w];
       if constexpr (std::is_same_v<OutputT, float>) {
-        output[row * N + out_idx] = sum + output[row * N + out_idx];
+        // Atomic FP32 accumulate: prevents race condition
+        if constexpr (UseAtomic) {
+          atomicAdd(&output[row * N + out_idx], sum);
+        } else {
+          // Direct write: faster when safe (no race conditions)
+          output[row * N + out_idx] = sum;
+        }
       } else {
         output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
       }
@@ -1503,6 +1532,42 @@ template <typename BlockT,
                           int)>
 bool DispatchMmvqAccum(const void *data, const void *act_q8_1, half *output,
                        int M, int N, int K, cudaStream_t stream) {
+  auto *w = static_cast<const BlockT *>(data);
+  auto *a = static_cast<const block_q8_1 *>(act_q8_1);
+
+  auto launch = [&](int ncols, auto kernel) {
+    dim3 grid(N, (M + ncols - 1) / ncols);
+    size_t smem = sizeof(float) * kMmvqWarps * ncols;
+    const int threads = calc_mmvq_threads(ncols);
+    kernel<<<grid, threads, smem, stream>>>(w, a, output, N, K, M);
+    return true;
+  };
+
+  if (M <= 1)
+    return launch(1, Kernel1);
+  if (M <= 2)
+    return launch(2, Kernel2);
+  if (M <= 4)
+    return launch(4, Kernel4);
+  if (M <= 8)
+    return launch(8, Kernel8);
+  return false;
+}
+
+// FP32 output variant of DispatchMmvqAccum for FP32 residual stream.
+// Kernel function pointers take float* output instead of half*.
+template <typename BlockT,
+          void (*Kernel1)(const BlockT *, const block_q8_1 *, float *, int, int,
+                          int),
+          void (*Kernel2)(const BlockT *, const block_q8_1 *, float *, int, int,
+                          int),
+          void (*Kernel4)(const BlockT *, const block_q8_1 *, float *, int, int,
+                          int),
+          void (*Kernel8)(const BlockT *, const block_q8_1 *, float *, int, int,
+                          int)>
+bool DispatchMmvqAccumF32(const void *data, const void *act_q8_1,
+                           float *output, int M, int N, int K,
+                           cudaStream_t stream) {
   auto *w = static_cast<const BlockT *>(data);
   auto *a = static_cast<const block_q8_1 *>(act_q8_1);
 

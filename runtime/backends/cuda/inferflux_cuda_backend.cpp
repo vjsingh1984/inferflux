@@ -29,6 +29,18 @@ bool InferfluxCudaBackend::NativeKernelsReady() {
   return NativeCudaDeviceStrategy::NativeKernelsReady();
 }
 
+AttentionTensorData InferfluxCudaBackend::CaptureAttentionTensors() {
+  if (!Runtime()) {
+    AttentionTensorData result;
+    result.ok = false;
+    result.error = "No runtime available";
+    return result;
+  }
+
+  // Forward to the native runtime's CaptureAttentionTensors implementation
+  return Runtime()->CaptureAttentionTensors();
+}
+
 #ifdef INFERFLUX_HAS_CUDA
 static const bool kInferfluxCudaRegistered =
     (BackendRegistry::Instance().Register(

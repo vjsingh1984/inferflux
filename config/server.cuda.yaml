@@ -132,3 +132,11 @@ registry:
 # - FlashAttention (FA2) requires SM 8.0+ (Ampere, Hopper, Ada)
 # - Phase overlap improves mixed prefill/decode workloads
 # - KV cache pages: 256-512 for 3B models, 4096+ for 7B+ models
+
+# Hybrid KV cache: dense base slots + paged overflow
+# Reduces KV cache memory by 50% for typical workloads
+runtime:
+  backends:
+    cuda:
+      native:
+        kv_base_slots: 8  # Use 8 dense slots + overflow for max_batch=16

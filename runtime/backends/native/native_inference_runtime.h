@@ -152,6 +152,12 @@ public:
     (void)out_tokens;
     return 0;
   }
+
+  /// Capture intermediate attention tensors for debugging/profiling.
+  /// Default implementation returns empty data. Overridden by CUDA runtime.
+  virtual AttentionTensorData CaptureAttentionTensors() {
+    return {{}, false, "Not implemented for this runtime"};
+  }
 };
 
 } // namespace inferflux

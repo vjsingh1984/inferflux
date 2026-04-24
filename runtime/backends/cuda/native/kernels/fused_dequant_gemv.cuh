@@ -36,6 +36,19 @@ LoadHalfToSmemSumSq(const half *__restrict__ src, float *__restrict__ dst,
 }
 
 
+// Float→smem load with sum-of-squares (for FP32 residual stream).
+__device__ __forceinline__ float
+LoadF32ToSmemSumSq(const float *__restrict__ src, float *__restrict__ dst,
+                   int K, int tid) {
+  float local_sum_sq = 0.0f;
+  for (int i = tid; i < K; i += kGemvThreadsPerBlock) {
+    float v = src[i];
+    dst[i] = v;
+    local_sum_sq += v * v;
+  }
+  return local_sum_sq;
+}
+
 // Vectorized in-place RmsNorm application with half2 norm weight loads.
 __device__ __forceinline__ void
 ApplyNormInPlace(float *__restrict__ sx, const half *__restrict__ norm_weight,
@@ -748,6 +761,94 @@ __global__ void fused_rmsnorm_quantize_q8_1_kernel(
   rms = warp_sums[0];
 
   // Phase 2: Apply norm weights in-place (vectorized half2 norm loads)
+  ApplyNormInPlace(sx, norm_weight, rms, K, tid);
+  __syncthreads();
+
+  // Phase 3: Quantize normalized values to Q8_1 blocks
+  const int num_blocks = K / QK8_1;
+  block_q8_1 *out_row = output + row * num_blocks;
+
+  for (int blk0 = warp_id * 2; blk0 < num_blocks;
+       blk0 += kGemvWarpsPerBlock * 2) {
+    const int blk1 = blk0 + 1;
+    const bool has_blk1 = blk1 < num_blocks;
+
+    float val0 = sx[blk0 * QK8_1 + lane];
+    float val1 = has_blk1 ? sx[blk1 * QK8_1 + lane] : 0.0f;
+
+    float amax0 = fabsf(val0);
+    float amax1 = fabsf(val1);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      amax0 = fmaxf(amax0, __shfl_xor_sync(0xFFFFFFFF, amax0, offset));
+      amax1 = fmaxf(amax1, __shfl_xor_sync(0xFFFFFFFF, amax1, offset));
+    }
+
+    float d0 = amax0 / 127.0f;
+    float inv_d0 = (amax0 > 0.0f) ? 127.0f / amax0 : 0.0f;
+    int q0 = __float2int_rn(val0 * inv_d0);
+    q0 = max(-128, min(127, q0));
+    int sum0 = q0;
+
+    float d1 = amax1 / 127.0f;
+    float inv_d1 = (amax1 > 0.0f) ? 127.0f / amax1 : 0.0f;
+    int q1 = has_blk1 ? __float2int_rn(val1 * inv_d1) : 0;
+    q1 = max(-128, min(127, q1));
+    int sum1 = q1;
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, offset);
+      sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, offset);
+    }
+
+    out_row[blk0].qs[lane] = static_cast<int8_t>(q0);
+    if (lane == 0) {
+      out_row[blk0].ds = __halves2half2(
+          __float2half(d0), __float2half(d0 * static_cast<float>(sum0)));
+    }
+    if (has_blk1) {
+      out_row[blk1].qs[lane] = static_cast<int8_t>(q1);
+      if (lane == 0) {
+        out_row[blk1].ds = __halves2half2(
+            __float2half(d1), __float2half(d1 * static_cast<float>(sum1)));
+      }
+    }
+  }
+}
+
+// FP32 residual variant: reads float* residual instead of half*.
+__global__ void fused_rmsnorm_quantize_q8_1_kernel_f32(
+    const float *__restrict__ residual, const half *__restrict__ norm_weight,
+    block_q8_1 *__restrict__ output, int K, float eps) {
+  extern __shared__ char smem_raw[];
+  float *sx = reinterpret_cast<float *>(smem_raw);
+  float *warp_sums = sx + K;
+
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+
+  // Phase 1: Load FP32 residual → FP32 smem (no conversion needed)
+  const float *res_row = residual + row * K;
+  float local_sum_sq = LoadF32ToSmemSumSq(res_row, sx, K, tid);
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_sum_sq += __shfl_down_sync(0xFFFFFFFF, local_sum_sq, offset);
+  }
+  if (lane == 0)
+    warp_sums[warp_id] = local_sum_sq;
+  __syncthreads();
+
+  float rms;
+  if (tid == 0) {
+    float total = 0.0f;
+    for (int w = 0; w < kGemvWarpsPerBlock; ++w)
+      total += warp_sums[w];
+    warp_sums[0] = rsqrtf(total / static_cast<float>(K) + eps);
+  }
+  __syncthreads();
+  rms = warp_sums[0];
+
+  // Phase 2: Apply norm weights in-place
   ApplyNormInPlace(sx, norm_weight, rms, K, tid);
   __syncthreads();
 

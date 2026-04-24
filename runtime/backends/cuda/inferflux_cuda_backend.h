@@ -25,6 +25,8 @@ public:
 
   static bool NativeKernelsReady();
 
+  AttentionTensorData CaptureAttentionTensors() override;
+
 protected:
   const char *LogTag() const override { return "inferflux_cuda_backend"; }
 
